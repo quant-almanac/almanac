@@ -1,0 +1,21 @@
+{
+  "openai": ["9984.T", "MSFT", "NVDA", "ARM"],
+  "stripe": ["V", "MA", "PYPL"],
+  "anthropic": ["AMZN", "GOOGL"],
+  "deepseek": ["BABA", "BIDU"],
+  "perplexity": ["NVDA", "AAPL"],
+  "ai_data_center": ["NVDA", "AVGO", "AMAT", "ANET", "6857.T", "6920.T"],
+  "lithium_battery": ["LIT", "ALB"],
+  "rare_earth": ["MP", "TMRC"],
+  "chatgpt": ["MSFT", "NVDA", "9984.T"],
+  "gemini": ["GOOGL", "NVDA"],
+  "stargate": ["NVDA", "MSFT", "ARM", "9984.T"],
+  "arm_ipo": ["ARM", "9984.T"],
+  "waymo": ["GOOGL", "UBER"],
+  "neuralink": ["TSLA"],
+  "shein_ipo": ["BABA", "JD"],
+  "databricks": ["NVDA", "AMZN", "GOOGL", "MSFT"],
+  "autonomous_vehicle": ["TSLA", "GOOGL", "UBER", "APTV"],
+  "quantum_computing": ["IBM", "GOOGL", "IONQ", "QBTS"],
+  "nuclear_power": ["CCJ", "NNE", "VST"]
+}

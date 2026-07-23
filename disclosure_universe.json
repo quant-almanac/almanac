@@ -1,0 +1,35 @@
+{
+  "_doc": "Pre-registered fixed scan universe for the observe_only disclosure-feature pipeline.",
+  "_criterion": "Largest liquid US large-cap constituent(s) per GICS sector (index-defined, public). NOT derived from the portfolio — overlap with held names is incidental (everyone holds mega-caps); the selection rule is book-independent and reproducible, so the list reveals nothing about the book.",
+  "_why_fixed": "observe_only validation needs a fixed, pre-registered universe so rank-IC / Deflated-Sharpe are not contaminated by selection bias. News/SNS-driven (already-moving) names would bias the sample and break reproducibility — those belong in the crowding feature, not the scan universe.",
+  "_pinned_at": "2026-06-11",
+  "_market": "US",
+  "_count": 30,
+  "_spend_note": "First backfill ~= count x --limit DeepSeek calls (deepseek-chat, ~JPY 0.1/disclosure). Recommended: --limit 6 for the first run; the daily cron then only pays for genuinely new filings (skip_existing dedup).",
+  "by_sector": {
+    "Information Technology": ["AAPL", "MSFT", "NVDA", "AVGO"],
+    "Communication Services": ["GOOGL", "META", "NFLX"],
+    "Consumer Discretionary": ["AMZN", "TSLA", "HD"],
+    "Consumer Staples": ["PG", "KO", "COST"],
+    "Health Care": ["UNH", "JNJ", "LLY", "MRK"],
+    "Financials": ["JPM", "BAC", "V", "MA"],
+    "Industrials": ["CAT", "GE", "HON", "UNP"],
+    "Energy": ["XOM", "CVX"],
+    "Materials": ["LIN"],
+    "Utilities": ["NEE"],
+    "Real Estate": ["PLD"]
+  },
+  "tickers": [
+    "AAPL", "MSFT", "NVDA", "AVGO",
+    "GOOGL", "META", "NFLX",
+    "AMZN", "TSLA", "HD",
+    "PG", "KO", "COST",
+    "UNH", "JNJ", "LLY", "MRK",
+    "JPM", "BAC", "V", "MA",
+    "CAT", "GE", "HON", "UNP",
+    "XOM", "CVX",
+    "LIN",
+    "NEE",
+    "PLD"
+  ]
+}

@@ -1,0 +1,25 @@
+{
+  "husband": {
+    "broker": "sample",
+    "tsumitate_limit_annual": 1200000,
+    "growth_limit_annual": 2400000,
+    "lifetime_limit": 18000000,
+    "tsumitate_used_this_year": 0,
+    "growth_used_this_year": 0,
+    "lifetime_used_estimate": 0,
+    "holdings": {},
+    "notes": "Sample only. Replace with local private data."
+  },
+  "wife": {
+    "broker": "sample",
+    "tsumitate_limit_annual": 1200000,
+    "growth_limit_annual": 2400000,
+    "lifetime_limit": 18000000,
+    "tsumitate_used_this_year": 0,
+    "growth_used_this_year": 0,
+    "lifetime_used_estimate": 0,
+    "holdings": {},
+    "notes": "Sample secondary account. Replace with local private data or leave empty."
+  },
+  "last_updated": "2026-01-01"
+}

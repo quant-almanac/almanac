@@ -1,0 +1,29 @@
+{
+  "schema_version": "1.0.0",
+  "lanes": [
+    {"name": "sonnet_long", "measurement_path": "catalyst_outcome_log.jsonl", "final_outcome_date": null, "status": "measured"},
+    {"name": "sonnet_medium", "measurement_path": "catalyst_outcome_log.jsonl", "final_outcome_date": null, "status": "measured"},
+    {"name": "sonnet_swing", "measurement_path": "catalyst_outcome_log.jsonl", "final_outcome_date": null, "status": "measured"},
+    {"name": "sonnet_short", "measurement_path": "catalyst_outcome_log.jsonl", "final_outcome_date": null, "status": "measured"},
+    {"name": "opus_final", "measurement_path": "agent_attribution_log.jsonl", "final_outcome_date": null, "status": "measured"},
+    {"name": "screener_short", "measurement_path": "catalyst_outcome_log.jsonl", "final_outcome_date": null, "status": "measured"},
+    {"name": "screener_short_overheat", "measurement_path": "catalyst_outcome_log.jsonl", "final_outcome_date": null, "status": "measured", "role_note": "BULL過熱逆張りshort(rsi>=80 & ma50+20%)"},
+    {"name": "screener_short_event", "measurement_path": "catalyst_outcome_log.jsonl", "final_outcome_date": null, "status": "measured", "role_note": "触媒short(dilution/going_concern)"},
+    {"name": "screener_short_bear", "measurement_path": "catalyst_outcome_log.jsonl", "final_outcome_date": null, "status": "measured", "role_note": "弱気レジームshort"},
+    {"name": "screener_margin_long", "measurement_path": "catalyst_outcome_log.jsonl", "final_outcome_date": null, "status": "measured"},
+    {"name": "screener_pair", "measurement_path": "catalyst_outcome_log.jsonl", "final_outcome_date": null, "status": "measured"},
+    {"name": "screener_squeeze", "measurement_path": "catalyst_outcome_log.jsonl", "final_outcome_date": null, "status": "measured"},
+    {"name": "disclosure_deterministic", "measurement_path": "catalyst_outcome_log.jsonl", "final_outcome_date": null, "status": "measured"},
+    {"name": "revision_tracker", "measurement_path": "catalyst_outcome_log.jsonl", "final_outcome_date": null, "status": "measured"},
+    {"name": "scenario_monitor", "measurement_path": "catalyst_outcome_log.jsonl", "promotion_path": "scenario_promotion_summary.json", "final_outcome_date": null, "status": "measured"},
+    {"name": "proxy_mapper", "measurement_path": "catalyst_outcome_log.jsonl", "final_outcome_date": null, "status": "measured", "role_note": "pre-listing entity to listed proxies; ipo_watch handles post-listing universe onboarding alerts"},
+    {"name": "ipo_watch", "measurement_path": "data/ipo_watch_state.json", "final_outcome_date": null, "status": "display_only", "role_note": "post-listing alert-only watcher; AI verdict required, but universe onboarding remains via download_tickers.py NEW_LISTINGS"},
+    {"name": "news_topic", "measurement_path": "sell_decision_log.jsonl", "final_outcome_date": null, "status": "display_only", "role_note": "AI verdict required; actionization requires ticker, price/liquidity/freshness, insider, and policy gates"},
+    {"name": "social_topic", "measurement_path": "sell_decision_log.jsonl", "final_outcome_date": null, "status": "display_only", "role_note": "AI verdict required; actionization requires ticker, price/liquidity/freshness, insider, and policy gates"},
+    {"name": "geopolitical", "measurement_path": "sell_decision_log.jsonl", "final_outcome_date": null, "status": "display_only", "role_note": "AI verdict required; macro narrative cannot bypass hard safety gates"},
+    {"name": "jp_dilution", "measurement_path": "catalyst_outcome_log.jsonl", "final_outcome_date": null, "status": "measured"},
+    {"name": "jp_going_concern", "measurement_path": "catalyst_outcome_log.jsonl", "final_outcome_date": null, "status": "measured"},
+    {"name": "signal_tracker", "measurement_path": "signal_history.json", "final_outcome_date": null, "status": "retired", "role_note": "legacy 5/10 business-day win-rate tracker; superseded by PIT catalyst outcomes and certify harness"},
+    {"name": "backtest_wfo", "measurement_path": "backtest_wfo_results.json", "final_outcome_date": null, "status": "retired"}
+  ]
+}

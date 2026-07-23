@@ -1,0 +1,62 @@
+@import "tailwindcss";
+
+/* ═══════════════════════════════════════════════════
+   ALMANAC — 黒曜石オペレーションコンソール 全体クローム
+   面・文字・状態色は components/today/ops/tokens.ts (OPS) が唯一の真実。
+   ここに置くのは「ページを跨ぐブラウザ由来のクローム」だけ:
+   ベース背景 / スクロールバー / 選択色 / フォーカスリング / ナビ微細挙動。
+   フォント (Shippori Mincho / Noto Sans JP / JetBrains Mono / DotGothic16)
+   は app/layout.tsx の <link> 経由で読み込み済み。
+   ═══════════════════════════════════════════════════ */
+
+:root {
+  --background: #0B0D12; /* OPS.bg */
+  --foreground: #E9E7DF; /* OPS.text */
+}
+
+* { box-sizing: border-box; }
+
+body {
+  background: var(--background);
+  color: var(--foreground);
+  font-family: 'Noto Sans JP', 'Hiragino Sans', 'Yu Gothic', sans-serif;
+  font-weight: 400;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* ── キーボードフォーカス: 金のリング（マウス操作では出ない） ── */
+:focus-visible {
+  outline: 2px solid rgba(201, 167, 93, 0.65);
+  outline-offset: 2px;
+  border-radius: 2px;
+}
+
+/* ── テキスト選択: 注目=金 の言語に合わせる（朱は警告専用） ── */
+::selection { background: rgba(201, 167, 93, 0.30); color: #F5EFE0; }
+
+/* ── スクロールバー: 黒曜石トーンで細く静かに ── */
+* { scrollbar-width: thin; scrollbar-color: #232833 transparent; }
+::-webkit-scrollbar { width: 8px; height: 8px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: #232833; border-radius: 4px; }
+::-webkit-scrollbar-thumb:hover { background: #2E3542; }
+nav::-webkit-scrollbar { display: none; }
+
+/* ── トップナビ ── */
+.nav-link:not([data-active="true"]):hover {
+  color: #9C9889 !important;
+}
+.nav-link:not([data-active="true"]):hover > span:first-child {
+  opacity: 0.9 !important;
+}
+
+@keyframes navLivePulse {
+  0%, 100% { opacity: 1; box-shadow: 0 0 0 0 rgba(87,190,146,0.5); }
+  50%      { opacity: 0.55; box-shadow: 0 0 0 3px rgba(87,190,146,0); }
+}
+.nav-live-dot { animation: navLivePulse 2.4s ease-in-out infinite; }
+
+@media (prefers-reduced-motion: reduce) {
+  .nav-live-dot { animation: none; }
+}

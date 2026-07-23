@@ -1,0 +1,30 @@
+{
+  "CASH_JPY": {
+    "ticker": "CASH_JPY",
+    "name": "JPY Cash",
+    "shares": 1000000,
+    "current_price": 1,
+    "currency": "JPY",
+    "account": "sample",
+    "broker": "sample"
+  },
+  "CASH_USD": {
+    "ticker": "CASH_USD",
+    "name": "USD Cash",
+    "shares": 5000,
+    "current_price": 150,
+    "currency": "JPY",
+    "account": "sample",
+    "broker": "sample"
+  },
+  "SPY": {
+    "ticker": "SPY",
+    "name": "SPDR S&P 500 ETF Trust",
+    "shares": 1,
+    "entry_price": 500,
+    "current_price": 500,
+    "currency": "USD",
+    "account": "sample",
+    "broker": "sample"
+  }
+}

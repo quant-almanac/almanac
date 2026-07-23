@@ -1,0 +1,16 @@
+{
+  "ticker": "EMPLOYER_STOCK",
+  "monthly_amount": 0,
+  "monthly_employee": 0,
+  "monthly_incentive": 0,
+  "incentive_rate": 0,
+  "hold_limit_pct": 0.1,
+  "current_shares": 0,
+  "avg_cost": 0,
+  "total_invested": 0,
+  "total_incentive": 0,
+  "purchase_history": [],
+  "sell_history": [],
+  "dividend_history": [],
+  "notes": "Sample only. Replace with local private data or leave at zero."
+}

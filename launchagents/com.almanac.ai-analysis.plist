@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.almanac.ai-analysis</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/path/to/ALMANAC/run_with_secrets.sh</string>
+    <string>/path/to/ALMANAC/venv/bin/python</string>
+    <string>/path/to/ALMANAC/portfolio_analyst.py</string>
+    <string>--force</string>
+    <string>--telegram</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>/path/to/ALMANAC</string>
+  <key>StartCalendarInterval</key>
+  <array>
+    <dict><key>Weekday</key><integer>1</integer><key>Hour</key><integer>6</integer><key>Minute</key><integer>15</integer></dict>
+    <dict><key>Weekday</key><integer>2</integer><key>Hour</key><integer>6</integer><key>Minute</key><integer>15</integer></dict>
+    <dict><key>Weekday</key><integer>3</integer><key>Hour</key><integer>6</integer><key>Minute</key><integer>15</integer></dict>
+    <dict><key>Weekday</key><integer>4</integer><key>Hour</key><integer>6</integer><key>Minute</key><integer>15</integer></dict>
+    <dict><key>Weekday</key><integer>5</integer><key>Hour</key><integer>6</integer><key>Minute</key><integer>15</integer></dict>
+  </array>
+  <key>StandardOutPath</key>
+  <string>/path/to/ALMANAC/ai_analysis_log.txt</string>
+  <key>StandardErrorPath</key>
+  <string>/path/to/ALMANAC/ai_analysis_log.txt</string>
+</dict>
+</plist>

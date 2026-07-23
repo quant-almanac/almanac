@@ -1,0 +1,6 @@
+{
+  "_doc": "Tickers structurally excluded from every signal, hypothesis, universe, and push surface. Holdings/risk measurement remains allowed. The B2 employee-share sale planner is the only exception and requires insider_window.json.",
+  "tickers": [
+    "9999.T"
+  ]
+}

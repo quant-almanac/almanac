@@ -1,0 +1,73 @@
+{
+  "version": 2,
+  "auto_apply_allowlist": [
+    "recovery_window_days",
+    "currency_usd_target_pct",
+    "currency_jpy_target_pct",
+    "sector_max_pct",
+    "sector_rebalance_threshold_pct",
+    "max_short_positions",
+    "macro_cache_hours",
+    "geopolitical_cache_hours",
+    "price_cache_minutes",
+    "news_articles_per_ticker"
+  ],
+  "auto_apply_denylist": [
+    "min_action_jpy",
+    "min_action_pct_of_portfolio",
+    "done_list_same_direction_days",
+    "loss_harvest_min_jpy",
+    "cash_critical_ratio_pct",
+    "news_score_threshold",
+    "vix_margin_buy_block",
+    "vix_emergency_threshold",
+    "rebalance_cooldown_days",
+    "execution_plan_gate_mode"
+  ],
+  "risk_class": {
+    "recovery_window_days": "high",
+    "max_short_positions": "high",
+    "currency_usd_target_pct": "medium",
+    "currency_jpy_target_pct": "medium",
+    "sector_max_pct": "medium",
+    "sector_rebalance_threshold_pct": "medium",
+    "macro_cache_hours": "low",
+    "geopolitical_cache_hours": "low",
+    "price_cache_minutes": "low",
+    "news_articles_per_ticker": "low"
+  },
+  "atomic_groups": [
+    ["currency_usd_target_pct", "currency_jpy_target_pct"],
+    ["sector_max_pct", "sector_rebalance_threshold_pct"]
+  ],
+  "max_absolute_step": {
+    "recovery_window_days": 1,
+    "max_short_positions": 1,
+    "currency_usd_target_pct": 3,
+    "currency_jpy_target_pct": 3,
+    "sector_max_pct": 3,
+    "sector_rebalance_threshold_pct": 3,
+    "macro_cache_hours": 2,
+    "geopolitical_cache_hours": 1,
+    "price_cache_minutes": 5,
+    "news_articles_per_ticker": 1
+  },
+  "max_groups_per_risk_class": {
+    "high": 1,
+    "medium": 1,
+    "low": 1
+  },
+  "cooldown_trading_days": 1,
+  "freshness_hours": {
+    "guard": 3,
+    "vix": 4,
+    "regime": 8,
+    "macro": 12
+  },
+  "schedule": {
+    "source": "launchd",
+    "timezone": "Asia/Tokyo",
+    "weekdays": ["Mon", "Tue", "Wed", "Thu", "Fri"],
+    "times": ["06:30", "10:30", "14:30", "19:30"]
+  }
+}

@@ -1,0 +1,9 @@
+{
+  "balance": 1000000,
+  "usd_balance": 5000,
+  "fx_rate_usdjpy": 150,
+  "jpy_equivalent_usd": 750000,
+  "total_cash": 1750000,
+  "risk_per_trade": 0.02,
+  "last_updated": "2026-01-01"
+}

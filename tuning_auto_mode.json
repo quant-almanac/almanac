@@ -1,0 +1,83 @@
+{
+  "enabled": false,
+  "disabled_reason": "2026-07-09 review: live LaunchAgent was applying AI recommendations from stale analyzer_log-based advisor. Keep scheduled job harmless until state/history/log audit and allowlist policy are reviewed.",
+  "auto_apply_allowlist": [],
+  "auto_apply_denylist": [
+    "min_action_jpy",
+    "min_action_pct_of_portfolio",
+    "done_list_same_direction_days",
+    "loss_harvest_min_jpy",
+    "cash_critical_ratio_pct",
+    "news_score_threshold",
+    "vix_margin_buy_block",
+    "vix_emergency_threshold",
+    "rebalance_cooldown_days",
+    "execution_plan_gate_mode"
+  ],
+  "audit_reconciliation": {
+    "as_of": "2026-07-09T00:00:00+09:00",
+    "canonical_source": "tunable_params.json",
+    "history_policy": "tunable_params_history.jsonl is append-only audit history; do not rewrite old ai_auto rows.",
+    "decision": "Use current tunable_params.json values as canonical after 2026-07-09 settings review.",
+    "latest_ai_auto_history_seen": "2026-06-29T14:31:18.437408",
+    "last_auto_tune_log_seen": "2026-07-09 19:30:00",
+    "reconciled_history_mismatches": [
+      {
+        "key": "min_action_jpy",
+        "canonical_value": 300000,
+        "latest_history_value": 250000,
+        "history_timestamp": "2026-06-29T14:31:18.435821",
+        "reason": "Current runtime config remains canonical; min_action_jpy was not the primary scarcity driver and auto_tune is disabled."
+      },
+      {
+        "key": "vix_emergency_threshold",
+        "canonical_value": 20.0,
+        "latest_history_value": 22.0,
+        "history_timestamp": "2026-06-29T14:31:18.437408",
+        "reason": "Current runtime config remains canonical; VIX emergency threshold should be reviewed manually, not inherited from stale ai_auto history."
+      }
+    ]
+  },
+  "interval_hours": 4,
+  "min_change_pct": 5,
+  "max_change_pct": 50,
+  "telegram_notify": true,
+  "skip_if_same_regime": true,
+  "last_run": "2026-05-09T09:06",
+  "last_regime": "A_強気",
+  "last_vix": 17.18,
+  "last_changes": [
+    {
+      "key": "min_action_jpy",
+      "old": 250000,
+      "new": 300000,
+      "delta_pct": 20.0,
+      "rationale": "[Auto Mode] レジームA_強気・VIX17台で攻撃局面。小ロット排除を強化し大型エントリーに集中。現在値250000から引き上げ。 | regime=A_強気",
+      "applied": true
+    },
+    {
+      "key": "sector_rebalance_threshold_pct",
+      "old": 40,
+      "new": 35,
+      "delta_pct": 12.5,
+      "rationale": "[Auto Mode] Cash比率32.6%がトリガー閾値40%に近づいているが未達。強気局面でキャッシュドラッグ解消を促進するため閾値を35%に引き下げ、早期リバランス検討を促す。 | regime=A_強気",
+      "applied": true
+    },
+    {
+      "key": "cash_critical_ratio_pct",
+      "old": 30,
+      "new": 25,
+      "delta_pct": 16.7,
+      "rationale": "[Auto Mode] 現金比率3.8%は低水準だが、top_sector=Cashが32.6%と高い。キャッシュドラッグ警告をより早期に発動させるため30%から25%に引き下げ、積極的な資金投入を促す。 | regime=A_強気",
+      "applied": true
+    },
+    {
+      "key": "news_score_threshold",
+      "old": 20,
+      "new": 15,
+      "delta_pct": 25.0,
+      "rationale": "[Auto Mode] 強気局面で機会捕捉を優先。ニューススコア閾値を20から15に引き下げ、より多くの銘柄シグナルを拾いエントリー機会を拡大する。 | regime=A_強気",
+      "applied": true
+    }
+  ]
+}

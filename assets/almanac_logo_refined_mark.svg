@@ -1,0 +1,42 @@
+<svg width="512" height="512" viewBox="0 0 512 512" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="bg" x1="80" y1="48" x2="420" y2="462" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#151A23"/>
+      <stop offset="1" stop-color="#070A10"/>
+    </linearGradient>
+    <linearGradient id="gold" x1="194" y1="96" x2="322" y2="397" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#FFF0B9"/>
+      <stop offset="0.48" stop-color="#D9AE53"/>
+      <stop offset="1" stop-color="#9A6D25"/>
+    </linearGradient>
+    <linearGradient id="signal" x1="155" y1="248" x2="356" y2="184" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#2DD4BF"/>
+      <stop offset="1" stop-color="#8AF4E6"/>
+    </linearGradient>
+    <filter id="shadow" x="88" y="70" width="336" height="370" filterUnits="userSpaceOnUse" color-interpolation-filters="sRGB">
+      <feDropShadow dx="0" dy="17" stdDeviation="16" flood-color="#000000" flood-opacity="0.38"/>
+      <feDropShadow dx="0" dy="0" stdDeviation="7" flood-color="#D9AE53" flood-opacity="0.15"/>
+    </filter>
+  </defs>
+  <rect width="512" height="512" rx="112" fill="#070A10"/>
+  <rect x="36" y="36" width="440" height="440" rx="88" fill="url(#bg)" stroke="#D8B867" stroke-opacity="0.24" stroke-width="2"/>
+  <rect x="58" y="58" width="396" height="396" rx="68" stroke="#334052" stroke-opacity="0.44" stroke-width="1"/>
+
+  <g filter="url(#shadow)">
+    <path d="M256 98L372 390H316L292 325H220L196 390H140L256 98Z" fill="#05080D" opacity="0.85"/>
+    <path d="M256 119L351 374H319L293 305H219L193 374H161L256 119Z" fill="url(#gold)"/>
+    <path d="M234 270H278L256 207L234 270Z" fill="#0D131C"/>
+    <path d="M182 374H330" stroke="#080C13" stroke-width="16" stroke-linecap="round"/>
+    <path d="M194 374H318" stroke="#E7CA73" stroke-width="7" stroke-linecap="round"/>
+    <path d="M154 248H358" stroke="#4D5B6F" stroke-width="5" stroke-linecap="round" opacity="0.72"/>
+    <path d="M156 247C192 225 218 239 247 213C275 188 304 192 354 166" stroke="url(#signal)" stroke-width="11" stroke-linecap="round" stroke-linejoin="round"/>
+    <circle cx="354" cy="166" r="11" fill="#69EADC" stroke="#071018" stroke-width="5"/>
+  </g>
+
+  <g stroke="#DDBF68" stroke-width="6" stroke-linecap="round" opacity="0.76">
+    <path d="M256 78V100"/>
+    <path d="M256 412V434"/>
+    <path d="M86 256H108"/>
+    <path d="M404 256H426"/>
+  </g>
+</svg>

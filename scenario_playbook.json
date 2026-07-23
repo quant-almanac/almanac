@@ -1,0 +1,1714 @@
+{
+  "version": "1.0",
+  "description": "マクロシナリオ別プレイブック — イベント駆動型ポートフォリオ対応",
+  "updated_at": "2026-07-07",
+  "scenarios": [
+    {
+      "id": "war_end",
+      "name": "戦争終結ラリー",
+      "icon": "🕊️",
+      "color": "#4CAF50",
+      "priority": "high",
+      "description": "停戦合意・和平交渉進展による地政学リスク後退。防衛・エネルギー売り→テック・欧州リスクオン。",
+      "detect": {
+        "news_keywords": [
+          "ceasefire",
+          "peace deal",
+          "peace agreement",
+          "truce",
+          "armistice",
+          "war ended",
+          "conflict resolution",
+          "peace talks breakthrough",
+          "Iran War",
+          "Iran war end",
+          "Iran de-escalation",
+          "Iran ceasefire",
+          "Iran peace agreement",
+          "Israel Iran truce",
+          "Israel Iran ceasefire",
+          "Middle East ceasefire",
+          "Hormuz resolution",
+          "Strait of Hormuz resolution",
+          "Strait of Hormuz reopen",
+          "Hormuz reopening",
+          "reopen the Strait of Hormuz",
+          "Hormuz tensions ease",
+          "Iran oil sanctions lifted",
+          "Iran sanctions waiver",
+          "Iran oil exports",
+          "General License X",
+          "oil prices drop",
+          "停戦",
+          "和平合意",
+          "休戦",
+          "終戦",
+          "停戦協定",
+          "和平交渉妥結",
+          "イラン停戦",
+          "中東停戦",
+          "ホルムズ海峡",
+          "ホルムズ海峡再開",
+          "イラン制裁緩和",
+          "イスラエル イラン 停戦"
+        ],
+        "min_keyword_score": 2,
+        "indicators": {
+          "vix": {
+            "condition": "below",
+            "threshold": 18,
+            "key": "vix_current"
+          },
+          "vix_delta_5d": {
+            "condition": "drop_pct",
+            "threshold": -20,
+            "description": "VIX 5日間で20%以上低下"
+          },
+          "oil_wti": {
+            "condition": "drop_pct_5d",
+            "threshold": -10,
+            "description": "WTI原油5日間10%以上下落"
+          },
+          "defense_etf_ita": {
+            "condition": "drop_pct_5d",
+            "threshold": -5,
+            "description": "ITA(防衛ETF)5日間5%以上下落"
+          },
+          "gold_gld": {
+            "condition": "drop_pct_5d",
+            "threshold": -3,
+            "description": "GLD 5日間で3%以上下落"
+          }
+        },
+        "technical": {
+          "SPY_rsi_14": {
+            "condition": "above",
+            "threshold": 50
+          },
+          "SOXX_macd": {
+            "condition": "bullish_cross",
+            "description": "半導体MACD ゴールデンクロス"
+          }
+        },
+      "min_signals": 3,
+      "activation_policy": {
+        "required_any": [
+          [
+            "oil_wti",
+            "vix_delta_5d"
+          ]
+        ],
+        "ai_fallback_cannot_satisfy_required": [
+          "news_keywords"
+        ],
+        "freshness_requirements": {
+          "vix": {
+            "state": "vix",
+            "max_age_minutes": 60
+          },
+          "oil_wti": {
+            "state": "vix",
+            "max_age_minutes": 60
+          },
+          "vix_delta_5d": {
+            "state": "vix",
+            "max_age_minutes": 60
+          }
+        },
+        "contradiction_veto": [
+          {
+            "key": "oil_wti",
+            "condition": "above",
+            "threshold": 0
+          },
+          {
+            "key": "vix_delta_5d",
+            "condition": "above",
+            "threshold": 0
+          }
+        ]
+      },
+      "required_signals_rationale": "war_end は停戦/和平ニュースと低VIXのリスクオン初動を必須にする。SPY MA50 や regime_bull_confirmed は bull_pullback 由来で、停戦イベントの必須条件ではない。",
+        "required_signals": [
+          "news_keywords",
+          "vix"
+        ]
+      },
+      "actions": {
+        "phase_1": {
+          "label": "即時対応（0-2日）",
+          "buy": [
+            {
+              "ticker": "SOXL",
+              "allocation_usd": 5000,
+              "reason": "半導体3倍レバ — 地政学解消で最大受益"
+            },
+            {
+              "ticker": "TQQQ",
+              "allocation_usd": 5000,
+              "reason": "NASDAQ3倍レバ — リスクオン初動"
+            },
+            {
+              "ticker": "EWG",
+              "allocation_usd": 5000,
+              "reason": "ドイツETF — 欧州復興の恩恵"
+            },
+            {
+              "ticker": "1306.T",
+              "allocation_jpy": 200000,
+              "reason": "TOPIX連動ETF — 中東停戦は原油安+リスクオンで日本株(エネルギー輸入国)が実需受益。円建てで為替リスクなし。"
+            }
+          ],
+          "sell": [
+            {
+              "ticker": "GLD",
+              "action": "trim_50pct",
+              "reason": "安全資産需要低下"
+            }
+          ],
+          "notes": "USD現金$25Kから$15K投入。残り$10Kはphase_2用に温存。JP ETFはJPY口座から別枠で¥20万(ドル転不要)。"
+        },
+        "phase_2": {
+          "label": "確認後（3-7日）",
+          "buy": [
+            {
+              "ticker": "EWG",
+              "allocation_usd": 3000,
+              "reason": "欧州復興継続確認で追加"
+            },
+            {
+              "ticker": "IEV",
+              "allocation_usd": 3000,
+              "reason": "欧州広域ETF追加"
+            },
+            {
+              "ticker": "EPOL",
+              "allocation_usd": 2000,
+              "reason": "ポーランド — 東欧復興"
+            },
+            {
+              "ticker": "1489.T",
+              "allocation_jpy": 200000,
+              "reason": "日経高配当50 — 停戦ラリー継続確認で日本株を追加。配当+キャピタル両取り・円建てコア。"
+            }
+          ],
+          "confirmation_required": [
+            "VIX remains below 20",
+            "SPY above 20-day MA",
+            "Defense ETF stabilized",
+            "EWJ または 日経225 が MA50 を回復している"
+          ]
+        },
+        "sell_on_trigger": [
+          "GLD"
+        ],
+        "leverage_ok": true,
+        "margin_ok": true,
+        "cash_target_pct": 15,
+        "stop_loss_pct": 5
+      }
+    },
+    {
+      "id": "fed_pivot",
+      "name": "Fed利下げ転換",
+      "icon": "🏦",
+      "color": "#2196F3",
+      "priority": "high",
+      "description": "FOMCハト派転換・利下げサイクル開始。金利感応度の高い小型株・REIT・長期債に資金流入。",
+      "detect": {
+        "news_keywords": [
+          "rate cut",
+          "dovish",
+          "pivot",
+          "easing cycle",
+          "accommodative",
+          "fed funds rate cut",
+          "FOMC dovish",
+          "rate reduction",
+          "利下げ",
+          "ハト派",
+          "金融緩和",
+          "利下げ転換",
+          "緩和サイクル",
+          "FOMC利下げ"
+        ],
+        "indicators": {
+          "yield_2y": {
+            "condition": "drop_bps_5d",
+            "threshold": -20,
+            "description": "2年債利回り5日で20bp以上低下",
+            "key": "yield_2y"
+          },
+          "yield_spread": {
+            "condition": "above",
+            "threshold": 0.1,
+            "description": "イールドスプレッド正常化（逆イールド解消）",
+            "key": "yield_spread"
+          },
+          "vix": {
+            "condition": "below",
+            "threshold": 22,
+            "key": "vix_current"
+          },
+          "yield_30y_10y_spread": {
+            "condition": "above",
+            "threshold": 0.3,
+            "description": "30年-10年スプレッド拡大（緩和期待で長期金利上昇）"
+          },
+          "dxy_dollar": {
+            "condition": "drop_pct_5d",
+            "threshold": -2,
+            "description": "ドル指数5日で2%以上下落（注: データソース要確認 — resolverはNoneを返す場合あり）"
+          }
+        },
+        "technical": {
+          "TLT_rsi_14": {
+            "condition": "above",
+            "threshold": 55,
+            "description": "長期債RSI上昇トレンド"
+          },
+          "IWM_macd": {
+            "condition": "bullish_cross",
+            "description": "小型株MACD ゴールデンクロス"
+          }
+        },
+        "min_signals": 3
+      },
+      "actions": {
+        "phase_1": {
+          "label": "即時対応（0-2日）",
+          "buy": [
+            {
+              "ticker": "TLT",
+              "allocation_usd": 8000,
+              "reason": "長期米国債ETF — 利下げで価格上昇"
+            },
+            {
+              "ticker": "IWM",
+              "allocation_usd": 5000,
+              "reason": "小型株ETF — 金利低下の最大受益者"
+            },
+            {
+              "ticker": "VNQ",
+              "allocation_usd": 5000,
+              "reason": "REIT ETF — 金利感応度高"
+            }
+          ],
+          "sell": [],
+          "notes": "USD現金$25Kから$18K投入。利下げ確認まで段階的に。"
+        },
+        "phase_2": {
+          "label": "確認後（3-7日）",
+          "buy": [
+            {
+              "ticker": "IWM",
+              "allocation_usd": 3000,
+              "reason": "小型株追加（利下げ恩恵継続）"
+            },
+            {
+              "ticker": "VNQ",
+              "allocation_usd": 2000,
+              "reason": "REIT追加"
+            }
+          ],
+          "confirmation_required": [
+            "2Y yield continues declining",
+            "FOMC minutes confirm dovish tone",
+            "IWM above 200-day MA"
+          ]
+        },
+        "sell_on_trigger": [],
+        "leverage_ok": false,
+        "margin_ok": false,
+        "cash_target_pct": 20,
+        "stop_loss_pct": 4
+      }
+    },
+    {
+      "id": "credit_crisis",
+      "name": "信用危機",
+      "icon": "🚨",
+      "color": "#F44336",
+      "priority": "high",
+      "description": "銀行破綻・信用スプレッド急拡大。システミックリスク回避のため即座にリスク資産を縮小し現金比率を引き上げ。",
+      "detect": {
+        "news_keywords": [
+          "bank run",
+          "bank failure",
+          "credit crunch",
+          "liquidity crisis",
+          "systemic risk",
+          "contagion",
+          "FDIC",
+          "bailout",
+          "bank collapse",
+          "銀行破綻",
+          "信用収縮",
+          "流動性危機",
+          "取り付け騒ぎ",
+          "金融危機",
+          "システミックリスク",
+          "信用不安",
+          "連鎖破綻"
+        ],
+        "indicators": {
+          "vix": {
+            "condition": "above",
+            "threshold": 30,
+            "key": "vix_current"
+          },
+          "vix_delta_1d": {
+            "condition": "spike_pct",
+            "threshold": 30,
+            "description": "VIX 1日で30%以上急騰"
+          },
+          "kbw_bank_index": {
+            "condition": "drop_pct_5d",
+            "threshold": -10,
+            "description": "KBW銀行指数5日10%以上下落"
+          },
+          "hy_spread": {
+            "condition": "above_bps",
+            "threshold": 500,
+            "description": "ハイイールドスプレッド500bp超"
+          },
+          "yield_2y": {
+            "condition": "drop_bps_1d",
+            "threshold": -15,
+            "description": "2年債利回り1日15bp以上急低下（質への逃避）",
+            "key": "yield_2y"
+          }
+        },
+        "technical": {
+          "SPY_rsi_14": {
+            "condition": "below",
+            "threshold": 30
+          },
+          "XLF_rsi_14": {
+            "condition": "below",
+            "threshold": 25,
+            "description": "金融セクターRSI極端な売られすぎ"
+          }
+        },
+        "min_signals": 3
+      },
+      "actions": {
+        "phase_1": {
+          "label": "即時対応（0-2日）",
+          "buy": [
+            {
+              "ticker": "GLD",
+              "allocation_usd": 5000,
+              "reason": "安全資産への逃避"
+            }
+          ],
+          "sell": [
+            {
+              "ticker": "META",
+              "action": "sell_all",
+              "reason": "リスク資産即時撤退"
+            },
+            {
+              "ticker": "RCL",
+              "action": "sell_all",
+              "reason": "景気敏感株撤退"
+            },
+            {
+              "ticker": "CRWV",
+              "action": "sell_all",
+              "reason": "投機ポジション即時清算"
+            },
+            {
+              "ticker": "EPOL",
+              "action": "sell_all",
+              "reason": "新興国リスク回避"
+            }
+          ],
+          "notes": "レバレッジ全解消。信用ポジション全決済。現金比率50%目標。"
+        },
+        "phase_2": {
+          "label": "確認後（3-7日）",
+          "buy": [
+            {
+              "ticker": "TLT",
+              "allocation_usd": 5000,
+              "reason": "長期債— Fed緩和期待で上昇"
+            }
+          ],
+          "confirmation_required": [
+            "Fed emergency measures announced",
+            "VIX peaked and declining",
+            "Credit spreads stabilizing"
+          ]
+        },
+        "sell_on_trigger": [
+          "META",
+          "RCL",
+          "CRWV",
+          "EPOL",
+          "6762.T"
+        ],
+        "leverage_ok": false,
+        "margin_ok": false,
+        "cash_target_pct": 50,
+        "stop_loss_pct": 2
+      }
+    },
+    {
+      "id": "china_shock",
+      "name": "中国ショック",
+      "icon": "🇨🇳",
+      "color": "#FF9800",
+      "priority": "medium",
+      "description": "人民元急落・中国経済ハードランディング。新興国からの資金流出、コモディティ需要崩壊。円資産・金へのシフト。",
+      "detect": {
+        "news_keywords": [
+          "yuan devaluation",
+          "china hard landing",
+          "china crisis",
+          "property crisis china",
+          "capital flight china",
+          "PBOC intervention",
+          "emerging market outflow",
+          "china GDP miss",
+          "Evergrande",
+          "人民元切り下げ",
+          "中国経済危機",
+          "中国不動産危機",
+          "資本流出",
+          "新興国売り",
+          "人民元急落",
+          "中国ハードランディング"
+        ],
+        "indicators": {
+          "usdcny": {
+            "condition": "above",
+            "threshold": 7.5,
+            "description": "USD/CNY 7.5超（元安加速）"
+          },
+          "fxi_china_etf": {
+            "condition": "drop_pct_5d",
+            "threshold": -8,
+            "description": "FXI(中国大型株ETF)5日8%以上下落"
+          },
+          "eem_em_etf": {
+            "condition": "drop_pct_5d",
+            "threshold": -5,
+            "description": "EEM(新興国ETF)5日5%以上下落"
+          },
+          "vix": {
+            "condition": "above",
+            "threshold": 25,
+            "key": "vix_current"
+          },
+          "copper_hg": {
+            "condition": "drop_pct_5d",
+            "threshold": -8,
+            "description": "銅先物5日8%以上下落（中国需要崩壊）"
+          }
+        },
+        "technical": {
+          "EEM_rsi_14": {
+            "condition": "below",
+            "threshold": 35
+          },
+          "FXI_macd": {
+            "condition": "bearish_cross",
+            "description": "中国ETF MACDデッドクロス"
+          }
+        },
+        "min_signals": 3
+      },
+      "actions": {
+        "phase_1": {
+          "label": "即時対応（0-2日）",
+          "buy": [
+            {
+              "ticker": "GLD",
+              "allocation_usd": 5000,
+              "reason": "安全資産需要増加"
+            },
+            {
+              "ticker": "1489.T",
+              "allocation_jpy": 300000,
+              "reason": "日経高配当50 — 円資産シフト"
+            }
+          ],
+          "sell": [
+            {
+              "ticker": "EPOL",
+              "action": "sell_all",
+              "reason": "新興国連鎖安リスク"
+            },
+            {
+              "ticker": "EWG",
+              "action": "trim_50pct",
+              "reason": "欧州 — 中国輸出依存度高"
+            }
+          ],
+          "notes": "新興国・欧州エクスポージャー削減。円資産・金へ退避。"
+        },
+        "phase_2": {
+          "label": "確認後（3-7日）",
+          "buy": [
+            {
+              "ticker": "1306.T",
+              "allocation_jpy": 200000,
+              "reason": "TOPIX連動ETF — 内需ディフェンシブ（勤務先株 9999.T は S8 インサイダー除外のため ETF で代替）"
+            }
+          ],
+          "confirmation_required": [
+            "PBOC stimulus announced",
+            "CNY stabilized below 7.6",
+            "Copper prices bottoming"
+          ]
+        },
+        "sell_on_trigger": [
+          "EPOL",
+          "EWG"
+        ],
+        "leverage_ok": false,
+        "margin_ok": false,
+        "cash_target_pct": 35,
+        "stop_loss_pct": 4
+      }
+    },
+    {
+      "id": "tariff_war",
+      "name": "関税・貿易戦争",
+      "icon": "🏗️",
+      "color": "#795548",
+      "priority": "medium",
+      "description": "関税引き上げ・貿易摩擦激化。輸出依存銘柄を縮小し内需・ディフェンシブへローテーション。",
+      "detect": {
+        "news_keywords": [
+          "tariff",
+          "trade war",
+          "import duty",
+          "retaliatory tariff",
+          "section 301",
+          "trade barrier",
+          "export controls",
+          "sanctions",
+          "decoupling",
+          "reshoring",
+          "nearshoring",
+          "関税",
+          "貿易戦争",
+          "報復関税",
+          "輸入規制",
+          "貿易摩擦",
+          "制裁",
+          "デカップリング",
+          "リショアリング"
+        ],
+        "indicators": {
+          "vix": {
+            "condition": "above",
+            "threshold": 22,
+            "key": "vix_current"
+          },
+          "dxy_dollar": {
+            "condition": "rise_pct_5d",
+            "threshold": 2,
+            "description": "ドル高（関税でドル需要増）"
+          },
+          "eem_em_etf": {
+            "condition": "drop_pct_5d",
+            "threshold": -4,
+            "description": "新興国ETF下落（貿易摩擦被害）"
+          },
+          "soxx_semi": {
+            "condition": "drop_pct_5d",
+            "threshold": -5,
+            "description": "半導体ETF下落（サプライチェーン懸念）"
+          }
+        },
+        "technical": {
+          "SPY_rsi_14": {
+            "condition": "range",
+            "min": 35,
+            "max": 50,
+            "description": "S&P500 弱含み"
+          },
+          "XLI_macd": {
+            "condition": "bearish_cross",
+            "description": "産業セクターMACDデッドクロス"
+          }
+        },
+        "min_signals": 3
+      },
+      "actions": {
+        "phase_1": {
+          "label": "即時対応（0-2日）",
+          "buy": [],
+          "sell": [
+            {
+              "ticker": "EWG",
+              "action": "trim_30pct",
+              "reason": "ドイツ — 輸出依存経済"
+            },
+            {
+              "ticker": "6762.T",
+              "action": "trim_30pct",
+              "reason": "TDK — 海外売上比率高"
+            }
+          ],
+          "notes": "新規投資は控え、内需銘柄の買い場を探る。現金温存優先。"
+        },
+        "phase_2": {
+          "label": "確認後（3-7日）",
+          "buy": [
+            {
+              "ticker": "1489.T",
+              "allocation_jpy": 300000,
+              "reason": "日経高配当 — 内需ディフェンシブ寄り"
+            },
+            {
+              "ticker": "VNQ",
+              "allocation_usd": 3000,
+              "reason": "米国REIT — 国内不動産は関税影響軽微"
+            }
+          ],
+          "confirmation_required": [
+            "Tariff scope clarified",
+            "No further escalation in 5 days",
+            "Domestic sectors outperforming"
+          ]
+        },
+        "sell_on_trigger": [
+          "EWG",
+          "EPOL",
+          "6762.T"
+        ],
+        "leverage_ok": false,
+        "margin_ok": false,
+        "cash_target_pct": 30,
+        "stop_loss_pct": 4
+      }
+    },
+    {
+      "id": "bubble_burst",
+      "name": "バブル崩壊",
+      "icon": "💥",
+      "color": "#9C27B0",
+      "priority": "high",
+      "description": "市場全面崩壊。VIX 40超・追証発生・流動性枯渇。全ポジション清算し生存最優先。",
+      "detect": {
+        "news_keywords": [
+          "market crash",
+          "black monday",
+          "circuit breaker",
+          "margin call",
+          "flash crash",
+          "capitulation",
+          "panic selling",
+          "market meltdown",
+          "liquidity freeze",
+          "forced liquidation",
+          "暴落",
+          "サーキットブレーカー",
+          "追証",
+          "パニック売り",
+          "市場崩壊",
+          "投げ売り",
+          "流動性枯渇",
+          "強制決済"
+        ],
+        "indicators": {
+          "vix": {
+            "condition": "above",
+            "threshold": 40,
+            "key": "vix_current"
+          },
+          "vix_delta_1d": {
+            "condition": "spike_pct",
+            "threshold": 50,
+            "description": "VIX 1日で50%以上急騰"
+          },
+          "spy_drop_1d": {
+            "condition": "drop_pct",
+            "threshold": -4,
+            "description": "S&P500 1日4%以上下落"
+          },
+          "spy_drop_5d": {
+            "condition": "drop_pct",
+            "threshold": -10,
+            "description": "S&P500 5日10%以上下落"
+          },
+          "put_call_ratio": {
+            "condition": "above",
+            "threshold": 1.5,
+            "description": "Put/Callレシオ1.5超（極端な恐怖）"
+          }
+        },
+        "technical": {
+          "SPY_rsi_14": {
+            "condition": "below",
+            "threshold": 20,
+            "description": "S&P500 RSI極端な売られすぎ"
+          },
+          "QQQ_rsi_14": {
+            "condition": "below",
+            "threshold": 20,
+            "description": "NASDAQ RSI極端な売られすぎ"
+          }
+        },
+        "min_signals": 3
+      },
+      "actions": {
+        "phase_1": {
+          "label": "即時対応（0-2日）",
+          "buy": [],
+          "sell": [
+            {
+              "ticker": "NVDA",
+              "action": "sell_all",
+              "reason": "高ベータ株即時清算"
+            },
+            {
+              "ticker": "AVGO",
+              "action": "sell_all",
+              "reason": "半導体ポジション清算"
+            },
+            {
+              "ticker": "META",
+              "action": "sell_all",
+              "reason": "テック大型株清算"
+            },
+            {
+              "ticker": "RCL",
+              "action": "sell_all",
+              "reason": "景気敏感株清算"
+            },
+            {
+              "ticker": "CRWV",
+              "action": "sell_all",
+              "reason": "投機ポジション即座に損切り"
+            },
+            {
+              "ticker": "EPOL",
+              "action": "sell_all",
+              "reason": "新興国リスク回避"
+            },
+            {
+              "ticker": "6762.T",
+              "action": "sell_all",
+              "reason": "電子部品セクター清算"
+            }
+          ],
+          "notes": "全レバレッジ解消。全信用ポジション決済。現金60%以上を目標。生存最優先。"
+        },
+        "phase_2": {
+          "label": "確認後（3-7日）",
+          "buy": [
+            {
+              "ticker": "GLD",
+              "allocation_usd": 5000,
+              "reason": "安全資産（底打ち確認後）"
+            },
+            {
+              "ticker": "TLT",
+              "allocation_usd": 5000,
+              "reason": "長期債（Fed緩和期待）"
+            }
+          ],
+          "confirmation_required": [
+            "VIX peaked and declining from 40+",
+            "Fed emergency intervention announced",
+            "Circuit breakers not triggered for 2+ days"
+          ]
+        },
+        "sell_on_trigger": [
+          "NVDA",
+          "AVGO",
+          "META",
+          "RCL",
+          "CRWV",
+          "EPOL",
+          "6762.T",
+          "EWG",
+          "IEV"
+        ],
+        "leverage_ok": false,
+        "margin_ok": false,
+        "cash_target_pct": 60,
+        "stop_loss_pct": 0
+      }
+    },
+    {
+      "id": "yen_carry_unwind",
+      "name": "円キャリー巻き戻し",
+      "icon": "💴",
+      "color": "#FF9800",
+      "priority": "high",
+      "description": "BOJが利上げ・円高急進で円キャリートレード巻き戻し。日本株・米テック・新興国が急落。円建て資産・GLD・TLTへ避難。",
+      "detect": {
+        "news_keywords": [
+          "Bank of Japan rate hike",
+          "BOJ rate increase",
+          "yen surge",
+          "yen carry trade unwind",
+          "yen appreciation",
+          "USDJPY below 140",
+          "carry trade unwind",
+          "yen short squeeze",
+          "BOJ tightening",
+          "yen strengthening",
+          "日銀利上げ",
+          "円高急進",
+          "円キャリー巻き戻し",
+          "円高ショック",
+          "日銀正常化",
+          "ドル円140円割れ",
+          "キャリートレード解消"
+        ],
+        "indicators": {
+          "vix": {
+            "condition": "above",
+            "threshold": 25,
+            "key": "vix_current",
+            "description": "VIX 25超（リスクオフ）"
+          },
+          "vix_delta_5d": {
+            "condition": "rise_pct",
+            "threshold": 30,
+            "description": "VIX 5日間で30%以上上昇"
+          },
+          "ew_japan_ewj": {
+            "condition": "drop_pct_5d",
+            "threshold": -8,
+            "description": "日本株ETF(EWJ) 5日間8%以上下落"
+          },
+          "gold_gld": {
+            "condition": "rise_pct_5d",
+            "threshold": 3,
+            "description": "GLD 5日間3%以上上昇（安全資産フロー）"
+          }
+        },
+        "technical": {
+          "EEM_rsi_14": {
+            "condition": "below",
+            "threshold": 45,
+            "description": "新興国ETF RSI 45以下"
+          },
+          "QQQ_macd": {
+            "condition": "bearish_cross",
+            "description": "NASDAQ MACD デッドクロス（円高でリパトリ）"
+          },
+          "TLT_rsi_14": {
+            "condition": "above",
+            "threshold": 55,
+            "description": "長期債RSI 55超（安全資産需要）"
+          }
+        },
+        "min_signals": 3
+      },
+      "actions": {
+        "phase_1": {
+          "label": "即時対応（0-2日）",
+          "buy": [
+            {
+              "ticker": "GLD",
+              "allocation_usd": 8000,
+              "reason": "安全資産 — 円高局面で最も安定"
+            },
+            {
+              "ticker": "TLT",
+              "allocation_usd": 5000,
+              "reason": "米長期債 — リスクオフ・Fed利下げ期待"
+            }
+          ],
+          "sell": [
+            {
+              "ticker": "NVDA",
+              "action": "trim_30pct",
+              "reason": "米テック — 円高・リパトリ圧力"
+            },
+            {
+              "ticker": "AVGO",
+              "action": "trim_30pct",
+              "reason": "半導体 — 同上"
+            },
+            {
+              "ticker": "CRWV",
+              "action": "sell_all",
+              "reason": "投機ポジション — 高ベータ即座に清算"
+            },
+            {
+              "ticker": "RCL",
+              "action": "trim_50pct",
+              "reason": "景気敏感株 — リスクオフ回避"
+            },
+            {
+              "ticker": "EPOL",
+              "action": "sell_all",
+              "reason": "新興国 — 最も円高ショック脆弱"
+            }
+          ],
+          "notes": "円高が進む間は高ベータ株を段階的に削減。1489.T（日本株ETF）はJPY建て価値が相対的に維持されるため保有継続。"
+        },
+        "phase_2": {
+          "label": "確認後（3-7日）",
+          "buy": [
+            {
+              "ticker": "GLD",
+              "allocation_usd": 5000,
+              "reason": "金 — 円高収束まで追加積み増し"
+            },
+            {
+              "ticker": "EWG",
+              "allocation_usd": 3000,
+              "reason": "欧州 — 円高の影響が限定的"
+            }
+          ],
+          "confirmation_required": [
+            "USDJPY stabilizes above 135",
+            "VIX starts declining from peak",
+            "BOJ confirms no further near-term hikes"
+          ]
+        },
+        "sell_on_trigger": [
+          "CRWV",
+          "EPOL",
+          "RCL"
+        ],
+        "leverage_ok": false,
+        "margin_ok": false,
+        "cash_target_pct": 30,
+        "stop_loss_pct": 5
+      }
+    },
+    {
+      "id": "tech_boom",
+      "name": "テック新時代",
+      "icon": "🚀",
+      "color": "#00BCD4",
+      "priority": "medium",
+      "description": "AI規制緩和・半導体需要爆発。テック・半導体セクターに集中投資。レバレッジ許可。",
+      "detect": {
+        "news_keywords": [
+          "AI regulation easing",
+          "semiconductor boom",
+          "chip demand surge",
+          "AI spending increase",
+          "data center expansion",
+          "GPU shortage",
+          "tech earnings beat",
+          "NVIDIA record",
+          "AI investment boom",
+          "AI規制緩和",
+          "半導体需要急増",
+          "データセンター増設",
+          "GPU不足",
+          "AI投資ブーム",
+          "テック決算好調",
+          "半導体スーパーサイクル"
+        ],
+        "indicators": {
+          "vix": {
+            "condition": "below",
+            "threshold": 16,
+            "key": "vix_current"
+          },
+          "soxx_semi": {
+            "condition": "rise_pct_20d",
+            "threshold": 10,
+            "description": "半導体ETF 20日で10%以上上昇"
+          },
+          "qqq_nasdaq": {
+            "condition": "above_ma200",
+            "description": "QQQ 200日移動平均線上"
+          },
+          "smh_volume": {
+            "condition": "above_avg_pct",
+            "threshold": 50,
+            "description": "SMH出来高平均比50%以上増加"
+          }
+        },
+        "technical": {
+          "SOXX_rsi_14": {
+            "condition": "range",
+            "min": 55,
+            "max": 75,
+            "description": "半導体RSI強気トレンド（過熱前）"
+          },
+          "QQQ_macd": {
+            "condition": "bullish_cross",
+            "description": "NASDAQ MACDゴールデンクロス"
+          },
+          "NVDA_rsi_14": {
+            "condition": "above",
+            "threshold": 50,
+            "description": "NVDA RSI上昇トレンド"
+          }
+        },
+        "min_signals": 3
+      },
+      "actions": {
+        "phase_1": {
+          "label": "即時対応（0-2日）",
+          "buy": [
+            {
+              "ticker": "SOXL",
+              "allocation_usd": 3000,
+              "reason": "半導体3倍レバ — セクターモメンタム"
+            },
+            {
+              "ticker": "SOXX",
+              "allocation_usd": 4000,
+              "reason": "半導体ETF（非レバレッジ）— コア半導体エクスポージャー"
+            },
+            {
+              "ticker": "NVDA",
+              "allocation_usd": 5000,
+              "reason": "AI半導体の本命 — 追加投資"
+            }
+          ],
+          "sell": [
+            {
+              "ticker": "GLD",
+              "action": "trim_30pct",
+              "reason": "リスクオンで金需要低下"
+            }
+          ],
+          "notes": "USD現金$25Kから$15K投入。レバレッジETFは短期トレードとして管理。"
+        },
+        "phase_2": {
+          "label": "確認後（3-7日）",
+          "buy": [
+            {
+              "ticker": "AVGO",
+              "allocation_usd": 5000,
+              "reason": "Broadcom — AI ASIC需要"
+            },
+            {
+              "ticker": "META",
+              "allocation_usd": 3000,
+              "reason": "Meta — AI広告収益拡大"
+            }
+          ],
+          "confirmation_required": [
+            "SOXX above 52-week high",
+            "Semiconductor earnings beating estimates",
+            "VIX remains below 18"
+          ]
+        },
+        "sell_on_trigger": [
+          "GLD"
+        ],
+        "leverage_ok": true,
+        "margin_ok": false,
+        "cash_target_pct": 10,
+        "stop_loss_pct": 6
+      }
+    },
+    {
+      "id": "inflation_resurgence",
+      "name": "インフレ再燃",
+      "icon": "🔥",
+      "color": "#FF5722",
+      "priority": "high",
+      "description": "CPI再加速・Fedタカ派回帰。金利上昇でグロース株が調整、コモディティ・バリュー株へローテーション。",
+      "detect": {
+        "news_keywords": [
+          "inflation resurgence",
+          "CPI acceleration",
+          "core PCE rising",
+          "sticky inflation",
+          "hawkish fed",
+          "rate hike resume",
+          "inflation surprise",
+          "wage pressure",
+          "インフレ再燃",
+          "CPI加速",
+          "コアPCE上昇",
+          "粘着性インフレ",
+          "利上げ再開",
+          "タカ派",
+          "賃金上昇圧力",
+          "物価高"
+        ],
+        "indicators": {
+          "vix": {
+            "condition": "above",
+            "threshold": 22,
+            "key": "vix_current"
+          },
+          "yield_2y": {
+            "condition": "rise_bps_5d",
+            "threshold": 15,
+            "description": "2年債利回り5日15bp以上上昇"
+          },
+          "yield_10y": {
+            "condition": "above",
+            "threshold": 4.8,
+            "description": "10年債利回り4.8%超"
+          },
+          "gold_gld": {
+            "condition": "rise_pct_5d",
+            "threshold": 3,
+            "description": "GLD 5日3%以上上昇（インフレヘッジ需要）"
+          }
+        },
+        "technical": {
+          "TLT_rsi_14": {
+            "condition": "below",
+            "threshold": 35,
+            "description": "長期債RSI売られすぎ（金利上昇）"
+          },
+          "XLE_macd": {
+            "condition": "bullish_cross",
+            "description": "エネルギーセクターMACDゴールデンクロス"
+          }
+        },
+        "min_signals": 3
+      },
+      "actions": {
+        "phase_1": {
+          "label": "即時対応（0-2日）",
+          "buy": [
+            {
+              "ticker": "GLD",
+              "allocation_usd": 5000,
+              "reason": "インフレヘッジの王道"
+            },
+            {
+              "ticker": "1489.T",
+              "allocation_jpy": 300000,
+              "reason": "高配当 — インフレ環境でバリュー優位"
+            }
+          ],
+          "sell": [
+            {
+              "ticker": "NVDA",
+              "action": "trim_30pct",
+              "reason": "高バリュエーション・グロース株は金利上昇に脆弱"
+            },
+            {
+              "ticker": "META",
+              "action": "trim_20pct",
+              "reason": "テック大型 — 割引率上昇圧力"
+            }
+          ],
+          "notes": "グロース→バリューローテーション。金利感応度の高い銘柄を段階的に削減。"
+        },
+        "phase_2": {
+          "label": "確認後（3-7日）",
+          "buy": [
+            {
+              "ticker": "XLE",
+              "allocation_usd": 5000,
+              "reason": "エネルギーセクター — インフレ受益"
+            }
+          ],
+          "confirmation_required": [
+            "CPI data confirms acceleration",
+            "Fed rhetoric turns more hawkish",
+            "10Y yield above 5%"
+          ]
+        },
+        "sell_on_trigger": [
+          "NVDA",
+          "META"
+        ],
+        "leverage_ok": false,
+        "margin_ok": false,
+        "cash_target_pct": 25,
+        "stop_loss_pct": 4
+      }
+    },
+    {
+      "id": "ai_bubble_burst",
+      "name": "AIバブル崩壊",
+      "icon": "🤖💥",
+      "color": "#E91E63",
+      "priority": "high",
+      "description": "AI関連銘柄のバリュエーション崩壊。期待外れの決算・規制強化・競争激化でAI株が急落。半導体ポジション即座に縮小。",
+      "detect": {
+        "news_keywords": [
+          "AI bubble",
+          "AI overvalued",
+          "AI spending cut",
+          "AI capex reduction",
+          "semiconductor downturn",
+          "GPU oversupply",
+          "AI regulation",
+          "AI winter",
+          "NVIDIA miss",
+          "AI revenue disappointment",
+          "datacenter slowdown",
+          "AIバブル",
+          "AI過大評価",
+          "AI投資削減",
+          "半導体不況",
+          "GPU供給過剰",
+          "AI規制",
+          "AI冬の時代",
+          "NVIDIA決算ミス"
+        ],
+        "indicators": {
+          "vix": {
+            "condition": "above",
+            "threshold": 25,
+            "key": "vix_current"
+          },
+          "soxx_semi": {
+            "condition": "drop_pct_5d",
+            "threshold": -10,
+            "description": "半導体ETF 5日10%以上下落"
+          },
+          "qqq_nasdaq": {
+            "condition": "drop_pct_5d",
+            "threshold": -5,
+            "description": "NASDAQ 5日5%以上下落"
+          },
+          "smh_volume": {
+            "condition": "above_avg_pct",
+            "threshold": 100,
+            "description": "SMH出来高平均比100%以上（パニック売り）"
+          }
+        },
+        "technical": {
+          "NVDA_rsi_14": {
+            "condition": "below",
+            "threshold": 30,
+            "description": "NVDA RSI極端な売られすぎ"
+          },
+          "SOXX_macd": {
+            "condition": "bearish_cross",
+            "description": "半導体MACDデッドクロス"
+          },
+          "AVGO_rsi_14": {
+            "condition": "below",
+            "threshold": 35,
+            "description": "AVGO RSI売られすぎ"
+          }
+        },
+        "min_signals": 3
+      },
+      "actions": {
+        "phase_1": {
+          "label": "即時対応（0-2日）",
+          "buy": [
+            {
+              "ticker": "GLD",
+              "allocation_usd": 5000,
+              "reason": "安全資産へ逃避"
+            }
+          ],
+          "sell": [
+            {
+              "ticker": "NVDA",
+              "action": "sell_50pct",
+              "reason": "AI本命 — バブル崩壊の最大打撃"
+            },
+            {
+              "ticker": "AVGO",
+              "action": "sell_50pct",
+              "reason": "AI ASIC — 連鎖安リスク"
+            },
+            {
+              "ticker": "CRWV",
+              "action": "sell_all",
+              "reason": "小型AI株 — 真っ先に売られる"
+            }
+          ],
+          "notes": "AI/半導体ポジションを即座に50%以上縮小。残りは底打ち確認まで段階的に処分検討。"
+        },
+        "phase_2": {
+          "label": "確認後（3-7日）",
+          "buy": [
+            {
+              "ticker": "1489.T",
+              "allocation_jpy": 300000,
+              "reason": "日本高配当 — テック離れの受け皿"
+            },
+            {
+              "ticker": "EWG",
+              "allocation_usd": 3000,
+              "reason": "欧州バリュー — テックウェイト低い"
+            }
+          ],
+          "confirmation_required": [
+            "SOXX stabilized or bouncing",
+            "NVDA revenue guidance not cut further",
+            "Sector rotation into value confirmed"
+          ]
+        },
+        "sell_on_trigger": [
+          "NVDA",
+          "AVGO",
+          "CRWV"
+        ],
+        "leverage_ok": false,
+        "margin_ok": false,
+        "cash_target_pct": 40,
+        "stop_loss_pct": 3
+      }
+    },
+    {
+      "id": "liquidity_shock",
+      "name": "流動性ショック",
+      "icon": "🧊",
+      "color": "#607D8B",
+      "priority": "high",
+      "description": "QT加速・レポ市場凍結・ドル不足。短期金融市場が機能不全に。全リスク資産が無差別に売られる。",
+      "detect": {
+        "news_keywords": [
+          "liquidity crisis",
+          "repo market stress",
+          "dollar shortage",
+          "QT acceleration",
+          "treasury auction fail",
+          "money market freeze",
+          "reverse repo drain",
+          "funding stress",
+          "interbank rate spike",
+          "overnight rate surge",
+          "流動性危機",
+          "レポ市場",
+          "ドル不足",
+          "QT加速",
+          "国債入札不調",
+          "短期金融市場",
+          "資金調達困難"
+        ],
+        "indicators": {
+          "vix": {
+            "condition": "above",
+            "threshold": 30,
+            "key": "vix_current"
+          },
+          "vix_delta_1d": {
+            "condition": "spike_pct",
+            "threshold": 25,
+            "description": "VIX 1日で25%以上急騰"
+          },
+          "yield_2y": {
+            "condition": "spike_bps_1d",
+            "threshold": 20,
+            "description": "2年債利回り1日20bp以上急上昇"
+          },
+          "dxy_dollar": {
+            "condition": "rise_pct_5d",
+            "threshold": 3,
+            "description": "ドル指数急上昇（ドル不足）"
+          },
+          "hy_spread": {
+            "condition": "above_bps",
+            "threshold": 400,
+            "description": "ハイイールドスプレッド400bp超"
+          }
+        },
+        "technical": {
+          "SPY_rsi_14": {
+            "condition": "below",
+            "threshold": 30
+          },
+          "TLT_rsi_14": {
+            "condition": "below",
+            "threshold": 30,
+            "description": "債券も株も同時に売られる"
+          }
+        },
+        "min_signals": 3
+      },
+      "actions": {
+        "phase_1": {
+          "label": "即時対応（0-2日）",
+          "buy": [],
+          "sell": [
+            {
+              "ticker": "CRWV",
+              "action": "sell_all",
+              "reason": "小型株 — 流動性枯渇で最初に売買不能に"
+            },
+            {
+              "ticker": "EPOL",
+              "action": "sell_all",
+              "reason": "新興国 — ドル不足で最も脆弱"
+            },
+            {
+              "ticker": "RCL",
+              "action": "sell_all",
+              "reason": "景気敏感 — 信用収縮で打撃"
+            },
+            {
+              "ticker": "META",
+              "action": "trim_50pct",
+              "reason": "流動性確保のため大型株を部分売却"
+            }
+          ],
+          "notes": "全レバレッジ解消。信用ポジション全決済。現金確保最優先。GLD含め全資産が売られうるため、現金が最強。"
+        },
+        "phase_2": {
+          "label": "確認後（3-7日）",
+          "buy": [
+            {
+              "ticker": "GLD",
+              "allocation_usd": 5000,
+              "reason": "Fed介入後の安全資産回帰"
+            },
+            {
+              "ticker": "TLT",
+              "allocation_usd": 5000,
+              "reason": "Fed緊急利下げ期待で長期債上昇"
+            }
+          ],
+          "confirmation_required": [
+            "Fed announces emergency liquidity facility",
+            "Repo rates normalize",
+            "VIX peaked and declining"
+          ]
+        },
+        "sell_on_trigger": [
+          "CRWV",
+          "EPOL",
+          "RCL",
+          "6762.T"
+        ],
+        "leverage_ok": false,
+        "margin_ok": false,
+        "cash_target_pct": 55,
+        "stop_loss_pct": 0
+      }
+    },
+    {
+      "id": "bull_pullback",
+      "name": "強気相場の押し目買い",
+      "icon": "📈",
+      "color": "#1976D2",
+      "priority": "medium",
+      "description": "強気レジーム継続中に指数が 3-8% 押した場面で段階的に買い増す playbook。 VIX 25 未満 / SPY が MA50 より上 / 押し幅 3-8% / Fear&Greed が極端な Greed ではない、を全て満たすときに ACTIVE。Conservative (大型ETF) / Aggressive (個別グロース) / Tactical (レバETF) の 3 階層で実行。",
+      "enabled_for_decision": true,
+      "observe_only": false,
+      "detect": {
+        "news_keywords": [],
+        "indicators": {
+          "vix": {
+            "condition": "below",
+            "threshold": 25,
+            "key": "vix_current",
+            "description": "VIX 25 未満で panic でないことを確認"
+          },
+          "fear_greed_index": {
+            "condition": "below",
+            "threshold": 80,
+            "description": "Fear&Greed 80 未満 (極端な Greed を排除)"
+          },
+          "spy_dist_from_ma50_pct": {
+            "condition": "between",
+            "lower": -0.08,
+            "upper": -0.03,
+            "description": "SPY が MA50 から 3-8% 下に押した"
+          }
+        },
+        "technical": {
+          "SPY_above_MA50": {
+            "condition": "true",
+            "description": "SPY 終値が MA50 より上 (うわっち相場の押し)"
+          },
+          "regime_bull_confirmed": {
+            "condition": "true",
+            "description": "regime detector が bull_confirmed を返している"
+          }
+        },
+        "min_signals": 3
+      },
+      "actions": {
+        "phase_1_conservative": {
+          "label": "守りの押し目買い (0-2 日)",
+          "buy": [
+            {
+              "ticker": "SPY",
+              "allocation_amount": 2000,
+              "currency": "USD",
+              "reason": "大型ETF — リスク最小"
+            },
+            {
+              "ticker": "QQQ",
+              "allocation_amount": 2000,
+              "currency": "USD",
+              "reason": "NASDAQ — 押し目"
+            },
+            {
+              "ticker": "SMH",
+              "allocation_amount": 1500,
+              "currency": "USD",
+              "reason": "半導体ETF — リーダーセクター"
+            },
+            {
+              "ticker": "EWJ",
+              "allocation_amount": 1500,
+              "currency": "USD",
+              "reason": "日本株 — 通貨ヘッジ込み"
+            },
+            {
+              "ticker": "1489.T",
+              "allocation_amount": 200000,
+              "currency": "JPY",
+              "reason": "JP 高配当 — 円建て保守的"
+            }
+          ],
+          "notes": "USD $7K + JPY ¥200K を初動投入。Conservative 階層は失敗時の損失上限が小さい。"
+        },
+        "phase_2_aggressive": {
+          "label": "確認後の個別株積み増し (3-5 日)",
+          "buy": [
+            {
+              "ticker": "NVDA",
+              "allocation_amount": 2000,
+              "currency": "USD",
+              "reason": "AI リーダー — 押し目で買い増し"
+            },
+            {
+              "ticker": "AVGO",
+              "allocation_amount": 1500,
+              "currency": "USD",
+              "reason": "AI ネットワーク — 押し目"
+            },
+            {
+              "ticker": "9984.T",
+              "allocation_amount": 100000,
+              "currency": "JPY",
+              "reason": "JP テック — proxy 銘柄"
+            },
+            {
+              "ticker": "ARM",
+              "allocation_amount": 1000,
+              "currency": "USD",
+              "reason": "半導体 IP — 押し目"
+            }
+          ],
+          "confirmation_required": [
+            "VIX が 25 未満を維持していること",
+            "SPY が MA50 を割っていないこと",
+            "Conservative 階層の含み損が -3% を超えていないこと"
+          ],
+          "notes": "Conservative が機能していれば Aggressive を追加。逆張り単独では入らない。"
+        },
+        "phase_3_tactical": {
+          "label": "勢いの加速確認後 (5-10 日)",
+          "buy": [
+            {
+              "ticker": "SOXL",
+              "allocation_amount": 1000,
+              "currency": "USD",
+              "reason": "半導体 3 倍レバ — 確認後の加速時のみ"
+            },
+            {
+              "ticker": "TQQQ",
+              "allocation_amount": 1000,
+              "currency": "USD",
+              "reason": "QQQ 3 倍レバ — 加速時のみ"
+            },
+            {
+              "ticker": "1321.T",
+              "allocation_amount": 100000,
+              "currency": "JPY",
+              "reason": "日経225 ETF — 加速時のみ。1570.T はレバETFのため generic universe へ混入させない"
+            }
+          ],
+          "confirmation_required": [
+            "Aggressive 階層が +2% 以上含み益",
+            "SPY が MA20 を奪回",
+            "出来高が 20 日平均を上回っている"
+          ],
+          "notes": "Tactical 階層は失敗時の損失が大きい。Aggressive が機能していなければスキップ。"
+        }
+      }
+    },
+    {
+      "id": "japan_standalone_bull",
+      "name": "日本株単独強気",
+      "icon": "🗾",
+      "color": "#E91E63",
+      "priority": "medium",
+      "description": "米国株とデカップルした日本株独自の強気局面。EWJがSPYを相対的にアウトパフォームし、日経/TOPIXがMA50超。グローバルBULL局面限定。",
+      "observe_only": false,
+      "enabled_for_decision": true,
+      "detect": {
+        "news_keywords": [
+          "日本株上昇",
+          "日経平均高値",
+          "円安 株高",
+          "Japan rally",
+          "Nikkei surge",
+          "日本株外国人買い",
+          "Japan outperform",
+          "Japan decoupling"
+        ],
+        "indicators": {
+          "vix": {
+            "condition": "below",
+            "threshold": 25,
+            "key": "vix_current",
+            "description": "VIX < 25 (リスクオン環境)"
+          }
+        },
+        "technical": {
+          "ewj_outperforms_spy_20d": {
+            "condition": "true",
+            "description": "EWJ の 20 日リターンが SPY を上回る"
+          },
+          "nikkei_or_topix_above_ma50": {
+            "condition": "true",
+            "description": "日経225 または TOPIX が MA50 超"
+          },
+          "regime_bull_confirmed": {
+            "condition": "true",
+            "description": "グローバルレジームが BULL 確認済み"
+          }
+        },
+        "min_signals": 3,
+        "required_signals": [
+          "ewj_outperforms_spy_20d",
+          "nikkei_or_topix_above_ma50",
+          "regime_bull_confirmed"
+        ],
+        "activation_policy": {
+          "freshness_requirements": {
+            "nikkei_or_topix_above_ma50": {
+              "state": "market",
+              "max_age_minutes": 1440
+            }
+          }
+        }
+      },
+      "actions": {
+        "decision_note": "限定サイズで action 化済 (2026-06-27)。2026-07-07 上限改定: ¥100k/銘柄が総資産0.7%で エクスポージャー形成に実質寄与しなかったため ¥500k/銘柄 (計 ¥1M ≈ 総資産3.4%) へ引き上げ。Opus 判断 + policy/post_filter ゲート経由で発注候補化する。1489.T/1306.T は core ETF 枠 (単発上限 ¥150万) の範囲内。生 observe_only ではないため source_observe_only 付与は不要。",
+        "phase_1": {
+          "label": "発注候補（限定サイズ・action 化済）",
+          "buy": [
+            {
+              "ticker": "1489.T",
+              "reason": "日本高配当ETF — 日本株強気局面で配当+キャピタル両取り",
+              "allocation_jpy": 500000
+            },
+            {
+              "ticker": "1306.T",
+              "reason": "TOPIX連動ETF — 日本株ブロード・エクスポージャー",
+              "allocation_jpy": 500000
+            }
+          ]
+        }
+      }
+    }
+  ],
+  "global_rules": {
+    "max_concurrent_scenarios": 2,
+    "guard_state_override": "scenario actions respect guard_state.json — if trading_allowed=false, only sell actions are permitted",
+    "cash_available_usd": 25000,
+    "recheck_interval_hours": 6,
+    "cooldown_after_trigger_hours": 48,
+    "mutual_fund_exclusions": [
+      "SLIM_SP500",
+      "SLIM_ORCAN",
+      "MNXACT",
+      "IFREE_FANGPLUS",
+      "NOMURA_SEMI"
+    ],
+    "notes": "投信は自動売買対象外。NISAポジション(1489.T, GLD等)の売却は税務影響を要確認。"
+  }
+}

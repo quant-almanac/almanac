@@ -1,0 +1,31 @@
+{
+  "_doc": "Pre-registered machine rules for the disclosure shadow book. Measurement only; never connected to policy_engine or order execution.",
+  "_pinned_at": "2026-06-11",
+  "horizons": [5, 20, 60],
+  "notional_jpy": 100000,
+  "us_short_enabled": false,
+  "thresholds": {
+    "directional_score": 0.6,
+    "directional_confidence": 0.7,
+    "guidance_revision_pct": 0.1,
+    "monthly_yoy_pct": 0.1,
+    "insider_cluster_score": 3
+  },
+  "cost_model": {
+    "jp_spread_bps_each_side": {
+      "notional_lte_100k": 20,
+      "notional_lte_500k": 10,
+      "larger": 5
+    },
+    "us_commission_rate_each_side": 0.00495,
+    "us_commission_cap_usd_each_side": 22,
+    "us_spread_bps_each_side": 5,
+    "rakuten_fx_spread_jpy_per_usd_each_side": 0.25,
+    "jp_short": {
+      "standard_borrow_rate_annual": 0.011,
+      "reverse_daily_fee_buffer_annual": 0.01,
+      "general_borrow_rate_annual_min": 0.014,
+      "general_borrow_rate_annual_max": 0.039
+    }
+  }
+}

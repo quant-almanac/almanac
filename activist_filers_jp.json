@@ -1,0 +1,16 @@
+{
+  "_doc": "Public-name match list for observe_only EDINET stake filings. Match is case-insensitive and never resolves a ticker by itself.",
+  "names": [
+    "City Index Eleventh",
+    "シティインデックスイレブンス",
+    "Oasis Management",
+    "オアシス・マネジメント",
+    "Strategic Capital",
+    "ストラテジックキャピタル",
+    "Effissimo Capital Management",
+    "エフィッシモ キャピタル マネージメント",
+    "3D Investment Partners",
+    "3Dインベストメント・パートナーズ",
+    "AVI Japan Opportunity Trust"
+  ]
+}

@@ -1,0 +1,5 @@
+{
+  "adjustments": [],
+  "reset_at": "2026-05-26T07:36:55",
+  "reset_reason": "Reset derived AI-analysis data after harness/filter/max_tokens fixes; preserve broker/account/holdings/raw market data."
+}

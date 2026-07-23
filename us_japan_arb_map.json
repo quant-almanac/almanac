@@ -1,0 +1,32 @@
+{
+  "description": "US → 日本株 連動銘柄マップ (Part E-3 overnight gap scanner で使用)",
+  "updated_at": "2026-04-19",
+  "notes": "US AH で材料が出た際、日本市場寄りで先回り取引する対象。bias は 'positive'=同方向 / 'negative'=逆方向。Beta は目安 (1d リターン回帰)。",
+  "mappings": [
+    {"us": "TSM",   "jp": "6723.T",   "name_jp": "ルネサスエレクトロニクス",   "theme": "semiconductor", "bias": "positive", "beta": 0.8},
+    {"us": "NVDA",  "jp": "6857.T",   "name_jp": "アドバンテスト",             "theme": "semiconductor_ai", "bias": "positive", "beta": 0.9},
+    {"us": "NVDA",  "jp": "8035.T",   "name_jp": "東京エレクトロン",           "theme": "semiconductor_ai", "bias": "positive", "beta": 0.75},
+    {"us": "AVGO",  "jp": "6526.T",   "name_jp": "ソシオネクスト",             "theme": "semiconductor_ai", "bias": "positive", "beta": 0.7},
+    {"us": "META",  "jp": "6758.T",   "name_jp": "ソニーグループ",             "theme": "consumer_tech", "bias": "positive", "beta": 0.45},
+    {"us": "META",  "jp": "6762.T",   "name_jp": "TDK",                        "theme": "consumer_tech", "bias": "positive", "beta": 0.4},
+    {"us": "AAPL",  "jp": "6146.T",   "name_jp": "ディスコ",                   "theme": "apple_supply_chain", "bias": "positive", "beta": 0.55},
+    {"us": "AAPL",  "jp": "6967.T",   "name_jp": "新光電気工業",               "theme": "apple_supply_chain", "bias": "positive", "beta": 0.5},
+    {"us": "TSLA",  "jp": "6752.T",   "name_jp": "パナソニック",               "theme": "ev_battery",  "bias": "positive", "beta": 0.35},
+    {"us": "AMD",   "jp": "8035.T",   "name_jp": "東京エレクトロン",           "theme": "semiconductor_ai", "bias": "positive", "beta": 0.65},
+    {"us": "MU",    "jp": "8035.T",   "name_jp": "東京エレクトロン",           "theme": "semiconductor_memory", "bias": "positive", "beta": 0.6},
+    {"us": "GOOGL", "jp": "9984.T",   "name_jp": "ソフトバンクグループ",       "theme": "internet_ai",  "bias": "positive", "beta": 0.4},
+    {"us": "MSFT",  "jp": "9984.T",   "name_jp": "ソフトバンクグループ",       "theme": "internet_ai",  "bias": "positive", "beta": 0.5},
+    {"us": "SMH",   "jp": "1489.T",   "name_jp": "日経平均高配当ETF",          "theme": "index_correlation", "bias": "positive", "beta": 0.3},
+    {"us": "SOXX",  "jp": "6857.T",   "name_jp": "アドバンテスト",             "theme": "semiconductor", "bias": "positive", "beta": 0.85},
+    {"us": "SOXL",  "jp": "6857.T",   "name_jp": "アドバンテスト",             "theme": "semiconductor_3x", "bias": "positive", "beta": 2.5},
+    {"us": "TQQQ",  "jp": "9984.T",   "name_jp": "ソフトバンクグループ",       "theme": "nasdaq_3x",    "bias": "positive", "beta": 1.2},
+    {"us": "QQQ",   "jp": "9984.T",   "name_jp": "ソフトバンクグループ",       "theme": "nasdaq",       "bias": "positive", "beta": 0.5},
+    {"us": "XOM",   "jp": "5020.T",   "name_jp": "ENEOS",                     "theme": "oil_major",    "bias": "positive", "beta": 0.6},
+    {"us": "CVX",   "jp": "1605.T",   "name_jp": "INPEX",                      "theme": "oil_explorer", "bias": "positive", "beta": 0.5},
+    {"us": "JPM",   "jp": "8306.T",   "name_jp": "三菱UFJ",                    "theme": "megabank",     "bias": "positive", "beta": 0.55},
+    {"us": "GS",    "jp": "8306.T",   "name_jp": "三菱UFJ",                    "theme": "megabank",     "bias": "positive", "beta": 0.45},
+    {"us": "V",     "jp": "7974.T",   "name_jp": "任天堂",                     "theme": "none",         "bias": "positive", "beta": 0.1},
+    {"us": "LLY",   "jp": "4568.T",   "name_jp": "第一三共",                   "theme": "pharma_major", "bias": "positive", "beta": 0.35},
+    {"us": "NVO",   "jp": "4519.T",   "name_jp": "中外製薬",                   "theme": "pharma_major", "bias": "positive", "beta": 0.3}
+  ]
+}

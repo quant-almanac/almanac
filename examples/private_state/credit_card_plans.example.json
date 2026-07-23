@@ -1,0 +1,44 @@
+{
+  "husband": {
+    "plan_key": "husband",
+    "monthly_amount": 0,
+    "fund": "sample fund",
+    "account_type": "sample",
+    "broker": "sample",
+    "card": "sample",
+    "point_rate": 0,
+    "current_units": 0,
+    "avg_nav": 0,
+    "total_invested": 0,
+    "total_points": 0,
+    "purchase_history": [],
+    "sell_history": [],
+    "current_nav": 0,
+    "last_purchase_date": null,
+    "notes": "Sample only. Replace with local private data."
+  },
+  "wife": {
+    "plan_key": "wife",
+    "monthly_amount": 0,
+    "fund": "sample fund",
+    "account_type": "sample",
+    "broker": "sample",
+    "card": "sample",
+    "point_rate": 0,
+    "current_units": 0,
+    "avg_nav": 0,
+    "total_invested": 0,
+    "total_points": 0,
+    "purchase_history": [],
+    "sell_history": [],
+    "current_nav": 0,
+    "last_purchase_date": null,
+    "notes": "Sample secondary account. Replace with local private data or leave empty."
+  },
+  "sell_strategy": {
+    "method": "manual",
+    "trigger_amount": 0,
+    "sell_target": "none",
+    "purpose": "sample"
+  }
+}
