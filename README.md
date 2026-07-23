@@ -4,6 +4,8 @@
 
 **ALMANAC** is a personal, AI-assisted portfolio management and risk-control system. It pairs a quantitative Python backend with a Next.js dashboard to run daily portfolio analysis, market screening, and disciplined risk management for a real long-term investment account — with hard, deterministic guardrails sitting between any AI suggestion and an actual trade.
 
+**This is not an automated trading bot.** There is no broker order API anywhere in this codebase. The AI proposes, the policy engine either blocks or allows the proposal through, and a human places the actual order at their broker.
+
 This repository is a **public, sanitized snapshot** of that system. Runtime data, credentials, and anything that could identify the account owner are intentionally excluded — see [Public Repository Safety](#public-repository-safety).
 
 ## What it does
@@ -17,13 +19,13 @@ The objective function is explicit and version-controlled ([`objective.md`](obje
 | **Screening & signals** | Long-term JP/US fundamental screening, disclosure-driven catalyst detection (EDINET / TDnet / EDGAR filings), margin and short-sale candidate screening, insider-cluster and IPO tracking |
 | **Execution & guardrails** | Daily/monthly drawdown circuit breakers, VaR- and VIX-based trade blocking, an append-only event ledger for full auditability, open-order-aware position sizing |
 | **Tax & accounts** | FIFO/LIFO/loss-harvest/gain-minimize tax-lot strategies, NISA allocation tracking, employee-stock-plan concentration management |
-| **Observability** | NAV/TWR performance tracking (Modified Dietz) against benchmark, with a verification page that reports actual measured performance rather than a fixed claim |
+| **Observability** | NAV/TWR performance tracking against benchmark (a Modified Dietz cash-flow-adjusted approximation, not a daily sub-period-exact TWR), with a verification page that reports actual measured performance rather than a fixed claim |
 
 ## Architecture
 
 - **Backend** — Python 3.12 / FastAPI. Portfolio optimization ([PyPortfolioOpt](https://github.com/robertmartin8/PyPortfolioOpt), [riskfolio-lib](https://riskfolio-lib.readthedocs.io/), [skfolio](https://skfolio.org/)), GARCH risk modeling ([arch](https://arch.readthedocs.io/)), FinBERT sentiment (`transformers` / `torch`), Claude (Anthropic) and DeepSeek for LLM-assisted analysis.
 - **Frontend** — Next.js 16 (App Router) / React 19 / TypeScript. A single console covering portfolio, screening, risk, scenarios, strategy, margin, NISA, AI decision support, execution log, and a performance-verification page.
-- **Privacy layer** — every external LLM call is routed through a sanitizer (`almanac/llm_safety.py`) that strips holdings, balances, and other book data before anything leaves the machine. External models see anonymized market context, never the actual portfolio.
+- **Privacy layer** — ALMANAC runs locally, but some of its configured AI features do send portfolio context (holdings, quantities, P&L, allocation) to an external LLM. Non-Anthropic calls that are meant to carry only public or anonymized data (disclosure-feature extraction, the analyst debate, Red Team, screening) go through an allowlist gate (`almanac/llm_safety.py`). Separately, "book-aware" call sites (the chat assistant, case-based decision support, some guardrail alerts) send portfolio context to Anthropic — and in one path, to DeepSeek — by design, and log that usage. See [Public Repository Safety](#public-repository-safety) for exactly what never leaves the machine regardless.
 
 ## Configuration
 
@@ -68,18 +70,25 @@ python3 -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt
 
-cp .env.example .env               # fill in your own API keys
-python scripts/init_private_state.py   # creates empty local state files from examples/
+# API keys are read from ~/.almanac_secrets (shell-style KEY=VALUE, one per
+# line), not from a project-local .env file — nothing in this repo loads
+# dotenv. Copy .env.example there and fill in your own values:
+cp .env.example ~/.almanac_secrets
+chmod 600 ~/.almanac_secrets
 
-./start_v5.sh                      # FastAPI on :8000, Next.js dashboard on :3000
+python scripts/init_private_state.py   # seeds local state files with small
+                                        # demo values (sample cash + SPY),
+                                        # not your real portfolio
+
+./start_v5.sh                      # FastAPI on :8000 only — see below for the dashboard
 ```
 
-### Frontend only
+`start_v5.sh` starts the FastAPI backend and nothing else; the script's own comments say the Next.js dashboard is expected to be managed separately (a macOS LaunchAgent, in the original setup). To run the dashboard yourself:
 
 ```bash
 cd frontend
 npm install
-npm run dev                        # http://localhost:3000
+npm run dev                        # http://localhost:3000, talking to the FastAPI backend above
 ```
 
 Write endpoints require `ALMANAC_API_KEY` (or a key file at `~/.config/almanac/api_key`).
@@ -100,3 +109,7 @@ Most other top-level `.py` files are single-purpose modules — screeners, data 
 ## Disclaimer
 
 This is a personal project built around one person's own portfolio. It is not investment advice, has not been independently audited for correctness, and is shared as-is for anyone curious how the system works. Use any part of it at your own risk.
+
+## License
+
+[MIT](LICENSE)

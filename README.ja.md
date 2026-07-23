@@ -4,7 +4,9 @@
 
 **ALMANAC** は、個人のポートフォリオ運用を支援するAIアシスト型の資産管理・リスク管理システムです。Pythonバックエンドと Next.js ダッシュボードを組み合わせ、実際の長期投資口座に対して日次のポートフォリオ分析・銘柄スクリーニング・規律あるリスク管理を行います。AIの提案と実際の発注の間には、必ず決定論的なガードレールが挟まる設計です。
 
-このリポジトリは、そのシステムの**公開用に匿名化したスナップショット**です。実運用データ・認証情報・保有者を特定しうる情報は意図的に除外しています（詳細は [Public Repository Safety](#public-repository-safety)）。
+**自動売買botではありません。** このコードベースのどこにも証券会社への発注APIはありません。AIが提案し、ポリシーエンジンがその提案を通すか止めるかを判定し、実際の発注は人間が証券会社の画面で行います。
+
+このリポジトリは、そのシステムの**公開用に匿名化したスナップショット**です。実運用データ・認証情報・保有者を特定しうる情報は意図的に除外しています（詳細は [公開リポジトリの安全性](#公開リポジトリの安全性public-repository-safety)）。
 
 ## できること
 
@@ -17,13 +19,13 @@
 | **スクリーニング・シグナル** | 日米のファンダメンタルズ長期スクリーニング、開示（EDINET／TDnet／EDGAR）起点のカタリスト検知、信用・空売り候補スクリーニング、インサイダークラスター・IPO監視 |
 | **執行・ガードレール** | 日次／月次ドローダウンのサーキットブレーカー、VaR・VIX連動の発注ブロック、監査用のappend-onlyイベント台帳、既存注文を考慮したポジションサイジング |
 | **税務・口座管理** | FIFO/LIFO/損出し/利益最小化の税ロット戦略、NISA枠の追跡、持株会（従業員株式制度）の集中度管理 |
-| **可観測性** | ベンチマーク対比のNAV/TWR実績追跡（Modified Dietz法）。固定的な実績主張ではなく、実測値をそのまま示す検証ページ |
+| **可観測性** | ベンチマーク対比のNAV/TWR実績追跡（Modified Dietz法によるキャッシュフロー調整済みの近似値。日次sub-period計算による厳密なTWRではない）。固定的な実績主張ではなく、実測値をそのまま示す検証ページ |
 
 ## アーキテクチャ
 
 - **バックエンド** — Python 3.12 / FastAPI。ポートフォリオ最適化（[PyPortfolioOpt](https://github.com/robertmartin8/PyPortfolioOpt)、[riskfolio-lib](https://riskfolio-lib.readthedocs.io/)、[skfolio](https://skfolio.org/)）、GARCHリスクモデリング（[arch](https://arch.readthedocs.io/)）、FinBERTセンチメント分析（`transformers` / `torch`）、AI分析にClaude（Anthropic）とDeepSeekを使用。
 - **フロントエンド** — Next.js 16（App Router）/ React 19 / TypeScript。ポートフォリオ・スクリーニング・リスク・シナリオ・戦略・信用取引・NISA・AI判断支援・執行ログ・パフォーマンス検証ページを1つのコンソールに統合。
-- **プライバシー層** — 外部LLMへの呼び出しは全て、保有銘柄・残高等の帳簿情報を送信前に取り除くサニタイザ（`almanac/llm_safety.py`）を経由します。外部モデルが見るのは匿名化された市場コンテキストのみで、実際のポートフォリオを見ることはありません。
+- **プライバシー層** — ALMANACはローカルで動作しますが、設定されたAI機能の一部は、保有銘柄・数量・損益・配分などのポートフォリオコンテキストを外部LLMへ送信します。公開・匿名化データのみを扱うことを意図した非Anthropic経路（開示特徴量抽出・アナリスト間の討論・Red Team・スクリーニング）は、許可リスト方式のゲート（`almanac/llm_safety.py`）を通ります。一方、「book-aware」と呼ばれる別経路（チャットアシスタント・ケース別の判断支援・一部のガードレール通知）は、設計上ポートフォリオ情報をAnthropicへ（一部はDeepSeekへも）送信し、その利用を記録します。何がローカルから一切出ないかは [公開リポジトリの安全性](#公開リポジトリの安全性public-repository-safety) を参照してください。
 
 ## 設定（Configuration）
 
@@ -68,18 +70,25 @@ python3 -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt
 
-cp .env.example .env               # 自分のAPIキーを設定
-python scripts/init_private_state.py   # examples/ から空のローカル状態ファイルを作成
+# APIキーは ~/.almanac_secrets（シェル形式の KEY=VALUE、1行1項目）から
+# 読み込まれます。プロジェクト直下の .env ファイルではありません — この
+# リポジトリのどこもdotenvを読み込んでいません。
+cp .env.example ~/.almanac_secrets
+chmod 600 ~/.almanac_secrets
 
-./start_v5.sh                      # FastAPIが:8000、Next.jsダッシュボードが:3000で起動
+python scripts/init_private_state.py   # examples/ から少額のデモ値
+                                        # （サンプルの現金・SPY）を投入。
+                                        # 実際のポートフォリオではない
+
+./start_v5.sh                      # FastAPIのみ:8000で起動（ダッシュボードは下記）
 ```
 
-### フロントエンドのみ
+`start_v5.sh` はFastAPIバックエンドだけを起動します。スクリプト自身のコメントにある通り、Next.jsダッシュボードは別管理が前提です（元の環境ではmacOSのLaunchAgent）。ダッシュボードを自分で動かすには:
 
 ```bash
 cd frontend
 npm install
-npm run dev                        # http://localhost:3000
+npm run dev                        # http://localhost:3000（上記のFastAPIバックエンドと通信）
 ```
 
 書き込み系エンドポイントには `ALMANAC_API_KEY`（または `~/.config/almanac/api_key` のキーファイル）が必要です。
@@ -100,3 +109,7 @@ tests/                   pytestスイート
 ## 免責事項
 
 これは個人が自身のポートフォリオのために構築した個人プロジェクトです。投資助言ではなく、第三者による正確性の監査も受けていません。中身に興味のある方向けにそのまま公開しているものであり、利用は自己責任でお願いします。
+
+## ライセンス
+
+[MIT](LICENSE)
