@@ -1,5 +1,7 @@
 # ALMANAC
 
+*[日本語](README.ja.md)*
+
 **ALMANAC** is a personal, AI-assisted portfolio management and risk-control system. It pairs a quantitative Python backend with a Next.js dashboard to run daily portfolio analysis, market screening, and disciplined risk management for a real long-term investment account — with hard, deterministic guardrails sitting between any AI suggestion and an actual trade.
 
 This repository is a **public, sanitized snapshot** of that system. Runtime data, credentials, and anything that could identify the account owner are intentionally excluded — see [Public Repository Safety](#public-repository-safety).
@@ -19,17 +21,41 @@ The objective function is explicit and version-controlled ([`objective.md`](obje
 
 ## Architecture
 
-The application stack is Python, FastAPI, Next.js, React, and TypeScript.
-
 - **Backend** — Python 3.12 / FastAPI. Portfolio optimization ([PyPortfolioOpt](https://github.com/robertmartin8/PyPortfolioOpt), [riskfolio-lib](https://riskfolio-lib.readthedocs.io/), [skfolio](https://skfolio.org/)), GARCH risk modeling ([arch](https://arch.readthedocs.io/)), FinBERT sentiment (`transformers` / `torch`), Claude (Anthropic) and DeepSeek for LLM-assisted analysis.
 - **Frontend** — Next.js 16 (App Router) / React 19 / TypeScript. A single console covering portfolio, screening, risk, scenarios, strategy, margin, NISA, AI decision support, execution log, and a performance-verification page.
 - **Privacy layer** — every external LLM call is routed through a sanitizer (`almanac/llm_safety.py`) that strips holdings, balances, and other book data before anything leaves the machine. External models see anonymized market context, never the actual portfolio.
+
+## Configuration
+
+Copy `.env.example` to `.env` and fill in what you need. Nothing is required just to read the code — these only matter if you actually run the system.
+
+**Required for AI features**
+
+| Variable | Purpose |
+|---|---|
+| `ANTHROPIC_API_KEY` | Claude — powers AI decision support, case analysis, and LLM-generated portfolio views |
+| `DEEPSEEK_API_KEY` | DeepSeek — cost-efficient screening and long-term-scan harness |
+
+**Optional**
+
+| Variable | Purpose |
+|---|---|
+| `FRED_API_KEY` | Macro data (Federal Reserve Economic Data) for regime/risk context |
+| `FINNHUB_API_KEY` | Supplementary market data |
+| `GEMINI_API_KEY`, `GOOGLE_AI_API_KEY` | Alternative LLM backend |
+| `GROQ_API_KEY` | Alternative fast-inference LLM backend |
+| `OPENROUTER_API_KEY` | LLM routing/aggregator, alternative backend |
+| `TELEGRAM_TOKEN`, `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID` | Push notifications for alerts and daily briefings |
+| `ALMANAC_API_KEY`, `NEXT_PUBLIC_ALMANAC_API_KEY` | Auth key for write endpoints (recording trades, editing tuning params) — read-only browsing works without it |
+| `ALMANAC_ESPP_*` | Employee-stock-plan tracking; disabled (`0`) by default |
+| `ALMANAC_CONTRIBUTION_SCHEDULE_JSON` | Recurring cash-flow definitions; empty by default |
+| `ALMANAC_CLEAN_NAV_SINCE`, `ALMANAC_MIN_CLEAN_DAYS` | Performance-measurement window hygiene |
 
 ## Public Repository Safety
 
 This repository intentionally does not track local portfolio state, broker exports, databases, logs, screenshots, local AI-tool sessions, or API keys.
 
-Files such as `holdings.json`, `account.json`, `nisa_portfolio.json`, `trade_history.csv`, and `almanac.db` are ignored by Git and never leave the local machine. Worked examples in the docs use a rounded placeholder portfolio size rather than any real figure.
+Files such as `holdings.json`, `account.json`, `nisa_portfolio.json`, `trade_history.csv`, and `almanac.db` are ignored by Git and never leave the local machine. Worked examples use a rounded placeholder portfolio size rather than any real figure. `scripts/check_public_safety.py` scans tracked files for known private identifiers and secret-key patterns; it's meant to be run before every push.
 
 If you're preparing your own public release from a fork of this project, rotate any token that was ever committed or pasted into local tool settings before publishing repository history.
 
@@ -70,10 +96,6 @@ tests/                   pytest suite
 ```
 
 Most other top-level `.py` files are single-purpose modules — screeners, data fetchers, the policy and risk engines, tax tooling — rather than parts of a package. See individual file docstrings for details.
-
-## Notes on naming
-
-The project was previously named **KAIROS**, and earlier still, NexusTrader. The KAIROS-era compatibility code (legacy env var names, the `kairos` package import alias) has been fully removed; `ALMANAC_*` names and the `almanac` package are the only supported path going forward. A couple of NexusTrader-era fallbacks (e.g. reading an existing `nexustrader.db` if `almanac.db` isn't present yet) remain in `almanac/runtime_config.py` for anyone migrating an even older local setup.
 
 ## Disclaimer
 
