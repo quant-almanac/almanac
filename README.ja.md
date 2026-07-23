@@ -52,6 +52,19 @@
 | `ALMANAC_ESPP_*` | 持株会（従業員株式制度）追跡設定。既定は全て無効（`0`） |
 | `ALMANAC_CONTRIBUTION_SCHEDULE_JSON` | 定期積立の設定。既定は空 |
 | `ALMANAC_CLEAN_NAV_SINCE`, `ALMANAC_MIN_CLEAN_DAYS` | パフォーマンス計測期間の衛生設定 |
+| `ALMANAC_PRIVACY_MODE` | 「book-aware」な外部LLM呼び出し（チャット・判断支援・ガードレール通知・日次最終統合）をゲートする。詳細は下記 |
+
+### プライバシーモード
+
+一部のAI機能は、設計上ポートフォリオコンテキスト（保有銘柄・残高・損益）を外部モデルへ送信します（該当箇所は [公開リポジトリの安全性](#公開リポジトリの安全性public-repository-safety) を参照）。`ALMANAC_PRIVACY_MODE` は、それらの呼び出しをそもそも実行してよいかを制御します。
+
+| 値 | 効果 |
+|---|---|
+| `strict_local`（既定） | book-awareな呼び出しは一切外部へ出ない。チャット・判断支援・ガードレール通知・最終統合の各経路は、外部呼び出しの代わりにローカルの「無効化」応答を返す |
+| `anthropic_book_aware` | Anthropicへのbook-aware呼び出しのみ許可 |
+| `multi_provider_book_aware` | 設定済みの全プロバイダへのbook-aware呼び出しを許可（このコードベースの元々の、ゲート導入前の挙動） |
+
+公開・匿名化データの呼び出し（スクリーニング・開示特徴量抽出）はこの設定の影響を受けません。そもそもポートフォリオ情報を含まないためです。`assert_book_aware_allowed()` でゲートされている呼び出し箇所は全て `tests/test_llm_call_site_gating.py` で列挙・回帰テストされています。
 
 ## 公開リポジトリの安全性（Public Repository Safety）
 

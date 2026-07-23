@@ -516,6 +516,27 @@ def call_tier_analysis(system: str, user: str, *,
     model_id = get_model(role)
     source_tag = f"{adapter}:{model_id}"
 
+    # Tier analysis is inherently book-aware (it reasons over the actual
+    # portfolio) — gate it by ALMANAC_PRIVACY_MODE before it reaches either
+    # provider branch below. Fail-closed if the safety module itself can't
+    # be imported, matching the existing DeepSeek book-aware path's policy
+    # of refusing an un-audited call rather than silently proceeding.
+    try:
+        from almanac.llm_safety import assert_book_aware_allowed, BookAwareDisabled, get_privacy_mode
+    except ImportError as _ls_err:
+        return {
+            "error": f"almanac.llm_safety unavailable; refusing un-audited book-aware call: {_ls_err}",
+            "_source": f"blocked:{adapter}",
+        }
+    try:
+        assert_book_aware_allowed(provider=adapter)
+    except BookAwareDisabled as e:
+        return {
+            "error": str(e),
+            "_source": f"blocked:{adapter}",
+            "_privacy_mode": get_privacy_mode(),
+        }
+
     if adapter == "anthropic":
         try:
             result = call_claude(

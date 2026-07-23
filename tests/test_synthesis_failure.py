@@ -81,6 +81,7 @@ def test_swing_prompt_includes_deterministic_jp_only_candidates_without_ai_comme
 
 
 def test_final_synthesis_logs_llm_usage(monkeypatch):
+    monkeypatch.setenv("ALMANAC_PRIVACY_MODE", "anthropic_book_aware")
     rows = []
 
     class FakeMessages:

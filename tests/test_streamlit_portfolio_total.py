@@ -95,6 +95,7 @@ def test_holding_value_jpy_handles_cash_usd_and_domestic_funds(monkeypatch):
 
 
 def test_ai_explain_logs_stream_usage(monkeypatch):
+    monkeypatch.setenv("ALMANAC_PRIVACY_MODE", "anthropic_book_aware")
     rows: list[dict] = []
 
     class _Placeholder:

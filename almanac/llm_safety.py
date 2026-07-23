@@ -38,11 +38,12 @@ top-level ``utils.py`` already exists and ``analyzer.py`` imports it via
 
 from __future__ import annotations
 
+import os
 import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Iterable, Mapping
 
 from almanac.observability.append_only_log import append_jsonl_safe
 
@@ -50,13 +51,20 @@ __all__ = [
     "ALLOWED_KINDS",
     "DEFERRED_KINDS",
     "BOOK_AWARE_KIND",
+    "PRIVACY_MODES",
+    "DEFAULT_PRIVACY_MODE",
     "PrivacyViolation",
+    "BookAwareDisabled",
     "Payload",
     "ExternalLLMResult",
     "scan_text_for_pii",
     "assert_public_payload",
     "call_external_llm",
     "call_book_aware_llm",
+    "get_privacy_mode",
+    "book_aware_allowed",
+    "assert_book_aware_allowed",
+    "log_book_aware_call",
 ]
 
 # Repo root: almanac/llm_safety.py → parents[1] is the repo root.
@@ -176,6 +184,131 @@ def scan_text_for_pii(text: str, *, include_jp_book: bool = True) -> list[str]:
 
 class PrivacyViolation(ValueError):
     """Raised when a payload would leak non-public data to an external model."""
+
+
+class BookAwareDisabled(PrivacyViolation):
+    """Raised when a book-aware (portfolio-carrying) call is attempted while
+    the active :func:`get_privacy_mode` does not permit it. Callers should
+    catch this specifically and fall back to a local, non-portfolio-aware
+    response rather than letting it surface as a generic error."""
+
+
+# ---------------------------------------------------------------------------
+# Privacy mode — gates *book-aware* calls (portfolio data by design)
+# ---------------------------------------------------------------------------
+#
+# This is a different axis from ALLOWED_KINDS above. ALLOWED_KINDS decides
+# whether a payload is *public/anonymized enough* to leave the process at
+# all. Privacy mode decides whether *book-aware* calls (which intentionally
+# carry holdings / balances / P&L to a model, bypassing that scan by design)
+# are permitted to run right now, and to which providers.
+
+PRIVACY_MODES: frozenset[str] = frozenset(
+    {"strict_local", "anthropic_book_aware", "multi_provider_book_aware"}
+)
+"""
+- ``strict_local`` — no book-aware call reaches any external provider. Chat /
+  decision-support / guardrail-alert call sites must fall back to a local,
+  non-portfolio-aware response. **Default**, and the recommended setting for
+  this public snapshot.
+- ``anthropic_book_aware`` — book-aware calls to Anthropic only. Other
+  providers (DeepSeek, etc.) still may not receive portfolio data.
+- ``multi_provider_book_aware`` — book-aware calls to any configured
+  provider, matching this codebase's original (pre-privacy-mode) behavior.
+"""
+
+DEFAULT_PRIVACY_MODE = "strict_local"
+
+
+def get_privacy_mode() -> str:
+    """Return the active privacy mode from ``ALMANAC_PRIVACY_MODE``.
+
+    Falls back to :data:`DEFAULT_PRIVACY_MODE` (the safest option) if the
+    env var is unset or holds a value outside :data:`PRIVACY_MODES` — an
+    unrecognized value fails closed rather than silently allowing book-aware
+    calls through.
+    """
+    raw = os.environ.get("ALMANAC_PRIVACY_MODE", DEFAULT_PRIVACY_MODE).strip()
+    return raw if raw in PRIVACY_MODES else DEFAULT_PRIVACY_MODE
+
+
+def book_aware_allowed(*, provider: str) -> bool:
+    """Whether a book-aware call to ``provider`` (e.g. ``"anthropic"``,
+    ``"deepseek"``) is permitted under the current privacy mode."""
+    mode = get_privacy_mode()
+    if mode == "strict_local":
+        return False
+    if mode == "anthropic_book_aware":
+        return provider == "anthropic"
+    return mode == "multi_provider_book_aware"
+
+
+def assert_book_aware_allowed(*, provider: str = "anthropic") -> None:
+    """Raise :class:`BookAwareDisabled` unless the active mode permits a
+    book-aware call to ``provider``.
+
+    Call this *before* sending portfolio context (holdings, balances, P&L,
+    allocation) to any external model. Intended usage at a call site::
+
+        try:
+            assert_book_aware_allowed(provider="anthropic")
+        except BookAwareDisabled:
+            return _local_fallback_response()
+        # ... proceed with the existing Anthropic call, unchanged ...
+    """
+    if not book_aware_allowed(provider=provider):
+        raise BookAwareDisabled(
+            f"book-aware {provider} call blocked under "
+            f"ALMANAC_PRIVACY_MODE={get_privacy_mode()!r}; set it to "
+            "'anthropic_book_aware' (Anthropic only) or "
+            "'multi_provider_book_aware' (any provider) to allow"
+        )
+
+
+def log_book_aware_call(
+    *,
+    role: str,
+    model: str,
+    provider: str = "anthropic",
+    fields: Iterable[str] = (),
+    status: str = "ok",
+    error: str | None = None,
+    input_tokens: int | None = None,
+    output_tokens: int | None = None,
+    log_path: Path | str | None = None,
+    fsync: bool = True,
+) -> None:
+    """Append a book-aware call to the shared audit log (``logs/llm_calls.jsonl``
+    by default).
+
+    ``fields`` is a list of field *names* embedded in the prompt — e.g.
+    ``["balance", "holdings.ticker", "holdings.shares"]`` — never values, so
+    an audit reader can see what *kind* of data left the machine without the
+    log itself becoming a second copy of the book.
+    """
+    row: dict[str, Any] = {
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "role": role,
+        "model": model,
+        "provider": provider,
+        "kind": "book_aware",
+        "book_aware": True,
+        "contains_book": True,
+        "fields": sorted(set(fields)),
+        "status": status,
+    }
+    if error is not None:
+        row["error"] = error[:300]
+    if input_tokens is not None:
+        row["input_tokens"] = input_tokens
+    if output_tokens is not None:
+        row["output_tokens"] = output_tokens
+    row["adapter"] = "almanac.llm_safety"
+    append_jsonl_safe(
+        Path(log_path) if log_path is not None else _DEFAULT_LOG_PATH,
+        row,
+        fsync=fsync,
+    )
 
 
 @dataclass(frozen=True)
@@ -402,6 +535,7 @@ def call_book_aware_llm(
             f"call_book_aware_llm requires payload kind {BOOK_AWARE_KIND!r}, "
             f"got {getattr(payload, 'kind', None)!r}"
         )
+    assert_book_aware_allowed(provider="deepseek")
 
     _log = Path(log_path) if log_path is not None else _DEFAULT_LOG_PATH
 

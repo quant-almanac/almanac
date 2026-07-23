@@ -78,6 +78,7 @@ def test_sonnet_tier_retries_max_token_truncation(monkeypatch):
 def test_deepseek_tier_call_receives_request_timeout(monkeypatch):
     from analyst.llm_client import call_tier_analysis
 
+    monkeypatch.setenv("ALMANAC_PRIVACY_MODE", "multi_provider_book_aware")
     seen = {}
 
     def fake_call_by_role(**kwargs):
@@ -101,6 +102,7 @@ def test_deepseek_tier_call_receives_request_timeout(monkeypatch):
 def test_call_tier_analysis_retries_anthropic_max_tokens(monkeypatch):
     from analyst import llm_client
 
+    monkeypatch.setenv("ALMANAC_PRIVACY_MODE", "anthropic_book_aware")
     calls = []
 
     monkeypatch.setattr("model_router.resolve_adapter", lambda role: "anthropic")
@@ -132,6 +134,7 @@ def test_call_tier_analysis_retries_anthropic_max_tokens(monkeypatch):
 def test_call_tier_analysis_retries_deepseek_max_tokens(monkeypatch):
     from analyst.llm_client import call_tier_analysis
 
+    monkeypatch.setenv("ALMANAC_PRIVACY_MODE", "multi_provider_book_aware")
     calls = []
 
     def fake_call_by_role(**kwargs):

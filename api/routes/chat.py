@@ -128,11 +128,37 @@ JPY残高: ¥{account.get('balance', 0):,} / USD残高: ${account.get('usd_balan
     return ctx
 
 
+_PRIVACY_BLOCKED_MESSAGE = (
+    "この機能（保有銘柄・残高を含むチャット）は現在、プライバシーモードにより無効化されています。\n"
+    "ALMANAC_PRIVACY_MODE を anthropic_book_aware または multi_provider_book_aware に設定すると利用できます。"
+)
+
+
 def _stream_claude(system: str, messages: list[dict]):
+    from almanac.llm_safety import (
+        assert_book_aware_allowed,
+        BookAwareDisabled,
+        log_book_aware_call,
+    )
+
+    claude_msgs = [{"role": m["role"], "content": m["content"]} for m in messages]
+
+    try:
+        assert_book_aware_allowed(provider="anthropic")
+    except BookAwareDisabled:
+        log_book_aware_call(
+            role="chat_stream",
+            model=CHAT_MODEL,
+            fields=["balance", "usd_balance", "holdings.ticker", "holdings.shares", "holdings.entry_price"],
+            status="blocked",
+        )
+        yield f"data: {json.dumps({'text': _PRIVACY_BLOCKED_MESSAGE}, ensure_ascii=False)}\n\n"
+        yield "data: [DONE]\n\n"
+        return
+
     import anthropic
     client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY", ""))
 
-    claude_msgs = [{"role": m["role"], "content": m["content"]} for m in messages]
     started = time.monotonic()
     try:
         with client.messages.stream(
@@ -150,6 +176,12 @@ def _stream_claude(system: str, messages: list[dict]):
             messages=claude_msgs,
             response=final_message,
         )
+        log_book_aware_call(
+            role="chat_stream",
+            model=CHAT_MODEL,
+            fields=["balance", "usd_balance", "holdings.ticker", "holdings.shares", "holdings.entry_price"],
+            status="ok",
+        )
     except Exception as e:
         _log_chat_usage(
             started=started,
@@ -157,6 +189,13 @@ def _stream_claude(system: str, messages: list[dict]):
             messages=claude_msgs,
             status="error",
             error=e,
+        )
+        log_book_aware_call(
+            role="chat_stream",
+            model=CHAT_MODEL,
+            fields=["balance", "usd_balance", "holdings.ticker", "holdings.shares", "holdings.entry_price"],
+            status="error",
+            error=str(e),
         )
         raise
     yield "data: [DONE]\n\n"

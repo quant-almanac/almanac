@@ -4,6 +4,7 @@ import decision_support as ds
 
 
 def test_decision_support_sonnet_analysis_logs_llm_usage(monkeypatch):
+    monkeypatch.setenv("ALMANAC_PRIVACY_MODE", "anthropic_book_aware")
     rows: list[dict] = []
 
     class FakeMessages:
@@ -35,6 +36,7 @@ def test_decision_support_sonnet_analysis_logs_llm_usage(monkeypatch):
 
 
 def test_decision_support_final_judgment_logs_llm_usage(monkeypatch):
+    monkeypatch.setenv("ALMANAC_PRIVACY_MODE", "anthropic_book_aware")
     rows: list[dict] = []
 
     class FakeMessages:

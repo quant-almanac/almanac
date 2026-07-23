@@ -43,10 +43,14 @@ def test_start_script_does_not_advertise_start_v5_as_streamlit_launcher():
 def test_readme_describes_current_fastapi_nextjs_stack():
     readme = _read("README.md")
 
-    assert "Python, FastAPI, Next.js" in readme
+    # Check the constituent stack pieces rather than one exact phrase, so
+    # this doesn't break every time the README's wording is polished.
+    assert "Python" in readme
+    assert "FastAPI" in readme
+    assert "Next.js" in readme
     assert "./start_v5.sh" in readme
     assert "http://localhost:3000" in readme
-    assert "Python, FastAPI, Streamlit" not in readme
+    assert "Streamlit" not in readme
 
 
 def test_proposed_cron_and_launchagents_reference_existing_python_files():

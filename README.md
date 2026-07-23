@@ -52,6 +52,19 @@ Copy `.env.example` to `.env` and fill in what you need. Nothing is required jus
 | `ALMANAC_ESPP_*` | Employee-stock-plan tracking; disabled (`0`) by default |
 | `ALMANAC_CONTRIBUTION_SCHEDULE_JSON` | Recurring cash-flow definitions; empty by default |
 | `ALMANAC_CLEAN_NAV_SINCE`, `ALMANAC_MIN_CLEAN_DAYS` | Performance-measurement window hygiene |
+| `ALMANAC_PRIVACY_MODE` | Gates *book-aware* external LLM calls (chat, decision support, guardrail alerts, final daily synthesis) — see below |
+
+### Privacy mode
+
+Some AI features intentionally send portfolio context (holdings, balances, P&L) to an external model — see [Public Repository Safety](#public-repository-safety) for exactly which ones. `ALMANAC_PRIVACY_MODE` controls whether those specific calls are allowed to run at all:
+
+| Value | Effect |
+|---|---|
+| `strict_local` (default) | No book-aware call leaves the machine. Chat / decision-support / guardrail-alert / final-synthesis call sites return a local "disabled" response instead of calling out. |
+| `anthropic_book_aware` | Book-aware calls to Anthropic only. |
+| `multi_provider_book_aware` | Book-aware calls to any configured provider (this codebase's original, pre-gate behavior). |
+
+Public/anonymized calls (screening, disclosure-feature extraction) are unaffected by this setting — they never carry portfolio data in the first place. Every call site with a `assert_book_aware_allowed()` gate is enumerated (and enforced by a regression test) in `tests/test_llm_call_site_gating.py`.
 
 ## Public Repository Safety
 

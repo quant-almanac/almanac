@@ -5,6 +5,7 @@ import ollama_chat
 
 
 def test_ollama_chat_claude_fallback_logs_stream_usage(monkeypatch):
+    monkeypatch.setenv("ALMANAC_PRIVACY_MODE", "anthropic_book_aware")
     rows: list[dict] = []
 
     class FakeStream:

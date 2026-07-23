@@ -16,6 +16,7 @@ def _blocked_state() -> dict:
 
 
 def test_guardrail_suggestion_logs_haiku_usage_without_telegram(monkeypatch):
+    monkeypatch.setenv("ALMANAC_PRIVACY_MODE", "anthropic_book_aware")
     rows: list[dict] = []
 
     class FakeMessages:

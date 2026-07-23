@@ -471,6 +471,15 @@ def _send_guardrail_suggestion(state: dict, trading_stopped: bool):
 
 今すぐやるべきことを3つ、箇条書きで具体的に教えてください。"""
     try:
+        from almanac.llm_safety import assert_book_aware_allowed, BookAwareDisabled, log_book_aware_call
+        try:
+            assert_book_aware_allowed(provider="anthropic")
+        except BookAwareDisabled as _e:
+            log_book_aware_call(role="guardrail_suggestion", model=HAIKU_MODEL_ID,
+                                 fields=["daily_pnl", "monthly_pnl", "active_trades", "short_positions"],
+                                 status="blocked")
+            raise RuntimeError(str(_e))
+
         client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY", ""))
         started = time.monotonic()
         msg = client.messages.create(

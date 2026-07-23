@@ -391,6 +391,14 @@ def analyze_with_sonnet(case: str, context: str, question: str = '') -> str:
     Returns:
         Sonnetの分析テキスト
     """
+    from almanac.llm_safety import assert_book_aware_allowed, BookAwareDisabled, log_book_aware_call
+    try:
+        assert_book_aware_allowed(provider="anthropic")
+    except BookAwareDisabled as e:
+        log_book_aware_call(role="decision_support_sonnet", model=SONNET_MODEL,
+                             fields=["portfolio_context", "case_context"], status="blocked")
+        return f"（この機能は現在プライバシーモードにより無効化されています: {e}）"
+
     client = anthropic.Anthropic(api_key=os.environ.get('ANTHROPIC_API_KEY'))
 
     case_labels = {
@@ -479,6 +487,14 @@ def final_judgment_with_opus(
     Returns:
         Opusの最終判断テキスト
     """
+    from almanac.llm_safety import assert_book_aware_allowed, BookAwareDisabled, log_book_aware_call
+    try:
+        assert_book_aware_allowed(provider="anthropic")
+    except BookAwareDisabled as e:
+        log_book_aware_call(role="decision_support_opus", model=OPUS_MODEL,
+                             fields=["portfolio_context", "case_context", "sonnet_analysis"], status="blocked")
+        return f"（この機能は現在プライバシーモードにより無効化されています: {e}）"
+
     client = anthropic.Anthropic(api_key=os.environ.get('ANTHROPIC_API_KEY'))
 
     prompt = f"""以下の情報をすべて踏まえて、最終的な投資判断を下してください。

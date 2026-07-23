@@ -242,6 +242,15 @@ def chat_stream_claude(
     model: str = CHAT_FALLBACK_MODEL
 ) -> Generator[str, None, None]:
     """Claude Haiku でストリーミングチャット（Ollama フォールバック）。"""
+    from almanac.llm_safety import assert_book_aware_allowed, BookAwareDisabled, log_book_aware_call
+    try:
+        assert_book_aware_allowed(provider="anthropic")
+    except BookAwareDisabled:
+        log_book_aware_call(role="ollama_chat_claude_fallback", model=model,
+                             fields=["portfolio_context"], status="blocked")
+        yield "（この機能は現在プライバシーモードにより無効化されています。ALMANAC_PRIVACY_MODE を確認してください）"
+        return
+
     client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY", ""))
 
     portfolio_ctx = build_portfolio_context()

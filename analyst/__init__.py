@@ -3718,7 +3718,33 @@ VIX={market_meta.get('vix','不明')} {market_meta.get('vix_level','')} / 米10Y
     - 不確実なら省略してよい
 必ずJSONのみを出力してください。"""
 
-    import anthropic as _anthropic, time as _time
+    import time as _time
+    from almanac.llm_safety import assert_book_aware_allowed, BookAwareDisabled, log_book_aware_call, get_privacy_mode
+    try:
+        assert_book_aware_allowed(provider="anthropic")
+    except BookAwareDisabled as _e:
+        log_book_aware_call(
+            role="final_synthesis",
+            model="blocked",
+            fields=["long_tier_analysis", "medium_tier_analysis", "short_tier_analysis",
+                    "margin_long_analysis", "short_selling_analysis"],
+            status="blocked",
+        )
+        return {
+            "priority_actions": [],
+            "hold_notes": [],
+            "risk_warnings": [f"book-aware最終統合はプライバシーモード（{get_privacy_mode()}）により無効化されています。"],
+            "overall_stance": "neutral",
+            "stance_reason": "book-aware分析が無効化されているため判断を保留",
+            "telegram_message": "⚠️ 最終統合分析はプライバシーモードにより無効化されています",
+            "weekly_theme": "",
+            "geopolitical_note": "",
+            "model_used": "blocked:privacy_mode",
+            "_blocked": True,
+            "_privacy_mode": get_privacy_mode(),
+        }
+
+    import anthropic as _anthropic
     # タイムアウト明示設定 (10 分) — dead socket での無限待ち防止。
     # Extended Thinking 8k + max_tokens 16k でも通常 2-5 分で完走するため 600s で十分。
     _client = _anthropic.Anthropic(timeout=600.0, max_retries=0)

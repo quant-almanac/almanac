@@ -178,10 +178,11 @@ def test_call_returns_result_and_logs_usage(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_book_aware_logs_and_skips_pii_scan(tmp_path: Path) -> None:
+def test_book_aware_logs_and_skips_pii_scan(tmp_path: Path, monkeypatch) -> None:
     from almanac.llm_safety import (
         Payload, call_book_aware_llm, BOOK_AWARE_KIND, ExternalLLMResult,
     )
+    monkeypatch.setenv("ALMANAC_PRIVACY_MODE", "multi_provider_book_aware")
     log = tmp_path / "llm_calls.jsonl"
     seen: dict = {}
 
@@ -226,9 +227,10 @@ def test_public_path_rejects_book_aware_kind(tmp_path: Path) -> None:
         )
 
 
-def test_book_aware_logs_failed_call(tmp_path: Path) -> None:
+def test_book_aware_logs_failed_call(tmp_path: Path, monkeypatch) -> None:
     """Codex re-review #13: 失敗した book-aware 通信も監査ログ (status=error) に残し、再送出する。"""
     from almanac.llm_safety import Payload, call_book_aware_llm, BOOK_AWARE_KIND
+    monkeypatch.setenv("ALMANAC_PRIVACY_MODE", "multi_provider_book_aware")
     log = tmp_path / "llm_calls.jsonl"
 
     def _boom(**kwargs):

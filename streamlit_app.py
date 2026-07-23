@@ -753,6 +753,20 @@ def _render_ai_explain(section_label: str, context: dict, key: str,
         full_text = ''
         started = time.monotonic()
         try:
+            from almanac.llm_safety import assert_book_aware_allowed, BookAwareDisabled, log_book_aware_call
+            try:
+                # This helper is called from multiple sections with arbitrary
+                # `context`, which may include portfolio data depending on the
+                # caller — treat it as book-aware to be safe.
+                assert_book_aware_allowed(provider="anthropic")
+            except BookAwareDisabled:
+                log_book_aware_call(role=f"streamlit_ai_explain:{section_label}", model=AI_EXPLAIN_MODEL,
+                                     fields=["context"], status="blocked")
+                full_text = "この機能は現在プライバシーモードにより無効化されています。"
+                placeholder.markdown(full_text)
+                st.session_state[state_key] = full_text
+                return
+
             client = anthropic.Anthropic(api_key=os.environ.get('ANTHROPIC_API_KEY', ''))
             with client.messages.stream(
                 model=AI_EXPLAIN_MODEL,

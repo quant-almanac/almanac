@@ -5,6 +5,7 @@ from api.routes import chat
 
 
 def test_chat_stream_logs_final_message_usage(monkeypatch):
+    monkeypatch.setenv("ALMANAC_PRIVACY_MODE", "anthropic_book_aware")
     rows: list[dict] = []
 
     class FakeStream:
