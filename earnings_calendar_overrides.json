@@ -1,0 +1,11 @@
+{
+  "schema_version": 1,
+  "overrides": {
+    "META": {
+      "earnings_date": "2026-07-29",
+      "source": "https://investor.atmeta.com/investor-news/press-release-details/2026/Meta-to-Announce-Second-Quarter-2026-Results/default.aspx",
+      "verified_at": "2026-07-24",
+      "valid_until": "2026-07-30"
+    }
+  }
+}

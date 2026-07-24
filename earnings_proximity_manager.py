@@ -26,12 +26,14 @@ BASE_DIR = Path(__file__).parent
 OUTPUT   = BASE_DIR / "earnings_hedge_suggestions.json"
 HOLDINGS = BASE_DIR / "holdings.json"
 ANALYSIS = BASE_DIR / "ai_portfolio_analysis.json"
+EARNINGS_OVERRIDES = BASE_DIR / "earnings_calendar_overrides.json"
 
 PROX_DAYS              = 10    # 決算 10 営業日前から監視 (IV 膨張は 5-7 日前で顕在化だが、AAPL 等 8bd も救済)
 IMPL_MOVE_FUDGE        = 0.85  # ATM straddle → implied move 係数 (Bachelier/近似)
 DAMAGE_PCT_THRESHOLD   = 0.015 # total_portfolio の 1.5% で hedge 推奨
 BEAT_RATE_FORCE_TRIM   = 0.50
 YFIN_RETRY_ATTEMPTS    = 3     # yfinance .calendar の intermittent 404/rate-limit 対策リトライ
+OUTPUT_SCHEMA_VERSION  = 2
 
 
 def _business_days_until(target: date) -> int:
@@ -101,7 +103,58 @@ def _total_portfolio_jpy() -> float:
     return 30_000_000.0  # fallback
 
 
-def _next_earnings(tk: str):
+def _official_earnings_override(tk: str, *, today: date | None = None) -> dict | None:
+    """Return a time-bounded issuer-source override, never a stale past date."""
+    today = today or datetime.now().date()
+    try:
+        raw = json.loads(EARNINGS_OVERRIDES.read_text(encoding="utf-8"))
+        row = (raw.get("overrides") or {}).get(str(tk).upper())
+        if not isinstance(row, dict):
+            return None
+        earnings_date = date.fromisoformat(str(row.get("earnings_date")))
+        valid_until = date.fromisoformat(str(row.get("valid_until") or row.get("earnings_date")))
+        if earnings_date < today or today > valid_until:
+            return None
+        return {
+            "date": earnings_date,
+            "source": str(row.get("source") or "issuer_override"),
+            "verified_at": row.get("verified_at"),
+        }
+    except Exception:
+        return None
+
+
+def snapshot_is_current(*, today: date | None = None) -> bool:
+    """True only when today's snapshot includes every active issuer override."""
+    today = today or datetime.now().date()
+    try:
+        data = json.loads(OUTPUT.read_text(encoding="utf-8"))
+        generated = datetime.fromisoformat(str(data.get("generated_at"))).date()
+        if data.get("schema_version") != OUTPUT_SCHEMA_VERSION or generated != today:
+            return False
+        rows = {
+            str(row.get("ticker") or "").upper(): row
+            for row in list(data.get("suggestions") or []) + list(data.get("skipped") or [])
+            if isinstance(row, dict)
+        }
+        overrides = json.loads(EARNINGS_OVERRIDES.read_text(encoding="utf-8")).get("overrides") or {}
+        for ticker in overrides:
+            override = _official_earnings_override(ticker, today=today)
+            if not override:
+                continue
+            row = rows.get(str(ticker).upper())
+            if (
+                not row
+                or str(row.get("earnings") or row.get("earnings_date") or "") != override["date"].isoformat()
+                or str(row.get("earnings_source") or "") != override["source"]
+            ):
+                return False
+        return True
+    except Exception:
+        return False
+
+
+def _next_earnings_from_yfinance(tk: str):
     """
     次回決算日を取得。yfinance は intermittent 404/rate-limit を返すため、
     (a) .calendar dict / DataFrame の両方を許容
@@ -161,6 +214,22 @@ def _next_earnings(tk: str):
     if last_err:
         print(f"[earnings] {tk} calendar error (after {YFIN_RETRY_ATTEMPTS} retries): {last_err}", file=sys.stderr)
     return None
+
+
+def _next_earnings_with_source(tk: str) -> dict | None:
+    override = _official_earnings_override(tk)
+    if override:
+        return override
+    value = _next_earnings_from_yfinance(tk)
+    if value:
+        return {"date": value, "source": "yfinance"}
+    return None
+
+
+def _next_earnings(tk: str):
+    """Compatibility wrapper returning only the date."""
+    result = _next_earnings_with_source(tk)
+    return result.get("date") if result else None
 
 
 def _atm_straddle(tk: str, target_date: date) -> dict | None:
@@ -272,17 +341,25 @@ def scan(dry_run: bool = False) -> dict:
     skipped: list[dict] = []  # 観測性: なぜ hedge 対象から外されたかを記録
     for h in holdings:
         tk = h["ticker"]; sh = h["shares"]
-        ed = _next_earnings(tk)
-        if not ed:
+        earnings_record = _next_earnings_with_source(tk)
+        if not earnings_record:
             skipped.append({"ticker": tk, "reason": "no_earnings_date"})
             continue
+        ed = earnings_record["date"]
+        earnings_source = earnings_record.get("source")
         bdays = _business_days_until(ed)
         if bdays < 0 or bdays > PROX_DAYS:
-            skipped.append({"ticker": tk, "reason": "out_of_window", "earnings": ed.isoformat(), "bdays": bdays})
+            skipped.append({
+                "ticker": tk, "reason": "out_of_window", "earnings": ed.isoformat(),
+                "earnings_source": earnings_source, "bdays": bdays,
+            })
             continue
         info = _atm_straddle(tk, ed)
         if not info:
-            skipped.append({"ticker": tk, "reason": "no_option_chain", "earnings": ed.isoformat(), "bdays": bdays})
+            skipped.append({
+                "ticker": tk, "reason": "no_option_chain", "earnings": ed.isoformat(),
+                "earnings_source": earnings_source, "bdays": bdays,
+            })
             continue
         # USD position value
         pos_usd = info["spot"] * sh
@@ -299,7 +376,7 @@ def scan(dry_run: bool = False) -> dict:
         if not (needs_hedge or force_trim):
             skipped.append({
                 "ticker": tk, "reason": "damage_below_threshold",
-                "earnings": ed.isoformat(), "bdays": bdays,
+                "earnings": ed.isoformat(), "earnings_source": earnings_source, "bdays": bdays,
                 "damage_pct": round(damage_pct * 100, 3),
                 "threshold_pct": round(DAMAGE_PCT_THRESHOLD * 100, 2),
                 "implied_move_pct": round(info["implied_move_pct"] * 100, 2),
@@ -317,6 +394,7 @@ def scan(dry_run: bool = False) -> dict:
         suggestions.append({
             "ticker":            tk,
             "earnings_date":     ed.isoformat(),
+            "earnings_source":   earnings_source,
             "business_days":     bdays,
             "shares":            sh,
             "spot":              info["spot"],
@@ -339,6 +417,7 @@ def scan(dry_run: bool = False) -> dict:
 
     suggestions.sort(key=lambda s: s["damage_pct"], reverse=True)
     out = {
+        "schema_version":    OUTPUT_SCHEMA_VERSION,
         "generated_at":      time.strftime("%Y-%m-%d %H:%M:%S"),
         "holdings_scanned":  len(holdings),
         "portfolio_jpy":     total_jpy,
@@ -350,7 +429,11 @@ def scan(dry_run: bool = False) -> dict:
         "skipped":           skipped,  # 観測性: なぜ 0 suggestion かを Opus に伝えるため保持
     }
     if not dry_run:
-        OUTPUT.write_text(json.dumps(out, indent=2, ensure_ascii=False), encoding="utf-8")
+        try:
+            from utils import atomic_write_json
+            atomic_write_json(OUTPUT, out)
+        except Exception:
+            OUTPUT.write_text(json.dumps(out, indent=2, ensure_ascii=False), encoding="utf-8")
         print(f"[earnings] wrote {OUTPUT.name}: {len(suggestions)} suggestions, {len(skipped)} skipped")
         if skipped:
             reason_counts: dict[str, int] = {}

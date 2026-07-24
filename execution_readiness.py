@@ -170,6 +170,180 @@ def _requested_exit_quantity(action: dict) -> float | None:
     return None
 
 
+def _load_json_object(path: Path) -> dict | None:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def _cash_holding_row(base_dir: Path, key: str) -> dict | None:
+    raw = _load_json_object(base_dir / "holdings.json")
+    if raw is None:
+        return None
+    positions = raw.get("holdings") or raw.get("positions") or raw
+    if not isinstance(positions, dict):
+        return None
+    row = positions.get(key)
+    return row if isinstance(row, dict) else None
+
+
+def _requested_buy_quantity(action: dict) -> float | None:
+    for key in ("requested_buy_quantity", "quantity"):
+        quantity = _positive_number(action.get(key))
+        if quantity is not None:
+            return quantity
+    text = " ".join(str(action.get(key) or "") for key in ("amount_hint", "action"))
+    match = re.search(r"(\d+(?:\.\d+)?)\s*(?:株|口)", text)
+    return _positive_number(match.group(1)) if match else None
+
+
+def _requested_buy_notional(action: dict, *, currency: str) -> float | None:
+    """Return requested cash in the route's native currency."""
+    quantity = _requested_buy_quantity(action)
+    price = None
+    for key in ("limit_price", "decision_price", "price", "current_price"):
+        price = _positive_number(action.get(key))
+        if price is not None:
+            break
+    if quantity is not None and price is not None:
+        return quantity * price
+    if currency == "JPY":
+        amount_jpy = _positive_number(action.get("amount_jpy"))
+        if amount_jpy is not None:
+            return amount_jpy
+        estimated = _positive_number(action.get("estimated_notional_jpy"))
+        if estimated is not None:
+            return estimated
+    return None
+
+
+def evaluate_cash_buying_power(action: dict, *, base_dir: Path) -> dict:
+    """Check an explicitly routed cash buy against that wallet only.
+
+    The wife's SBI row is an estimated reconciliation ledger by design.  It is
+    shown in NAV, but unless explicitly confirmed it must never be treated as
+    fresh buying power.
+    """
+    action_type = str(action.get("type") or action.get("action_type") or "").lower()
+    if action_type not in {"buy", "add", "dca"}:
+        return {"required": False, "readiness": "ready", "reasons": []}
+
+    from execution_safety import canonical_broker, canonical_owner
+
+    owner = canonical_owner(action.get("execution_owner") or action.get("owner"))
+    broker = canonical_broker(action.get("execution_broker") or action.get("broker"))
+    # Legacy actions without a structured route are handled by the existing
+    # route/scope gates.  Do not infer a wallet from prose here.
+    if not owner or not broker:
+        return {"required": False, "readiness": "ready", "reasons": []}
+
+    ticker = str(action.get("ticker") or "").upper()
+    currency = str(action.get("currency") or ("JPY" if ticker.endswith(".T") else "USD")).upper()
+    required = _requested_buy_notional(action, currency=currency)
+    route = ""
+    balance = None
+    status = "confirmed"
+    reconciliation_required = False
+
+    if owner == "husband" and broker == "rakuten" and currency in {"JPY", "USD"}:
+        route = "account.json"
+        account = _load_json_object(base_dir / "account.json")
+        if account is not None:
+            raw_balance = account.get("balance") if currency == "JPY" else account.get("usd_balance")
+            try:
+                parsed_balance = float(raw_balance)
+                balance = parsed_balance if parsed_balance >= 0 else None
+            except (TypeError, ValueError):
+                balance = None
+    elif owner == "husband" and broker == "sbi" and currency == "JPY":
+        route = "CASH_JPY_SBI"
+        row = _cash_holding_row(base_dir, route)
+        if row is not None:
+            try:
+                balance = float(row.get("shares", 0) or 0)
+            except (TypeError, ValueError):
+                balance = None
+            status = str(row.get("balance_status") or "confirmed").lower()
+            reconciliation_required = bool(row.get("reconciliation_required", False))
+    elif owner == "wife" and broker == "sbi" and currency == "JPY":
+        route = "CASH_JPY_SBI_WIFE"
+        row = _cash_holding_row(base_dir, route)
+        if row is not None:
+            try:
+                balance = float(row.get("shares", 0) or 0)
+            except (TypeError, ValueError):
+                balance = None
+            status = str(row.get("balance_status") or "estimated").lower()
+            reconciliation_required = bool(row.get("reconciliation_required", True))
+    else:
+        return {
+            "required": True,
+            "readiness": "blocked",
+            "reasons": [{
+                "code": "cash_route_unresolved",
+                "message": f"{owner}×{broker}×{currency} の買付現金ルートは未定義です",
+                "execution_owner": owner,
+                "execution_broker": broker,
+                "currency": currency,
+            }],
+        }
+
+    details = {
+        "cash_route": route,
+        "execution_owner": owner,
+        "execution_broker": broker,
+        "currency": currency,
+        "available_cash": balance,
+        "requested_cash": round(required, 2) if required is not None else None,
+        "balance_status": status,
+        "reconciliation_required": reconciliation_required,
+    }
+    if balance is None:
+        return {
+            "required": True,
+            "readiness": "blocked",
+            "reasons": [{
+                "code": "cash_balance_unresolved",
+                "message": f"{route or '現金口座'} の買付余力を確認できません",
+                **details,
+            }],
+        }
+    if status != "confirmed" or reconciliation_required:
+        return {
+            "required": True,
+            "readiness": "blocked",
+            "reasons": [{
+                "code": "cash_balance_unconfirmed",
+                "message": f"{route} は推定残高のため、新規買付余力には使用しません",
+                **details,
+            }],
+        }
+    if required is None:
+        return {
+            "required": True,
+            "readiness": "blocked",
+            "reasons": [{
+                "code": "cash_notional_unresolved",
+                "message": "買付数量と価格から必要現金を確定できません",
+                **details,
+            }],
+        }
+    if required > balance:
+        return {
+            "required": True,
+            "readiness": "blocked",
+            "reasons": [{
+                "code": "cash_balance_insufficient",
+                "message": f"{route} の残高{balance:,.2f}{currency}では{required:,.2f}{currency}を買付できません",
+                "shortfall": round(required - balance, 2),
+                **details,
+            }],
+        }
+    return {"required": True, "readiness": "ready", "reasons": [], **details}
+
+
 def classify_execution_readiness(
     action: dict,
     *,
@@ -281,6 +455,19 @@ def classify_execution_readiness(
             },
         )
 
+    try:
+        cash_result = evaluate_cash_buying_power(action, base_dir=base_dir)
+    except Exception as exc:
+        cash_result = {
+            "readiness": "blocked",
+            "reasons": [{
+                "code": "cash_buying_power_check_error",
+                "message": f"買付余力判定に失敗: {type(exc).__name__}: {str(exc)[:160]}",
+            }],
+        }
+    readiness = _merge(readiness, str(cash_result.get("readiness") or "ready"))
+    reasons.extend(cash_result.get("reasons") or [])
+
     # The once-daily analysis intentionally runs after the US close and before
     # the JPX open.  Those are valid planning windows: keep the action ready,
     # start its TTL at the next opening, and ask the user to confirm the live
@@ -309,7 +496,7 @@ def classify_execution_readiness(
                 if opens_within_24h:
                     advisories.append({
                         "code": "market_quote_confirmation_required",
-                        "message": "次の寄付前後に現在値・スプレッドを確認してから発注してください",
+                        "message": "次の寄り付き前後に現在値・スプレッドを確認してから発注してください",
                         **market_context,
                     })
                 else:

@@ -44,6 +44,19 @@ from instrument_metadata import (
 from pseudo_tickers import is_pseudo_market_ticker
 
 
+def _finite_number_or_default(value: object, default: float = 0.0) -> float:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return default
+    return number if math.isfinite(number) else default
+
+
+def _safe_status_label(value: object, default: str = "未判定") -> str:
+    label = str(value or "").strip()
+    return default if not label or label.lower() in {"nan", "none", "null"} else label
+
+
 def _env_float(name: str, default: float) -> float:
     raw = get_env(name, str(default))
     try:
@@ -316,11 +329,12 @@ def _fmt_tax_context(data: dict) -> str:
     # 持株会
     kub = data.get("espp_context", {})
     if kub and not kub.get("error"):
-        ratio = kub.get("portfolio_ratio", 0) * 100
-        alert = kub.get("concentration_alert", "normal")
-        sell_rec = kub.get("sell_recommendation", 0)
+        ratio_raw = _finite_number_or_default(kub.get("portfolio_ratio"), float("nan"))
+        ratio_text = f"{ratio_raw * 100:.1f}%" if math.isfinite(ratio_raw) else "未計算"
+        alert = _safe_status_label(kub.get("concentration_alert"), "未判定")
+        sell_rec = _finite_number_or_default(kub.get("sell_recommendation"), 0.0)
         lines.append(
-            f"持株会(9999.T): ポートフォリオ比率{ratio:.1f}% / アラート:{alert}"
+            f"持株会(9999.T): ポートフォリオ比率{ratio_text} / アラート:{alert}"
             + (f" / 売却推奨¥{sell_rec:,.0f}" if sell_rec > 0 else "")
         )
         if kub.get("concentration_message"):
@@ -2132,7 +2146,7 @@ def _analyze_short_positions(data: dict, shared_ctx: str = "") -> dict:
                 lines.append("")
             lines.append("### スクリーニングWATCH（強気支持あり・条件付エントリー候補）")
             lines.append("※ Opus最終統合はWATCH判定だが、強気アナリストはBULLISH評価かつモメンタムスコア25以上。")
-            lines.append("※ 強気レジーム下では type:\"buy\" urgency:\"low\" で条件付エントリー（寄付後確認、指値等）を推奨可能。")
+            lines.append("※ 強気レジーム下では type:\"buy\" urgency:\"low\" で条件付エントリー（寄り付き後確認、指値等）を推奨可能。")
             for c in watch_signals[:5]:
                 db = c.get("ai_debate") or {}
                 lines.append(
@@ -2180,7 +2194,7 @@ def _analyze_short_positions(data: dict, shared_ctx: str = "") -> dict:
 以下のJSON形式で分析してください:
 ※楽天証券は米国株の端株取引不可。amount_hint は必ず整数株単位で記載すること。
 ※スクリーニングBUYシグナルがある場合、強気レジーム下では新規エントリー（type:"buy"）を推奨すること。
-※スクリーニングWATCHでも bull BULLISH かつ score≥25 の候補は、必ず type:"buy" urgency:"low" で条件付エントリー（寄付後の出来高・価格アクション確認、1%〜2%下での指値等）として priority_actions に1〜2件含めること。amount_hint は 1〜3株 の小ロットでよい。hold_notes への退避は禁止（保有していない候補を「保有継続」と扱うことはできない）。
+※スクリーニングWATCHでも bull BULLISH かつ score≥25 の候補は、必ず type:"buy" urgency:"low" で条件付エントリー（寄り付き後の出来高・価格アクション確認、1%〜2%下での指値等）として priority_actions に1〜2件含めること。amount_hint は 1〜3株 の小ロットでよい。hold_notes への退避は禁止（保有していない候補を「保有継続」と扱うことはできない）。
 {{
   "health": "good|caution|critical",
   "health_reason": "根拠",
@@ -3205,7 +3219,7 @@ def _annotate_us_holiday_actions(synthesis: dict, now: datetime | None = None) -
         action["market_closed_degraded"] = True
         action["market_closed_date"] = ny_date
         action["market_closed_source"] = source
-        note = f"NYSE休場({ny_date})のため、次営業日の寄付後に板・ギャップ確認して執行"
+        note = f"NYSE休場({ny_date})のため、次営業日の寄り付き後に板・ギャップ確認して執行"
         action["execution_note"] = note
         reason = str(action.get("reason") or "")
         if note not in reason:
@@ -3457,11 +3471,12 @@ def _synthesize(long_a: dict, medium_a: dict, short_positions_a: dict,
     _tax_urgent = _extract_tax_urgent_actions({"tax_context": tax_context or {}})
     _espp_note = ""
     if espp_context and not espp_context.get("error"):
-        ratio = espp_context.get("portfolio_ratio", 0) * 100
-        alert = espp_context.get("concentration_alert", "normal")
-        sell_rec = espp_context.get("sell_recommendation", 0)
+        ratio_raw = _finite_number_or_default(espp_context.get("portfolio_ratio"), float("nan"))
+        ratio_text = f"{ratio_raw * 100:.1f}%" if math.isfinite(ratio_raw) else "未計算"
+        alert = _safe_status_label(espp_context.get("concentration_alert"), "未判定")
+        sell_rec = _finite_number_or_default(espp_context.get("sell_recommendation"), 0.0)
         _espp_note = (
-            f"持株会(9999.T): {ratio:.1f}% / {alert}"
+            f"持株会(9999.T): 比率{ratio_text} / {alert}"
             + (f" / 売却推奨¥{sell_rec:,.0f}" if sell_rec > 0 else "")
         )
 
@@ -3618,7 +3633,7 @@ VIX={market_meta.get('vix','不明')} {market_meta.get('vix_level','')} / 米10Y
 - 証券会社制約: 楽天証券は米国株の端株取引不可。buy/add/dca アクションの amount_hint は必ず整数株単位で記載すること（例: "1株"、"2株"。"0.3株"や"0.5株"は不可）。
 - **NISAルーティング必須**: NISA成長投資枠の buy/add は `execution_account` に加え、`execution_owner`（husband|wife）と `execution_broker`（rakuten|sbi）を必ず明示する。名義・証券会社を入力根拠から特定できない場合は推測せず、priority_actions ではなく hold_notes に「口座確認が必要」と記載すること。
 - **売却元口座の整合必須**: 同一銘柄を複数口座で保有する sell/trim/reduce では、`execution_account` を実際に売却するロットの口座（特定/一般/NISA等）と一致させ、`action` 本文の口座名・保有株数とも食い違わせないこと。どのロットか確定できない場合は推測で priority_actions に入れず、hold_notes に口座確認が必要と記載すること。
-- **日本株制約（.T 銘柄）: 通常の普通株の現物単元注文と信用買いは100株単位。ただし、TUNABLE_LIMITSに明示されたJPX ETFは銘柄別の公式売買単位（1489.T=1口、1306.T=10口）を使い、100株へ丸めないこと。普通株でもローカルのかぶミニ対象台帳で確認できる現物 `buy/add` は、`execution_channel="rakuten_kabu_mini_open"` を付ければ1株単位で提案可。台帳未確認の普通株は100株単位に戻す。かぶミニは現物専用で `margin_buy` には使わない。リアルタイム取引は0.22%スプレッドがあるため、原則は寄付取引/寄付後確認を優先し、急ぐ理由がある場合のみリアルタイムを明記。** 投信（SLIM_*, IFREE_*, MNXACT, NOMURA_*）は円ベース（"¥XX,XXX 相当"）の amount_hint を使う。米国株は 1 株単位可。
+- **日本株制約（.T 銘柄）: 通常の普通株の現物単元注文と信用買いは100株単位。ただし、TUNABLE_LIMITSに明示されたJPX ETFは銘柄別の公式売買単位（1489.T=1口、1306.T=10口）を使い、100株へ丸めないこと。普通株でもローカルのかぶミニ対象台帳で確認できる現物 `buy/add` は、`execution_channel="rakuten_kabu_mini_open"` を付ければ1株単位で提案可。台帳未確認の普通株は100株単位に戻す。かぶミニは現物専用で `margin_buy` には使わない。リアルタイム取引は0.22%スプレッドがあるため、原則は寄り付き取引/寄り付き後確認を優先し、急ぐ理由がある場合のみリアルタイムを明記。** 投信（SLIM_*, IFREE_*, MNXACT, NOMURA_*）は円ベース（"¥XX,XXX 相当"）の amount_hint を使う。米国株は 1 株単位可。
 - **試験エントリー「1〜3株の小ロット」ルール**: 米国株は従来どおり1〜3株可。日本株 WATCH+BULLISH 候補も、かぶミニ現物または公式売買単位が1口のETFなら小口で提案可。それ以外は銘柄別売買単位に従うこと。
 - 新規購入クーリング期間: Sonnet出力は既にクーリングフィルタ適用済み（直近14日以内に買い執行記録のある銘柄の trim/sell/stop_loss は除去済み）。Opusで追加のクーリング判断は不要。priority_actions に残っている銘柄はそのまま採用してよい。holding_days だけでは判断しないこと。
 - overall_stance の判定基準（**aggressive 自動昇格 + override 禁止ルール**）:
@@ -4173,50 +4188,65 @@ def _estimate_action_jpy(action: dict, holdings_price_map: dict, fx_rate: float)
     """
     priority_action の概算金額を JPY で推定する。
     継続積立 (毎日/毎月) は inf 扱い (filter されない)。推定不能なら -1。
+
+    Equity/ETF orders deliberately prefer structured quantity × executable
+    unit price over prose.  The LLM occasionally emits a correct quantity and
+    price alongside a mistyped ``約¥N万`` / ``¥NK`` description; allowing the
+    prose to win would corrupt budget and cap checks.
     """
     import re
-    # 明示的な amount_jpy があればそれを優先
-    if action.get("amount_jpy"):
-        try:
-            return abs(float(action["amount_jpy"]))
-        except Exception:
-            pass
     hint = str(action.get("amount_hint") or "")
     body = str(action.get("action") or "")
     text = hint or body
-    if not text:
-        return -1.0
     # 継続フロー (一度設定すれば終わり) は filter から除外
     if any(k in text for k in ("毎日", "毎月", "毎週", "毎営業日", "自動積立", "DCA設定")):
         return float("inf")
-    # ¥N万 / N万円 表記
-    m = re.search(r"[¥￥]?\s*([\d][\d,]*\.?\d*)\s*(万円|万)", text)
-    if m:
-        return float(m.group(1).replace(",", "")) * 10_000
-    # ¥NNN,NNN 表記
-    m = re.search(r"[¥￥]\s*([\d][\d,]*)", text)
-    if m:
-        return float(m.group(1).replace(",", ""))
+
     ticker = str(action.get("ticker") or "").upper()
+    is_fund = ticker.startswith(("SLIM_", "IFREE_", "MNXACT", "NOMURA_"))
+    # ``amount_jpy`` is itself a structured contract field, not prose.
+    if action.get("amount_jpy") not in (None, ""):
+        try:
+            amount = abs(float(action["amount_jpy"]))
+            if amount > 0:
+                return amount
+        except Exception:
+            pass
     # Investment trusts are specified in JPY, not NAV "units".  Treating
     # e.g. 100口 as 100 shares multiplied by a quoted NAV caused enormous
     # fictional notionals.  A quantity-only fund instruction is deliberately
     # unpriceable and the existing hard-cap path rejects it fail-closed.
-    if ticker.startswith(("SLIM_", "IFREE_", "MNXACT", "NOMURA_")):
-        return -1.0
-    # N株/N口 表記 + ticker 価格
-    m = re.search(r"([\d][\d,]*)\s*(?:株|口)", text)
-    if m:
+    if not is_fund:
         try:
-            shares  = float(m.group(1).replace(",", ""))
-            ticker  = action.get("ticker") or ""
+            shares = float(
+                action.get("requested_buy_quantity")
+                or action.get("requested_sell_quantity")
+                or action.get("quantity")
+                or _parse_amount_hint_shares(action)
+                or 0
+            )
             info    = holdings_price_map.get(ticker, {})
             price   = _unit_price_for_notional(action, info)
             currency = action.get("currency") or info.get("currency") or ("JPY" if ticker.endswith(".T") else "USD")
-            if price > 0:
+            if shares > 0 and price > 0:
                 return shares * price * (fx_rate if currency == "USD" else 1.0)
         except Exception:
             pass
+
+    if not text:
+        return -1.0
+    # ¥N万 / N万円 表記
+    m = re.search(r"[¥￥]?\s*([\d][\d,]*\.?\d*)\s*(万円|万)", text)
+    if m:
+        return float(m.group(1).replace(",", "")) * 10_000
+    # ¥NK / ¥NNNk 表記
+    m = re.search(r"[¥￥]\s*([\d][\d,]*\.?\d*)\s*[Kk]\b", text)
+    if m:
+        return float(m.group(1).replace(",", "")) * 1_000
+    # ¥NNN,NNN 表記
+    m = re.search(r"[¥￥]\s*([\d][\d,]*)", text)
+    if m:
+        return float(m.group(1).replace(",", ""))
     return -1.0
 
 
@@ -4371,6 +4401,38 @@ def _normalize_notional_equation(action: dict, price_info: dict | None = None) -
     updated["reason"] = reason[: match.start()] + corrected + reason[match.end() :]
     updated["notional_claim_corrected"] = True
     updated["notional_claim_original"] = original
+    return updated
+
+
+_APPROX_NOTIONAL_RE = re.compile(
+    r"(?P<prefix>約?\s*[¥￥])\s*(?P<number>[\d,.]+)\s*(?P<suffix>万円|万|[Kk])(?P<trailer>\s*相当)?"
+)
+
+
+def _normalize_amount_hint_notional(action: dict, estimated_jpy: float) -> dict:
+    """Align a prose amount claim with the deterministic structured notional."""
+    hint = str(action.get("amount_hint") or "")
+    match = _APPROX_NOTIONAL_RE.search(hint)
+    if not match or estimated_jpy < 0 or not math.isfinite(estimated_jpy):
+        return action
+
+    suffix = match.group("suffix")
+    claimed = float(match.group("number").replace(",", ""))
+    if suffix in {"万円", "万"}:
+        claimed *= 10_000
+    else:
+        claimed *= 1_000
+    tolerance = max(1_000.0, abs(estimated_jpy) * 0.05)
+    if abs(claimed - estimated_jpy) <= tolerance:
+        return action
+
+    corrected = f"約¥{estimated_jpy:,.0f}{match.group('trailer') or '相当'}"
+    updated = dict(action)
+    updated["amount_hint"] = hint[:match.start()] + corrected + hint[match.end():]
+    updated["notional_claim_corrected"] = True
+    updated.setdefault("notional_claim_original", match.group(0))
+    updated["notional_claim_original_jpy"] = round(claimed)
+    updated["notional_claim_corrected_jpy"] = round(estimated_jpy)
     return updated
 
 
@@ -6070,8 +6132,14 @@ def _format_earnings_blackout_for_prompt(within_business_days: int = 5) -> str:
     return "\n".join(lines)
 
 
-def _sync_guard_promoted_stance_text(synthesis: dict, *, original_stance: str, promoted_stance: str) -> None:
-    """Keep user-facing stance headers aligned with deterministic stance promotion."""
+def _sync_guard_promoted_stance_text(
+    synthesis: dict,
+    *,
+    original_stance: str,
+    promoted_stance: str,
+    guard_reason: str | None = None,
+) -> None:
+    """Keep user-facing stance headers aligned with deterministic correction."""
     original_stance = str(original_stance or "").lower()
     promoted_stance = str(promoted_stance or "").lower()
     if not promoted_stance:
@@ -6091,21 +6159,17 @@ def _sync_guard_promoted_stance_text(synthesis: dict, *, original_stance: str, p
             synthesis["telegram_message"] = "\n".join(lines)
 
     reason = str(synthesis.get("stance_reason") or "").strip()
-    guard_note = (
-        f"stance_guard: {original_stance or 'none'}→{promoted_stance} "
-        "（実データのaggressive条件を満たし、有効なhard overrideなし）"
-    )
+    guard_note = f"stance_guard: {original_stance or 'none'}→{promoted_stance}（{guard_reason or '決定論的条件で補正'}）"
     if guard_note not in reason:
         synthesis["stance_reason"] = f"{reason} / {guard_note}" if reason else guard_note
 
 
 def _apply_stance_guard(synthesis: dict, data: dict, regime_bull_confirmed: bool) -> dict:
-    """P0-4: aggressive 昇格条件を**実データ**で満たすのに、有効な hard override 無しで
-    stance が格下げされている場合、aggressive へ決定論的に補正する。
+    """Validate aggressive in both directions against deterministic inputs.
 
     背景: 汚染メトリクス (excess α / CVaR) を口実にした不当な格下げ (prompt の override
-    規則違反) を是正する。override の妥当性は LLM のテキストではなく実データで判定する
-    (rule 3040 の defensive 強制条件 = VIX>30 / current_dd<=-8% / margin danger のみ)。
+    規則違反) と、条件未達なのに LLM が aggressive を出す過大表示の両方を是正する。
+    override の妥当性は LLM のテキストではなく実データで判定する。
     """
     if not isinstance(synthesis, dict) or not isinstance(data, dict):
         return synthesis
@@ -6179,9 +6243,42 @@ def _apply_stance_guard(synthesis: dict, data: dict, regime_bull_confirmed: bool
             synthesis,
             original_stance=stance,
             promoted_stance="aggressive",
+            guard_reason="実データのaggressive条件を満たし、有効なhard overrideなし",
         )
         synthesis["stance_guard_display_synced"] = True
         print(f"  🛡️ stance guard: {stance or 'none'} → aggressive（override 規則違反を実データで是正）")
+    elif stance == "aggressive" and (hard_override or not eligible):
+        if hard_override:
+            corrected_stance = "defensive"
+            correction_reason = "hard overrideを実データで検出"
+        elif not inputs_complete:
+            corrected_stance = "neutral"
+            correction_reason = "aggressive判定に必要な入力が欠損"
+        else:
+            corrected_stance = "moderately_aggressive"
+            correction_reason = "aggressive必須条件が未達"
+        synthesis["stance_guard_applied"] = True
+        synthesis["stance_guard_detail"] = {
+            "original_stance": stance,
+            "downgraded_to": corrected_stance,
+            "reason": correction_reason,
+            "vix": vix,
+            "actual_dd_pct": actual_dd,
+            "actual_dd_stage": actual_dd_stage,
+            "cash_pct": (round(cash_pct, 1) if cash_pct is not None else None),
+            "leverage_status": leverage_status,
+            "regime_bull_confirmed": bool(regime_bull_confirmed),
+            "inputs_complete": inputs_complete,
+        }
+        synthesis["overall_stance"] = corrected_stance
+        _sync_guard_promoted_stance_text(
+            synthesis,
+            original_stance=stance,
+            promoted_stance=corrected_stance,
+            guard_reason=correction_reason,
+        )
+        synthesis["stance_guard_display_synced"] = True
+        print(f"  🛡️ stance guard: aggressive → {corrected_stance}（{correction_reason}）")
     return synthesis
 
 
@@ -7058,7 +7155,13 @@ def _phase1_post_filter(
         atype_lc = str(a.get("type") or "").lower()
 
         amt = _attach_estimated_notional(a)
+        a = _normalize_amount_hint_notional(a, amt)
         a = _normalize_notional_equation(a, holdings_price_map.get(str(ticker), {}))
+        try:
+            from execution_explanation import normalize_execution_explanation
+            a = normalize_execution_explanation(a)
+        except Exception:
+            pass
 
         if ticker in raw_opposite_tickers:
             a["opposite_intent_conflict"] = True
@@ -8615,6 +8718,20 @@ def run_analysis(force: bool = False) -> dict:
     except Exception as _ne:
         print(f"  ⚠️ news_signal_candidates 鮮度保証スキップ: {_ne}")
 
+    # The legacy cron and this LaunchAgent may both fire at 06:15.  Make the
+    # analysis entrypoint self-sufficient: it waits for (or regenerates) a
+    # same-day, schema-valid earnings snapshot with issuer overrides applied.
+    # Atomic output prevents a concurrent cron write from exposing partial JSON.
+    try:
+        import earnings_proximity_manager as _earnings
+        if not _earnings.snapshot_is_current():
+            _earnings.scan(dry_run=False)
+            print("  🔄 earnings_hedge_suggestions.json 再生成 (決算日override・当日鮮度保証)")
+    except Exception as _ee:
+        # Existing blackout loading fails closed only for known dated rows; log
+        # the degraded state prominently instead of pretending no earnings.
+        print(f"  ⚠️ earnings proximity 鮮度保証スキップ: {_ee}")
+
     try:
         from vix_tracker import get_vix_context as _get_vix_context
         _vix_refresh = _get_vix_context()
@@ -9614,13 +9731,13 @@ def run_analysis(force: bool = False) -> dict:
             if not isinstance(_a, dict):
                 continue
             _row = dict(_a)
-            if _row.get("estimated_notional_jpy") is None:
-                try:
-                    _est = _estimate_action_jpy(_row, _asl_price_map, _asl_fx)
-                    if _est >= 0 and _est != float("inf"):
-                        _row["estimated_notional_jpy"] = round(_est)
-                except Exception:
-                    pass
+            try:
+                _est = _estimate_action_jpy(_row, _asl_price_map, _asl_fx)
+                if _est >= 0 and _est != float("inf"):
+                    _row["estimated_notional_jpy"] = round(_est)
+                    _row = _normalize_amount_hint_notional(_row, _est)
+            except Exception:
+                pass
             out.append(_row)
         return out
     try:

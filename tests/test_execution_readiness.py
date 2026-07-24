@@ -5,7 +5,11 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
-from execution_readiness import classify_execution_readiness, portfolio_snapshot_health
+from execution_readiness import (
+    classify_execution_readiness,
+    evaluate_cash_buying_power,
+    portfolio_snapshot_health,
+)
 
 
 JST = ZoneInfo("Asia/Tokyo")
@@ -88,6 +92,57 @@ def test_zero_discretionary_funding_does_not_block_sell(tmp_path):
     assert "no_approved_discretionary_funding" not in {
         row["code"] for row in result["execution_block_reasons"]
     }
+
+
+def test_wife_sbi_estimated_cash_is_not_buying_power(tmp_path):
+    (tmp_path / "holdings.json").write_text(json.dumps({
+        "CASH_JPY_SBI_WIFE": {
+            "ticker": "CASH_JPY_SBI_WIFE",
+            "shares": 492_606,
+            "currency": "JPY",
+            "reported_as_of": "2026-05-12",
+            "balance_status": "estimated",
+            "reconciliation_required": True,
+        },
+    }), encoding="utf-8")
+
+    result = evaluate_cash_buying_power({
+        "ticker": "1489.T",
+        "type": "add",
+        "amount_hint": "20口",
+        "limit_price": 3_382,
+        "execution_owner": "wife",
+        "execution_broker": "sbi",
+    }, base_dir=tmp_path)
+
+    assert result["readiness"] == "blocked"
+    assert result["reasons"][0]["code"] == "cash_balance_unconfirmed"
+    assert result["reasons"][0]["cash_route"] == "CASH_JPY_SBI_WIFE"
+
+
+def test_confirmed_wife_sbi_cash_must_cover_requested_notional(tmp_path):
+    (tmp_path / "holdings.json").write_text(json.dumps({
+        "CASH_JPY_SBI_WIFE": {
+            "ticker": "CASH_JPY_SBI_WIFE",
+            "shares": 50_000,
+            "currency": "JPY",
+            "balance_status": "confirmed",
+            "reconciliation_required": False,
+        },
+    }), encoding="utf-8")
+
+    result = evaluate_cash_buying_power({
+        "ticker": "1489.T",
+        "type": "buy",
+        "quantity": 20,
+        "limit_price": 3_382,
+        "execution_owner": "wife",
+        "execution_broker": "sbi",
+    }, base_dir=tmp_path)
+
+    assert result["readiness"] == "blocked"
+    assert result["reasons"][0]["code"] == "cash_balance_insufficient"
+    assert result["reasons"][0]["requested_cash"] == 67_640
 
 
 def test_exit_quantity_over_requested_account_inventory_is_blocked(tmp_path):

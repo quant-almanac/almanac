@@ -18,6 +18,8 @@ from datetime import datetime
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 
+from execution_explanation import normalize_execution_explanation
+
 BASE_DIR = Path(__file__).parent.parent
 CACHE_PATH = BASE_DIR / "ai_portfolio_analysis.json"
 
@@ -97,7 +99,7 @@ def _build_prompt(actions: list[dict], price_map: dict[str, dict], mm: dict) -> 
         "- VIX > 30、低流動性、spread>30bps、quote欠落は成行理由にしない → 指値または見送り\n"
         "- urgency=high の緊急リスク削減でも、成行はspread<=30bpsかつbid/ask確認済みに限定\n"
         "- urgency=low → 指値で攻める (やや有利な価格)\n"
-        "- 日本株 (.T) の通常単元注文は100株単位で指値推奨が基本。execution_channel が rakuten_kabu_mini_* の現物買いは1株単位可で、原則は寄付取引を優先\n"
+        "- 日本株 (.T) の通常単元注文は100株単位で指値推奨が基本。execution_channel が rakuten_kabu_mini_* の現物買いは1株単位可で、原則は寄り付き取引を優先\n"
         "- 投信 (SLIM_*, IFREE_*, MNXACT, NOMURA_*) は約定価格指定不可 → order_type=\"market\" 固定\n"
         "- 米株: 楽天証券は端株不可なので必ず整数株\n\n"
         "**stop_loss / 逆指値の推奨は禁止** (システムで除去対象なので order_type=\"stop_limit\" は出さない)。\n\n"
@@ -255,6 +257,10 @@ def re_evaluate(send_telegram: bool = False) -> dict:
                     action[{"bid": "quote_bid", "ask": "quote_ask"}.get(key, key)] = info.get(key)
             if action.get("decision_price") is None and info.get("current_price") is not None:
                 action["decision_price"] = info.get("current_price")
+            normalized = normalize_execution_explanation(action)
+            if normalized is not action:
+                action.clear()
+                action.update(normalized)
             if str(action.get("order_type") or "").lower() != "market":
                 continue
             urgency = str(action.get("urgency") or "medium").lower()

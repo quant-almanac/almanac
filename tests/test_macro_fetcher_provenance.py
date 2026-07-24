@@ -1,5 +1,6 @@
 import sys
 import types
+from datetime import datetime
 
 import pandas as pd
 import pytest
@@ -63,3 +64,32 @@ def test_cpi_yoy_is_none_when_exact_prior_year_observation_is_missing(monkeypatc
         result["series_provenance"]["cpi_yoy"]["status"]
         == "prior_year_observation_missing"
     )
+
+
+def test_legacy_cache_without_schema_or_cpi_provenance_is_rejected(monkeypatch, tmp_path):
+    cache = tmp_path / "macro_state.json"
+    cache.write_text(
+        '{"cached_at": "%s", "cpi_yoy": 3.7265}' % datetime.now().isoformat(),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(macro_fetcher, "CACHE_FILE", cache)
+
+    assert macro_fetcher._load_cache() == {}
+
+
+def test_current_cache_contract_is_reused(monkeypatch, tmp_path):
+    cache = tmp_path / "macro_state.json"
+    cache.write_text(
+        """{
+          "schema_version": 2,
+          "cached_at": "%s",
+          "cpi_yoy": 3.5,
+          "series_provenance": {
+            "cpi_yoy": {"source": "FRED:CPIAUCNS", "status": "ok"}
+          }
+        }""" % datetime.now().isoformat(),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(macro_fetcher, "CACHE_FILE", cache)
+
+    assert macro_fetcher._load_cache()["cpi_yoy"] == 3.5

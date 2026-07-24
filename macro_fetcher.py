@@ -15,6 +15,7 @@ from vix_classification import vix_macro_status
 BASE_DIR = Path(__file__).parent
 CACHE_FILE = BASE_DIR / "macro_state.json"
 CACHE_TTL = 3600 * 6  # 6時間（fallback）
+CACHE_SCHEMA_VERSION = 2
 
 def _get_cache_ttl() -> int:
     """tunable_params: macro_cache_hours を優先。なければ CACHE_TTL。"""
@@ -47,6 +48,14 @@ def _load_cache() -> dict:
     try:
         if CACHE_FILE.exists():
             data = json.loads(CACHE_FILE.read_text(encoding="utf-8"))
+            provenance = data.get("series_provenance")
+            cpi_provenance = provenance.get("cpi_yoy") if isinstance(provenance, dict) else None
+            if (
+                data.get("schema_version") != CACHE_SCHEMA_VERSION
+                or not isinstance(cpi_provenance, dict)
+                or cpi_provenance.get("source") != "FRED:CPIAUCNS"
+            ):
+                return {}
             cached_at = data.get("cached_at", "")
             if cached_at:
                 age = (datetime.now() - datetime.fromisoformat(cached_at)).total_seconds()
@@ -58,8 +67,14 @@ def _load_cache() -> dict:
 
 
 def _save_cache(data: dict) -> None:
-    data["cached_at"] = datetime.now().isoformat()
-    CACHE_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2))
+    payload = dict(data)
+    payload["schema_version"] = CACHE_SCHEMA_VERSION
+    payload["cached_at"] = datetime.now().isoformat()
+    CACHE_FILE.write_text(json.dumps(payload, ensure_ascii=False, indent=2))
+    data.update({
+        "schema_version": payload["schema_version"],
+        "cached_at": payload["cached_at"],
+    })
 
 
 # ============================================================
@@ -126,8 +141,13 @@ def _fetch_fred() -> dict | None:
                     "comparison_date": prior_date.date().isoformat(),
                     "status": "ok",
                 }
-        except Exception:
+        except Exception as exc:
             result["cpi_yoy"] = None
+            series_provenance["cpi_yoy"] = {
+                "source": "FRED:CPIAUCNS",
+                "status": "calculation_error",
+                "error": type(exc).__name__,
+            }
         result["series_provenance"] = series_provenance
 
         # HY OAS は FRED 上 % 単位（5.40=540bps）。bps に統一して保存。

@@ -577,6 +577,64 @@ def test_stance_guard_does_not_promote_on_emergency_leverage():
     assert "stance_guard_applied" not in result
 
 
+def test_stance_guard_downgrades_unqualified_aggressive():
+    synthesis = {
+        "overall_stance": "aggressive",
+        "leverage_health": {"status": "ok"},
+        "telegram_message": "📊 統合戦略 2026-07-24 (aggressive)\nbody",
+        "stance_reason": "LLM strong view",
+    }
+
+    result = analyst._apply_stance_guard(synthesis, _stance_guard_data(), False)
+
+    assert result["overall_stance"] == "moderately_aggressive"
+    assert result["stance_guard_detail"]["downgraded_to"] == "moderately_aggressive"
+    assert result["telegram_message"].splitlines()[0].endswith("(moderately_aggressive)")
+    assert "aggressive必須条件が未達" in result["stance_reason"]
+
+
+def test_stance_guard_forces_defensive_on_hard_override():
+    synthesis = {
+        "overall_stance": "aggressive",
+        "leverage_health": {"status": "emergency"},
+    }
+
+    result = analyst._apply_stance_guard(synthesis, _stance_guard_data(), True)
+
+    assert result["overall_stance"] == "defensive"
+    assert result["stance_guard_detail"]["downgraded_to"] == "defensive"
+
+
+def test_structured_equity_notional_wins_over_mistyped_prose():
+    action = {
+        "ticker": "1489.T",
+        "type": "add",
+        "amount_hint": "20口（約¥68万相当）",
+        "limit_price": 3382,
+    }
+
+    estimated = analyst._estimate_action_jpy(action, {}, 163.16)
+    normalized = analyst._normalize_amount_hint_notional(action, estimated)
+
+    assert estimated == 67_640
+    assert normalized["amount_hint"] == "20口（約¥67,640相当）"
+    assert normalized["notional_claim_original_jpy"] == 680_000
+
+
+def test_us_equity_k_suffix_does_not_override_quantity_price():
+    action = {
+        "ticker": "RTX",
+        "type": "trim",
+        "amount_hint": "1株（約¥34K相当）",
+        "limit_price": 211,
+        "currency": "USD",
+    }
+
+    estimated = analyst._estimate_action_jpy(action, {}, 163.16)
+
+    assert estimated == pytest.approx(34_426.76)
+
+
 def test_non_executable_zero_share_duplicate_order_is_filtered(monkeypatch):
     _silence_external_filters(monkeypatch)
     monkeypatch.setattr(tunable_params, "get", _tp_get)
@@ -1127,7 +1185,11 @@ def test_replay_2026_07_16_has_no_ready_actions(monkeypatch, tmp_path):
         reason["code"] == "same_session_opposite_execution"
         for reason in by_ticker["XLF"]["execution_block_reasons"]
     )
-    assert by_ticker["1489.T"]["execution_readiness"] == "review"
+    assert by_ticker["1489.T"]["execution_readiness"] == "blocked"
+    assert any(
+        reason["code"] in {"cash_balance_unresolved", "cash_balance_unconfirmed"}
+        for reason in by_ticker["1489.T"]["execution_block_reasons"]
+    )
     assert by_ticker["MDB"]["execution_readiness"] == "blocked"
     assert by_ticker["ROBO"]["execution_readiness"] == "blocked"
     assert any(

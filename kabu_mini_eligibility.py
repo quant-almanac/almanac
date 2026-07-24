@@ -32,7 +32,7 @@ def normalize_channel(channel: str | None) -> str | None:
         return None
     if "realtime" in raw or "real_time" in raw or "rt" == raw:
         return "realtime"
-    if "open" in raw or "寄付" in raw or "yoritsuki" in raw:
+    if "open" in raw or "寄付" in raw or "寄り付き" in raw or "yoritsuki" in raw:
         return "open"
     return raw
 
