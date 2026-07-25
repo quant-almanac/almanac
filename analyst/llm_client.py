@@ -12,6 +12,11 @@ from pathlib import Path
 
 BASE_DIR = Path(__file__).parent.parent
 
+# 共有の LLM 使用量／監査ログ。モジュール属性にしてあるのは、テストが
+# 本番ログへ追記してしまうのを conftest 側で一括して防げるようにするため
+# (almanac.llm_safety._DEFAULT_LOG_PATH と対になる)。
+_DEFAULT_LOG_PATH = BASE_DIR / "logs" / "llm_calls.jsonl"
+
 
 def _env_float(name: str, default: float) -> float:
     try:
@@ -133,7 +138,7 @@ def _append_llm_call_log(row: dict) -> None:
     try:
         from llm_cost_accounting import normalize_usage_row
         row = normalize_usage_row(row)
-        path = BASE_DIR / "logs" / "llm_calls.jsonl"
+        path = _DEFAULT_LOG_PATH
         path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("a", encoding="utf-8") as f:
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
