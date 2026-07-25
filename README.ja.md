@@ -122,7 +122,7 @@ flowchart TD
 
 - **バックエンド** — Python 3.12 / FastAPI。ポートフォリオ最適化（[PyPortfolioOpt](https://github.com/robertmartin8/PyPortfolioOpt)、[riskfolio-lib](https://riskfolio-lib.readthedocs.io/)、[skfolio](https://skfolio.org/)）、GARCHリスクモデリング（[arch](https://arch.readthedocs.io/)）、FinBERTセンチメント分析（`transformers` / `torch`）、AI分析にClaude（Anthropic）とDeepSeekを使用。
 - **フロントエンド** — Next.js 16（App Router）/ React 19 / TypeScript。ポートフォリオ・スクリーニング・リスク・シナリオ・戦略・信用取引・NISA・AI判断支援・執行ログ・パフォーマンス検証ページを1つのコンソールに統合。
-- **プライバシー層** — ALMANACはローカルで動作しますが、設定されたAI機能の一部は、保有銘柄・数量・損益・配分などのポートフォリオコンテキストを外部LLMへ送信します。公開・匿名化データだけを扱う非Anthropic経路（開示特徴量抽出・討論・外部Red Team・スクリーニング）は、許可リスト方式のゲート（`almanac/llm_safety.py`）を通ります。book-aware経路にはティア/最終分析・チャット・判断支援・ガードレール通知・Anthropic Red Teamが含まれます。大部分は呼び出し箇所単位のprivacy gateで制御されますが、現在のRed Team例外は下記に明記しています。
+- **プライバシー層** — ALMANACはローカルで動作しますが、設定されたAI機能の一部は、保有銘柄・数量・損益・配分などのポートフォリオコンテキストを外部LLMへ送信します。公開・匿名化データだけを扱う非Anthropic経路（開示特徴量抽出・討論・外部Red Team・スクリーニング）は、許可リスト方式のゲート（`almanac/llm_safety.py`）を通ります。book-aware経路にはティア/最終分析・チャット・判断支援・ガードレール通知・Anthropic Red Teamが含まれ、各経路を呼び出し箇所単位のprivacy gateで制御します。
 
 ## 設定（Configuration）
 
@@ -149,7 +149,7 @@ flowchart TD
 | `ALMANAC_ESPP_*` | 持株会（従業員株式制度）追跡設定。既定は全て無効（`0`） |
 | `ALMANAC_CONTRIBUTION_SCHEDULE_JSON` | 定期積立の設定。既定は空 |
 | `ALMANAC_CLEAN_NAV_SINCE`, `ALMANAC_MIN_CLEAN_DAYS` | パフォーマンス計測期間の衛生設定 |
-| `ALMANAC_PRIVACY_MODE` | 呼び出し箇所単位でゲートされたbook-aware外部LLM呼び出しを制御する。対象範囲と現在の例外は下記 |
+| `ALMANAC_PRIVACY_MODE` | 呼び出し箇所単位でゲートされたbook-aware外部LLM呼び出しを制御する。対象範囲は下記 |
 | `ALMANAC_BUDGET_MODE` | Claudeのルーティング方針: `eco` / `normal`（既定）/ `premium`。固定ユーティリティ呼び出しと外部プロバイダのロールは変えない |
 | `ALMANAC_MODEL_OVERRIDE_<ROLE>` | 制御されたテストやロールバック向けのロール別ルーティング上書き。値はプロバイダのモデルIDではなく `sonnet` などのレジストリキー |
 
@@ -159,13 +159,13 @@ flowchart TD
 
 | 値 | 効果 |
 |---|---|
-| `strict_local`（既定） | ゲート済みのbook-aware経路 — ティア分析・チャット・判断支援・ガードレール通知・最終統合 — はプロバイダ呼び出し前に遮断され、ローカルの無効化/エラー結果を返す |
+| `strict_local`（既定） | book-aware経路 — ティア/最終分析・チャット・判断支援・ガードレール通知・Anthropic Red Team — はプロバイダ呼び出し前に遮断され、ローカルの無効化/エラー結果を返す |
 | `anthropic_book_aware` | Anthropicへのbook-aware呼び出しのみ許可 |
 | `multi_provider_book_aware` | 設定済みの全プロバイダへのbook-aware呼び出しを許可（このコードベースの元々の、ゲート導入前の挙動） |
 
 公開・匿名化データの呼び出し（スクリーニング・開示特徴量抽出）はこの設定の影響を受けません。そもそもポートフォリオ情報を含まないためです。`assert_book_aware_allowed()` でゲートされている呼び出し箇所は `tests/test_llm_call_site_gating.py` の回帰テストで列挙されています。
 
-> **重要な実装上の境界:** privacy mode は呼び出し箇所単位のポリシーであり、プロセス全体のネットワークsandboxではありません。このスナップショットでは、Claude Haiku の Red Team レーンが共通Claude transport経由で保有情報を含むプロンプトを構築しますが、まだ `assert_book_aware_allowed()` の対象外です。非Anthropicの Red Team レーンは引き続き公開情報のみを扱います。この呼び出しがゲートされるまでは、`strict_local` を「全てのAnthropicリクエストを必ず遮断する証明」とみなさないでください。外部送信を完全に止める実行では、外部APIキーを設定しないか、ネットワーク隔離を併用してください。
+> **実装上の境界:** privacy mode はテストされた呼び出し箇所単位のポリシーであり、プロセス全体のネットワークsandboxではありません。既知のbook-aware経路はゲートされますが、公開・匿名化された呼び出しは引き続き許可されます。多層防御または外部送信を完全に止める実行では、外部APIキーを設定しないか、ネットワーク隔離を併用してください。
 
 ## 公開リポジトリの安全性（Public Repository Safety）
 
@@ -245,7 +245,7 @@ NEXT_PUBLIC_ALMANAC_API_KEY=<~/.config/almanac/api_key の内容>
 ./run_with_secrets.sh venv/bin/python portfolio_analyst.py --force
 ```
 
-このコマンドは外部APIを実際に呼び、プロバイダ料金が発生する場合があります。既定の `ALMANAC_PRIVACY_MODE=strict_local` は、book-awareな最終合成を意図的にブロックします。`anthropic_book_aware` または `multi_provider_book_aware` は、各モードでどのポートフォリオ情報が外部へ出るかを確認してから有効にしてください。
+このコマンドは外部APIを実際に呼び、プロバイダ料金が発生する場合があります。既定の `ALMANAC_PRIVACY_MODE=strict_local` は、book-awareなティア/最終分析とAnthropic Red Teamをブロックしますが、公開・匿名化されたプロバイダ呼び出しは実行される場合があります。`anthropic_book_aware` または `multi_provider_book_aware` は、各モードでどのポートフォリオ情報が外部へ出るかを確認してから有効にしてください。
 
 ### 4. ローカル検証
 

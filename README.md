@@ -122,7 +122,7 @@ Degradation is explicit rather than silent. A timed-out tier marks the run degra
 
 - **Backend** — Python 3.12 / FastAPI. Portfolio optimization ([PyPortfolioOpt](https://github.com/robertmartin8/PyPortfolioOpt), [riskfolio-lib](https://riskfolio-lib.readthedocs.io/), [skfolio](https://skfolio.org/)), GARCH risk modeling ([arch](https://arch.readthedocs.io/)), FinBERT sentiment (`transformers` / `torch`), Claude (Anthropic) and DeepSeek for LLM-assisted analysis.
 - **Frontend** — Next.js 16 (App Router) / React 19 / TypeScript. A single console covering portfolio, screening, risk, scenarios, strategy, margin, NISA, AI decision support, execution log, and a performance-verification page.
-- **Privacy layer** — ALMANAC runs locally, but some configured AI features do send portfolio context (holdings, quantities, P&L, allocation) to an external LLM. Non-Anthropic calls intended to carry only public or anonymized data (disclosure extraction, debate, external Red Team legs, screening) go through an allowlist gate (`almanac/llm_safety.py`). Book-aware paths include tier/final analysis, chat, decision support, guardrail alerts, and the Anthropic Red Team leg. Most are controlled by a call-site privacy gate; the current Red Team exception is documented below.
+- **Privacy layer** — ALMANAC runs locally, but some configured AI features do send portfolio context (holdings, quantities, P&L, allocation) to an external LLM. Non-Anthropic calls intended to carry only public or anonymized data (disclosure extraction, debate, external Red Team legs, screening) go through an allowlist gate (`almanac/llm_safety.py`). Book-aware paths include tier/final analysis, chat, decision support, guardrail alerts, and the Anthropic Red Team leg; each is controlled by a call-site privacy gate.
 
 ## Configuration
 
@@ -149,7 +149,7 @@ Use `.env.example` as a template. CLI analysis secrets are supplied through the 
 | `ALMANAC_ESPP_*` | Employee-stock-plan tracking; disabled (`0`) by default |
 | `ALMANAC_CONTRIBUTION_SCHEDULE_JSON` | Recurring cash-flow definitions; empty by default |
 | `ALMANAC_CLEAN_NAV_SINCE`, `ALMANAC_MIN_CLEAN_DAYS` | Performance-measurement window hygiene |
-| `ALMANAC_PRIVACY_MODE` | Controls call-site-gated *book-aware* external LLM calls — see the scope and current exception below |
+| `ALMANAC_PRIVACY_MODE` | Controls call-site-gated *book-aware* external LLM calls — see the scope below |
 | `ALMANAC_BUDGET_MODE` | Routed Claude tier policy: `eco`, `normal` (default), or `premium`; fixed utility calls and external-provider roles are unchanged |
 | `ALMANAC_MODEL_OVERRIDE_<ROLE>` | Per-role routing override for controlled testing or rollback; the value is a registry key such as `sonnet`, not a provider model ID |
 
@@ -159,13 +159,13 @@ Some AI features intentionally send portfolio context (holdings, balances, P&L) 
 
 | Value | Effect |
 |---|---|
-| `strict_local` (default) | Gated book-aware call sites — tier analysis, chat, decision support, guardrail alerts, and final synthesis — are blocked before the provider request and return a local disabled/error result. |
+| `strict_local` (default) | Book-aware call sites — tier/final analysis, chat, decision support, guardrail alerts, and the Anthropic Red Team leg — are blocked before the provider request and return a local disabled/error result. |
 | `anthropic_book_aware` | Book-aware calls to Anthropic only. |
 | `multi_provider_book_aware` | Book-aware calls to any configured provider (this codebase's original, pre-gate behavior). |
 
 Public/anonymized calls (screening, disclosure-feature extraction) are unaffected by this setting — they never carry portfolio data in the first place. Every call site with an `assert_book_aware_allowed()` gate is enumerated by a regression test in `tests/test_llm_call_site_gating.py`.
 
-> **Important implementation boundary:** privacy mode is a call-site policy, not a process-wide network sandbox. In this snapshot, the Claude Haiku Red Team leg builds a holdings-aware prompt through the shared Claude transport and is not yet covered by `assert_book_aware_allowed()`; the non-Anthropic Red Team legs remain public-only. Until that call site is gated, do not treat `strict_local` as proof that every possible Anthropic request is blocked. For an absolute no-egress run, omit external API keys or enforce network isolation.
+> **Implementation boundary:** privacy mode is a tested call-site policy, not a process-wide network sandbox. Known book-aware paths are gated, while public/anonymized calls are still allowed. For defense in depth or an absolute no-egress run, omit external API keys or enforce network isolation.
 
 ## Public Repository Safety
 
@@ -245,7 +245,7 @@ NEXT_PUBLIC_ALMANAC_API_KEY=<contents of ~/.config/almanac/api_key>
 ./run_with_secrets.sh venv/bin/python portfolio_analyst.py --force
 ```
 
-This command makes live external API calls and can incur provider charges. The default `ALMANAC_PRIVACY_MODE=strict_local` intentionally blocks book-aware final synthesis. Enable `anthropic_book_aware` or `multi_provider_book_aware` only after reviewing what portfolio context each mode permits to leave the machine.
+This command can make live external API calls and incur provider charges. The default `ALMANAC_PRIVACY_MODE=strict_local` blocks book-aware tier/final analysis and the Anthropic Red Team leg; public/anonymized provider calls may still run. Enable `anthropic_book_aware` or `multi_provider_book_aware` only after reviewing what portfolio context each mode permits to leave the machine.
 
 ### 4. Local verification
 

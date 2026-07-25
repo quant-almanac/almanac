@@ -377,7 +377,10 @@ def test_redteam_default_token_budget_covers_larger_v2_schema(monkeypatch):
         }
 
     monkeypatch.delenv("KAIROS_REDTEAM_MAX_TOKENS", raising=False)
+    monkeypatch.setenv("ALMANAC_PRIVACY_MODE", "anthropic_book_aware")
     monkeypatch.setattr(analyst, "call_claude", fake_call_claude)
+    from almanac import llm_safety
+    monkeypatch.setattr(llm_safety, "log_book_aware_call", lambda **kwargs: None)
 
     result = analyst._analyze_redteam({"positions": []}, shared_ctx="market context")
 

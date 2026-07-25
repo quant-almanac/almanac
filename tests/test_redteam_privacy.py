@@ -4,6 +4,8 @@ Plan 🔴 #2: the external Red Team models (DeepSeek / Groq / Gemini / Qwen) mus
 receive PUBLIC market context only — never the book (holdings / sizes / P&L /
 beliefs). These tests pin:
 
+- The book-aware Claude Haiku leg is blocked before transport under
+  ``strict_local`` and allowed only under an explicit Anthropic-capable mode.
 - ``_build_anonymized_market_gap_user`` produces a prompt the PII scanner deems
   clean and that carries no book-data tokens, while public market context
   passes through.
@@ -23,6 +25,7 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 import analyst  # noqa: E402
+import almanac.llm_safety as llm_safety  # noqa: E402
 from analyst import (  # noqa: E402
     _build_anonymized_market_gap_user,
     _build_public_market_context,
@@ -46,6 +49,62 @@ def _data_with_book() -> dict:
         "positions": [{"ticker": "9999.T", "value_jpy": 12000000}],
         "guard_state": {"entry_allowed": False, "n_positions": 9},
     }
+
+
+def test_haiku_redteam_is_blocked_before_transport_in_strict_local(monkeypatch) -> None:
+    calls: list[dict] = []
+    audits: list[dict] = []
+
+    monkeypatch.setenv("ALMANAC_PRIVACY_MODE", "strict_local")
+    monkeypatch.setattr(analyst, "call_claude", lambda **kwargs: calls.append(kwargs))
+    monkeypatch.setattr(
+        llm_safety,
+        "log_book_aware_call",
+        lambda **kwargs: audits.append(kwargs),
+    )
+
+    result = analyst._analyze_redteam(
+        _data_with_book(),
+        shared_ctx="book-derived-risk-context",
+        beliefs=[{"ticker": "9999.T", "theme": "private-belief"}],
+        tier_hints={"long": "private-tier-hint"},
+    )
+
+    assert result == {"attacks": [], "underutilized": []}
+    assert calls == []
+    assert len(audits) == 1
+    assert audits[0]["role"] == "red_team_haiku"
+    assert audits[0]["status"] == "blocked"
+
+
+def test_haiku_redteam_runs_and_audits_when_anthropic_book_aware(monkeypatch) -> None:
+    calls: list[dict] = []
+    audits: list[dict] = []
+
+    def _fake_call_claude(**kwargs):
+        calls.append(kwargs)
+        return {
+            "attacks": [{"ticker": "NVDA", "action": "add"}],
+            "underutilized": [],
+        }
+
+    monkeypatch.setenv("ALMANAC_PRIVACY_MODE", "anthropic_book_aware")
+    monkeypatch.setattr(analyst, "call_claude", _fake_call_claude)
+    monkeypatch.setattr(
+        llm_safety,
+        "log_book_aware_call",
+        lambda **kwargs: audits.append(kwargs),
+    )
+
+    book = _data_with_book()
+    result = analyst._analyze_redteam(book, shared_ctx="private-context")
+
+    assert result["attacks"]
+    assert len(calls) == 1
+    assert book["positions"][0]["ticker"] in calls[0]["user"]
+    assert len(audits) == 1
+    assert audits[0]["role"] == "red_team_haiku"
+    assert audits[0]["status"] == "ok"
 
 
 def test_anonymized_prompt_is_pii_clean() -> None:

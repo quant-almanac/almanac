@@ -2416,6 +2416,45 @@ def _analyze_redteam(data: dict, shared_ctx: str = "", beliefs: list | None = No
     後段 Opus が検証・採択を判断する（Phase 2D）。
     tier_hints: Sonnet ティア分析が出した high_return_* を Red Team の参考情報として注入。
     """
+    _empty = {"attacks": [], "underutilized": []}
+    _model = "claude-haiku-4-5-20251001"
+    _audit_fields = [
+        "positions.ticker",
+        "positions.investment_type",
+        "positions.unrealized_pct",
+        "positions.value_jpy",
+        "beliefs",
+        "tier_hints",
+        "shared_context",
+    ]
+
+    # This leg is intentionally book-aware. Gate it at the call site rather
+    # than in call_claude(), which is also used by public-data-only paths.
+    # Missing safety code fails closed so a refactor cannot silently bypass
+    # ALMANAC_PRIVACY_MODE.
+    try:
+        from almanac.llm_safety import (
+            assert_book_aware_allowed,
+            BookAwareDisabled,
+            log_book_aware_call,
+        )
+    except ImportError as e:
+        print(f"  ⚠️ Red Team/Haiku: privacy safety unavailable; refusing book-aware call: {e}")
+        return _empty
+
+    try:
+        assert_book_aware_allowed(provider="anthropic")
+    except BookAwareDisabled as e:
+        log_book_aware_call(
+            role="red_team_haiku",
+            model=_model,
+            fields=_audit_fields,
+            status="blocked",
+            error=str(e),
+        )
+        print("  🔒 Red Team/Haiku: book-aware call blocked by privacy mode")
+        return _empty
+
     positions = data.get("positions", [])
     pos_summary = [
         {"ticker": p.get("ticker"), "tier": p.get("investment_type"),
@@ -2461,17 +2500,30 @@ required JSON output:
         result = call_claude(
             system="あなたは攻撃的なリターン追求型の投資アナリストです。リスクペナルティを持たず最大リターンの可能性を率直に提示してください。後段でOpusが最終リスク検証を行います。",
             user=prompt,
-            model="claude-haiku-4-5-20251001",
+            model=_model,
             max_tokens=_redteam_max_tokens(),
             use_tool=True,
+        )
+        log_book_aware_call(
+            role="red_team_haiku",
+            model=_model,
+            fields=_audit_fields,
+            status="ok",
         )
         if isinstance(result, dict) and result.get("attacks"):
             print(f"  ⚔️ Red Team仮説: {len(result['attacks'])}件生成")
             return result
-        return {"attacks": [], "underutilized": []}
+        return _empty
     except Exception as e:
+        log_book_aware_call(
+            role="red_team_haiku",
+            model=_model,
+            fields=_audit_fields,
+            status="error",
+            error=str(e),
+        )
         print(f"  ⚠️ Red Team分析スキップ: {e}")
-        return {"attacks": [], "underutilized": []}
+        return _empty
 
 
 # ── Red Team マルチモデル版 ───────────────────────────────────────
