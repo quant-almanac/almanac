@@ -26,6 +26,18 @@ DEFAULT_PRICES_PER_MILLION = {
     "deepseek-v4-flash": {"input": 0.27, "output": 1.10},
     "deepseek-v4-pro": {"input": 0.27, "output": 1.10},
     "deepseek-reasoner": {"input": 0.55, "output": 2.19},
+    # Red Team / news フォールバックで使う外部モデル。いずれも無料枠で運用して
+    # いるため 0 を明示する (未登録のままだと cost_usd が None になり「不明」と
+    # 「無料」の区別がつかない)。
+    # ⚠️ 有料プランへ移行したらここを実価格に更新すること。特に qwen は
+    #    DASHSCOPE→OPENROUTER→GROQ のキーチェーン (llm_adapters.call_qwen) で
+    #    実際の課金元が変わるため、0 が正しいのは全経路が無料枠である間だけ。
+    # モデルIDは完全形で登録する。版が上がった新IDは意図的に未登録=None となり、
+    # 「気づかないうちに 0 円計上される」のではなく欠落として表面化する。
+    "llama-3.3-70b-versatile": {"input": 0.0, "output": 0.0},
+    "qwen/qwen3-235b-a22b-2507": {"input": 0.0, "output": 0.0},
+    "qwen/qwen-2.5-72b-instruct": {"input": 0.0, "output": 0.0},
+    "gemini-flash-latest": {"input": 0.0, "output": 0.0},
 }
 
 WEB_SEARCH_PRICE_USD_PER_REQUEST = 10.0 / 1_000
