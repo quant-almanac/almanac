@@ -14,6 +14,8 @@ This repository is a **public, sanitized snapshot** of that system. Runtime data
 
 The objective function is explicit and version-controlled ([`objective.md`](objective.md)): maximize **after-tax, after-fee, JPY-denominated time-weighted return**, benchmarked against a 60% global equity / 40% global bond blend, subject to hard risk limits (VaR, drawdown, VIX-based circuit breakers) enforced by a deterministic policy engine — not by an LLM's judgment call.
 
+> **Time-weighted return (TWR)** strips out the effect of deposits and withdrawals. Paying in on payday makes the account bigger without the investing having been any good; TWR removes that, so what is left reflects the decisions rather than the cash flow. Unfamiliar terms used below are collected in the [Glossary](#glossary).
+
 | Area | What it does |
 |---|---|
 | **Portfolio & risk** | Black-Litterman optimization with LLM-generated views, GJR-GARCH volatility modeling, market-regime detection (bull / neutral / bear / crash), concentration and human-capital-exposure limits |
@@ -55,7 +57,7 @@ Each stage exists for a reason:
 
 **Adversarial review.** The tier outputs go to a Red Team of *different* model families whose job is to attack the reasoning. A Claude Haiku leg can use book-aware context; the external legs use only public or anonymized material and may run through DeepSeek, Groq, Gemini, and Qwen when their keys are configured. Using different vendors is deliberate — models from the same family tend to share blind spots. A disagreement score between agents is computed and carried forward, so downstream stages can see where the analysts diverged instead of only seeing a merged consensus.
 
-**Optional judge, then synthesis.** When `DEEPSEEK_API_KEY` is configured, DeepSeek-R1 adjudicates pseudonymized actions without receiving ticker symbols or the analysts' free-text rationales. If that optional judge is unavailable, the stage is omitted rather than taking down the whole run. Claude Opus then performs the final synthesis into a structured result. The synthesis call uses forced tool use, so the output is a validated object rather than prose that has to be parsed — and a response truncated by the token limit is rejected outright rather than accepted as a partial answer.
+**Optional judge, then synthesis.** When `DEEPSEEK_API_KEY` is configured, DeepSeek-R1 adjudicates pseudonymized actions without receiving ticker symbols or the analysts' free-text rationales. If that optional judge is unavailable, the stage is omitted rather than taking down the whole run. Claude Opus then performs the final synthesis into a structured result. The synthesis call forces the model to answer through a declared tool schema, so the result arrives as a validated object rather than prose that has to be parsed — and a response truncated by the token limit is rejected outright rather than accepted as a partial answer, so a half-finished list is never mistaken for a conclusion.
 
 **Context before synthesis, execution detail after.** News, catalyst, chart, and options context can be gathered before or during synthesis when it can affect the judgment. After structured proposals come back, deterministic code adds routing, size, and limit-price context before the policy gate.
 
@@ -118,6 +120,32 @@ A verification page in the dashboard reports what was actually measured, includi
 
 Degradation is explicit rather than silent. A timed-out tier marks the run degraded and says so in the output; a truncated LLM response is rejected instead of parsed; a stale input downgrades an action instead of being trusted; an unavailable safety module refuses the call rather than proceeding un-audited. The recurring principle is that the system would rather produce *no* recommendation than a confident wrong one.
 
+## Glossary
+
+Terms used above, for readers who don't work in finance or haven't seen the house vocabulary.
+
+| Term | Meaning |
+|---|---|
+| **TWR (time-weighted return)** | Performance with deposits and withdrawals stripped out, so payday inflows don't read as investing skill |
+| **Modified Dietz** | An approximation of TWR: cash flows during the period are weighted by when they landed |
+| **VaR (value at risk)** | An estimate of how much could be lost in one day if things go badly. Here, at 95% confidence |
+| **CVaR** | The average loss *given* that you have already blown through VaR — the mean of the worst cases |
+| **Drawdown** | How far below its previous peak the portfolio currently sits |
+| **VIX** | The market's expectation of near-term US equity volatility. Higher means a more unstable market |
+| **Black-Litterman** | A way to combine the market's implied view with your own views to produce allocations. Here, the views come from the LLM analysis |
+| **GJR-GARCH** | A volatility model that allows downside moves to raise expected volatility more than upside moves — the asymmetry real markets show |
+| **Regime** | Which state the market is in (bull / neutral / bear / crash). The same action can be reasonable in one and reckless in another |
+| **DCA** | Buying in scheduled instalments instead of all at once |
+| **NISA** | Japan's tax-exempt investment allowance. It is capped, so the remaining headroom has to be tracked |
+| **Margin buying** | Buying with borrowed money, taking a position larger than your own cash |
+| **Short selling** | Borrowing shares, selling them, and buying them back later — profitable if the price falls |
+| **Fail-closed** | When the system cannot tell whether something is safe, it refuses. The opposite, fail-open, would let it through silently |
+| **Append-only** | Records are only ever added, never edited or deleted, so the history can be audited |
+| **Idempotent** | Repeating the same operation changes nothing after the first time — a double-submitted form cannot become two trades |
+| **Book-aware** | A call that includes the actual portfolio — holdings, quantities, P&L. The opposite carries only public or anonymized material |
+| **Tier** | One of the five analysis lanes (long / medium / swing / margin-long / short-sell). Also used for a model's grade |
+| **Red Team** | Models whose assigned job is to attack the conclusion and surface its weak points |
+
 ## Architecture
 
 - **Backend** — Python 3.12 / FastAPI. Portfolio optimization ([PyPortfolioOpt](https://github.com/robertmartin8/PyPortfolioOpt), [riskfolio-lib](https://riskfolio-lib.readthedocs.io/), [skfolio](https://skfolio.org/)), GARCH risk modeling ([arch](https://arch.readthedocs.io/)), FinBERT sentiment (`transformers` / `torch`), Claude (Anthropic) and DeepSeek for LLM-assisted analysis.
@@ -148,7 +176,7 @@ Use `.env.example` as a template. CLI analysis secrets are supplied through the 
 | `ALMANAC_API_KEY`, `NEXT_PUBLIC_ALMANAC_API_KEY` | Auth key for write endpoints (recording trades, editing tuning params) — read-only browsing works without it |
 | `ALMANAC_ESPP_*` | Employee-stock-plan tracking; disabled (`0`) by default |
 | `ALMANAC_CONTRIBUTION_SCHEDULE_JSON` | Recurring cash-flow definitions; empty by default |
-| `ALMANAC_CLEAN_NAV_SINCE`, `ALMANAC_MIN_CLEAN_DAYS` | Performance-measurement window hygiene |
+| `ALMANAC_CLEAN_NAV_SINCE`, `ALMANAC_MIN_CLEAN_DAYS` | Narrows the performance-measurement window, so periods with known-dirty data are excluded from the result |
 | `ALMANAC_PRIVACY_MODE` | Controls call-site-gated *book-aware* external LLM calls — see the scope below |
 | `ALMANAC_BUDGET_MODE` | Routed Claude tier policy: `eco`, `normal` (default), or `premium`; fixed utility calls and external-provider roles are unchanged |
 | `ALMANAC_MODEL_OVERRIDE_<ROLE>` | Per-role routing override for controlled testing or rollback; the value is a registry key such as `sonnet`, not a provider model ID |
