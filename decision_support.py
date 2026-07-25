@@ -1,7 +1,8 @@
 """
 ALMANAC v4.0 - 意思決定支援エンジン
-Sonnet（claude-sonnet-4-6）が状況を分析し、
-Opus（model_router の "decision_support" ロールで解決）が最終判断を下す。
+分析と最終判断の 2 段構成。両段とも model_router の "decision_support" ロールで
+解決する（コスト最適化のため既定では Opus ではなく Sonnet に解決される。
+ALMANAC_BUDGET_MODE=premium なら両段とも Opus に昇格する）。
 NOTE: モデルIDは import 時に一度だけ解決されるため、ALMANAC_BUDGET_MODE を
 変更してもプロセスを再起動するまで反映されない。
 
@@ -31,9 +32,10 @@ try:
     SONNET_MODEL = _get_model_router('decision_support')   # 以前は sonnet 固定
     OPUS_MODEL   = _get_model_router('decision_support')   # 以前は opus 固定 → Sonnet に降格
 except ImportError:
-    # フォールバック
-    SONNET_MODEL = 'claude-sonnet-4-6'
-    OPUS_MODEL   = 'claude-sonnet-4-6'  # Opus → Sonnet にコスト最適化
+    # フォールバック。Opus ではなく Sonnet を使うのは意図的なコスト最適化なので
+    # 維持し、モデルIDのみ現行世代に追従させる。
+    SONNET_MODEL = 'claude-sonnet-5'
+    OPUS_MODEL   = 'claude-sonnet-5'  # Opus → Sonnet にコスト最適化
 
 SYSTEM_PROMPT = """あなたはALMANAC v4.0の専任投資アドバイザーです。
 ユーザーはユーザー（長期投資家）です。

@@ -234,20 +234,41 @@ def test_premium_escalates_sonnet_roles_to_opus_5(monkeypatch):
         assert mr.get_model(role) == "claude-opus-5", role
 
 
-def test_long_term_thesis_role_is_not_wired_to_implementation(monkeypatch):
-    """``long_term_thesis`` resolves to Opus under premium, but the screener
-    hardcodes Sonnet 5, so premium does *not* actually escalate it.
+def test_long_term_thesis_is_wired_to_the_model_router(monkeypatch):
+    """``long_term_thesis`` の budget mode が実装まで届くこと。
 
-    This test documents the gap so it isn't mistaken for coverage.
+    以前は long_term_screener がモデルIDを直書きしており、MODEL_REGISTRY に
+    登録済みのロールが使われず premium/eco がこの経路だけ無視されていた。
+
+    ``SONNET_MODEL_ID`` は import 時に確定するため、import 順に依存しない
+    ``_resolve_thesis_model()`` を直接検証する。
     """
     import model_router as mr
+    import long_term_screener
 
     monkeypatch.setenv("ALMANAC_BUDGET_MODE", "premium")
     assert mr.get_model("long_term_thesis") == "claude-opus-5"
+    assert long_term_screener._resolve_thesis_model() == "claude-opus-5"
+
+    monkeypatch.setenv("ALMANAC_BUDGET_MODE", "normal")
+    assert long_term_screener._resolve_thesis_model() == "claude-sonnet-5"
+
+
+def test_thesis_model_resolution_falls_back_when_router_unavailable(monkeypatch):
+    """model_router を import できない場合も現行世代の Sonnet に落ちること。"""
+    import builtins
 
     import long_term_screener
 
-    assert long_term_screener.SONNET_MODEL_ID == "claude-sonnet-5"
+    real_import = builtins.__import__
+
+    def _blocked(name, *args, **kwargs):
+        if name == "model_router":
+            raise ImportError("blocked for test")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", _blocked)
+    assert long_term_screener._resolve_thesis_model() == "claude-sonnet-5"
 
 
 # ---------------------------------------------------------------------------

@@ -475,7 +475,7 @@ def _call_sonnet_second_opinion(top_buys: list, market_meta: dict,
         from model_router import get_model
         sonnet_id = get_model("screener_second_opinion")
     except Exception:
-        sonnet_id = "claude-sonnet-4-6"
+        sonnet_id = "claude-sonnet-5"
     try:
         c = _anthropic.Anthropic()
         started = time.monotonic()

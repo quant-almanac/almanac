@@ -389,7 +389,7 @@ _GEO_KEYWORDS = {
 }
 
 
-def call_claude(system: str, user: str, model: str = "claude-sonnet-4-6",
+def call_claude(system: str, user: str, model: str = "claude-sonnet-5",
                 max_tokens: int = 8192, cached_prefix: str = "",
                 use_tool: bool = False,
                 temperature: float | None = None,

@@ -60,28 +60,28 @@ if stock:
     context = f"銘柄: {stock['ticker']}, 現在値: ${stock['price']}, RSI: {stock['rsi']}, 前日比: {stock['change_pct']}%"
 
     bull = client.messages.create(
-        model="claude-sonnet-4-6",
+        model="claude-sonnet-5",
         max_tokens=300,
         system="強気派アナリストとして、この銘柄を買うべき理由を3つ簡潔に述べてください。",
         messages=[{"role": "user", "content": context}]
     ).content[0].text
 
     bear = client.messages.create(
-        model="claude-sonnet-4-6",
+        model="claude-sonnet-5",
         max_tokens=300,
         system="慎重派アナリストとして、この銘柄を買ってはいけない理由を3つ簡潔に述べてください。",
         messages=[{"role": "user", "content": context}]
     ).content[0].text
 
     skeptic = client.messages.create(
-        model="claude-sonnet-4-6",
+        model="claude-sonnet-5",
         max_tokens=300,
         system="リスク管理の専門家として、最悪のシナリオを簡潔に述べてください。",
         messages=[{"role": "user", "content": f"{context}\n強気派:{bull}\n慎重派:{bear}"}]
     ).content[0].text
 
     final = client.messages.create(
-        model="claude-opus-4-6",
+        model="claude-opus-5",
         max_tokens=600,
         system="""ヘッジファンドマネージャーとして最終判断をJSON形式で返してください：
 {"signal": "買い" or "様子見", "score": 1-5, "entry_price": 数値, "target_price": 数値, "stop_loss": 数値, "reason": "理由", "holding_period": "期間"}""",

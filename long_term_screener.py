@@ -691,7 +691,27 @@ def send_screening_alert(results: dict):
 # ============================================================
 
 _BATCH_STATE_FILE = BASE_DIR / 'long_term_batch_state.json'
-SONNET_MODEL_ID = "claude-sonnet-5"
+
+
+def _resolve_thesis_model() -> str:
+    """``long_term_thesis`` ロールを model_router 経由で解決する。
+
+    以前はモデルIDを直書きしていたため、model_router に登録済みの
+    ``long_term_thesis`` ロール (MODEL_REGISTRY) が実際には使われず、
+    ALMANAC_BUDGET_MODE の eco/premium がこの経路だけ効かなかった。
+
+    解決は import 時に一度だけ (decision_support.py と同じ方式)。週次 Batch は
+    cron が新プロセスで起動するため実運用上の問題は無いが、常駐プロセスから
+    budget mode を変えた場合は反映に再起動が必要。
+    """
+    try:
+        from model_router import get_model
+        return get_model("long_term_thesis")
+    except Exception:
+        return "claude-sonnet-5"
+
+
+SONNET_MODEL_ID = _resolve_thesis_model()
 HAIKU_MODEL_ID = "claude-haiku-4-5-20251001"
 
 

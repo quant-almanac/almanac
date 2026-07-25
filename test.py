@@ -12,7 +12,7 @@ def send_telegram(message):
 # Claude APIテスト
 client = anthropic.Anthropic()
 response = client.messages.create(
-    model="claude-sonnet-4-6",
+    model="claude-sonnet-5",
     max_tokens=200,
     messages=[{"role": "user", "content": "資産管理Botのテストです。一言挨拶してください。"}]
 )
