@@ -48,12 +48,16 @@ def _log_anthropic_usage(
         **extra,
     }
     if response is not None:
-        row.update({
-            "stop_reason": getattr(response, "stop_reason", None),
-            "content_types": [getattr(block, "type", None) for block in getattr(response, "content", [])],
-            "input_tokens": getattr(usage, "input_tokens", None),
-            "output_tokens": getattr(usage, "output_tokens", None),
-        })
+        try:
+            from analyst.llm_client import usage_fields as _usage_fields
+            row.update(_usage_fields(response))
+        except ImportError:
+            row.update({
+                "stop_reason": getattr(response, "stop_reason", None),
+                "content_types": [getattr(block, "type", None) for block in getattr(response, "content", [])],
+                "input_tokens": getattr(usage, "input_tokens", None),
+                "output_tokens": getattr(usage, "output_tokens", None),
+            })
     if error is not None:
         row.update({
             "error_type": type(error).__name__,
@@ -286,6 +290,7 @@ def _call_debate_signals(candidates: list, market_meta: dict,
         # model_router 経由で "screener_deepdive" → Sonnet に降格。
         # ALMANAC_BUDGET_MODE=premium で Opus に戻せる。
         from model_router import get_model as _get_model
+        from analyst.llm_client import anthropic_compat_kwargs as _compat
         _screener_model = _get_model("screener_deepdive")
         started = time.monotonic()
         resp = client.messages.create(
@@ -295,7 +300,9 @@ def _call_debate_signals(candidates: list, market_meta: dict,
             messages=[{"role": "user", "content": opus_prompt}],
             tools=[_FINAL_SIGNAL_TOOL],
             tool_choice={"type": "tool", "name": "submit_final_signals"},
+            **_compat(_screener_model),
         )
+        _truncated = getattr(resp, "stop_reason", None) == "max_tokens"
         _log_anthropic_usage(
             role="screener_legacy_final_signal",
             model=_screener_model,
@@ -304,11 +311,16 @@ def _call_debate_signals(candidates: list, market_meta: dict,
             prompt_chars=len(opus_prompt),
             response=resp,
             candidate_count=len(candidates),
+            status="max_tokens" if _truncated else "ok",
         )
         final_signals = []
-        for block in resp.content:
-            if block.type == "tool_use":
-                final_signals = block.input.get("signals", [])
+        # truncate されたレスポンスは signals が非空でも採用しない（部分結果）。
+        if _truncated:
+            print("  [screener] max_tokens で切断 — 部分シグナルを破棄します")
+        else:
+            for block in resp.content:
+                if block.type == "tool_use":
+                    final_signals = block.input.get("signals", [])
     except Exception as e:
         _log_anthropic_usage(
             role="screener_legacy_final_signal",
@@ -467,6 +479,7 @@ def _call_sonnet_second_opinion(top_buys: list, market_meta: dict,
     try:
         c = _anthropic.Anthropic()
         started = time.monotonic()
+        from analyst.llm_client import anthropic_compat_kwargs as _compat
         resp = c.messages.create(
             model=sonnet_id,
             max_tokens=1500,
@@ -474,6 +487,7 @@ def _call_sonnet_second_opinion(top_buys: list, market_meta: dict,
             tools=[_FINAL_SIGNAL_TOOL],
             tool_choice={"type": "tool", "name": "submit_final_signals"},
             messages=[{"role": "user", "content": text}],
+            **_compat(sonnet_id),
         )
     except Exception as e:
         _log_anthropic_usage(
@@ -488,6 +502,7 @@ def _call_sonnet_second_opinion(top_buys: list, market_meta: dict,
         )
         print(f"  [sonnet 2nd] エラー: {e}")
         return {}
+    _second_truncated = getattr(resp, "stop_reason", None) == "max_tokens"
     _log_anthropic_usage(
         role="screener_sonnet_second_opinion",
         model=sonnet_id,
@@ -496,7 +511,12 @@ def _call_sonnet_second_opinion(top_buys: list, market_meta: dict,
         prompt_chars=len(text),
         response=resp,
         candidate_count=len(top_buys),
+        status="max_tokens" if _second_truncated else "ok",
     )
+    # truncate されたレスポンスは部分結果なので採用しない。
+    if _second_truncated:
+        print("  [sonnet 2nd] max_tokens で切断 — 部分結果を破棄します")
+        return {}
     out: dict = {}
     for blk in resp.content:
         if getattr(blk, "type", None) == "tool_use" and getattr(blk, "name", "") == "submit_final_signals":

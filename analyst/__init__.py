@@ -3764,45 +3764,82 @@ VIX={market_meta.get('vix','不明')} {market_meta.get('vix_level','')} / 米10Y
     # Extended Thinking 8k + max_tokens 16k でも通常 2-5 分で完走するため 600s で十分。
     _client = _anthropic.Anthropic(timeout=600.0, max_retries=0)
 
-    # Opus 4.7 に昇格：全ティア合成の最重要ステップ。model_router で一元管理。
+    # Opus 5 に昇格：全ティア合成の最重要ステップ。model_router で一元管理。
     from model_router import get_model as _get_model
+    from analyst.llm_client import (
+        anthropic_compat_kwargs as _compat_kwargs,
+        usage_fields as _usage_fields,
+        DEFAULT_EFFORT as _DEFAULT_EFFORT,
+    )
     _synthesis_model = _get_model("final_synthesis")
     _prompt_chars = len(prompt or "")
     _started = _time.monotonic()
 
+    # thinking が発火すると max_tokens は「思考 + 応答」の合計上限になる。
+    # 切れた場合は _SYNTHESIS_MAX_TOKENS_RETRY まで引き上げて再試行する。
+    _SYNTHESIS_MAX_TOKENS = 24000
+    _SYNTHESIS_MAX_TOKENS_RETRY = 32000
+    _synthesis_max_tokens = _SYNTHESIS_MAX_TOKENS
+
     for attempt in range(4):
         try:
-            # Anthropic API 制約 (2026-05-06 確認):
-            # thinking=adaptive と tool_choice=force は同時使用不可 → 400 Bad Request。
-            # thinking なし + tool_choice=force が唯一の確実解。
-            # Opus 4.7 は tool_choice=force でも内部推論を行うため品質は維持される。
+            # Anthropic API 仕様 (2026-07 公式ドキュメントで再確認):
+            # forced tool_choice と非互換なのは manual extended thinking
+            # (thinking={"type":"enabled","budget_tokens":N}) のみ。adaptive
+            # thinking は forced tool use と併用できる。
+            # Opus 5 は thinking 省略時に adaptive が既定で有効になるため、ここでは
+            # thinking を明示せず adaptive に任せ、コストは effort で制御する。
+            # thinking を disabled にすると Opus 5 はツール呼び出しを構造化
+            # tool_use ではなく可視テキストで返すことがあり、合成結果が無言で
+            # 空になるため、disabled にはしない。
             response = _client.messages.create(
                 model=_synthesis_model,
-                max_tokens=16000,
+                max_tokens=_synthesis_max_tokens,
                 system=[{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}],
                 messages=[{"role": "user", "content": prompt}],
                 tools=[_SUBMIT_TOOL],
                 tool_choice={"type": "tool", "name": "submit_analysis"},
+                **_compat_kwargs(_synthesis_model),
             )
-            _usage = getattr(response, "usage", None)
+            _hit_max_tokens = getattr(response, "stop_reason", None) == "max_tokens"
             _append_llm_call_log({
                 "ts": _time.strftime("%Y-%m-%dT%H:%M:%S"),
                 "role": "final_synthesis",
                 "model": _synthesis_model,
                 "use_tool": True,
-                "max_tokens": 16000,
+                "max_tokens": _synthesis_max_tokens,
                 "timeout_sec": 600.0,
                 "attempt": attempt + 1,
                 "elapsed_sec": round(_time.monotonic() - _started, 2),
                 "prompt_chars": _prompt_chars,
-                "status": "ok",
-                "stop_reason": getattr(response, "stop_reason", None),
-                "content_types": [getattr(b, "type", None) for b in getattr(response, "content", [])],
-                "input_tokens": getattr(_usage, "input_tokens", None),
-                "output_tokens": getattr(_usage, "output_tokens", None),
+                "status": "max_tokens" if _hit_max_tokens else "ok",
+                **_usage_fields(response, effort=_DEFAULT_EFFORT, thinking_mode="adaptive"),
             })
+
+            # ⚠️ truncate されたレスポンスは tool_use.input が非空でも採用しない。
+            # 部分的な priority_actions をその日の最終判断として受け入れてしまうため。
+            if _hit_max_tokens:
+                if attempt < 3:
+                    _synthesis_max_tokens = _SYNTHESIS_MAX_TOKENS_RETRY
+                    print(
+                        f"⚠️ synthesis max_tokens 到達 (attempt {attempt+1}) — "
+                        f"{_synthesis_max_tokens} に引き上げて再試行します"
+                    )
+                    _time.sleep(5)
+                    continue
+                print("⛔ synthesis: max_tokens 再試行後も切断。結果を破棄します。")
+                return {
+                    "error": (
+                        "max_tokens_truncated: 再試行後も応答が max_tokens で切断されました。"
+                        "部分的な結果は採用していません。"
+                    ),
+                    "priority_actions": [],
+                    "hold_notes": [],
+                    "model_used": _synthesis_model,
+                }
+
             thinking_text = ""
-            thinking_signature = ""  # Opus 4.7 adaptive: 暗号化 signature が thinking 実施の proxy
+            thinking_signature = ""  # adaptive は thinking 本文を隠すため signature を補助 proxy に使う
             result_dict: dict = {}
             raw_text = ""
             for block in response.content:
@@ -3844,14 +3881,23 @@ VIX={market_meta.get('vix','不明')} {market_meta.get('vix_level','')} / 米10Y
                 except Exception:
                     pass
 
-            # 観測性: 使用モデル ID / thinking mode / 実施フラグを記録
-            # Opus 4.7 adaptive は thinking 本文を隠蔽するため、signature 存在を proxy 指標とする
+            # 観測性: 使用モデル ID / thinking mode / 実施フラグを記録。
+            # これらはシステム由来の事実なので setdefault ではなく代入する
+            # （モデル出力に同名キーがあっても上書きさせない）。
+            # thinking_fired の一次判定は thinking_tokens > 0。取得できない場合のみ
+            # signature を補助指標に使う（adaptive は本文を隠蔽するため）。
             if isinstance(result_dict, dict):
-                result_dict.setdefault("model_used", _synthesis_model)
-                result_dict.setdefault("thinking_mode", "adaptive")
-                result_dict.setdefault("thinking_len", len(thinking_text))
-                result_dict.setdefault("thinking_fired", bool(thinking_signature))
-                result_dict.setdefault("thinking_signature_len", len(thinking_signature))
+                _uf = _usage_fields(response)
+                _thinking_fired = _uf.get("thinking_fired")
+                if _thinking_fired is None:
+                    _thinking_fired = bool(thinking_signature) or None
+                result_dict["model_used"] = _synthesis_model
+                result_dict["thinking_mode"] = "adaptive"
+                result_dict["effort"] = _DEFAULT_EFFORT
+                result_dict["thinking_len"] = len(thinking_text)
+                result_dict["thinking_tokens"] = _uf.get("thinking_tokens")
+                result_dict["thinking_fired"] = _thinking_fired
+                result_dict["thinking_signature_len"] = len(thinking_signature)
                 _context_blocks = result_dict.get("context_blocks")
                 if not isinstance(_context_blocks, dict):
                     _context_blocks = {}
@@ -3876,7 +3922,7 @@ VIX={market_meta.get('vix','不明')} {market_meta.get('vix_level','')} / 米10Y
             if _is_empty:
                 result_dict["error"] = (
                     "empty_synthesis: tool_use が呼ばれず、テキストも空。"
-                    "プロンプト過大 or Opus 4.7 が tool 選択を断念した可能性。"
+                    "プロンプト過大 or モデルが tool 選択を断念した可能性。"
                     "max_tokens / tool_choice / system プロンプトの肥大化を見直してください。"
                 )
                 print(f"⛔ {result_dict['error']}")

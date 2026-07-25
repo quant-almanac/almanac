@@ -10,7 +10,10 @@ from typing import Any, Iterable
 DEFAULT_PRICES_PER_MILLION = {
     # prefix match (_price_for_model) は挿入順なので、特定的なキーを
     # 汎用プレフィックスより先に置くこと。
-    # Opus 4.6 以降は $5/$25。旧世代 (Opus 4.0/4.1) のみ $15/$75。
+    # Opus 4.6〜Opus 5 は $5/$25。旧世代 (Opus 4.0/4.1) のみ $15/$75。
+    # NOTE: "claude-opus-4" は "claude-opus-5" の部分文字列ではないため、
+    # Opus 5 は専用エントリが無いと prefix match が全滅し価格 None になる。
+    "claude-opus-5": {"input": 5.0, "output": 25.0},
     "claude-opus-4-8": {"input": 5.0, "output": 25.0},
     "claude-opus-4-7": {"input": 5.0, "output": 25.0},
     "claude-opus-4-6": {"input": 5.0, "output": 25.0},

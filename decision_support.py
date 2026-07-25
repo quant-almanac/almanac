@@ -1,7 +1,9 @@
 """
 ALMANAC v4.0 - 意思決定支援エンジン
 Sonnet（claude-sonnet-4-6）が状況を分析し、
-Opus（claude-opus-4-6）が最終判断を下す。
+Opus（model_router の "decision_support" ロールで解決）が最終判断を下す。
+NOTE: モデルIDは import 時に一度だけ解決されるため、ALMANAC_BUDGET_MODE を
+変更してもプロセスを再起動するまで反映されない。
 
 対応ケース:
   A. 短期トレードシグナル
@@ -84,12 +86,16 @@ def _log_anthropic_usage(
         **extra,
     }
     if response is not None:
-        row.update({
-            "stop_reason": getattr(response, "stop_reason", None),
-            "content_types": [getattr(block, "type", None) for block in getattr(response, "content", [])],
-            "input_tokens": getattr(usage, "input_tokens", None),
-            "output_tokens": getattr(usage, "output_tokens", None),
-        })
+        try:
+            from analyst.llm_client import usage_fields as _usage_fields
+            row.update(_usage_fields(response))
+        except ImportError:
+            row.update({
+                "stop_reason": getattr(response, "stop_reason", None),
+                "content_types": [getattr(block, "type", None) for block in getattr(response, "content", [])],
+                "input_tokens": getattr(usage, "input_tokens", None),
+                "output_tokens": getattr(usage, "output_tokens", None),
+            })
     if error is not None:
         row.update({
             "error_type": type(error).__name__,
@@ -431,13 +437,16 @@ def analyze_with_sonnet(case: str, context: str, question: str = '') -> str:
 （最終判断にあたって確認すべき点）"""
 
     try:
+        from analyst.llm_client import anthropic_compat_kwargs as _compat
         started = time.monotonic()
         response = client.messages.create(
             model=SONNET_MODEL,
             max_tokens=1500,
             system=SYSTEM_PROMPT,
             messages=[{'role': 'user', 'content': prompt}],
+            **_compat(SONNET_MODEL),
         )
+        _truncated = getattr(response, "stop_reason", None) == "max_tokens"
         _log_anthropic_usage(
             role="decision_support_sonnet_analysis",
             model=SONNET_MODEL,
@@ -447,6 +456,7 @@ def analyze_with_sonnet(case: str, context: str, question: str = '') -> str:
             prompt_chars=len(prompt),
             response=response,
             question_present=bool(question),
+            status="max_tokens" if _truncated else "ok",
         )
     except Exception as e:
         _log_anthropic_usage(
@@ -462,6 +472,14 @@ def analyze_with_sonnet(case: str, context: str, question: str = '') -> str:
         )
         raise
 
+    # truncate されたテキストは途中で切れているため、そのまま分析結果として
+    # 返さず切断された事実を明示する。
+    if _truncated:
+        return (
+            "（分析が max_tokens で切断されました。以下は不完全な出力です。"
+            "判断材料としては使用しないでください。）\n\n"
+            + response.content[0].text
+        )
     return response.content[0].text
 
 
@@ -525,13 +543,16 @@ def final_judgment_with_opus(
 （この判断がポートフォリオ全体の長期目標に合致しているか）"""
 
     try:
+        from analyst.llm_client import anthropic_compat_kwargs as _compat
         started = time.monotonic()
         response = client.messages.create(
             model=OPUS_MODEL,
             max_tokens=1000,
             system=SYSTEM_PROMPT,
             messages=[{'role': 'user', 'content': prompt}],
+            **_compat(OPUS_MODEL),
         )
+        _truncated = getattr(response, "stop_reason", None) == "max_tokens"
         _log_anthropic_usage(
             role="decision_support_final_judgment",
             model=OPUS_MODEL,
@@ -541,6 +562,7 @@ def final_judgment_with_opus(
             prompt_chars=len(prompt),
             response=response,
             user_preference_present=bool(user_preference),
+            status="max_tokens" if _truncated else "ok",
         )
     except Exception as e:
         _log_anthropic_usage(
@@ -556,6 +578,12 @@ def final_judgment_with_opus(
         )
         raise
 
+    if _truncated:
+        return (
+            "（最終判断が max_tokens で切断されました。以下は不完全な出力です。"
+            "判断材料としては使用しないでください。）\n\n"
+            + response.content[0].text
+        )
     return response.content[0].text
 
 

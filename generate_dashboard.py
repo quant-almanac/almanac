@@ -729,7 +729,7 @@ tr:hover td{{background:#0f1825}}
         <span class="flow-num">STEP 3</span>
         <div class="flow-content">
           <div class="flow-title">マルチエージェント分析</div>
-          <div class="flow-desc">上位5候補をSonnet 4.6（強気派・慎重派・リスク派）が議論し、Opus 4.6が最終判断を下します。スコア3.5以上かつ「買い」シグナルのみ通知されます。</div>
+          <div class="flow-desc">上位候補を予選モデルが3視点（強気派・慎重派・リスク派）で評価し、上位のみ第二意見モデルが確認、最終判断モデルが統合します。スコア3.5以上かつ「買い」シグナルのみ通知されます。使用モデルは model_router で一元管理され、システム画面で確認できます。</div>
         </div>
       </div>
       <div class="flow-step">
@@ -754,19 +754,19 @@ tr:hover td{{background:#0f1825}}
     <p>単一モデルの判断よりも、異なる視点を持つ複数のエージェントが議論することで、より堅牢な判断を実現します。</p>
     <div class="agent-grid">
       <div class="agent-card">
-        <div class="agent-name" style="color:#00ff88">🟢 強気派 (Sonnet 4.6)</div>
+        <div class="agent-name" style="color:#00ff88">🟢 強気派</div>
         <div class="agent-desc">買うべき理由を3つ提示。テクニカルリバウンド・ファンダメンタルズ・セクタートレンドを根拠に楽観的ケースを構築。</div>
       </div>
       <div class="agent-card">
-        <div class="agent-name" style="color:#ff4444">🔴 慎重派 (Sonnet 4.6)</div>
+        <div class="agent-name" style="color:#ff4444">🔴 慎重派</div>
         <div class="agent-desc">買ってはいけない理由を3つ提示。下落トレンド継続・マクロリスク・業界逆風などの悲観的ケースを構築。</div>
       </div>
       <div class="agent-card">
-        <div class="agent-name" style="color:#ffa500">⚠ リスク派 (Sonnet 4.6)</div>
+        <div class="agent-name" style="color:#ffa500">⚠ リスク派</div>
         <div class="agent-desc">両派の議論の穴を指摘し最悪のシナリオを想定。ブラックスワンリスクや流動性リスクを評価。</div>
       </div>
       <div class="agent-card">
-        <div class="agent-name" style="color:#0088ff">⚖ 審判 (Opus 4.6)</div>
+        <div class="agent-name" style="color:#0088ff">⚖ 審判</div>
         <div class="agent-desc">3つの意見を総合してスコア1-5と最終判断を出力。スコア3.5以上の「買い」のみシグナルとして送信。</div>
       </div>
     </div>
@@ -898,7 +898,7 @@ tr:hover td{{background:#0f1825}}
   <div class="design-section">
     <h3>運用コスト</h3>
     <p>月間コストはClaude API（¥500-800）、Telegram（無料）、yfinance（無料）、MacBook M1電力（¥300-500）の合計で<strong style="color:var(--accent)">約¥800-1,300/月</strong>です。</p>
-    <p>使用モデル: Claude Sonnet 4.6（強気派・慎重派・リスク派）× 3 + Claude Opus 4.6（審判）× 1 / シグナル</p>
+    <p>使用モデル: 予選（3視点）＋ 第二意見 ＋ 最終判断の多段構成。実際のモデルIDは model_router.MODEL_REGISTRY で一元管理されており、予算モード（eco / normal / premium）で自動的に昇降格します。</p>
   </div>
 
 </div>

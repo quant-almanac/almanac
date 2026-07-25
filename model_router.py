@@ -2,13 +2,13 @@
 model_router.py — ALMANAC の LLM モデル一元ルーティング
 
 全 LLM 呼び出しは `get_model(role)` 経由にすることで、
-- モデル昇降格（Opus 4.6 → 4.7 等）を一箇所で管理
+- モデル昇降格（Opus 4.8 → Opus 5 等）を一箇所で管理
 - 予算モード（eco/normal/premium）でモデル自動降格
 - A/B テスト・カナリアデプロイの容易化
 
 使い方:
     from model_router import get_model, resolve_adapter
-    model_id = get_model("final_synthesis")  # "claude-opus-4-8"
+    model_id = get_model("final_synthesis")  # "claude-opus-5"
     adapter  = resolve_adapter("red_team_1") # "deepseek" → llm_adapters.call_deepseek
 
 環境変数:
@@ -43,8 +43,13 @@ BudgetMode = Literal["eco", "normal", "premium"]
 # ─────────────────────────────────────────────────────────────
 MODEL_REGISTRY: dict[str, str] = {
     # Anthropic
-    # Opus 4.8: 4.7 と同価格 ($5/$25 per M)・API 互換 (破壊的変更なし) で能力向上
-    "opus":         "claude-opus-4-8",
+    # Opus 5: 4.8 と同価格 ($5/$25 per M)・同トークナイザ・同コンテキスト長 (1M/128k)。
+    # 4.8 からの破壊的変更は「thinking 省略時に adaptive が有効化される」こと。
+    # 強制ツール呼び出しと adaptive は併用可 (非互換なのは manual extended thinking)。
+    # コストは thinking を切らずに effort=low で制御する (analyst.llm_client
+    # .anthropic_compat_kwargs)。thinking を切ると Opus 5 はツール呼び出しを
+    # 構造化 tool_use ではなく可視テキストで返すことがあるため。
+    "opus":         "claude-opus-5",
     "sonnet":       "claude-sonnet-5",
     "haiku":        "claude-haiku-4-5-20251001",
 
@@ -157,7 +162,7 @@ def get_model_key(role: str) -> str:
 
 def get_model(role: str) -> str:
     """
-    role → ベンダー固有の model_id（例: "claude-opus-4-8"）を返す。
+    role → ベンダー固有の model_id（例: "claude-opus-5"）を返す。
     既存の `client.messages.create(model=...)` 呼び出しで直接使える。
     """
     key = get_model_key(role)

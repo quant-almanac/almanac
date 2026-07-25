@@ -162,12 +162,16 @@ def _log_anthropic_usage(
         **extra,
     }
     if response is not None:
-        row.update({
-            "stop_reason": getattr(response, "stop_reason", None),
-            "content_types": [getattr(block, "type", None) for block in getattr(response, "content", [])],
-            "input_tokens": getattr(usage, "input_tokens", None),
-            "output_tokens": getattr(usage, "output_tokens", None),
-        })
+        try:
+            from analyst.llm_client import usage_fields as _usage_fields
+            row.update(_usage_fields(response))
+        except ImportError:
+            row.update({
+                "stop_reason": getattr(response, "stop_reason", None),
+                "content_types": [getattr(block, "type", None) for block in getattr(response, "content", [])],
+                "input_tokens": getattr(usage, "input_tokens", None),
+                "output_tokens": getattr(usage, "output_tokens", None),
+            })
     if error is not None:
         row.update({
             "error_type": type(error).__name__,
@@ -643,39 +647,101 @@ def analyze_with_agents(stock_data, macro_info, batch_results: "dict | None" = N
         f"慎重派:\n{bear}\n\n"
         f"リスク派:\n{skeptic}"
     )
-    def _opus_call():
-        # model_router 経由で Opus 4.8 に昇格。ALMANAC_BUDGET_MODE=eco で Sonnet に降格可能。
+    # Opus 5 は thinking が既定で adaptive なため、思考トークンが max_tokens を
+    # 圧迫しうる。旧値 800 では truncate しやすいので余裕を持たせ、それでも
+    # 足りない場合は _OPUS_JUDGMENT_MAX_TOKENS_RETRY まで引き上げて再試行する。
+    _OPUS_JUDGMENT_MAX_TOKENS = 4000
+    _OPUS_JUDGMENT_MAX_TOKENS_RETRY = 8000
+
+    def _opus_judgment_retry_prompt(user: str) -> str:
+        """submit_judgment 用の圧縮再指示。
+
+        analyst.llm_client._compact_retry_prompt は priority_actions 等の
+        tier/final-synthesis 専用フィールドを要求するため、ここでは流用しない。
+        """
+        return (
+            f"{user}\n\n"
+            "## 再出力制約（max_tokens 対策・必須）\n"
+            "- 前回の出力が長すぎて途中で切れました。\n"
+            "- 各理由は簡潔に（120字以内）。\n"
+            "- 必ず submit_judgment ツールのみで回答してください。\n"
+        )
+
+    def _resolve_judgment_model() -> str:
         try:
             from model_router import get_model as _get_model
-            _model_id = _get_model("final_synthesis")
+            return _get_model("final_synthesis")
         except ImportError:
-            _model_id = "claude-opus-4-8"
+            return "claude-opus-5"
+
+    def _make_opus_call(user_text: str, max_tokens: int):
+        # model_router 経由で Opus 5 に昇格。ALMANAC_BUDGET_MODE=eco で Sonnet に降格可能。
+        _model_id = _resolve_judgment_model()
+        try:
+            from analyst.llm_client import anthropic_compat_kwargs as _compat
+            _extra = _compat(_model_id)
+        except ImportError:
+            _extra = {}
         return client.messages.create(
             model=_model_id,
-            max_tokens=800,
+            max_tokens=max_tokens,
             system=(
                 "あなたはヘッジファンドのポートフォリオマネージャーです。"
                 "3つのアナリストの意見を総合して最終判断を submit_judgment ツールで提出してください。"
             ),
             tools=[_OPUS_JUDGMENT_TOOL],
             tool_choice={"type": "tool", "name": "submit_judgment"},
-            messages=[{"role": "user", "content": opus_user}],
+            messages=[{"role": "user", "content": user_text}],
+            **_extra,
         )
+
+    def _opus_call():
+        return _make_opus_call(opus_user, _OPUS_JUDGMENT_MAX_TOKENS)
 
     started = time.monotonic()
     response = safe_api_call(_opus_call)
+
+    # safe_api_call は API 例外しか再試行しない。stop_reason="max_tokens" は
+    # 正常レスポンスとして返るため、ここで明示判定する。truncate された
+    # tool_use.input は非空でも採用してはならない。
+    _judgment_max_tokens = _OPUS_JUDGMENT_MAX_TOKENS
+    if response is not None and getattr(response, "stop_reason", None) == "max_tokens":
+        _log_anthropic_usage(
+            role="analyzer_final_judgment",
+            model=getattr(response, "model", None) or _resolve_judgment_model(),
+            max_tokens=_judgment_max_tokens,
+            started=started,
+            prompt_chars=len(opus_user),
+            response=response,
+            use_tool=True,
+            ticker=ticker,
+            status="max_tokens",
+        )
+        _judgment_max_tokens = _OPUS_JUDGMENT_MAX_TOKENS_RETRY
+        started = time.monotonic()
+        response = safe_api_call(
+            lambda: _make_opus_call(_opus_judgment_retry_prompt(opus_user), _judgment_max_tokens)
+        )
+        if response is not None and getattr(response, "stop_reason", None) == "max_tokens":
+            # 再試行でも切れた場合は結果を採用せず失敗扱いにする。
+            _log_anthropic_usage(
+                role="analyzer_final_judgment",
+                model=getattr(response, "model", None) or _resolve_judgment_model(),
+                max_tokens=_judgment_max_tokens,
+                started=started,
+                prompt_chars=len(opus_user),
+                response=response,
+                use_tool=True,
+                ticker=ticker,
+                status="max_tokens_retry_failed",
+            )
+            response = None
     if response:
-        model_id = getattr(response, "model", None)
-        if not model_id:
-            try:
-                from model_router import get_model as _get_model
-                model_id = _get_model("final_synthesis")
-            except ImportError:
-                model_id = "claude-opus-4-8"
+        model_id = getattr(response, "model", None) or _resolve_judgment_model()
         _log_anthropic_usage(
             role="analyzer_final_judgment",
             model=model_id,
-            max_tokens=800,
+            max_tokens=_judgment_max_tokens,
             started=started,
             prompt_chars=len(opus_user),
             response=response,
@@ -686,15 +752,11 @@ def analyze_with_agents(stock_data, macro_info, batch_results: "dict | None" = N
             if block.type == "tool_use":
                 return block.input
     else:
-        try:
-            from model_router import get_model as _get_model
-            model_id = _get_model("final_synthesis")
-        except ImportError:
-            model_id = "claude-opus-4-8"
+        model_id = _resolve_judgment_model()
         _log_anthropic_usage(
             role="analyzer_final_judgment",
             model=model_id,
-            max_tokens=800,
+            max_tokens=_judgment_max_tokens,
             started=started,
             prompt_chars=len(opus_user),
             status="error",

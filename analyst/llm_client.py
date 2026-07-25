@@ -23,12 +23,13 @@ def _env_float(name: str, default: float) -> float:
 ANTHROPIC_REQUEST_TIMEOUT_SECONDS = _env_float("ANTHROPIC_REQUEST_TIMEOUT_SECONDS", 300.0)
 ANTHROPIC_WEB_SEARCH_TIMEOUT_SECONDS = _env_float("ANTHROPIC_WEB_SEARCH_TIMEOUT_SECONDS", 60.0)
 
-# Sonnet 5 / Opus 4.7+ / Fable 5 reject a non-default temperature (400);
+# Sonnet 5 / Opus 4.7+ / Opus 5 / Fable 5 reject a non-default temperature (400);
 # Opus 4.7+ rejects the field outright even at the default. Omit it for these.
 _MODELS_REJECTING_SAMPLING_PARAMS = frozenset({
     "claude-sonnet-5",
     "claude-opus-4-7",
     "claude-opus-4-8",
+    "claude-opus-5",
     "claude-fable-5",
     "claude-mythos-5",
 })
@@ -39,9 +40,16 @@ def _model_rejects_sampling_params(model: str) -> bool:
 
 
 # Sonnet 5 / Fable 5 / Mythos 5 default to adaptive thinking when `thinking`
-# is omitted (Opus 4.7/4.8 still default to no-thinking, unchanged from 4.6).
+# is omitted (Opus 4.7/4.8 default to no-thinking; Opus 5 defaults to adaptive).
 # Explicitly disable it for non-tool-forced calls to preserve prior behavior
 # and avoid an uncontrolled thinking-token cost/latency increase.
+#
+# Opus 5 is deliberately NOT listed here: it also defaults to adaptive when
+# `thinking` is omitted, but we *want* that. Disabling thinking on Opus 5 can
+# make it emit a tool call as visible text instead of a structured `tool_use`
+# block (per the official Opus 5 prompting guide), which would silently produce
+# an empty analysis on our forced-tool call sites. Cost is controlled with
+# `effort` instead — see `anthropic_compat_kwargs`.
 _MODELS_DEFAULTING_TO_ADAPTIVE_THINKING = frozenset({
     "claude-sonnet-5",
     "claude-fable-5",
@@ -51,6 +59,73 @@ _MODELS_DEFAULTING_TO_ADAPTIVE_THINKING = frozenset({
 
 def _model_defaults_to_adaptive_thinking(model: str) -> bool:
     return model in _MODELS_DEFAULTING_TO_ADAPTIVE_THINKING
+
+
+# Haiku 4.5 errors when `effort` is sent. The eco budget mode downgrades
+# sonnet -> haiku, so this must be keyed on the *resolved model id*, never on
+# the role name.
+_MODELS_WITHOUT_EFFORT = frozenset({
+    "claude-haiku-4-5",
+    "claude-haiku-4-5-20251001",
+})
+
+DEFAULT_EFFORT = "low"
+
+
+def anthropic_compat_kwargs(model: str, *, effort: str = DEFAULT_EFFORT) -> dict:
+    """Model-specific request kwargs shared by every Anthropic call site.
+
+    Returns ``{}`` for models that don't accept the parameters, so callers can
+    always ``**anthropic_compat_kwargs(model)`` unconditionally.
+
+    Every direct ``messages.create()`` call site must apply this explicitly —
+    routing it through ``call_claude`` alone does not cover them.
+    """
+    if not model or model in _MODELS_WITHOUT_EFFORT:
+        return {}
+    return {"output_config": {"effort": effort}}
+
+
+def usage_fields(response, *, effort: str | None = None, thinking_mode: str | None = None) -> dict:
+    """Extract the shared observability fields from an Anthropic response.
+
+    ``thinking_fired`` is deliberately three-valued: ``None`` means the token
+    count was unavailable, which must not be recorded as "did not think".
+    """
+    usage = getattr(response, "usage", None)
+    details = getattr(usage, "output_tokens_details", None)
+    thinking_tokens = getattr(details, "thinking_tokens", None)
+
+    if thinking_tokens is None:
+        thinking_fired = None
+    else:
+        try:
+            thinking_fired = int(thinking_tokens) > 0
+        except (TypeError, ValueError):
+            thinking_fired = None
+
+    row = {
+        "stop_reason": getattr(response, "stop_reason", None),
+        "content_types": [getattr(b, "type", None) for b in getattr(response, "content", [])],
+        "input_tokens": getattr(usage, "input_tokens", None),
+        "output_tokens": getattr(usage, "output_tokens", None),
+        "thinking_tokens": thinking_tokens,
+        "thinking_fired": thinking_fired,
+    }
+    if effort is not None:
+        row["effort"] = effort
+    if thinking_mode is not None:
+        row["thinking_mode"] = thinking_mode
+    return row
+
+
+def response_hit_max_tokens(response) -> bool:
+    """True when a response was cut off by ``max_tokens``.
+
+    Such a response must never be accepted as a result, even when its
+    ``tool_use.input`` or ``text`` is non-empty — the content is truncated.
+    """
+    return getattr(response, "stop_reason", None) == "max_tokens"
 
 
 def _append_llm_call_log(row: dict) -> None:
@@ -372,6 +447,10 @@ def call_claude(system: str, user: str, model: str = "claude-sonnet-4-6",
     )
     if not _model_rejects_sampling_params(model):
         kwargs["temperature"] = effective_temp
+    # effort applies to tool and non-tool calls alike, so it must sit OUTSIDE
+    # the if/elif below — putting it inside would silently skip every
+    # forced-tool call.
+    kwargs.update(anthropic_compat_kwargs(model))
     if use_tool:
         kwargs["tools"] = [_SUBMIT_TOOL]
         kwargs["tool_choice"] = {"type": "tool", "name": "submit_analysis"}
@@ -399,10 +478,10 @@ def call_claude(system: str, user: str, model: str = "claude-sonnet-4-6",
                 "prompt_chars": prompt_chars,
                 "cached_prefix_chars": prefix_chars,
                 "status": "ok",
-                "stop_reason": _stop_reason,
-                "content_types": _content_types,
-                "input_tokens": getattr(_usage, "input_tokens", None),
-                "output_tokens": getattr(_usage, "output_tokens", None),
+                **usage_fields(
+                    msg,
+                    effort=(anthropic_compat_kwargs(model).get("output_config") or {}).get("effort"),
+                ),
             })
             if use_tool:
                 tool_result = None
@@ -505,7 +584,7 @@ def call_tier_analysis(system: str, user: str, *,
       - anthropic → 既存 call_claude(use_tool=True) で構造化 JSON 取得
       - deepseek  → llm_adapters.call_by_role(json_mode=True) で JSON 取得 → parse
     返り値は **必ず dict**。失敗時は {"error": "...", "_source": "..."} を返す。
-    呼出側は dict["_source"] でモデル出典を確認可能（例: "anthropic:claude-opus-4-7", "deepseek:deepseek-v4-pro"）。
+    呼出側は dict["_source"] でモデル出典を確認可能（例: "anthropic:claude-opus-5", "deepseek:deepseek-v4-pro"）。
     """
     try:
         from model_router import get_model, resolve_adapter
