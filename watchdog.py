@@ -810,10 +810,12 @@ def _notification_report(report: dict) -> dict:
         'outcome_log_issues': report.get('outcome_log_issues', []),
         'disclosure_freshness': report.get('disclosure_freshness', []),
         'shadow_book_issues': report.get('shadow_book_issues', []),
-        'disk_space_issues': [
-            issue for issue in report.get('disk_space_issues', [])
-            if str(issue.get('severity') or '').lower() == 'critical'
-        ],
+        # critical (8GB) だけを通知対象にしていると、警告水準 (15GB) は算出だけ
+        # されて誰にも届かず、実質的に無効な監視になる。ディスク逼迫は単調に
+        # 進行し critical 到達時には猶予がほとんど残らないため warning も通知する。
+        # 連投は _notification_fingerprint の severity ベース化 + 24h cooldown
+        # で抑える（同一深刻度が続く限り 1 日 1 通）。
+        'disk_space_issues': report.get('disk_space_issues', []),
         'backup_issues': _blocking_backup_issues(report),
     }
 
@@ -850,7 +852,12 @@ def _notification_fingerprint(report: dict) -> str:
         'outcomes': sorted((i.get('file'), i.get('issue')) for i in report.get('outcome_log_issues', [])),
         'disclosure': sorted((i.get('file'), i.get('issue')) for i in report.get('disclosure_freshness', [])),
         'shadow': sorted((i.get('file'), i.get('issue')) for i in report.get('shadow_book_issues', [])),
-        'disk': sorted((i.get('severity'), i.get('free_gb')) for i in report.get('disk_space_issues', [])),
+        # free_gb は毎回変動するため fingerprint に含めない。含めると 30 分毎の
+        # 実行で毎回 fingerprint が変わり 24h cooldown が無効化され、ディスクが
+        # 逼迫している間ずっと通知が飛び続ける（最大 48 通/日）。
+        # 「同じ深刻度の同じパス」なら同一condition とみなして抑制し、
+        # 実際の残量はメッセージ本文で伝える。
+        'disk': sorted((i.get('path'), i.get('severity')) for i in report.get('disk_space_issues', [])),
         'backup': sorted((i.get('severity'), i.get('status'), i.get('reason')) for i in report.get('backup_issues', [])),
     }
     return _json.dumps(payload, ensure_ascii=False, sort_keys=True)

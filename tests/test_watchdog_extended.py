@@ -468,7 +468,8 @@ def test_run_check_records_notification_skip_reason(monkeypatch, tmp_path):
     assert state["last_notification_failure_reason"] == "notify_disabled"
 
 
-def test_notification_report_excludes_disk_warning_but_keeps_critical():
+def test_notification_report_keeps_disk_warning_and_critical():
+    """warning も通知対象。critical だけだと 15GB 警告が誰にも届かない。"""
     report = _notification_test_report()
     report["errors"] = []
     report["disk_space_issues"] = [
@@ -479,5 +480,40 @@ def test_notification_report_excludes_disk_warning_but_keeps_critical():
     notify_report = wd._notification_report(report)
 
     assert notify_report["disk_space_issues"] == [
+        {"severity": "warning", "free_gb": 12.7, "issue": "disk_low"},
         {"severity": "critical", "free_gb": 7.9, "issue": "disk_critical"},
     ]
+
+
+def test_disk_fingerprint_ignores_fluctuating_free_gb():
+    """残量の小数変動で fingerprint が変わると 24h cooldown が無効化される。
+
+    watchdog は 30 分毎に走るため、free_gb を含めていた時期は逼迫中ずっと
+    最大 48 通/日の通知が飛ぶ状態だった。
+    """
+    def _with_disk(free_gb, severity="warning"):
+        report = _notification_test_report()
+        report["errors"] = []
+        report["disk_space_issues"] = [
+            {"path": "/srv/almanac", "severity": severity,
+             "free_gb": free_gb, "issue": "free space below 15GB"}
+        ]
+        return wd._notification_fingerprint(wd._notification_report(report))
+
+    # 残量だけが動いた場合は同一 condition とみなす
+    assert _with_disk(12.16) == _with_disk(11.83)
+
+    # 深刻度が上がったら別 condition として即通知させる
+    assert _with_disk(12.16) != _with_disk(7.4, severity="critical")
+
+
+def test_disk_warning_reaches_the_telegram_message_body():
+    """本文に残量が出ること（fingerprint から外しても情報は失われない）。"""
+    report = _notification_test_report()
+    report["disk_space_issues"] = [
+        {"path": "/x", "severity": "warning", "free_gb": 12.16,
+         "issue": "free space below 15GB"}
+    ]
+    message = wd._build_watchdog_message(wd._notification_report(report))
+    assert "12.16GB free" in message
+    assert "warning" in message
