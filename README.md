@@ -21,6 +21,101 @@ The objective function is explicit and version-controlled ([`objective.md`](obje
 | **Tax & accounts** | FIFO/LIFO/loss-harvest/gain-minimize tax-lot strategies, NISA allocation tracking, employee-stock-plan concentration management |
 | **Observability** | NAV/TWR performance tracking against benchmark (a Modified Dietz cash-flow-adjusted approximation, not a daily sub-period-exact TWR), with a verification page that reports actual measured performance rather than a fixed claim |
 
+## How it works
+
+The heart of the system is a daily pipeline that turns market data into a small number of concrete, human-executable proposals — and a deterministic gate that throws most of them away.
+
+### 1. The daily loop
+
+```mermaid
+flowchart TD
+    A["Freshness guarantee<br/>macro events · technicals · VIX · earnings · scenarios"] --> B["Data gathering<br/>positions · prices · FX · signals"]
+    B --> C{"5 tier analyses<br/>(parallel)"}
+    C --> C1["Long / Medium / Swing<br/>Claude Sonnet"]
+    C --> C2["Margin-long / Short-sell<br/>DeepSeek V4 Pro"]
+    C1 --> D["Red Team<br/>DeepSeek · Qwen · Gemini"]
+    C2 --> D
+    D --> E["Disagreement score<br/>+ Black-Litterman views"]
+    E --> F["Judge<br/>DeepSeek-R1"]
+    F --> G["Final synthesis<br/>Claude Opus"]
+    G --> H["Enrichment<br/>web search · catalysts · limit prices · options"]
+    H --> I{"Policy Engine<br/>deterministic gate"}
+    I -->|rejected| J["Logged with a reason<br/>never reaches the user as an action"]
+    I -->|accepted / modified| K["action_state.json<br/>+ recommendation log"]
+    K --> L["Dashboard + Telegram<br/>human decides and places the order"]
+```
+
+Each stage exists for a reason:
+
+**Freshness first.** Every input the gate depends on — the macro-event calendar, technical state, VIX, earnings proximity, scenario snapshot — is regenerated *before* analysis starts. A stale calendar would otherwise be silently read as "no important events coming up," which is the difference between an earnings blackout firing and not firing. Refresh failures are printed rather than swallowed, and the readiness gate treats a missing calendar as `review`, not as "clear."
+
+**Five specialists, not one generalist.** The portfolio is split by holding intent — long-term core, medium-term, swing — plus two credit-side lanes (margin-long, short-sell). Each gets its own analysis with its own prompt and its own risk vocabulary. They run in parallel with a per-call timeout, and a tier that times out degrades that lane rather than failing the whole run.
+
+**Adversarial review.** The tier outputs go to a Red Team of *different* model families (DeepSeek, Qwen, Gemini) whose job is to attack the reasoning. Using different vendors is deliberate — models from the same family tend to share blind spots. A disagreement score between agents is computed and carried forward, so downstream stages can see where the analysts diverged instead of only seeing a merged consensus.
+
+**Judge, then synthesis.** A reasoning model (DeepSeek-R1) adjudicates, then Claude Opus performs the final synthesis into a structured result. The synthesis call uses forced tool use, so the output is a validated object rather than prose that has to be parsed — and a response truncated by the token limit is rejected outright rather than accepted as a partial answer.
+
+**Enrichment.** Only after a proposal survives that far does the system spend effort on execution detail: current news, catalyst hypotheses, chart-derived limit-price context, and options signals.
+
+### 2. Why several models
+
+Model choice is centralized in one registry (`model_router.py`) that maps a *role* to a *tier*, so no module hardcodes a model ID. A single environment variable (`ALMANAC_BUDGET_MODE=eco|normal|premium`) shifts every role at once.
+
+| Role | Model tier | Why |
+|---|---|---|
+| Final synthesis | Claude Opus | The one call where a mistake propagates into every proposal |
+| Long / Medium / Swing tiers | Claude Sonnet | Bulk analysis where quality still matters |
+| Margin-long / Short-sell | DeepSeek V4 Pro | Credit-side first pass; the final synthesis decides whether to adopt it |
+| Screener pre-debate | DeepSeek | Wide, cheap first pass over many candidates |
+| Screener second opinion | Claude Sonnet | Only the top BUY candidates get the expensive look |
+| Red Team | DeepSeek / Qwen / Gemini | Deliberately different vendors, for uncorrelated criticism |
+| Chat / delta monitor | Claude Haiku | High frequency, low stakes |
+
+The economic shape is a funnel: cheap models see everything, expensive models see only what survived. Every call is logged with its token usage and estimated cost to a shared ledger, so the spend is measurable rather than assumed.
+
+### 3. The gate
+
+This is the part that makes the system something other than "an LLM that suggests trades." Every proposed action passes through an ordered chain of **deterministic rules** — plain Python, no model in the loop. A rule can reject an action or modify it (downgrade urgency, halve the size).
+
+| Rule | What it does |
+|---|---|
+| `ledger_integrity` | If the event ledger is inconsistent, nothing passes. Fail-closed. |
+| `var_budget` | Ex-ante 1-day 95% VaR over budget → reject **all** new buying |
+| `dd_stage` | Drawdown ≤ −8% → new buys stop entirely; ≤ −5% → urgency downgraded and size halved |
+| `leverage_block` | Leverage status in warning/deleverage/emergency → no new margin positions |
+| `earnings_blackout` | Within 5 business days of earnings → reject buy / add / DCA on that name |
+| `freshness_downgrade` | Inputs too old → downgrade rather than trust them |
+| `cvar_unstable` | Tail sample too thin to estimate CVaR → no margin buying |
+| `vix_extreme` | VIX ≥ 40 → speculative types rejected, buy urgency downgraded |
+
+Two design choices matter more than the individual thresholds:
+
+- **Fail-closed, not fail-open.** A missing or unreadable input is treated as "not permitted," never as "no objection." Several rules distinguish `False` from `None` explicitly for exactly this reason.
+- **Rejections are recorded, not discarded.** Rejected and modified actions are written into the analysis output with their reason, so the gate's behavior is auditable after the fact — you can ask why a trade you expected never appeared.
+
+The thresholds themselves are not arbitrary: they derive from [`objective.md`](objective.md), a version-controlled definition of what the system is optimizing. Changing a limit means changing that document first.
+
+### 4. From suggestion to executed trade
+
+**There is no broker API in this repository.** The loop closes through a human:
+
+```
+proposal → readiness (ready | review | blocked) → human places the order at their broker
+         → human records the fill → executed | partial → event ledger → portfolio state
+```
+
+Recording a fill is deliberately separated from applying it to the portfolio. An execution whose account/route cannot be determined unambiguously is stored as a *fact that happened* and held as `portfolio_application_pending` rather than being guessed into the wrong account — because a wrong attribution silently corrupts every downstream tax lot, NISA allowance, and performance figure. Writes are idempotent through a client-generated key, so a double-submitted form cannot become two trades.
+
+### 5. How performance is measured
+
+The system grades itself rather than asserting a result. A daily recorder captures NAV and computes time-weighted return (a Modified Dietz cash-flow-adjusted approximation, not a sub-period-exact TWR) against a 60% global equity / 40% global bond benchmark. The objective is **after-tax, after-fee, JPY-denominated** — Japanese separate taxation and US dividend withholding are modeled, USD positions are converted at the daily close.
+
+A verification page in the dashboard reports what was actually measured, including when the measurement window is too short or too dirty to support a conclusion. Separately, a watchdog checks data freshness, schema drift, ledger integrity, backup status, and disk headroom on a schedule, and pushes only genuinely actionable problems.
+
+### 6. What happens when something breaks
+
+Degradation is explicit rather than silent. A timed-out tier marks the run degraded and says so in the output; a truncated LLM response is rejected instead of parsed; a stale input downgrades an action instead of being trusted; an unavailable safety module refuses the call rather than proceeding un-audited. The recurring principle is that the system would rather produce *no* recommendation than a confident wrong one.
+
 ## Architecture
 
 - **Backend** — Python 3.12 / FastAPI. Portfolio optimization ([PyPortfolioOpt](https://github.com/robertmartin8/PyPortfolioOpt), [riskfolio-lib](https://riskfolio-lib.readthedocs.io/), [skfolio](https://skfolio.org/)), GARCH risk modeling ([arch](https://arch.readthedocs.io/)), FinBERT sentiment (`transformers` / `torch`), Claude (Anthropic) and DeepSeek for LLM-assisted analysis.
