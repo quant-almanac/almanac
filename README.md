@@ -201,9 +201,11 @@ The system does **not** simply apply what comes back. Auto-application is constr
 
 In other words, **tuning uses the same structure as trading.** The model proposes; deterministic rules decide what may change, by how much, and how often.
 
-And right now, **auto-application is switched off** (`enabled: false` in `tuning_auto_mode.json`). A review in July 2026 found the scheduled job applying recommendations derived from stale logs. Until the state, history, and log audit is finished and the allowlist policy is revisited, the job still runs but applies nothing. The reason is recorded in the file itself.
+The runtime state has three modes — `off`, `shadow`, and `apply` — and **only `apply` may mutate a parameter**. A `--force` flag exists, but it only de-duplicates context for dry runs; it never crosses that boundary. This guarded orchestrator replaced an earlier design after a July 2026 review found the scheduled job applying recommendations derived from stale logs. The values that review reconciled by hand are still the ones in effect.
 
-Leaving that visible — built, but distrusted and therefore disabled — is itself the policy.
+It currently runs in `apply` mode, four times per weekday. In practice the constraints bind hard: since it was re-enabled, every run has ended in either "no change warranted" or "context unchanged since last evaluation," and **no parameter has been auto-applied at all**. The mechanism is live; it simply does not often clear its own bar.
+
+That is the intended shape. A tuner that rarely fires is working; one that changes something every run would mean the bar is too low.
 
 ### 9. What happens when something breaks
 
