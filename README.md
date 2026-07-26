@@ -91,7 +91,7 @@ The daily loop above is mostly about **what to do with positions you already hol
 | `news_screener.py` | News sentiment |
 | `social_screener.py` | Social chatter plus options-market anomalies |
 | `pair_screener.py` | Long-short pair-trading signals |
-| `screener_shadow_book.py` | **Measures what actually happened** to the candidates the others produced — it places nothing (see §8) |
+| `screener_shadow_book.py` | **Measures what actually happened** to the candidates the others produced — it places nothing (see §11) |
 
 **When they run**
 
@@ -130,7 +130,23 @@ Thesis generation goes through the Batch API — submit now, collect later, at h
 
 These cadences are collected in [`examples/crontab.example`](examples/crontab.example).
 
-### 4. Why several models
+### 4. From disclosures to signals
+
+Corporate filings — earnings releases, timely disclosures, large-shareholding reports — are documents, not decision inputs. Turning them into numbers takes a pipeline.
+
+| Stage | Script | What it does |
+|---|---|---|
+| Ingest | `ingest_disclosures.py` | Pull the day's items from EDINET and TDnet |
+| Extract | `disclosure_feature_extractor.py` | Derive evidence-backed numeric features from the text |
+| Promote | `disclosure_feature_promotion.py` | Decide whether a feature is fit to actually use |
+| Enrich | `disclosure_enrich.py` | Attach additional context |
+| Measure | `disclosure_shadow_book.py` | Record what following the signal would have returned, broker costs included |
+
+The important part is that extracted features land as **observe_only** first. They are not fed into trading decisions on arrival. Only features whose usefulness survives comparison against subsequent price action get promoted.
+
+The extraction prompt carries a version number, so rewriting the prompt does not silently mix features produced by two different versions.
+
+### 5. Why several models
 
 Primary role-based model choice is centralized in `model_router.py`. `ALMANAC_BUDGET_MODE=eco|normal|premium` changes the routed Claude tiers after the role is resolved. It does **not** rewrite fixed low-stakes utility calls, fallback model IDs, or external-provider roles; those exceptions are intentionally visible at their call sites.
 
@@ -146,7 +162,7 @@ Primary role-based model choice is centralized in `model_router.py`. `ALMANAC_BU
 
 The economic shape is a funnel: cheap models see everything, expensive models see only what survived. Every call is logged with its token usage and estimated cost to a shared ledger, so the spend is measurable rather than assumed.
 
-### 5. The gate
+### 6. The gate
 
 This is the part that makes the system something other than "an LLM that suggests trades." Every proposed action passes through an ordered chain of **deterministic rules** — plain Python, no model in the loop. A rule can reject an action or modify it (downgrade urgency, halve the size).
 
@@ -168,7 +184,15 @@ Two design choices matter more than the individual thresholds:
 
 The default thresholds are intended to implement [`objective.md`](objective.md), the version-controlled definition of what the system is optimizing. When a limit changes, the objective, runtime configuration, code, and regression tests should be kept in sync.
 
-### 6. From suggestion to executed trade
+### 7. Scenarios and playbooks
+
+A mechanism for deciding "if X happens, do Y" ahead of time.
+
+`geopolitical_monitor.py` watches for geopolitical events and regime shifts, scores keyword matches, and judges which scenarios are becoming plausible. Each scenario has trigger conditions — how many signals, at what severity — and when they are met the matching playbook is injected as a proposal. Definitions live in `scenario_playbook.json` and can be written per ticker or per event.
+
+The thing to note is that **a playbook proposal does not bypass the gate**. `execution_plan_engine.py` can tell that a proposal originated from a playbook, and sends it through the same review as anything else. Deciding in advance buys speed, not exemption.
+
+### 8. From suggestion to executed trade
 
 **There is no broker API in this repository.** The loop closes through a human:
 
@@ -179,13 +203,42 @@ proposal → readiness (ready | review | blocked) → human places the order at 
 
 Recording a fill is deliberately separated from applying it to the portfolio. An execution whose account/route cannot be determined unambiguously is stored as a *fact that happened* and held as `portfolio_application_pending` rather than being guessed into the wrong account — because a wrong attribution silently corrupts every downstream tax lot, NISA allowance, and performance figure. Writes are idempotent through a client-generated key, so a double-submitted form cannot become two trades.
 
-### 7. How performance is measured
+### 9. The record, and auditing it
+
+The ledger is SQLite, in three tables.
+
+**`ledger_events`** holds what happened. The design point here is that **the time something occurred and the time it was recorded are stored separately**. Enter a trade from three days ago today, and the first is three days ago while the second is today. Collapse them into one column and you can no longer reconstruct when you found out.
+
+Three event types carry most of the traffic:
+
+| Type | Meaning |
+|---|---|
+| `trade` | A buy or sell |
+| `cash_flow` | External deposits and withdrawals — salary in, cash out |
+| `dividend` | Dividends received |
+
+`cash_flow` is its own type because performance measurement (§10) has to control those out. Mix them into trades and TWR stops meaning anything.
+
+**`execution_idempotency`** prevents double registration. It keys on an idempotency key plus a hash of the request, so the same operation arriving twice does not become two trades.
+
+**`portfolio_application_journal`** stores the full holdings state after application, so "what did applying this record actually do" can be inspected — or unwound — later.
+
+On top of that, `portfolio_integrity.py` periodically checks the record against reality. What it looks for is concrete:
+
+- an execution exists but has no ledger event
+- a ledger event exists but was never applied to holdings
+- an application is stuck pending
+- no external reconciliation source was recorded
+
+Once you separate "recorded" from "applied," you need something that finds the ones stalled in between.
+
+### 10. How performance is measured
 
 The system grades itself rather than asserting a result. A daily recorder captures NAV and computes time-weighted return (a Modified Dietz cash-flow-adjusted approximation, not a sub-period-exact TWR) against a 60% global equity / 40% global bond benchmark. The objective is **after-tax, after-fee, JPY-denominated** — Japanese separate taxation and US dividend withholding are modeled, USD positions are converted at the daily close.
 
 A verification page in the dashboard reports what was actually measured, including when the measurement window is too short or too dirty to support a conclusion. Separately, a watchdog checks data freshness, schema drift, ledger integrity, backup status, and disk headroom on a schedule, and pushes only genuinely actionable problems.
 
-### 8. Learning from outcomes
+### 11. Learning from outcomes
 
 Recommendations are not issued and forgotten — they are marked afterwards and fed back. There are three kinds of learning here, and each is allowed a different amount of autonomy.
 
@@ -229,9 +282,60 @@ It currently runs in `apply` mode, four times per weekday. In practice the const
 
 That is the intended shape. A tuner that rarely fires is working; one that changes something every run would mean the bar is too low.
 
-### 9. What happens when something breaks
+### 12. What happens when something breaks
 
 Degradation is explicit rather than silent. A timed-out tier marks the run degraded and says so in the output; a truncated LLM response is rejected instead of parsed; a stale input downgrades an action instead of being trusted; an unavailable safety module refuses the call rather than proceeding un-audited. The recurring principle is that the system would rather produce *no* recommendation than a confident wrong one.
+
+## The dashboard
+
+Twenty pages, split by purpose.
+
+| Page | Purpose |
+|---|---|
+| `/today` | What to do today — effectively the home screen |
+| `/portfolio` | Holdings and allocation |
+| `/performance` | Performance verification, reporting measured values as-is |
+| `/risk` | VaR, drawdown, concentration |
+| `/screening` | Screener output |
+| `/decision` | AI decision support |
+| `/executions`, `/trade`, `/history` | Recording fills, and the history of them |
+| `/nisa`, `/cash`, `/margin` | Tax-exempt allowance, cash, margin |
+| `/scenarios`, `/strategy` | Scenarios and strategy |
+| `/disclosures` | Disclosure feed |
+| `/tuning`, `/admin` | Parameter tuning and administration |
+| `/agent`, `/design` | Agent output and design review |
+
+Reading requires no API key. Authentication applies only to writes — recording a fill, changing a setting.
+
+## Tests and backups
+
+### Tests
+
+**2,704 tests across 202 files** (`pytest tests/ -q --collect-only` counts them).
+
+The composition matters more than the count: **14 files are named for the invariant they hold down** — safety, gating, policy, guard, integrity, privacy. A sample:
+
+| File | What it protects |
+|---|---|
+| `test_llm_call_site_gating.py` | Every site that sends portfolio context outward goes through the gate |
+| `test_llm_safety.py` | Public/anonymized payload validation |
+| `test_redteam_privacy.py` | The Red Team legs cannot leak portfolio context |
+| `test_execution_safety.py` | Execution handling |
+| `test_actions_ledger_safety.py` | Ledger writes |
+| `test_cash_route_safety.py` | Cash never lands in the wrong account |
+| `test_order_strategy_safety.py` | Order strategy |
+| `test_portfolio_integrity.py` | Detecting drift between record and reality |
+
+Add a new call site and forget to gate it, and these fail. The point is that the guarantee is enforced rather than remembered.
+
+### Backups
+
+`backup_manager.py` covers the files that cannot be reconstructed if lost: holdings, accounts, NISA, trade history, cash movements, beliefs, tuned parameters.
+
+- `rotate` — prune old generations
+- `offsite` — copy the day's set to an encrypted rclone remote
+
+A copy on the same disk dies with the disk, which is why off-site is a separate command.
 
 ## Glossary
 
