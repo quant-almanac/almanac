@@ -3813,7 +3813,8 @@ VIX={market_meta.get('vix','不明')} {market_meta.get('vix_level','')} / 米10Y
 
     import anthropic as _anthropic
     # タイムアウト明示設定 (10 分) — dead socket での無限待ち防止。
-    # Extended Thinking 8k + max_tokens 16k でも通常 2-5 分で完走するため 600s で十分。
+    # Adaptive thinking (effort=low) + max_tokens 24k/32k retry を含め、
+    # 通常 2-5 分で完走するため 600s を上限とする。
     _client = _anthropic.Anthropic(timeout=600.0, max_retries=0)
 
     # Opus 5 に昇格：全ティア合成の最重要ステップ。model_router で一元管理。

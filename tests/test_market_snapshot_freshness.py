@@ -4,6 +4,10 @@ from datetime import datetime
 from api.routes import market
 
 
+def test_market_snapshot_cache_is_checkout_relative():
+    assert market.CACHE_PATH == market.REPO_ROOT / "market_snapshot.json"
+
+
 def test_market_snapshot_persists_full_as_of_timestamp(monkeypatch, tmp_path):
     cache = tmp_path / "market_snapshot.json"
     monkeypatch.setattr(market, "CACHE_PATH", str(cache))

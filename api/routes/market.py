@@ -5,11 +5,12 @@ import os
 import time
 from datetime import datetime
 from fastapi import APIRouter
+from almanac.runtime_config import REPO_ROOT
 from vix_classification import classify_vix
 
 router = APIRouter()
 
-CACHE_PATH = os.path.expanduser("~/portfolio-bot/market_snapshot.json")
+CACHE_PATH = REPO_ROOT / "market_snapshot.json"
 CACHE_TTL = 300  # 5分キャッシュ
 
 

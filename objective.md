@@ -33,15 +33,21 @@ env で上書き可:
 
 | 制約 | 閾値 | env override | 違反時の挙動 |
 |---|---|---|---|
-| ex-ante VaR_1d_95% | ≤ 1.2% | `POLICY_VAR_THRESHOLD` | 新規 buy/add/dca/margin_buy を reject |
-| current drawdown | > -8% で reject | `POLICY_DD_BLOCK_THRESHOLD` | 新規 buy を全停止 |
-| current drawdown | > -5% で警戒 | `POLICY_DD_CAUTION_THRESHOLD` | urgency 降格 + size 半減 |
+| portfolio ledger integrity | `ok is not False` | — | 不整合が明示された場合、実行可能な提案を reject |
+| ex-ante VaR_1d_95% | 弱気・ストレス時 `< 1.2%` / 通常時 `< 1.6%` / 強気かつ VIX<25 時 `< 2.0%` | `POLICY_VAR_THRESHOLD`（絶対上限は `POLICY_VAR_MAX_THRESHOLD`、既定2.3%） | 閾値以上なら新規 buy/add/dca/margin_buy を reject |
+| current drawdown | ≤ -8% で block | `POLICY_DD_BLOCK_THRESHOLD` | 新規 buy を原則停止。実損益ガードが許可したDCAラダーだけは別上限で扱う |
+| current drawdown | ≤ -5% で警戒 | `POLICY_DD_CAUTION_THRESHOLD` | urgency 降格 + size 半減 |
 | VIX (extreme) | < 40 | `POLICY_VIX_BLOCK_THRESHOLD` | margin_buy / short を reject、buy urgency 降格 |
 | leverage_status | ∈ {warning, deleverage, emergency} | — | margin_buy reject |
-| earnings 5 営業日以内 | — | — | 該当 ticker への buy reject |
+| earnings 5 営業日以内 | — | — | 該当 ticker への buy を原則 reject。イベント取引の明示理由がある場合のみ後段capつきで暫定許可 |
+| CVaR tail sample | 安定していること | — | margin_buy を reject。クリーン履歴不足だけが理由なら、buy系をsize半減 + urgency降格 |
 | data_freshness | ≥ 0.7 | `POLICY_FRESHNESS_THRESHOLD` | high urgency を medium に降格 |
 
 すべて `policy_engine.RULES` に実装。後付けで足すルールも本ファイルに追記すること。
+
+VaR の3段階は `policy_engine.build_context_from_synthesis_inputs()` が、シナリオ・
+レジーム・VIX・実損益ガードの状態から決める。`POLICY_VAR_THRESHOLD` を明示した場合は
+その値を使うが、`POLICY_VAR_MAX_THRESHOLD` を超える値にはならない。
 
 ## 4. 受入れ基準 (継続評価)
 

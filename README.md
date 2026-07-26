@@ -10,6 +10,8 @@ This repository is a **public, sanitized snapshot** of that system. Runtime data
 
 > **Project status:** this is an opinionated reference implementation and an evolving personal system, not a turnkey portfolio product or a stable public API. Start with the demo state, inspect the rules, and expect file schemas and operating procedures to change.
 
+> **Portability boundary:** the Getting Started path and documented screener schedule resolve state relative to the checkout. Some older, non-core utilities — legacy Telegram/reporting scripts, static-dashboard generation, and backtest helpers — still contain the reference deployment name `~/portfolio-bot`. Inspect an unlisted top-level script before using it from a differently named checkout.
+
 ## What it does
 
 The objective function is explicit and version-controlled ([`objective.md`](objective.md)): maximize **after-tax, after-fee, JPY-denominated time-weighted return**, benchmarked against a 60% global equity / 40% global bond blend, subject to hard risk limits (VaR, drawdown, VIX-based circuit breakers) enforced by a deterministic policy engine — not by an LLM's judgment call.
@@ -21,7 +23,7 @@ The objective function is explicit and version-controlled ([`objective.md`](obje
 | **Portfolio & risk** | Black-Litterman optimization with LLM-generated views, GJR-GARCH volatility modeling, market-regime detection (bull / neutral / bear / crash), concentration and human-capital-exposure limits |
 | **AI decision support** | Multi-model analysis (Claude + DeepSeek, cost-routed by task) for case-based decisions — trim, add, rebalance, tax-loss harvest — all gated by deterministic policy rules before anything reaches an order |
 | **Screening & signals** | Long-term JP/US fundamental screening, disclosure-driven catalyst detection (EDINET / TDnet / EDGAR filings), margin and short-sale candidate screening, insider-cluster and IPO tracking |
-| **Execution & guardrails** | Daily/monthly drawdown circuit breakers, VaR- and VIX-based trade blocking, an append-only event ledger for full auditability, open-order-aware position sizing |
+| **Execution & guardrails** | Daily/monthly drawdown circuit breakers, VaR- and VIX-based trade blocking, an append-only event ledger plus reconciliation checks for an audit trail, open-order-aware position sizing |
 | **Tax & accounts** | FIFO/LIFO/loss-harvest/gain-minimize tax-lot strategies, NISA allocation tracking, employee-stock-plan concentration management |
 | **Observability** | NAV/TWR performance tracking against benchmark (a Modified Dietz cash-flow-adjusted approximation, not a daily sub-period-exact TWR), with a verification page that reports actual measured performance rather than a fixed claim |
 
@@ -33,7 +35,7 @@ The heart of the system is a daily pipeline that turns market data into a small 
 
 ```mermaid
 flowchart TD
-    A["Freshness guarantee<br/>macro events · technicals · VIX · earnings · scenarios"] --> B["Data + context gathering<br/>positions · prices · FX · news · catalysts"]
+    A["Freshness checks<br/>macro events · technicals · VIX · earnings · scenarios"] --> B["Data + context gathering<br/>positions · prices · FX · news · catalysts"]
     B --> C{"5 tier analyses<br/>(parallel)"}
     C --> C1["Long / Medium / Swing<br/>Claude Sonnet"]
     C --> C2["Margin-long / Short-sell<br/>DeepSeek V4 Pro"]
@@ -51,19 +53,19 @@ flowchart TD
 
 Each stage exists for a reason:
 
-**Freshness first.** Every input the gate depends on — the macro-event calendar, technical state, VIX, earnings proximity, scenario snapshot — is regenerated *before* analysis starts. A stale calendar would otherwise be silently read as "no important events coming up," which is the difference between an earnings blackout firing and not firing. Refresh failures are printed rather than swallowed, and the readiness gate treats a missing calendar as `review`, not as "clear."
+**Freshness first.** Every input the gate depends on — the macro-event calendar, technical state, VIX, earnings proximity, scenario snapshot — is checked *before* analysis starts and refreshed when its own staleness rule requires it. A stale calendar would otherwise be silently read as "no important events coming up," which is the difference between an earnings blackout firing and not firing. Refresh failures are printed rather than swallowed, and the readiness gate treats a missing calendar as `review`, not as "clear."
 
 **Five specialists, not one generalist.** The portfolio is split by holding intent — long-term core, medium-term, swing — plus two credit-side lanes (margin-long, short-sell). Each gets its own analysis with its own prompt and its own risk vocabulary. They run in parallel with a per-call timeout, and a tier that times out degrades that lane rather than failing the whole run.
 
 **Adversarial review.** The tier outputs go to a Red Team of *different* model families whose job is to attack the reasoning. A Claude Haiku leg can use book-aware context; the external legs use only public or anonymized material and may run through DeepSeek, Groq, Gemini, and Qwen when their keys are configured. Using different vendors is deliberate — models from the same family tend to share blind spots. A disagreement score between agents is computed and carried forward, so downstream stages can see where the analysts diverged instead of only seeing a merged consensus.
 
-**Optional judge, then synthesis.** When `DEEPSEEK_API_KEY` is configured, DeepSeek-R1 adjudicates pseudonymized actions without receiving ticker symbols or the analysts' free-text rationales. If that optional judge is unavailable, the stage is omitted rather than taking down the whole run. Claude Opus then performs the final synthesis into a structured result. The synthesis call forces the model to answer through a declared tool schema, so the result arrives as a validated object rather than prose that has to be parsed — and a response truncated by the token limit is rejected outright rather than accepted as a partial answer, so a half-finished list is never mistaken for a conclusion.
+**Optional judge, then synthesis.** When `DEEPSEEK_API_KEY` is configured, DeepSeek-R1 adjudicates pseudonymized actions without receiving ticker symbols or the analysts' free-text rationales. If that optional judge is unavailable, the stage is omitted rather than taking down the whole run. Claude Opus then performs the final synthesis. The normal path forces a declared tool and reads its structured input; a compatibility fallback can extract JSON if the provider returns visible text instead. Downstream empty-result and action guards still apply. A response truncated by the token limit is rejected outright rather than accepted as a partial answer, so a half-finished list is never mistaken for a conclusion.
 
 **Context before synthesis, execution detail after.** News, catalyst, chart, and options context can be gathered before or during synthesis when it can affect the judgment. After structured proposals come back, deterministic code adds routing, size, and limit-price context before the policy gate.
 
 ### 2. What runs when
 
-The included automation (`launchagents/`) runs these on weekdays. Times are Asia/Tokyo.
+The repository ships **example** macOS LaunchAgent definitions in `launchagents/`; they are not installed automatically. After replacing every `/path/to/ALMANAC` placeholder and loading only the jobs you want, they run the following weekday cadence. Times are Asia/Tokyo.
 
 | Time | Job |
 |---|---|
@@ -98,7 +100,7 @@ The daily loop above is mostly about **what to do with positions you already hol
 The time-of-day split is deliberate:
 
 - **06:00–06:05 on weekdays** — `--us-only --morning`. US names only, using prices from the close that just happened overnight, so candidates exist before Tokyo opens.
-- **15:30 on weekdays** — `--jp-only`, right after the Tokyo close.
+- **15:30 on weekdays** — `--jp-only`, at the Tokyo close.
 - **18:00–19:15 on weekdays** — the unrestricted runs: momentum → measurement → news → pairs/shorts → social → margin, staggered 10–15 minutes apart so they don't hammer the market-data APIs simultaneously.
 - **07:00 on Sunday and Thursday** — the long-term screener, twice a week.
 
@@ -124,9 +126,9 @@ The universe is yours to define: it is read from `long_term_universe` in `ticker
 | Analyst ratings | 15 |
 | Technicals | 10 |
 | Preferred-sector bonus | 10 |
-| Insider buying / buybacks | 5 |
+| Insider ownership / capital-return capacity | 10 |
 
-Thesis generation goes through the Batch API — submit now, collect later, at half price. That asynchrony is why **submission (Sunday and Thursday) and collection (Monday and Friday at 08:30) are separate jobs**. It is not urgent work, so it takes the slower, cheaper path.
+Thesis generation goes through Anthropic's Batch API — submit now, collect later, with the provider's current [50% batch discount](https://docs.anthropic.com/en/docs/about-claude/pricing#batch-processing) on input and output tokens. That asynchrony is why **submission (Sunday and Thursday) and collection (Monday and Friday at 08:30) are separate jobs**. It is not urgent work, so it takes the slower, cheaper path.
 
 These cadences are collected in [`examples/crontab.example`](examples/crontab.example).
 
@@ -138,11 +140,13 @@ Corporate filings — earnings releases, timely disclosures, large-shareholding 
 |---|---|---|
 | Ingest | `ingest_disclosures.py` | Pull the day's items from EDINET and TDnet |
 | Extract | `disclosure_feature_extractor.py` | Derive evidence-backed numeric features from the text |
-| Promote | `disclosure_feature_promotion.py` | Decide whether a feature is fit to actually use |
+| Review | `disclosure_feature_promotion.py` | Produce promote / maintain / retire verdicts for monthly governance |
 | Enrich | `disclosure_enrich.py` | Attach additional context |
 | Measure | `disclosure_shadow_book.py` | Record what following the signal would have returned, broker costs included |
 
-The important part is that extracted features land as **observe_only** first. They are not fed into trading decisions on arrival. Only features whose usefulness survives comparison against subsequent price action get promoted.
+The important part is that extracted features land as **observe_only** first. The promotion script compares disclosure types with later excess returns, but only produces a governance verdict; it does not silently mutate live configuration or turn the raw row into an order.
+
+There is a narrower, explicitly bounded path for an observe-only source to become a *provisional* action. The final synthesis must emit provenance, a reason, and the provisional marker; deterministic post-processing then applies a confidence floor and size cap before the normal policy gate. A raw `observe_only=true` action is rejected. Measurement, governance promotion, and capped provisional review are therefore separate concepts.
 
 The extraction prompt carries a version number, so rewriting the prompt does not silently mix features produced by two different versions.
 
@@ -160,7 +164,7 @@ Primary role-based model choice is centralized in `model_router.py`. `ALMANAC_BU
 | Red Team | Claude Haiku / DeepSeek / Groq / Gemini / Qwen | Book-aware Anthropic leg plus public/anonymized cross-vendor criticism |
 | Chat / delta monitor | Claude Haiku | High frequency, low stakes |
 
-The economic shape is a funnel: cheap models see everything, expensive models see only what survived. Every call is logged with its token usage and estimated cost to a shared ledger, so the spend is measurable rather than assumed.
+The economic shape is a funnel: cheap models see everything, expensive models see only what survived. The main analysis, screening, disclosure, and monitoring transports write token usage and estimated cost to a shared LLM-call log, so the spend on those instrumented paths is measurable rather than assumed.
 
 ### 6. The gate
 
@@ -169,7 +173,7 @@ This is the part that makes the system something other than "an LLM that suggest
 | Rule | What it does |
 |---|---|
 | `ledger_integrity` | If the event ledger is inconsistent, no executable action passes. Fail-closed. |
-| `var_budget` | Ex-ante 1-day 95% VaR over budget (1.6% by default) → reject **all** new buying |
+| `var_budget` | Ex-ante 1-day 95% VaR at or above the regime budget (1.2% stress / 1.6% normal / 2.0% confirmed bull with VIX < 25) → reject **all** new buying. Environment override remains capped at 2.3% by default. |
 | `dd_stage` | Drawdown ≤ −8% → new buys normally stop; ≤ −5% → urgency downgraded and size halved. A deterministic DCA-ladder exception is separately bounded. |
 | `leverage_block` | Leverage status in warning/deleverage/emergency → no new margin positions |
 | `earnings_blackout` | Within 5 business days of earnings → normally reject buy / add / DCA. An explicit high-confidence event-trade exception is capped downstream. |
@@ -179,7 +183,7 @@ This is the part that makes the system something other than "an LLM that suggest
 
 Two design choices matter more than the individual thresholds:
 
-- **Fail-closed, not fail-open.** A missing or unreadable input is treated as "not permitted," never as "no objection." Several rules distinguish `False` from `None` explicitly for exactly this reason.
+- **Fail closed where safety depends on the answer.** A policy-engine failure or missing safety-critical evidence blocks the affected action instead of becoming "no objection." Less critical freshness gaps may downgrade an action to review. Several rules distinguish `False` from `None` explicitly so "unknown" cannot masquerade as "safe."
 - **Rejections are recorded, not discarded.** Rejected and modified actions are written into the analysis output with their reason, so the gate's behavior is auditable after the fact — you can ask why a trade you expected never appeared.
 
 The default thresholds are intended to implement [`objective.md`](objective.md), the version-controlled definition of what the system is optimizing. When a limit changes, the objective, runtime configuration, code, and regression tests should be kept in sync.
@@ -188,9 +192,9 @@ The default thresholds are intended to implement [`objective.md`](objective.md),
 
 A mechanism for deciding "if X happens, do Y" ahead of time.
 
-`geopolitical_monitor.py` watches for geopolitical events and regime shifts, scores keyword matches, and judges which scenarios are becoming plausible. Each scenario has trigger conditions — how many signals, at what severity — and when they are met the matching playbook is injected as a proposal. Definitions live in `scenario_playbook.json` and can be written per ticker or per event.
+`geopolitical_monitor.py` matches public news against the keywords in `scenario_playbook.json`. `scenario_engine.py` evaluates the scenario definitions — required signals, severity, decision enablement, and phase actions — and writes the resulting state. When a scenario is `active` or `partial` and explicitly enabled for decisions, the analysis pipeline can deterministically inject its eligible phase-one actions as proposals.
 
-The thing to note is that **a playbook proposal does not bypass the gate**. `execution_plan_engine.py` can tell that a proposal originated from a playbook, and sends it through the same review as anything else. Deciding in advance buys speed, not exemption.
+The thing to note is that **a playbook proposal does not bypass the gate**. Injection happens before the policy and post-filter stages, with `source=scenario_playbook` and an attestation record. `execution_plan_engine.py` later recognizes that provenance and accepts a playbook-specific override only when the scenario status, per-entry and per-run caps, and target checks all attest correctly. Deciding in advance buys speed, not exemption.
 
 ### 8. From suggestion to executed trade
 
@@ -205,7 +209,7 @@ Recording a fill is deliberately separated from applying it to the portfolio. An
 
 ### 9. The record, and auditing it
 
-The ledger is SQLite, in three tables.
+The ledger subsystem creates three SQLite tables.
 
 **`ledger_events`** holds what happened. The design point here is that **the time something occurred and the time it was recorded are stored separately**. Enter a trade from three days ago today, and the first is three days ago while the second is today. Collapse them into one column and you can no longer reconstruct when you found out.
 
@@ -219,9 +223,11 @@ Three event types carry most of the traffic:
 
 `cash_flow` is its own type because performance measurement (§10) has to control those out. Mix them into trades and TWR stops meaning anything.
 
+The schema also supports tax, fee, FX-conversion, split/merge, NISA-use, internal-transfer, and reconciliation events. They are omitted from the short table above, not from the ledger.
+
 **`execution_idempotency`** prevents double registration. It keys on an idempotency key plus a hash of the request, so the same operation arriving twice does not become two trades.
 
-**`portfolio_application_journal`** stores the full holdings state after application, so "what did applying this record actually do" can be inspected — or unwound — later.
+**`portfolio_application_journal`** stores the exact holdings and account *after-state*, the application inputs, result, and status before local portfolio files are touched. That makes an interrupted application inspectable and recoverable; it is not a general-purpose undo history for completed trades.
 
 On top of that, `portfolio_integrity.py` periodically checks the record against reality. What it looks for is concrete:
 
@@ -248,7 +254,7 @@ Recommendations are not issued and forgotten — they are marked afterwards and 
 
 One detail matters. **Sells, trims, and shorts are not graded on whether the price fell.** They are graded against SPY. In a bull regime the whole market drifts up, so an absolute test would mark nearly every sell as wrong and distort the win rate structurally. A name that underperforms SPY by at least 0.5% counts as a correct trim.
 
-Screener candidates are tracked the same way. `screener_shadow_book.py` runs on weekdays and records what happened to candidates that were **never actually bought** — a way to measure "what if we had" without placing anything. It exists so screener quality is judged on the record rather than on the hits people remember.
+Screener candidates are tracked the same way. `screener_shadow_book.py` runs on weekdays and records what would have happened to the candidates, without placing an order or writing to the financial event ledger. It measures the candidate stream independently; it does not attempt to prove that a candidate was never bought manually. It exists so screener quality is judged on the record rather than on the hits people remember.
 
 **2. Accumulating beliefs, and discarding stale ones**
 
@@ -276,9 +282,9 @@ The system does **not** simply apply what comes back. Auto-application is constr
 
 In other words, **tuning uses the same structure as trading.** The model proposes; deterministic rules decide what may change, by how much, and how often.
 
-The runtime state has three modes — `off`, `shadow`, and `apply` — and **only `apply` may mutate a parameter**. A `--force` flag exists, but it only de-duplicates context for dry runs; it never crosses that boundary. This guarded orchestrator replaced an earlier design after a July 2026 review found the scheduled job applying recommendations derived from stale logs. The values that review reconciled by hand are still the ones in effect.
+The runtime state has three modes — `off`, `shadow`, and `apply` — and **only `apply` may mutate a parameter**. A `--force` flag exists, but it is valid only with `--dry-run` and merely bypasses same-context de-duplication; it never crosses that boundary. This guarded orchestrator replaced an earlier design after a July 2026 review found the scheduled job applying recommendations derived from stale logs.
 
-It currently runs in `apply` mode, four times per weekday. In practice the constraints bind hard: since it was re-enabled, every run has ended in either "no change warranted" or "context unchanged since last evaluation," and **no parameter has been auto-applied at all**. The mechanism is live; it simply does not often clear its own bar.
+A fresh clone starts **off**: the mutable `tuning_auto_state.json` is local runtime state and is not shipped. In the reference deployment, that state was changed to `apply` and a separate LaunchAgent runs it four times per weekday. As of the 2026-07-24 operational snapshot, runs since re-enablement had ended in either "no change warranted" or "context unchanged," with zero parameters auto-applied. That is a dated deployment observation, not the repository default or a promise about future runs. Inspect your own state with `python auto_tune.py --status` or the `/tuning` page.
 
 That is the intended shape. A tuner that rarely fires is working; one that changes something every run would mean the bar is too low.
 
@@ -288,7 +294,7 @@ Degradation is explicit rather than silent. A timed-out tier marks the run degra
 
 ## The dashboard
 
-Twenty pages, split by purpose.
+The current snapshot exposes 20 routes, split by purpose.
 
 | Page | Purpose |
 |---|---|
@@ -311,31 +317,34 @@ Reading requires no API key. Authentication applies only to writes — recording
 
 ### Tests
 
-**2,704 tests across 202 files** (`pytest tests/ -q --collect-only` counts them).
+At this snapshot, pytest collects **2,706 tests across 202 files** (`pytest tests/ -q --collect-only` is the authoritative count).
 
-The composition matters more than the count: **14 files are named for the invariant they hold down** — safety, gating, policy, guard, integrity, privacy. A sample:
+The composition matters more than the count: **13 files are named for the invariant they hold down** — safety, gating, policy, guard, integrity, privacy. A sample:
 
 | File | What it protects |
 |---|---|
-| `test_llm_call_site_gating.py` | Every site that sends portfolio context outward goes through the gate |
+| `test_llm_call_site_gating.py` | Coarse file-level backstop for new direct LLM clients; it does not prove each individual call is wired correctly |
 | `test_llm_safety.py` | Public/anonymized payload validation |
-| `test_redteam_privacy.py` | The Red Team legs cannot leak portfolio context |
+| `test_redteam_privacy.py` | External Red Team payloads stay public/anonymized, and the book-aware Haiku leg obeys privacy mode |
 | `test_execution_safety.py` | Execution handling |
 | `test_actions_ledger_safety.py` | Ledger writes |
-| `test_cash_route_safety.py` | Cash never lands in the wrong account |
+| `test_cash_route_safety.py` | Cash-route classification and ambiguous-account rejection |
 | `test_order_strategy_safety.py` | Order strategy |
 | `test_portfolio_integrity.py` | Detecting drift between record and reality |
 
-Add a new call site and forget to gate it, and these fail. The point is that the guarantee is enforced rather than remembered.
+The targeted tests pin known paths, and the file-level test catches many common omissions when a new client is added. It is intentionally only a backstop: a gate call elsewhere in the same file can satisfy its heuristic. Review call-site wiring as well, and use key omission or network isolation when an absolute no-egress guarantee is required.
 
 ### Backups
 
-`backup_manager.py` covers the files that cannot be reconstructed if lost: holdings, accounts, NISA, trade history, cash movements, beliefs, tuned parameters.
+`backup_manager.py` covers local state that cannot be reconstructed easily: holdings, accounts, NISA, trade and cash history, beliefs, tuned parameters, observability logs, and the SQLite databases. A snapshot also creates a hash manifest, Git bundles, and a frontend worktree archive; missing optional targets are reported rather than invented.
 
-- `rotate` — prune old generations
-- `offsite` — copy the day's set to an encrypted rclone remote
+- `snapshot` — create today's set under `backups/YYYYMMDD/`
+- `verify` — validate JSON/JSONL and run SQLite integrity checks
+- `restore YYYYMMDD <file>` — stage a file-level recovery; `--yes` performs it after preserving the current file as `.bak`
+- `rotate` — retain daily sets for 7 days, Mondays through 30 days, and first-of-month sets through 365 days
+- `offsite` — copy today's set to the configured rclone remote
 
-A copy on the same disk dies with the disk, which is why off-site is a separate command.
+Off-site copy is opt-in. The default remote name is `crypt-gdrive:almanac_backup`, but encryption is provided by how **you configure rclone**, not enforced by this Python code; `ALMANAC_OFFSITE_REMOTE` may point elsewhere. The watchdog expects off-site backup by default, which can be changed with `ALMANAC_REQUIRE_OFFSITE_BACKUP=0`. A copy on the same disk dies with the disk, which is why off-site is a separate command.
 
 ## Glossary
 
@@ -345,7 +354,7 @@ Terms used above, for readers who don't work in finance or haven't seen the hous
 |---|---|
 | **TWR (time-weighted return)** | Performance with deposits and withdrawals stripped out, so payday inflows don't read as investing skill |
 | **Modified Dietz** | An approximation of TWR: cash flows during the period are weighted by when they landed |
-| **VaR (value at risk)** | An estimate of how much could be lost in one day if things go badly. Here, at 95% confidence |
+| **VaR (value at risk)** | A one-day loss threshold estimated to be exceeded on roughly 5% of modeled days; it is not a maximum-loss guarantee |
 | **CVaR** | The average loss *given* that you have already blown through VaR — the mean of the worst cases |
 | **Drawdown** | How far below its previous peak the portfolio currently sits |
 | **VIX** | The market's expectation of near-term US equity volatility. Higher means a more unstable market |
@@ -367,18 +376,19 @@ Terms used above, for readers who don't work in finance or haven't seen the hous
 
 - **Backend** — Python 3.12 / FastAPI. Portfolio optimization ([PyPortfolioOpt](https://github.com/robertmartin8/PyPortfolioOpt), [riskfolio-lib](https://riskfolio-lib.readthedocs.io/), [skfolio](https://skfolio.org/)), GARCH risk modeling ([arch](https://arch.readthedocs.io/)), FinBERT sentiment (`transformers` / `torch`), Claude (Anthropic) and DeepSeek for LLM-assisted analysis.
 - **Frontend** — Next.js 16 (App Router) / React 19 / TypeScript. A single console covering portfolio, screening, risk, scenarios, strategy, margin, NISA, AI decision support, execution log, and a performance-verification page.
-- **Privacy layer** — ALMANAC runs locally, but some configured AI features do send portfolio context (holdings, quantities, P&L, allocation) to an external LLM. Non-Anthropic calls intended to carry only public or anonymized data (disclosure extraction, debate, external Red Team legs, screening) go through an allowlist gate (`almanac/llm_safety.py`). Book-aware paths include tier/final analysis, chat, decision support, guardrail alerts, and the Anthropic Red Team leg; each is controlled by a call-site privacy gate.
+- **Privacy layer** — ALMANAC runs locally, but some configured AI features do send portfolio context (holdings, quantities, P&L, allocation) to an external LLM. Disclosure extraction, the pseudonymized judge, external Red Team legs, and selected analyzer transports validate their public/anonymized payload through `almanac/llm_safety.py`. Public-only screeners use direct provider adapters and are explicitly allowlisted by the coarse call-site test, so their no-book contract still depends on call-site review. Book-aware paths include tier/final analysis, chat, decision support, guardrail alerts, and the Anthropic Red Team leg; each is controlled by a privacy gate.
 
 ## Configuration
 
-Use `.env.example` as a template. CLI analysis secrets are supplied through the process environment or `~/.almanac_secrets` (via `run_with_secrets.sh`). FastAPI write authentication separately reads `ALMANAC_API_KEY` or `~/.config/almanac/api_key`. A project-local `.env` is **not** loaded. Nothing is required just to read the code, use the read-only API, or inspect the demo dashboard.
+Use `.env.example` as a template. CLI analysis secrets are supplied through the process environment or `~/.almanac_secrets` (via `run_with_secrets.sh`). FastAPI write authentication separately reads `ALMANAC_API_KEY` or `~/.config/almanac/api_key`. The backend and CLI do **not** load a repository-root `.env`; the Next.js frontend uses `frontend/.env.local` in the normal way. Nothing is required just to read the code, use the read-only API, or inspect the demo dashboard.
 
-**Required only for the corresponding AI workflows**
+**Required only for the corresponding external workflows**
 
 | Variable | Purpose |
 |---|---|
 | `ANTHROPIC_API_KEY` | Claude — powers AI decision support, case analysis, and LLM-generated portfolio views |
 | `DEEPSEEK_API_KEY` | DeepSeek — cost-efficient screening and long-term-scan harness |
+| `EDINET_API_KEY` | Live EDINET v2 filing ingestion and document enrichment |
 
 **Optional**
 
@@ -389,8 +399,10 @@ Use `.env.example` as a template. CLI analysis secrets are supplied through the 
 | `GEMINI_API_KEY`, `GOOGLE_AI_API_KEY` | Alternative LLM backend |
 | `GROQ_API_KEY` | Alternative fast-inference LLM backend |
 | `OPENROUTER_API_KEY` | LLM routing/aggregator, alternative backend |
+| `DASHSCOPE_API_KEY` | Direct Qwen adapter; otherwise that adapter can fall back to OpenRouter or Groq |
 | `TELEGRAM_TOKEN`, `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID` | Push notifications for alerts and daily briefings |
 | `ALMANAC_API_KEY`, `NEXT_PUBLIC_ALMANAC_API_KEY` | Auth key for write endpoints (recording trades, editing tuning params) — read-only browsing works without it |
+| `ALMANAC_OFFSITE_REMOTE`, `ALMANAC_REQUIRE_OFFSITE_BACKUP` | rclone backup destination and whether watchdog requires a recent off-site copy |
 | `ALMANAC_ESPP_*` | Employee-stock-plan tracking; disabled (`0`) by default |
 | `ALMANAC_CONTRIBUTION_SCHEDULE_JSON` | Recurring cash-flow definitions; empty by default |
 | `ALMANAC_CLEAN_NAV_SINCE`, `ALMANAC_MIN_CLEAN_DAYS` | Narrows the performance-measurement window, so periods with known-dirty data are excluded from the result |
@@ -408,7 +420,7 @@ Some AI features intentionally send portfolio context (holdings, balances, P&L) 
 | `anthropic_book_aware` | Book-aware calls to Anthropic only. |
 | `multi_provider_book_aware` | Book-aware calls to any configured provider (this codebase's original, pre-gate behavior). |
 
-Public/anonymized calls (screening, disclosure-feature extraction) are unaffected by this setting — they never carry portfolio data in the first place. Every call site with an `assert_book_aware_allowed()` gate is enumerated by a regression test in `tests/test_llm_call_site_gating.py`.
+Public/anonymized calls (screening, disclosure-feature extraction) are unaffected by this setting — their intended payload contains no portfolio data. Some use the validation choke point; explicitly reviewed public-only screeners call provider adapters directly. A regression test scans direct-client files for either a gate marker or a reviewed public allowlist entry, and targeted tests pin important paths, but that scanner is a coarse file-level heuristic rather than proof of every call site's data flow.
 
 > **Implementation boundary:** privacy mode is a tested call-site policy, not a process-wide network sandbox. Known book-aware paths are gated, while public/anonymized calls are still allowed. For defense in depth or an absolute no-egress run, omit external API keys or enforce network isolation.
 
@@ -416,7 +428,7 @@ Public/anonymized calls (screening, disclosure-feature extraction) are unaffecte
 
 This repository intentionally does not track local portfolio state, broker exports, databases, logs, screenshots, local AI-tool sessions, or API keys.
 
-Files such as `holdings.json`, `account.json`, `nisa_portfolio.json`, `trade_history.csv`, and `almanac.db` are ignored by Git and never leave the local machine. Worked examples use a rounded placeholder portfolio size rather than any real figure. `scripts/check_public_safety.py` scans the **current tracked snapshot** for known private identifiers and secret-key patterns; it does not inspect Git history or replace a dedicated secret scanner. Run it before every push.
+Files such as `holdings.json`, `account.json`, `nisa_portfolio.json`, `trade_history.csv`, and `almanac.db` are ignored by Git, so normal commits do not publish them. Git ignore is not a data-loss-prevention boundary: configured book-aware AI calls can transmit selected portfolio context, and a user can still copy or upload an ignored file manually. Worked examples use a rounded placeholder portfolio size rather than any real figure. `scripts/check_public_safety.py` scans the **current tracked snapshot** for known private identifiers and secret-key patterns; it does not inspect Git history or replace a dedicated secret scanner. Run it before every push.
 
 If you're preparing your own public release from a fork of this project, rotate any token that was ever committed or pasted into local tool settings before publishing repository history.
 
@@ -492,7 +504,11 @@ NEXT_PUBLIC_ALMANAC_API_KEY=<contents of ~/.config/almanac/api_key>
 
 This command can make live external API calls and incur provider charges. The default `ALMANAC_PRIVACY_MODE=strict_local` blocks book-aware tier/final analysis and the Anthropic Red Team leg; public/anonymized provider calls may still run. Enable `anthropic_book_aware` or `multi_provider_book_aware` only after reviewing what portfolio context each mode permits to leave the machine.
 
-### 4. Local verification
+### 4. Optional scheduling
+
+Nothing in `launchagents/` or [`examples/crontab.example`](examples/crontab.example) is installed by setup. For macOS automation, first replace every `/path/to/ALMANAC` in the selected plist, inspect its command and log paths, then copy and load only that plist under your own `~/Library/LaunchAgents`. For the screener schedule, set `ALMANAC_DIR` in the crontab example to your checkout before copying selected entries into `crontab -e`. The examples assume Asia/Tokyo local time and that `venv/` plus `~/.almanac_secrets` already exist.
+
+### 5. Local verification
 
 ```bash
 venv/bin/python -m pytest tests/ -q

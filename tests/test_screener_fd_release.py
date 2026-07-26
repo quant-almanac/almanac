@@ -3,6 +3,18 @@ import json
 import pytest
 
 
+def test_screener_runtime_paths_are_checkout_relative():
+    from pathlib import Path
+
+    import screener
+
+    expected_root = Path(screener.__file__).resolve().parent
+    assert Path(screener.TICKERS_FILE).parent == expected_root
+    assert Path(screener.RESULTS_FILE).parent == expected_root
+    assert Path(screener.SIGNAL_HISTORY_FILE).parent == expected_root
+    assert "~/portfolio-bot" not in Path(screener.__file__).read_text(encoding="utf-8")
+
+
 def test_run_full_screen_releases_market_data_handles_before_result_write(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path,

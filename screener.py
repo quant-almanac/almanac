@@ -4,12 +4,14 @@ import os
 import time
 import pandas as pd
 from datetime import datetime, timedelta
+from pathlib import Path
 from almanac.runtime_config import get_env
 from regime_params import get_params, get_regime
 from utils import init_yfinance_timeout
 
 init_yfinance_timeout()
 
+BASE_DIR = Path(__file__).resolve().parent
 SONNET_MODEL_ID = "claude-sonnet-5"
 HAIKU_MODEL_ID = "claude-haiku-4-5-20251001"
 
@@ -704,7 +706,7 @@ def add_ai_signals(candidates: list, market_meta: dict, macro_context: dict | No
     return _haiku_fallback_loop(candidates, market_meta, macro_context)
 
 
-SIGNAL_HISTORY_FILE = os.path.expanduser('~/portfolio-bot/signal_history.json')
+SIGNAL_HISTORY_FILE = str(BASE_DIR / "signal_history.json")
 
 def save_signal_history(candidates: list) -> None:
     from insider_restrictions import filter_signal_records
@@ -784,8 +786,8 @@ TICKER_SECTOR_MAP = {
     'VZ':'通信','T':'通信',
 }
 
-TICKERS_FILE = os.path.expanduser('~/portfolio-bot/tickers.json')
-RESULTS_FILE = os.path.expanduser('~/portfolio-bot/screen_results.json')
+TICKERS_FILE = str(BASE_DIR / "tickers.json")
+RESULTS_FILE = str(BASE_DIR / "screen_results.json")
 
 def load_tickers():
     with open(TICKERS_FILE) as f:
@@ -1212,7 +1214,7 @@ def format_candidate_for_claude(c, market_meta):
 def _get_current_regime() -> str:
     """regime_state.json からレジームを取得する（v5.0形式）"""
     try:
-        path = os.path.expanduser('~/portfolio-bot/regime_state.json')
+        path = BASE_DIR / "regime_state.json"
         with open(path) as f:
             state = json.load(f)
         if 'regime' in state:
@@ -1236,9 +1238,9 @@ def run_full_screen(
     # 出力先選択（朝バッチ・JP-only は別ファイル、フロントから両方マージ表示）
     output_path = RESULTS_FILE
     if morning:
-        output_path = os.path.expanduser('~/portfolio-bot/screen_results_morning.json')
+        output_path = BASE_DIR / "screen_results_morning.json"
     elif jp_only:
-        output_path = os.path.expanduser('~/portfolio-bot/screen_results_jp.json')
+        output_path = BASE_DIR / "screen_results_jp.json"
 
     # レジーム取得（先に行い、スクリーニング閾値に反映）
     regime = _get_current_regime()
@@ -1253,7 +1255,7 @@ def run_full_screen(
     # セクター強度をループ外で一度だけ読み込む
     sector_strength = {}
     try:
-        sp = os.path.expanduser('~/portfolio-bot/sector_strength.json')
+        sp = BASE_DIR / "sector_strength.json"
         with open(sp) as f:
             sector_strength = json.load(f)
     except Exception:
@@ -1365,7 +1367,7 @@ def run_full_screen(
     # マクロコンテキスト取得（任意）
     macro_context = None
     try:
-        macro_path = os.path.expanduser('~/portfolio-bot/macro_state.json')
+        macro_path = BASE_DIR / "macro_state.json"
         if os.path.exists(macro_path):
             with open(macro_path) as f:
                 macro_context = json.load(f)
