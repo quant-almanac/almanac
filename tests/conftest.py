@@ -26,3 +26,47 @@ def _isolate_llm_call_log(tmp_path, monkeypatch):
         if hasattr(module, "_DEFAULT_LOG_PATH"):
             monkeypatch.setattr(module, "_DEFAULT_LOG_PATH", log)
     return log
+
+
+# ---------------------------------------------------------------------------
+# 本番状態ファイルの保護
+#
+# テストは実データを読むことがあるため読み取りは許すが、書き込みは残さない。
+# 実測で account.json (fx 取得時刻) と data/short_universe.json がフルラン時
+# のみ書き換わっていた。個別実行では再現せず、テスト間の相互作用による。
+# 内容は無害だったが、書けてしまう構造自体を塞ぐ。
+# 同種の実例: logs/llm_calls.jsonl は偽の監査行を 678 行蓄積していた。
+# ---------------------------------------------------------------------------
+PROTECTED_STATE = (
+    "account.json", "holdings.json", "nisa_portfolio.json", "tickers.json",
+    "trade_history.csv", "action_state.json", "tunable_params.json",
+    "data/short_universe.json", "beliefs/agent_beliefs.json",
+)
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _protect_production_state():
+    snapshot = {}
+    for rel in PROTECTED_STATE:
+        f = ROOT / rel
+        if f.is_file():
+            try:
+                snapshot[f] = f.read_bytes()
+            except OSError:
+                pass
+    yield
+    restored = []
+    for f, data in snapshot.items():
+        try:
+            if f.read_bytes() != data:
+                f.write_bytes(data)
+                restored.append(str(f.relative_to(ROOT)))
+        except OSError:
+            continue
+    if restored:
+        import warnings
+        warnings.warn(
+            "テストが本番状態ファイルを書き換えたため復元しました: "
+            + ", ".join(sorted(restored)),
+            stacklevel=1,
+        )
