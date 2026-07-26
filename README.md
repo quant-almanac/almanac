@@ -10,7 +10,9 @@ This repository is a **public, sanitized snapshot** of that system. Runtime data
 
 > **Project status:** this is an opinionated reference implementation and an evolving personal system, not a turnkey portfolio product or a stable public API. Start with the demo state, inspect the rules, and expect file schemas and operating procedures to change.
 
-> **Portability boundary:** the Getting Started path and documented screener schedule resolve state relative to the checkout. Some older, non-core utilities — legacy Telegram/reporting scripts, static-dashboard generation, and backtest helpers — still contain the reference deployment name `~/portfolio-bot`. Inspect an unlisted top-level script before using it from a differently named checkout.
+> **Will it run anywhere?** The paths this document covers — Getting Started, and the documented schedule — resolve state relative to your checkout.
+>
+> There is an exception. Some older, non-core utilities — legacy Telegram and reporting scripts, static-dashboard generation, backtest helpers — still have the reference deployment path `~/portfolio-bot` written into them. Inspect any top-level script this document does not mention before running it from a differently named checkout.
 
 ## What it does
 
@@ -59,7 +61,11 @@ Each stage exists for a reason:
 
 **Adversarial review.** The tier outputs go to a Red Team of *different* model families whose job is to attack the reasoning. A Claude Haiku leg can use book-aware context; the external legs use only public or anonymized material and may run through DeepSeek, Groq, Gemini, and Qwen when their keys are configured. Using different vendors is deliberate — models from the same family tend to share blind spots. A disagreement score between agents is computed and carried forward, so downstream stages can see where the analysts diverged instead of only seeing a merged consensus.
 
-**Optional judge, then synthesis.** When `DEEPSEEK_API_KEY` is configured, DeepSeek-R1 adjudicates pseudonymized actions without receiving ticker symbols or the analysts' free-text rationales. If that optional judge is unavailable, the stage is omitted rather than taking down the whole run. Claude Opus then performs the final synthesis. The normal path forces a declared tool and reads its structured input; a compatibility fallback can extract JSON if the provider returns visible text instead. Downstream empty-result and action guards still apply. A response truncated by the token limit is rejected outright rather than accepted as a partial answer, so a half-finished list is never mistaken for a conclusion.
+**Optional judge, then synthesis.** When `DEEPSEEK_API_KEY` is configured, DeepSeek-R1 adjudicates pseudonymized actions without receiving ticker symbols or the analysts' free-text rationales. If that optional judge is unavailable, the stage is omitted rather than taking down the whole run. Claude Opus then performs the final synthesis.
+
+The normal path forces the model to answer through a declared tool, so what comes back is structured data rather than prose that has to be interpreted. Occasionally a provider returns visible text instead; a fallback extracts the JSON from it. Either way, downstream guards then check that the result is not empty and that the action fields are present.
+
+On top of that, **a response truncated by the token limit is rejected outright** rather than accepted as a partial answer, so a half-finished list is never mistaken for a conclusion.
 
 **Context before synthesis, execution detail after.** News, catalyst, chart, and options context can be gathered before or during synthesis when it can affect the judgment. After structured proposals come back, deterministic code adds routing, size, and limit-price context before the policy gate.
 
@@ -144,7 +150,9 @@ Corporate filings — earnings releases, timely disclosures, large-shareholding 
 | Enrich | `disclosure_enrich.py` | Attach additional context |
 | Measure | `disclosure_shadow_book.py` | Record what following the signal would have returned, broker costs included |
 
-The important part is that extracted features land as **observe_only** first. The promotion script compares disclosure types with later excess returns, but only produces a governance verdict; it does not silently mutate live configuration or turn the raw row into an order.
+The important part is that extracted features land as **observe_only** first.
+
+The promotion script compares disclosure types against later excess returns — but **it only produces a verdict to review.** It does not mutate live configuration, and it does not turn a raw feature row into an order candidate. Whether a feature is adopted is decided by a human at monthly governance.
 
 There is a narrower, explicitly bounded path for an observe-only source to become a *provisional* action. The final synthesis must emit provenance, a reason, and the provisional marker; deterministic post-processing then applies a confidence floor and size cap before the normal policy gate. A raw `observe_only=true` action is rejected. Measurement, governance promotion, and capped provisional review are therefore separate concepts.
 
@@ -164,7 +172,9 @@ Primary role-based model choice is centralized in `model_router.py`. `ALMANAC_BU
 | Red Team | Claude Haiku / DeepSeek / Groq / Gemini / Qwen | Book-aware Anthropic leg plus public/anonymized cross-vendor criticism |
 | Chat / delta monitor | Claude Haiku | High frequency, low stakes |
 
-The economic shape is a funnel: cheap models see everything, expensive models see only what survived. The main analysis, screening, disclosure, and monitoring transports write token usage and estimated cost to a shared LLM-call log, so the spend on those instrumented paths is measurable rather than assumed.
+The economic shape is a funnel: cheap models see everything, expensive models see only what survived.
+
+Spend is measurable rather than assumed, because the main analysis, screening, disclosure, and monitoring transports all write token usage and estimated cost to a shared LLM-call log. The caveat is that this covers the instrumented paths, not every call in the tree.
 
 ### 6. The gate
 
@@ -173,7 +183,7 @@ This is the part that makes the system something other than "an LLM that suggest
 | Rule | What it does |
 |---|---|
 | `ledger_integrity` | If the event ledger is inconsistent, no executable action passes. Fail-closed. |
-| `var_budget` | Ex-ante 1-day 95% VaR at or above the regime budget (1.2% stress / 1.6% normal / 2.0% confirmed bull with VIX < 25) → reject **all** new buying. Environment override remains capped at 2.3% by default. |
+| `var_budget` | Ex-ante 1-day 95% VaR at or above budget → reject **all** new buying. The budget moves with the regime (1.2% stress / 1.6% normal / 2.0% confirmed bull with VIX < 25). Raising it by environment variable still cannot pass 2.3%. |
 | `dd_stage` | Drawdown ≤ −8% → new buys normally stop; ≤ −5% → urgency downgraded and size halved. A deterministic DCA-ladder exception is separately bounded. |
 | `leverage_block` | Leverage status in warning/deleverage/emergency → no new margin positions |
 | `earnings_blackout` | Within 5 business days of earnings → normally reject buy / add / DCA. An explicit high-confidence event-trade exception is capped downstream. |
@@ -420,7 +430,11 @@ Some AI features intentionally send portfolio context (holdings, balances, P&L) 
 | `anthropic_book_aware` | Book-aware calls to Anthropic only. |
 | `multi_provider_book_aware` | Book-aware calls to any configured provider (this codebase's original, pre-gate behavior). |
 
-Public/anonymized calls (screening, disclosure-feature extraction) are unaffected by this setting — their intended payload contains no portfolio data. Some use the validation choke point; explicitly reviewed public-only screeners call provider adapters directly. A regression test scans direct-client files for either a gate marker or a reviewed public allowlist entry, and targeted tests pin important paths, but that scanner is a coarse file-level heuristic rather than proof of every call site's data flow.
+Public/anonymized calls (screening, disclosure-feature extraction) are unaffected by this setting — by design their payload contains no portfolio data.
+
+There are two kinds. Some go through the shared validation choke point; explicitly reviewed public-only screeners call provider adapters directly.
+
+A regression test checks this, and **its limits are worth stating.** It scans files holding a direct client for either a gate marker or a reviewed public-allowlist entry, and targeted tests pin the important paths. But it is a coarse file-level heuristic — **not proof of every call site's data flow.**
 
 > **Implementation boundary:** privacy mode is a tested call-site policy, not a process-wide network sandbox. Known book-aware paths are gated, while public/anonymized calls are still allowed. For defense in depth or an absolute no-egress run, omit external API keys or enforce network isolation.
 
@@ -428,7 +442,9 @@ Public/anonymized calls (screening, disclosure-feature extraction) are unaffecte
 
 This repository intentionally does not track local portfolio state, broker exports, databases, logs, screenshots, local AI-tool sessions, or API keys.
 
-Files such as `holdings.json`, `account.json`, `nisa_portfolio.json`, `trade_history.csv`, and `almanac.db` are ignored by Git, so normal commits do not publish them. Git ignore is not a data-loss-prevention boundary: configured book-aware AI calls can transmit selected portfolio context, and a user can still copy or upload an ignored file manually. Worked examples use a rounded placeholder portfolio size rather than any real figure. `scripts/check_public_safety.py` scans the **current tracked snapshot** for known private identifiers and secret-key patterns; it does not inspect Git history or replace a dedicated secret scanner. Run it before every push.
+Files such as `holdings.json`, `account.json`, `nisa_portfolio.json`, `trade_history.csv`, and `almanac.db` are ignored by Git, so normal commits do not publish them.
+
+But **gitignore is not a data-loss-prevention boundary.** Configured book-aware calls do transmit selected portfolio context, and nothing stops a user copying or uploading an ignored file by hand. What it prevents is the accidental commit, and no more. Worked examples use a rounded placeholder portfolio size rather than any real figure. `scripts/check_public_safety.py` scans the **current tracked snapshot** for known private identifiers and secret-key patterns; it does not inspect Git history or replace a dedicated secret scanner. Run it before every push.
 
 If you're preparing your own public release from a fork of this project, rotate any token that was ever committed or pasted into local tool settings before publishing repository history.
 
@@ -506,7 +522,21 @@ This command can make live external API calls and incur provider charges. The de
 
 ### 4. Optional scheduling
 
-Nothing in `launchagents/` or [`examples/crontab.example`](examples/crontab.example) is installed by setup. For macOS automation, first replace every `/path/to/ALMANAC` in the selected plist, inspect its command and log paths, then copy and load only that plist under your own `~/Library/LaunchAgents`. For the screener schedule, set `ALMANAC_DIR` in the crontab example to your checkout before copying selected entries into `crontab -e`. The examples assume Asia/Tokyo local time and that `venv/` plus `~/.almanac_secrets` already exist.
+Nothing in `launchagents/` or [`examples/crontab.example`](examples/crontab.example) **is installed by setup.** Adding them is a deliberate step.
+
+**For the macOS LaunchAgents**
+
+1. Pick the plist you want
+2. Replace every `/path/to/ALMANAC` in it with your own path
+3. Check its command and log paths
+4. Copy just that one into your `~/Library/LaunchAgents` and load it
+
+**For the screener schedule**
+
+1. Set `ALMANAC_DIR` in the crontab example to your checkout
+2. Copy only the entries you want into `crontab -e`
+
+Both assume Asia/Tokyo local time, and that `venv/` and `~/.almanac_secrets` already exist.
 
 ### 5. Local verification
 
