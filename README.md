@@ -61,7 +61,56 @@ Each stage exists for a reason:
 
 **Context before synthesis, execution detail after.** News, catalyst, chart, and options context can be gathered before or during synthesis when it can affect the judgment. After structured proposals come back, deterministic code adds routing, size, and limit-price context before the policy gate.
 
-### 2. Why several models
+### 2. What runs when
+
+The included automation (`launchagents/`) runs these on weekdays. Times are Asia/Tokyo.
+
+| Time | Job |
+|---|---|
+| 06:15 | The AI analysis — the entire daily loop above |
+| 16:30 | Ingest TDnet timely disclosures |
+| 16:45 | Ingest EDINET filings |
+| 17:10 | Update the disclosure-driven shadow book |
+| 23:00 | Record the day's NAV |
+| 23:05 | Recompute the benchmark comparison |
+
+The analysis runs at 06:15 so the day's proposals exist before the Tokyo market opens. Disclosure ingestion clusters at 16:30–17:10 because that is after the Tokyo close, when the day's filings have landed.
+
+Screening and threshold tuning run on their own cadences, described below.
+
+### 3. Finding candidates (screening)
+
+The daily loop above is mostly about **what to do with positions you already hold**. Finding new candidates is a separate mechanism, split in two by time horizon.
+
+**Short-term and swing candidates (`screener.py`)**
+
+Two stages:
+
+1. One DeepSeek call evaluates every candidate, expanding bull, bear, and macro perspectives *within* that single call, and labels each one BUY / WATCH / SKIP.
+2. Only the **top three BUY candidates** get a Claude Sonnet second opinion.
+
+An earlier version ran three Claude Sonnet passes in parallel and merged them with Opus. That cost far more calls than the result justified, so it was replaced. The funnel logic is the same as everywhere else: broad and cheap first, narrow and expensive second.
+
+**Long-term candidates (`long_term_screener.py`)**
+
+About 90 names (US across all sectors, plus Japanese non-tech). Ten metrics are scored out of 160 points.
+
+| Metric | Points |
+|---|---|
+| EPS growth | 25 |
+| ROE | 20 |
+| Revenue growth | 15 |
+| Gross margin | 15 |
+| FCF yield | 15 |
+| PEG ratio | 15 |
+| Analyst ratings | 15 |
+| Technicals | 10 |
+| Preferred-sector bonus | 10 |
+| Insider buying / buybacks | 5 |
+
+This one runs weekly, on Sunday morning. Thesis generation goes through the Batch API: results come back asynchronously, at half price. It is not urgent work, so it takes the slower, cheaper path.
+
+### 4. Why several models
 
 Primary role-based model choice is centralized in `model_router.py`. `ALMANAC_BUDGET_MODE=eco|normal|premium` changes the routed Claude tiers after the role is resolved. It does **not** rewrite fixed low-stakes utility calls, fallback model IDs, or external-provider roles; those exceptions are intentionally visible at their call sites.
 
@@ -77,7 +126,7 @@ Primary role-based model choice is centralized in `model_router.py`. `ALMANAC_BU
 
 The economic shape is a funnel: cheap models see everything, expensive models see only what survived. Every call is logged with its token usage and estimated cost to a shared ledger, so the spend is measurable rather than assumed.
 
-### 3. The gate
+### 5. The gate
 
 This is the part that makes the system something other than "an LLM that suggests trades." Every proposed action passes through an ordered chain of **deterministic rules** — plain Python, no model in the loop. A rule can reject an action or modify it (downgrade urgency, halve the size).
 
@@ -99,7 +148,7 @@ Two design choices matter more than the individual thresholds:
 
 The default thresholds are intended to implement [`objective.md`](objective.md), the version-controlled definition of what the system is optimizing. When a limit changes, the objective, runtime configuration, code, and regression tests should be kept in sync.
 
-### 4. From suggestion to executed trade
+### 6. From suggestion to executed trade
 
 **There is no broker API in this repository.** The loop closes through a human:
 
@@ -110,13 +159,53 @@ proposal → readiness (ready | review | blocked) → human places the order at 
 
 Recording a fill is deliberately separated from applying it to the portfolio. An execution whose account/route cannot be determined unambiguously is stored as a *fact that happened* and held as `portfolio_application_pending` rather than being guessed into the wrong account — because a wrong attribution silently corrupts every downstream tax lot, NISA allowance, and performance figure. Writes are idempotent through a client-generated key, so a double-submitted form cannot become two trades.
 
-### 5. How performance is measured
+### 7. How performance is measured
 
 The system grades itself rather than asserting a result. A daily recorder captures NAV and computes time-weighted return (a Modified Dietz cash-flow-adjusted approximation, not a sub-period-exact TWR) against a 60% global equity / 40% global bond benchmark. The objective is **after-tax, after-fee, JPY-denominated** — Japanese separate taxation and US dividend withholding are modeled, USD positions are converted at the daily close.
 
 A verification page in the dashboard reports what was actually measured, including when the measurement window is too short or too dirty to support a conclusion. Separately, a watchdog checks data freshness, schema drift, ledger integrity, backup status, and disk headroom on a schedule, and pushes only genuinely actionable problems.
 
-### 6. What happens when something breaks
+### 8. Learning from outcomes
+
+Recommendations are not issued and forgotten — they are marked afterwards and fed back. There are three kinds of learning here, and each is allowed a different amount of autonomy.
+
+**1. Grading past recommendations**
+
+`recommendation_verifier.py` scores past recommendations against prices **5, 20, and 60 business days** later, producing a win-rate table by action type × urgency. That table is injected back into the next analysis prompt, so the model sees its own hit rate before deciding.
+
+One detail matters. **Sells, trims, and shorts are not graded on whether the price fell.** They are graded against SPY. In a bull regime the whole market drifts up, so an absolute test would mark nearly every sell as wrong and distort the win rate structurally. A name that underperforms SPY by at least 0.5% counts as a correct trim.
+
+**2. Accumulating beliefs, and discarding stale ones**
+
+Each run updates a set of investment beliefs, each carrying a conviction score.
+
+Accumulating without pruning would let old assumptions sit around forever, so **generic beliefs with conviction ≤ 55 that have not been updated in 30 days are deleted automatically.** There is a mechanism for forgetting, not only for remembering.
+
+Alongside this, the gap between the price at decision time and the actual fill price (implementation shortfall) is recorded — median and spread — once at least 10 samples exist. That separates "the call was right but the execution was poor" from "the call was wrong."
+
+**3. Tuning the thresholds themselves — but not all of them**
+
+`tuning_advisor.py` feeds current market and portfolio state, plus 30 days of rejection statistics, to a model and asks for recommended parameter values with reasoning.
+
+The system does **not** simply apply what comes back. Auto-application is constrained at several levels:
+
+| Constraint | Effect |
+|---|---|
+| Allowlist / denylist | Auto-changeable parameters are enumerated explicitly. **VIX thresholds, minimum order size, the loss-harvest floor, the critical cash ratio, and the execution-gate mode** sit on the denylist and can never be applied automatically |
+| Risk class | Every parameter is classified high / medium / low |
+| Step size | Per-parameter cap on a single move — currency targets, for example, may shift at most 3 points |
+| Batch size | At most one group per risk class per run; changes are not made en masse |
+| Cooldown | One trading day before the next change |
+| Input freshness | No tuning on inputs older than 3h (guard), 4h (VIX), 8h (regime), 12h (macro) |
+| Atomic groups | Parameters that only make sense together — the JPY and USD targets, say — always move together |
+
+In other words, **tuning uses the same structure as trading.** The model proposes; deterministic rules decide what may change, by how much, and how often.
+
+And right now, **auto-application is switched off** (`enabled: false` in `tuning_auto_mode.json`). A review in July 2026 found the scheduled job applying recommendations derived from stale logs. Until the state, history, and log audit is finished and the allowlist policy is revisited, the job still runs but applies nothing. The reason is recorded in the file itself.
+
+Leaving that visible — built, but distrusted and therefore disabled — is itself the policy.
+
+### 9. What happens when something breaks
 
 Degradation is explicit rather than silent. A timed-out tier marks the run degraded and says so in the output; a truncated LLM response is rejected instead of parsed; a stale input downgrades an action instead of being trusted; an unavailable safety module refuses the call rather than proceeding un-audited. The recurring principle is that the system would rather produce *no* recommendation than a confident wrong one.
 
