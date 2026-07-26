@@ -314,114 +314,119 @@ Degradation is explicit rather than silent. A timed-out tier marks the run degra
 
 ## The quant layer
 
-Everything above is about how AI suggestions are handled. This section is about **where the numbers come from** — the parts with no model in them at all.
+Where the numbers come from. **Each item carries its status**, because having an implementation and having it drive daily decisions are different things.
+
+| Label | Meaning |
+|---|---|
+| **Live** | Wired into the daily decision path |
+| **Optional** | Runs only when explicitly enabled |
+| **Unwired** | Implemented but not used for decisions (CLI/diagnostic) |
+| **Retired** | Not used in normal operation |
 
 ### Choosing weights
 
-Allocation runs through [PyPortfolioOpt](https://github.com/robertmartin8/PyPortfolioOpt), [Riskfolio-Lib](https://riskfolio-lib.readthedocs.io/) and [skfolio](https://skfolio.org/), with three objectives available.
+Allocation runs through [PyPortfolioOpt](https://github.com/robertmartin8/PyPortfolioOpt) and [skfolio](https://skfolio.org/), with three objectives.
 
-| Method | What it optimises |
+| Method | What it does |
 |---|---|
-| `max_sharpe` | Return per unit of risk |
-| `min_cvar` | The average loss in the worst cases |
-| `equal_risk` | Equal risk contribution from each holding |
+| `max_sharpe` | Maximises return per unit of risk |
+| `min_cvar` | Minimises the average loss in the worst cases |
+| `equal_risk` | **Inverse-volatility weighting** — quieter names get more. Not true risk parity, which would equalise each holding's risk contribution |
 
-Black-Litterman then blends your own views into the market's implied returns.
+**Black-Litterman (Optional)** — runs only when explicitly selected.
 
-**There is a design failure here, and its correction.** Originally the Sonnet tier's (action, urgency) output was mapped to expected returns and injected straight into Black-Litterman as views. That is a loop: the same model's subjective confidence, dressed up as a number, handed back to the same model to reconsider. A review called it *confidence laundering*, which is exactly right — it produced quant-looking figures with no independent information in them.
+There is a design failure here, and a correction that is **not finished**. Originally the Sonnet tier's (action, urgency) output was mapped to expected returns and injected straight in as views: the same model's subjective confidence, dressed up as a number and handed back to itself. A review called it *confidence laundering*.
 
-`bl_alpha_sources.py` now supplies three alpha sources that owe nothing to the LLM:
+`bl_alpha_sources.py` implements three alpha sources independent of the LLM — analyst consensus, momentum, factor beta. **They are not on by default.** `BL_USE_INDEPENDENT_ALPHA` defaults to `"0"`, meaning LLM-derived views only (a backward-compatible mode that down-weights them with a large Ω); `"1"` uses independent sources alone, `"mix"` combines them.
 
-- `analyst_consensus_alpha` — external analyst estimates
-- `momentum_alpha` — price momentum
-- `factor_beta_alpha` — factor betas
+So the default path today **is still the structure the review objected to.** The alternative exists; it is not the default.
 
 ### Measuring risk
 
-VaR and CVaR are computed **Cornish-Fisher** rather than plain. Ordinary VaR assumes returns are normal; real markets have fat tails. The Cornish-Fisher expansion corrects the quantile using skewness and kurtosis, so the tail is not understated.
+**VaR uses the Cornish-Fisher expansion.** Plain VaR assumes normal returns; real markets have fat tails, so the quantile is corrected using skewness and kurtosis.
+
+**CVaR's primary output is historical Expected Shortfall** — the mean of observed losses beyond the quantile. A Cornish-Fisher-threshold CVaR is also computed but is an auxiliary value (`method: 'historical'`). Fewer than ten tail observations raises `cvar_unstable`.
 
 Volatility is forecast with **GJR-GARCH**, which lets downside moves raise expected volatility more than upside ones.
 
-On top of that, `ginn_model.py` implements **GINN (GARCH-Informed Neural Network, ICAIF 2024)** — the GARCH forecast acts as a physical constraint on an LSTM:
+**GINN (Research)** — `ginn_model.py` implements the GARCH-Informed Neural Network (ICAIF 2024).
 
 ```
-input:  [returns, σ_GARCH, VIX, regime] × 60 days
-model:  2-layer LSTM (hidden=64) + linear head
-loss:   MSE(σ_pred, |ε_t|) + 0.3 · MSE(σ_pred, σ_GARCH)
+model: 2-layer LSTM (hidden=64, dropout=0.1) + linear + Softplus
+loss:  MSE(σ_pred, |ε_t|) + 0.3 · MSE(σ_pred, σ_GARCH)
 ```
 
-The second loss term is the point. An unconstrained network overfits; penalising divergence from the GARCH estimate pulls it back toward the statistical model.
+The second term penalises divergence from the GARCH estimate. **It cannot be claimed to prevent overfitting**: during training VIX and regime are passed as constants (0.2 / 1.0) rather than real series, and the GARCH σ is a single per-ticker forecast broadcast across the window. Recent training runs held out no test set. Without a model, the code falls back to GARCH.
 
-**Risk is computed on current holdings, not on the NAV series.** That series is short, and older accounting bugs contaminated part of it. `portfolio_risk_returns.py` instead reconstructs daily returns by applying **today's weights to historical market prices**:
+**Risk is computed on current holdings, not the NAV series.** That series is short and older accounting bugs contaminated part of it, so `portfolio_risk_returns.py` reconstructs daily returns by applying today's weights to historical prices.
 
-```
-portfolio_return_t = Σ wᵢ · rᵢ,t        wᵢ = current JPY market-value weight
-```
+**The VaR model is validated.** `risk_model_validation.py` stores each day's forecast and runs a **Kupiec proportion-of-failures test** — do breaches of the 95% VaR occur about 5% of the time? It covers the Cornish-Fisher VaR built from clean daily P&L, not the risk stack as a whole.
 
-That yields several hundred sessions of returns untouched by the accounting history.
+### Sizing (Unwired)
 
-**The risk model is itself validated.** `risk_model_validation.py` stores each day's VaR forecast and runs a **Kupiec proportion-of-failures test** — checking statistically that days breaching the 95% VaR actually occur about 5% of the time. Too many breaches or too few both mean the model does not match reality.
-
-### Sizing
-
-`kelly_sizing.py` proposes position sizes at **half-Kelly**:
+`kelly_sizing.py` proposes sizes at **half-Kelly**:
 
 ```
-kelly = 0.5 × (p·b − q) / b
-  p = win rate, q = 1−p, b = average win ÷ average loss
+kelly = 0.5 × (p·b − q) / b     p = win rate, b = average win ÷ average loss
 ```
 
-Win rate and payoff ratio come per-ticker from the graded record of past recommendations (§11). Full Kelly is the theoretical growth-optimal bet but swings too hard in practice, so it is halved.
+p and b come per-ticker from the graded record of past recommendations (§11), requiring at least five observations. **Its only callers are the CLI and tests** — it does not size real orders.
 
 ### Adding on the way down
 
-`drawdown_dca_engine.py` exists for a specific problem: buy only after the bottom is confirmed and the rebound has already happened. Three tranches fire on different conditions.
+`drawdown_dca_engine.py` addresses a specific failure: wait for the bottom to be confirmed and the rebound has already passed you. Three tranches fire on **separate** conditions.
 
-| | Driven by |
+| | Trigger |
 |---|---|
-| T1 | Decay from the VIX peak |
-| T2 | Fear & Greed plus high-yield spreads (≥ 500bps) |
-| T3 | A combination of the above |
+| T1 | Decay from the VIX peak (VIX-led; no Fear & Greed condition) |
+| T2 | DD ≤ −12% and VIX ≥ 25 and Fear & Greed ≤ 25 and HY spread ≥ 500bps |
+| T3 | DD ≤ −18% and VIX ≥ 40 and (Put/Call > 1.2 **or** VIX > 40) and an RSI reversal |
 
-Each is an AND of several signals, because any single indicator can be faked out.
+T3 is not a combination of T1 and T2; it is a distinct capitulation-reversal condition.
 
-### Currency
+All tranches additionally pass sector-breadth, volume, a five-day cooldown, an annual budget cap (15% of net worth) and per-currency cash checks.
 
-`fx_hedge_manager.py` derives a target hedge ratio from regime × VIX × USDJPY momentum × implied volatility. It deliberately avoids a fixed ratio, moving within **0–70%**, and clamps daily change to **±10%** so it cannot whipsaw.
+### Currency (Unwired)
 
-Three instruments: JPY-hedged ETFs (1655.T / 2040.T), futures, or simply holding more JPY.
+`fx_hedge_manager.py` computes a target hedge ratio between **0 and 70%** from regime, VIX, implied volatility and the USDJPY level, clamping change from the previous target to **±10 points** to prevent whipsaw.
+
+**It is not wired into the decision pipeline** — it is a standalone CLI. USDJPY momentum is passed in but does not materially affect the computed ratio.
+
+Specific instrument codes are omitted here because the classification in the code itself is wrong.
 
 ### Tax
 
-`tax_lot.py` rebuilds a **per-ticker lot timeline** — which shares were bought when and at what price — FIFO from the event ledger's trade history.
+`tax_lot.py` reconstructs a per-ticker acquisition-lot history from the event ledger's trade record, **FIFO**. Its purpose is internal audit and surfacing candidate gains and losses.
 
-The reason it exists: the holdings file carries only a weighted-average cost, which makes it impossible to sell one specific losing lot to realise a loss, or to pick lots that avoid consuming NISA allowance. Tracking lots individually makes those choices possible.
+**The authoritative cost basis is the broker's and the tax authority's calculation** — for partial sales of the same security, Japan uses a weighted-average-based method. The internal lot view is not treated as establishing cost basis for tax.
 
-`tax_optimizer.py` handles loss-harvest candidates, NISA headroom, and foreign tax credit simulation.
+`tax_harvest_scanner.py` runs on a schedule and surfaces loss-harvest candidates for a human to act on. `tax_optimizer.py` covers NISA headroom and foreign tax credit simulation.
 
 ### Attributing performance
 
-`factor_attribution.py` regresses monthly portfolio returns by **OLS** onto Fama-French-style factors built from ETF proxies, producing α, β and R²:
+`factor_attribution.py` regresses by **OLS** to produce α, β and R². The ETF-proxy factors are **eight**, not three: MKT/SMB/HML plus MOM, QMJ, LVOL, BAB and FX.
 
 ```
-MKT = SPY               (the market)
-SMB = IWM − SPY         (small minus large)
-HML = IVE − IVW         (value minus growth)
+MKT = SPY          SMB = IWM − SPY       HML = IVE − IVW
+MOM = MTUM − SPY   QMJ = QUAL − SPY      LVOL = SPLV − SPY   …
 ```
 
-The question it answers is whether returns came from skill (α) or from simply riding the market and a style tilt (β). The proxies are all buyable from Japan.
+**The dependent variable is not realised return.** It is a synthetic series: current weights held fixed backwards, funds and cash excluded and the remainder renormalised, USDJPY pinned to a constant. So α here cannot be read as skill. It is the regression residual of a proxy portfolio built from part of the current book.
 
-### Regimes and their parameters
+### Regimes
 
-Market state is classified with a hidden Markov model, and each regime carries its own parameters, generated by the **walk-forward optimisation** in `backtest_wfo.py` — repeatedly fitting on one window and validating on the next.
+**The operating regime is a deterministic classification** — 50-day moving averages on SPY and the Nikkei, VIX, and a macro score (`alert.py`). An HMM exists as a separate risk signal but is not the authority for the operating regime.
 
-**The limits are worth stating.** The bull regime uses whole-period parameters rather than regime-specific ones, to avoid overfitting on a small sample, and **the bear regime borrows the neutral regime's values outright** because there were not enough observations. It is not fully optimised per regime.
+The parameters in `regime_params.py` started from an older walk-forward optimisation and have since been **updated by hand**. The generator, `backtest_wfo.py`, is now **retired** — it exits unless explicitly enabled.
 
 ### Also present
 
-- `technical_signals.py` — RSI, MACD, Bollinger Bands and volume across holdings and market ETFs
-- `rebalance_engine.py` — detects currency and sector drift, emits prioritised orders
-- `pair_screener.py` — long-short pair candidates
+- `technical_signals.py` — RSI, MACD, Bollinger Bands, volume
+- `rebalance_engine.py` — currency and sector drift detection with prioritised orders
+- `currency_policy.py` — validates AI currency targets on confidence, expiry and a ±10-point change limit before they reach the rebalance target
+- `sector_rotation.py` — narrows screening candidates to the leading sectors
+- `insider_restrictions.py` — compliance exclusions wired across the screeners
+- `short_universe.py` — fail-closed checks on borrow availability, regulation, freshness and liquidity (human-only)
 
 ## The dashboard
 
