@@ -111,7 +111,7 @@ An earlier version ran three Claude Sonnet passes in parallel and merged them wi
 
 **Inside the long-term screener**
 
-About 90 names (US across all sectors, plus Japanese non-tech). Ten metrics are scored out of 160 points.
+The universe is yours to define: it is read from `long_term_universe` in `tickers.json`, which is gitignored and ships as an empty template in `examples/private_state/`. The reference deployment runs about 120 names — US across all sectors, plus Japanese non-tech. Ten metrics are scored out of 160 points.
 
 | Metric | Points |
 |---|---|
@@ -153,7 +153,7 @@ This is the part that makes the system something other than "an LLM that suggest
 | Rule | What it does |
 |---|---|
 | `ledger_integrity` | If the event ledger is inconsistent, no executable action passes. Fail-closed. |
-| `var_budget` | Ex-ante 1-day 95% VaR over budget → reject **all** new buying |
+| `var_budget` | Ex-ante 1-day 95% VaR over budget (1.6% by default) → reject **all** new buying |
 | `dd_stage` | Drawdown ≤ −8% → new buys normally stop; ≤ −5% → urgency downgraded and size halved. A deterministic DCA-ladder exception is separately bounded. |
 | `leverage_block` | Leverage status in warning/deleverage/emergency → no new margin positions |
 | `earnings_blackout` | Within 5 business days of earnings → normally reject buy / add / DCA. An explicit high-confidence event-trade exception is capped downstream. |
