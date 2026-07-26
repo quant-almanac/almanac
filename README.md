@@ -29,6 +29,20 @@ The objective function is explicit and version-controlled ([`objective.md`](obje
 | **Tax & accounts** | FIFO/LIFO/loss-harvest/gain-minimize tax-lot strategies, NISA allocation tracking, employee-stock-plan concentration management |
 | **Observability** | NAV/TWR performance tracking against benchmark (a Modified Dietz cash-flow-adjusted approximation, not a daily sub-period-exact TWR), with a verification page that reports actual measured performance rather than a fixed claim |
 
+## What this assumes
+
+Things worth knowing before you decide to adopt it.
+
+**It is built for a Japanese retail investor.** The objective is denominated in JPY, the tax model is Japan's 20.315% separate taxation plus 10% US dividend withholding, the tax-exempt allowance is NISA, and the disclosure sources are EDINET and TDnet. These are not switchable settings; they are baked into the design. Using this from another country means rebuilding the tax, allowance, and domestic-disclosure layers.
+
+**It needs a machine that stays running.** The automation is the point, and none of it fires if the machine is asleep at the scheduled time. What a missed run costs is covered in [Keeping it running](#5-keeping-it-running).
+
+**It costs money to operate.** LLM usage. Over 45 days of logs from the reference deployment, the **median was $0.91/day, or roughly $27/month**. The mean is $1.50, pulled up by days with development work on them (the heaviest was $13.63). Your figure moves with `ALMANAC_BUDGET_MODE` and which features you enable.
+
+**Price data depends on yfinance.** 61 modules import it, which makes it the de-facto foundation. It is an unofficial Yahoo Finance library and breaks when the upstream changes; when it does, screening and outcome verification stop. `FINNHUB_API_KEY` supplies supplementary data, not a full substitute.
+
+**Manual work remains.** A human places every order and a human records every fill. What is automated ends at deciding what should be done.
+
 ## How it works
 
 The heart of the system is a daily pipeline that turns market data into a small number of concrete, human-executable proposals — and a deterministic gate that can reject or modify them before they reach the user.
