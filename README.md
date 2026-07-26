@@ -456,6 +456,7 @@ If you're preparing your own public release from a fork of this project, rotate 
 - Node.js 20 and npm for the dashboard
 - macOS only if you want to reuse the included LaunchAgent automation; manual backend and frontend development also work without it
 - API keys only for the external data or AI features you choose to enable
+- A machine that is awake at the scheduled times, if you use the automation (see "Keeping it running" below)
 
 The supported Python install includes `torch`, `transformers`, portfolio optimizers, and risk libraries, so the first dependency install is substantial.
 
@@ -538,7 +539,43 @@ Nothing in `launchagents/` or [`examples/crontab.example`](examples/crontab.exam
 
 Both assume Asia/Tokyo local time, and that `venv/` and `~/.almanac_secrets` already exist.
 
-### 5. Local verification
+### 5. Keeping it running
+
+This system **assumes it runs on a schedule.** The daily analysis fires at 06:15 on weekdays, NAV is recorded at 23:00, the screeners run in the evening, the watchdog every 30 minutes. None of it happens unless the machine is awake at that moment.
+
+That makes it a poor fit for a laptop you close and carry around. It assumes a machine that **stays on** — a desktop, or one configured not to sleep.
+
+What a missed run costs you depends on what was missed.
+
+**What heals itself**
+
+Benchmark history can be rebuilt with `benchmark_tracker.py rebuild`. It is derived from public market data, so running it later produces the same answer.
+
+**What does not**
+
+Your own NAV is different. **Nobody else has a record of what you held that day.** If the machine is not running at 23:00, that day's measured value is simply gone.
+
+`nav_backfill.py` can reconstruct it afterwards. It anchors on your current holdings and rewinds trade and cash-flow events from the ledger, so it is a derivation rather than interpolation. But the result is marked `estimated=1`, because mutual funds stay pinned at their anchor valuation and gaps in price data are approximated.
+
+That mark carries weight. The lookup for the previous NAV **excludes estimated rows**, because daily P&L feeds the drawdown and VaR gates and an estimate should not be treated as a measurement.
+
+So skipping a day means the next day's "daily" P&L is computed against the day *before* that one, and the −4% / −8% thresholds shift accordingly. **A backfill restores the chart; it does not restore the measured chain the guardrails read.**
+
+**Recovering from a missed run**
+
+```bash
+# Run the analysis now
+./run_with_secrets.sh venv/bin/python portfolio_analyst.py --force
+
+# Rebuild the benchmark
+venv/bin/python benchmark_tracker.py rebuild
+
+# Inspect NAV gaps (dry-run by default; --apply writes)
+venv/bin/python nav_backfill.py --days 30
+venv/bin/python nav_backfill.py --days 30 --apply
+```
+
+### 6. Local verification
 
 ```bash
 venv/bin/python -m pytest tests/ -q
