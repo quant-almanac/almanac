@@ -1,0 +1,52 @@
+# ALMANAC — screener schedule (example crontab)
+#
+# The repository ships the screeners but not a schedule, so this file records
+# the cadence the system is actually operated on. Copy it, replace ALMANAC_DIR
+# with your checkout path, and install with `crontab -e`.
+#
+# The daily AI analysis, disclosure ingestion, NAV recording and benchmark
+# rebuild are NOT here — those run from launchagents/ (macOS). This file covers
+# the screeners only.
+#
+# Times are local (the reference deployment runs Asia/Tokyo). Weekday numbering
+# is cron's: 0 = Sunday, 1-5 = Mon-Fri.
+#
+# All entries go through run_with_secrets.sh so API keys come from
+# ~/.almanac_secrets rather than the cron environment, which is nearly empty.
+
+# ---------------------------------------------------------------------------
+# Morning — US only, before the Tokyo open.
+# The US close has just happened overnight, so these run on fresh US prices and
+# have candidates ready before the trading day starts here.
+# ---------------------------------------------------------------------------
+0  6 * * 1-5 cd $ALMANAC_DIR && ./run_with_secrets.sh venv/bin/python screener.py --us-only --morning            >> logs/screener.log 2>&1
+2  6 * * 1-5 cd $ALMANAC_DIR && ./run_with_secrets.sh venv/bin/python short_screener.py --us-only --morning      >> logs/screener.log 2>&1
+5  6 * * 1-5 cd $ALMANAC_DIR && ./run_with_secrets.sh venv/bin/python margin_long_screener.py --us-only --morning >> logs/screener.log 2>&1
+
+# ---------------------------------------------------------------------------
+# Afternoon — Japan only, right after the Tokyo close (15:00).
+# ---------------------------------------------------------------------------
+30 15 * * 1-5 cd $ALMANAC_DIR && ./run_with_secrets.sh venv/bin/python screener.py --jp-only                     >> logs/screener.log 2>&1
+
+# ---------------------------------------------------------------------------
+# Evening — the unrestricted runs.
+# Staggered 10-15 minutes apart on purpose: run together they would hit the
+# market-data APIs simultaneously and start tripping rate limits.
+# ---------------------------------------------------------------------------
+0  18 * * 1-5 cd $ALMANAC_DIR && ./run_with_secrets.sh venv/bin/python screener.py                               >> logs/screener.log 2>&1
+10 18 * * 1-5 cd $ALMANAC_DIR && ./run_with_secrets.sh venv/bin/python screener_shadow_book.py daily             >> logs/screener_shadow.log 2>&1
+15 18 * * 1-5 cd $ALMANAC_DIR && ./run_with_secrets.sh venv/bin/python news_screener.py                          >> logs/news_screener.log 2>&1
+30 18 * * 1-5 cd $ALMANAC_DIR && ./run_with_secrets.sh venv/bin/python short_screener.py                         >> logs/screener.log 2>&1
+30 18 * * 1-5 cd $ALMANAC_DIR && ./run_with_secrets.sh venv/bin/python pair_screener.py                          >> logs/pair.log 2>&1
+45 18 * * 1-5 cd $ALMANAC_DIR && ./run_with_secrets.sh venv/bin/python social_screener.py                        >> logs/social_screener.log 2>&1
+15 19 * * 1-5 cd $ALMANAC_DIR && ./run_with_secrets.sh venv/bin/python margin_long_screener.py                   >> logs/screener.log 2>&1
+
+# ---------------------------------------------------------------------------
+# Long-term screener — twice weekly (Sunday and Thursday).
+# Thesis generation is submitted to the Batch API here and collected by the
+# separate batch-poll job below; that is why submission and collection are on
+# different days. Batch results come back asynchronously at half price.
+# ---------------------------------------------------------------------------
+0  7 * * 0,4 cd $ALMANAC_DIR && ./run_with_secrets.sh venv/bin/python long_term_screener.py                      >> logs/screener.log 2>&1
+30 8 * * 1   cd $ALMANAC_DIR && ./run_with_secrets.sh venv/bin/python long_term_screener.py batch-poll           >> logs/screener.log 2>&1
+30 8 * * 5   cd $ALMANAC_DIR && ./run_with_secrets.sh venv/bin/python long_term_screener.py batch-poll           >> logs/screener.log 2>&1

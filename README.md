@@ -80,18 +80,36 @@ Screening and threshold tuning run on their own cadences, described below.
 
 ### 3. Finding candidates (screening)
 
-The daily loop above is mostly about **what to do with positions you already hold**. Finding new candidates is a separate mechanism, split in two by time horizon.
+The daily loop above is mostly about **what to do with positions you already hold**. Finding new candidates is an entirely separate mechanism, with a dedicated screener per thing being hunted.
 
-**Short-term and swing candidates (`screener.py`)**
+| Script | What it looks for |
+|---|---|
+| `screener.py` | Momentum |
+| `short_screener.py` | Short candidates, with conditions that vary by market regime |
+| `margin_long_screener.py` | Margin-buy candidates |
+| `long_term_screener.py` | Long-term fundamentals |
+| `news_screener.py` | News sentiment |
+| `social_screener.py` | Social chatter plus options-market anomalies |
+| `pair_screener.py` | Long-short pair-trading signals |
+| `screener_shadow_book.py` | **Measures what actually happened** to the candidates the others produced — it places nothing (see §8) |
 
-Two stages:
+**When they run**
+
+The time-of-day split is deliberate:
+
+- **06:00–06:05 on weekdays** — `--us-only --morning`. US names only, using prices from the close that just happened overnight, so candidates exist before Tokyo opens.
+- **15:30 on weekdays** — `--jp-only`, right after the Tokyo close.
+- **18:00–19:15 on weekdays** — the unrestricted runs: momentum → measurement → news → pairs/shorts → social → margin, staggered 10–15 minutes apart so they don't hammer the market-data APIs simultaneously.
+- **07:00 on Sunday and Thursday** — the long-term screener, twice a week.
+
+**Inside the momentum path: two stages**
 
 1. One DeepSeek call evaluates every candidate, expanding bull, bear, and macro perspectives *within* that single call, and labels each one BUY / WATCH / SKIP.
 2. Only the **top three BUY candidates** get a Claude Sonnet second opinion.
 
 An earlier version ran three Claude Sonnet passes in parallel and merged them with Opus. That cost far more calls than the result justified, so it was replaced. The funnel logic is the same as everywhere else: broad and cheap first, narrow and expensive second.
 
-**Long-term candidates (`long_term_screener.py`)**
+**Inside the long-term screener**
 
 About 90 names (US across all sectors, plus Japanese non-tech). Ten metrics are scored out of 160 points.
 
@@ -108,7 +126,9 @@ About 90 names (US across all sectors, plus Japanese non-tech). Ten metrics are 
 | Preferred-sector bonus | 10 |
 | Insider buying / buybacks | 5 |
 
-This one runs weekly, on Sunday morning. Thesis generation goes through the Batch API: results come back asynchronously, at half price. It is not urgent work, so it takes the slower, cheaper path.
+Thesis generation goes through the Batch API — submit now, collect later, at half price. That asynchrony is why **submission (Sunday and Thursday) and collection (Monday and Friday at 08:30) are separate jobs**. It is not urgent work, so it takes the slower, cheaper path.
+
+These cadences are collected in [`examples/crontab.example`](examples/crontab.example).
 
 ### 4. Why several models
 
@@ -174,6 +194,8 @@ Recommendations are not issued and forgotten — they are marked afterwards and 
 `recommendation_verifier.py` scores past recommendations against prices **5, 20, and 60 business days** later, producing a win-rate table by action type × urgency. That table is injected back into the next analysis prompt, so the model sees its own hit rate before deciding.
 
 One detail matters. **Sells, trims, and shorts are not graded on whether the price fell.** They are graded against SPY. In a bull regime the whole market drifts up, so an absolute test would mark nearly every sell as wrong and distort the win rate structurally. A name that underperforms SPY by at least 0.5% counts as a correct trim.
+
+Screener candidates are tracked the same way. `screener_shadow_book.py` runs on weekdays and records what happened to candidates that were **never actually bought** — a way to measure "what if we had" without placing anything. It exists so screener quality is judged on the record rather than on the hits people remember.
 
 **2. Accumulating beliefs, and discarding stale ones**
 
