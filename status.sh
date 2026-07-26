@@ -1,7 +1,7 @@
 #!/bin/zsh
 # ALMANAC v5.0 稼働状態確認
 
-cd ~/portfolio-bot
+cd "$(cd "$(dirname "$0")" && pwd)"
 echo "=== ALMANAC v5.0 状態確認 ==="
 echo "$(date)"
 echo ""

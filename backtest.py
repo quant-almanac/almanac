@@ -4,6 +4,11 @@ import json
 import os
 from datetime import datetime, timedelta
 
+# 状態ファイルはこのスクリプトの置き場所を基準に解決する。
+# (以前は ~/portfolio-bot 固定で、別の場所へ clone すると旧パスを読み書きしていた)
+_BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
 # S&P500代表銘柄（各セクターから）
 SP500_TICKERS = [
     # テック
@@ -320,7 +325,7 @@ if __name__ == "__main__":
 
     print_summary(results)
 
-    output_path = os.path.expanduser('~/portfolio-bot/backtest_results.json')
+    output_path = os.path.join(_BASE_DIR, 'backtest_results.json')
     with open(output_path, 'w', encoding='utf-8') as f:
         json.dump(results, f, indent=2, ensure_ascii=False)
     print(f"\n結果保存: {output_path}")

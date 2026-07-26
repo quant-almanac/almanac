@@ -2,7 +2,7 @@
 # ALMANAC v5.0 起動スクリプト（launchd 管理プロセスとの競合回避）
 # alert.py / telegram_bot.py は launchd (KeepAlive) で管理されているため
 # このスクリプトからは起動しない
-cd ~/portfolio-bot
+cd "$(cd "$(dirname "$0")" && pwd)"
 
 echo "=== ALMANAC v5.0 起動 ==="
 echo "$(date)"

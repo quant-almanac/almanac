@@ -5,7 +5,12 @@ import os
 from datetime import datetime, timedelta
 from itertools import product
 
-TICKERS_FILE = os.path.expanduser('~/portfolio-bot/tickers.json')
+# 状態ファイルはこのスクリプトの置き場所を基準に解決する。
+# (以前は ~/portfolio-bot 固定で、別の場所へ clone すると旧パスを読み書きしていた)
+_BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
+TICKERS_FILE = os.path.join(_BASE_DIR, 'tickers.json')
 
 def load_tickers():
     with open(TICKERS_FILE) as f:
@@ -202,7 +207,7 @@ if __name__ == "__main__":
         else:
             print(f"\n【{label}】最適解なし")
 
-    out = os.path.expanduser('~/portfolio-bot/backtest_full_results.json')
+    out = os.path.join(_BASE_DIR, 'backtest_full_results.json')
     with open(out, 'w', encoding='utf-8') as f:
         json.dump(optimal, f, indent=2, ensure_ascii=False, default=str)
     print(f"\n結果保存: {out}")

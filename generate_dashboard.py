@@ -2,9 +2,14 @@ import json, csv, os
 import yfinance as yf
 from datetime import datetime
 
+# 状態ファイルはこのスクリプトの置き場所を基準に解決する。
+# (以前は ~/portfolio-bot 固定で、別の場所へ clone すると旧パスを読み書きしていた)
+_BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
 def generate():
     # 保有銘柄
-    holdings_path = os.path.expanduser('~/portfolio-bot/holdings.json')
+    holdings_path = os.path.join(_BASE_DIR, 'holdings.json')
     holdings = {}
     if os.path.exists(holdings_path):
         with open(holdings_path) as f:
@@ -45,7 +50,7 @@ def generate():
 
     # 売買履歴
     trades = []
-    history_path = os.path.expanduser('~/portfolio-bot/trade_history.csv')
+    history_path = os.path.join(_BASE_DIR, 'trade_history.csv')
     if os.path.exists(history_path):
         with open(history_path, encoding='utf-8') as f:
             trades = list(csv.DictReader(f))
@@ -60,7 +65,7 @@ def generate():
     screen_time = '-'
     screen_meta_text = ''
     screen_strategy_counts = {}
-    screen_path = os.path.expanduser('~/portfolio-bot/screen_results.json')
+    screen_path = os.path.join(_BASE_DIR, 'screen_results.json')
     if os.path.exists(screen_path):
         with open(screen_path) as f:
             sr = json.load(f)
@@ -71,19 +76,19 @@ def generate():
 
     # セクター強度
     sector_strength = {}
-    sector_path = os.path.expanduser('~/portfolio-bot/sector_strength.json')
+    sector_path = os.path.join(_BASE_DIR, 'sector_strength.json')
     if os.path.exists(sector_path):
         with open(sector_path) as f:
             sector_strength = json.load(f)
 
     # バックテスト結果
     backtest_results = {}
-    bt_path = os.path.expanduser('~/portfolio-bot/backtest_full_results.json')
+    bt_path = os.path.join(_BASE_DIR, 'backtest_full_results.json')
     if os.path.exists(bt_path):
         with open(bt_path) as f:
             backtest_results = json.load(f)
     wfo_results = {}
-    wfo_path = os.path.expanduser('~/portfolio-bot/backtest_wfo_results.json')
+    wfo_path = os.path.join(_BASE_DIR, 'backtest_wfo_results.json')
     if os.path.exists(wfo_path):
         with open(wfo_path) as f:
             wfo_results = json.load(f)
@@ -105,7 +110,7 @@ def generate():
         spy_ma50_disp, nk_ma50_disp = '-', '-' 
 
     # 最終分析
-    log_path = os.path.expanduser('~/portfolio-bot/log.txt')
+    log_path = os.path.join(_BASE_DIR, 'log.txt')
     last_run = 'なし'
     if os.path.exists(log_path):
         with open(log_path) as f:
@@ -918,7 +923,7 @@ function showPage(name, el) {{
 </body>
 </html>"""
 
-    output = os.path.expanduser('~/portfolio-bot/dashboard.html')
+    output = os.path.join(_BASE_DIR, 'dashboard.html')
     with open(output, 'w', encoding='utf-8') as f:
         f.write(html)
     print(f'ダッシュボード生成完了: {output}')

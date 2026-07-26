@@ -6,6 +6,11 @@ from collections import defaultdict
 from datetime import datetime, timedelta
 from pathlib import Path
 
+# 状態ファイルはこのスクリプトの置き場所を基準に解決する。
+# (以前は ~/portfolio-bot 固定で、別の場所へ clone すると旧パスを読み書きしていた)
+_BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
 TELEGRAM_TOKEN = os.environ.get('TELEGRAM_TOKEN')
 TELEGRAM_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID')
 
@@ -16,7 +21,7 @@ def send_telegram(msg):
 
 
 def generate_weekly_report():
-    filepath = os.path.expanduser('~/portfolio-bot/trade_history.csv')
+    filepath = os.path.join(_BASE_DIR, 'trade_history.csv')
 
     if not os.path.exists(filepath):
         print("[weekly_report] 売買履歴なし — スキップ")
@@ -72,7 +77,7 @@ def generate_weekly_report():
     beta_alpha_lines = _fmt_beta_adjusted_alpha()
 
     # ── 現在の保有銘柄 ────────────────────────────────────
-    holdings_path = os.path.expanduser('~/portfolio-bot/holdings.json')
+    holdings_path = os.path.join(_BASE_DIR, 'holdings.json')
     holdings = {}
     if os.path.exists(holdings_path):
         with open(holdings_path) as f:
@@ -356,7 +361,7 @@ def _fmt_strategy_stats(stats: dict) -> str:
 def _generate_quantstats_tearsheet():
     """
     trade_history.csv の日次損益から QuantStats HTML レポートを生成。
-    ~/portfolio-bot/reports/tearsheet_YYYYWWW.html に保存。
+    reports/tearsheet_YYYYWWW.html に保存。
     """
     try:
         import quantstats as qs
@@ -365,7 +370,7 @@ def _generate_quantstats_tearsheet():
         print("[QuantStats] quantstats または pandas 未インストール → スキップ")
         return
 
-    filepath = os.path.expanduser("~/portfolio-bot/trade_history.csv")
+    filepath = os.path.join(_BASE_DIR, "trade_history.csv")
     if not os.path.exists(filepath):
         return
 
@@ -385,7 +390,7 @@ def _generate_quantstats_tearsheet():
         daily.index = pd.to_datetime(daily.index)
         daily = daily.asfreq("D", fill_value=0.0)
 
-        reports_dir = Path(os.path.expanduser("~/portfolio-bot/reports"))
+        reports_dir = Path(os.path.join(_BASE_DIR, "reports"))
         reports_dir.mkdir(exist_ok=True)
         week_label  = datetime.now().strftime("%Y-W%V")
         output_path = reports_dir / f"tearsheet_{week_label}.html"

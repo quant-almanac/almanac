@@ -2,6 +2,11 @@ import yfinance as yf
 import json
 import os
 
+# 状態ファイルはこのスクリプトの置き場所を基準に解決する。
+# (以前は ~/portfolio-bot 固定で、別の場所へ clone すると旧パスを読み書きしていた)
+_BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
 # S&P500・ナスダック100の主要銘柄を直接定義
 SP500_MAJOR = [
     "AAPL","MSFT","NVDA","AMZN","META","GOOGL","GOOG","BRK-B","LLY","AVGO",
@@ -50,41 +55,53 @@ NEW_LISTINGS = ["SPCX", "285A.T"]
 
 all_tickers = list(set(SP500_MAJOR + NASDAQ100_EXTRA + NIKKEI225_MAJOR + ETF_LIST + JP_ETF_LIST + NEW_LISTINGS))
 
-TICKERS_PATH = os.path.expanduser('~/portfolio-bot/tickers.json')
-
-# 既存 tickers.json を読み込み、専用 universe を破壊しないようにマージする。
-# この関数が上書きするのは下記の管理キーのみ。long_term_universe /
-# margin_long_universe / short_scan_tickers / russell2000_subset などの
-# 手動・別スクリプト由来キーはそのまま保持する。
-existing = {}
-if os.path.exists(TICKERS_PATH):
-    try:
-        with open(TICKERS_PATH, encoding="utf-8") as f:
-            existing = json.load(f)
-        if not isinstance(existing, dict):
-            existing = {}
-    except Exception:
-        existing = {}
+TICKERS_PATH = os.path.join(_BASE_DIR, 'tickers.json')
 
 MANAGED_KEYS = {"sp500_major", "nasdaq100_extra", "nikkei225_major", "etf_list", "all"}
 
-output = dict(existing)  # 既存キーを保持
-output["sp500_major"]    = SP500_MAJOR
-output["nasdaq100_extra"] = NASDAQ100_EXTRA
-output["nikkei225_major"] = NIKKEI225_MAJOR
-# etf_list は JP ETF を含めて拡張（既存に他キーから追加された ETF があれば保持）
-output["etf_list"] = sorted(set(ETF_LIST) | set(JP_ETF_LIST) | set(existing.get("etf_list", [])))
-# all は全ソース + 既存 all の和集合（他ユニバースの銘柄も維持）
-output["all"] = sorted(set(all_tickers) | set(existing.get("all", [])))
 
-# long_term_universe に 1489.T を確実に含める（既存があれば維持して追加）
-_ltu = set(existing.get("long_term_universe", []))
-_ltu.add("1489.T")
-output["long_term_universe"] = sorted(_ltu)
+def main() -> None:
+    """tickers.json を更新する。
 
-with open(TICKERS_PATH, 'w', encoding="utf-8") as f:
-    json.dump(output, f, ensure_ascii=False, indent=2)
+    import しただけでは何もしない。以前はこの処理がモジュール直下にあり、
+    `import download_tickers` するだけでファイルが書き換わっていた
+    (テストがそれを踏み、書き込み先が別 checkout の状態ファイルだった)。
+    """
+    # 既存 tickers.json を読み込み、専用 universe を破壊しないようにマージする。
+    # 上書きするのは MANAGED_KEYS のみ。long_term_universe /
+    # margin_long_universe / short_scan_tickers / russell2000_subset などの
+    # 手動・別スクリプト由来キーはそのまま保持する。
+    existing = {}
+    if os.path.exists(TICKERS_PATH):
+        try:
+            with open(TICKERS_PATH, encoding="utf-8") as f:
+                existing = json.load(f)
+            if not isinstance(existing, dict):
+                existing = {}
+        except Exception:
+            existing = {}
 
-_preserved = [k for k in existing if k not in MANAGED_KEYS and k != "long_term_universe"]
-print(f"銘柄リスト保存完了: all={len(output['all'])}銘柄 / etf_list={len(output['etf_list'])} / "
-      f"JP ETF={JP_ETF_LIST} / 保持キー={_preserved}")
+    output = dict(existing)  # 既存キーを保持
+    output["sp500_major"]     = SP500_MAJOR
+    output["nasdaq100_extra"] = NASDAQ100_EXTRA
+    output["nikkei225_major"] = NIKKEI225_MAJOR
+    # etf_list は JP ETF を含めて拡張（既存に他キーから追加された ETF があれば保持）
+    output["etf_list"] = sorted(set(ETF_LIST) | set(JP_ETF_LIST) | set(existing.get("etf_list", [])))
+    # all は全ソース + 既存 all の和集合（他ユニバースの銘柄も維持）
+    output["all"] = sorted(set(all_tickers) | set(existing.get("all", [])))
+
+    # long_term_universe に 1489.T を確実に含める（既存があれば維持して追加）
+    _ltu = set(existing.get("long_term_universe", []))
+    _ltu.add("1489.T")
+    output["long_term_universe"] = sorted(_ltu)
+
+    with open(TICKERS_PATH, 'w', encoding="utf-8") as f:
+        json.dump(output, f, ensure_ascii=False, indent=2)
+
+    _preserved = [k for k in existing if k not in MANAGED_KEYS and k != "long_term_universe"]
+    print(f"銘柄リスト保存完了: all={len(output['all'])}銘柄 / etf_list={len(output['etf_list'])} / "
+          f"JP ETF={JP_ETF_LIST} / 保持キー={_preserved}")
+
+
+if __name__ == "__main__":
+    main()

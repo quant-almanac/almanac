@@ -2,6 +2,11 @@ import yfinance as yf
 import json
 import os
 
+# 状態ファイルはこのスクリプトの置き場所を基準に解決する。
+# (以前は ~/portfolio-bot 固定で、別の場所へ clone すると旧パスを読み書きしていた)
+_BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
 # セクターETFとティッカーのマッピング
 SECTOR_ETFS = {
     'テクノロジー': 'XLK',
@@ -113,7 +118,7 @@ def filter_by_sector_strength(candidates, top_n=4):
 def save_sector_report():
     """セクター強度レポートを保存"""
     strength = get_sector_strength()
-    out = os.path.expanduser('~/portfolio-bot/sector_strength.json')
+    out = os.path.join(_BASE_DIR, 'sector_strength.json')
     # bool型をPython標準のboolに変換してシリアライズ
     serializable = {}
     for sector, v in strength.items():

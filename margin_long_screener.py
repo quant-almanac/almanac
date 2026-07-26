@@ -18,7 +18,7 @@ margin_long_screener.py — 信用買いスクリーニング
   - 強セクター補正
 
 crontab: 55 17 * * 1-5  (平日17:55)
-  cd ~/portfolio-bot && venv/bin/python margin_long_screener.py
+  cd "$ALMANAC_DIR" && venv/bin/python margin_long_screener.py
 """
 
 import json

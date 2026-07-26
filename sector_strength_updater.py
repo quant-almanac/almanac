@@ -12,7 +12,7 @@ sector_strength.json を atomic に更新する。
   - strong  = (score > 0)
 
 cron 例:
-  30 17 * * 1-5 cd ~/portfolio-bot && run_with_secrets.sh venv/bin/python sector_strength_updater.py
+  30 17 * * 1-5 cd "$ALMANAC_DIR" && run_with_secrets.sh venv/bin/python sector_strength_updater.py
 """
 from __future__ import annotations
 

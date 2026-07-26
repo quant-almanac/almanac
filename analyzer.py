@@ -11,6 +11,11 @@ from generate_dashboard import generate as update_dashboard
 import time
 from utils import init_yfinance_timeout
 
+# 状態ファイルはこのスクリプトの置き場所を基準に解決する。
+# (以前は ~/portfolio-bot 固定で、別の場所へ clone すると旧パスを読み書きしていた)
+_BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
 init_yfinance_timeout()
 
 # 設定
@@ -120,8 +125,8 @@ def _call_fast_llm(system: str, user: str, max_tokens: int = 200) -> str | None:
     )
     return None
 
-RESULTS_FILE = os.path.expanduser("~/portfolio-bot/screen_results.json")
-TICKERS_FILE = os.path.expanduser("~/portfolio-bot/tickers.json")
+RESULTS_FILE = os.path.join(_BASE_DIR, "screen_results.json")
+TICKERS_FILE = os.path.join(_BASE_DIR, "tickers.json")
 
 # Batch API タイムアウト（秒）。小バッチ(30件以下)は通常1〜3分で完了する。
 BATCH_TIMEOUT_SECONDS = 3600
@@ -770,7 +775,7 @@ def analyze_with_agents(stock_data, macro_info, batch_results: "dict | None" = N
 def get_position_size(price_usd, opus_score=3.5):
     """口座残高とOpusスコアからポジションサイズを計算（ケリー基準的）"""
     try:
-        filepath = os.path.expanduser('~/portfolio-bot/account.json')
+        filepath = os.path.join(_BASE_DIR, 'account.json')
         if not os.path.exists(filepath):
             return None
         with open(filepath) as f:
@@ -1023,7 +1028,7 @@ def main(*, force_evening: bool = False, now: datetime | None = None):
             # send_telegram(msg)
             # シグナルをログに保存
             try:
-                log_path = os.path.expanduser('~/portfolio-bot/signals_log.json')
+                log_path = os.path.join(_BASE_DIR, 'signals_log.json')
                 logs = {}
                 if os.path.exists(log_path):
                     with open(log_path) as f:
@@ -1195,8 +1200,8 @@ def regen_stale_signals(min_days_stale: int = 30) -> dict:
         {"scanned": int, "regenerated": int, "skipped": int,
          "stale_tickers": [str], "errors": {ticker: msg}}
     """
-    log_path = os.path.expanduser('~/portfolio-bot/signals_log.json')
-    holdings_path = os.path.expanduser('~/portfolio-bot/holdings.json')
+    log_path = os.path.join(_BASE_DIR, 'signals_log.json')
+    holdings_path = os.path.join(_BASE_DIR, 'holdings.json')
 
     result = {
         "scanned": 0, "regenerated": 0, "skipped": 0,

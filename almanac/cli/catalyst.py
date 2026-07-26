@@ -32,16 +32,16 @@ Example cron entries::
 
     ALMANAC_ENABLE_CATALYST=1
     # daily 18:00  — refresh revision_state from news_signal_candidates
-    0 18 * * 1-5  cd ~/portfolio-bot && python -m almanac.cli.catalyst revision
+    0 18 * * 1-5  cd "$ALMANAC_DIR" && python -m almanac.cli.catalyst revision
     # daily 18:15  — apply invalidation deltas to beliefs adjustments
-    15 18 * * 1-5 cd ~/portfolio-bot && python -m almanac.cli.catalyst invalidate
+    15 18 * * 1-5 cd "$ALMANAC_DIR" && python -m almanac.cli.catalyst invalidate
     # daily 18:30  — synthesise the catalyst hypothesis log + top-N
-    30 18 * * 1-5 cd ~/portfolio-bot && python -m almanac.cli.catalyst catalyst
+    30 18 * * 1-5 cd "$ALMANAC_DIR" && python -m almanac.cli.catalyst catalyst
     # daily 18:50  — append due outcomes and refresh scenario promotion view
-    50 18 * * 1-5 cd ~/portfolio-bot && python -m almanac.cli.catalyst outcomes
-    55 18 * * 1-5 cd ~/portfolio-bot && python -m almanac.cli.catalyst scenario-promotion
+    50 18 * * 1-5 cd "$ALMANAC_DIR" && python -m almanac.cli.catalyst outcomes
+    55 18 * * 1-5 cd "$ALMANAC_DIR" && python -m almanac.cli.catalyst scenario-promotion
     # weekly Sun  — refresh agent_reliability snapshot
-    0 7 * * 0     cd ~/portfolio-bot && python -m almanac.cli.catalyst reliability
+    0 7 * * 0     cd "$ALMANAC_DIR" && python -m almanac.cli.catalyst reliability
 """
 
 from __future__ import annotations

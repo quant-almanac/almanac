@@ -5,6 +5,11 @@ import os
 from datetime import datetime, timedelta
 from itertools import product
 
+# 状態ファイルはこのスクリプトの置き場所を基準に解決する。
+# (以前は ~/portfolio-bot 固定で、別の場所へ clone すると旧パスを読み書きしていた)
+_BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
 TEST_TICKERS = [
     'AAPL', 'MSFT', 'GOOGL', 'AMZN', 'NVDA', 'META', 'TSLA',
     'JPM', 'JNJ', 'XOM', 'WMT', 'PG', 'KO', 'MRK', 'ADI',
@@ -236,7 +241,7 @@ if __name__ == "__main__":
                   f"PF: {r['stats']['profit_factor']} | トレード数: {r['stats']['trades']}")
 
     # 結果保存
-    output_path = os.path.expanduser('~/portfolio-bot/optimize_results.json')
+    output_path = os.path.join(_BASE_DIR, 'optimize_results.json')
     with open(output_path, 'w', encoding='utf-8') as f:
         json.dump(results, f, indent=2, ensure_ascii=False, default=str)
     print(f"\n結果を保存: {output_path}")

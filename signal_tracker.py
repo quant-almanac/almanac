@@ -10,7 +10,12 @@ from datetime import datetime, timedelta
 import pandas as pd
 import yfinance as yf
 
-SIGNAL_HISTORY_FILE = os.path.expanduser('~/portfolio-bot/signal_history.json')
+# 状態ファイルはこのスクリプトの置き場所を基準に解決する。
+# (以前は ~/portfolio-bot 固定で、別の場所へ clone すると旧パスを読み書きしていた)
+_BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
+SIGNAL_HISTORY_FILE = os.path.join(_BASE_DIR, 'signal_history.json')
 
 # 評価は 5営業日後 / 10営業日後（単純カレンダー日数ではなく取引日ベース）
 # 取引日 N 営業日後 ≒ カレンダー日で N*7/5 日後 + 余裕 4 日
@@ -448,7 +453,7 @@ def _run_tracking() -> None:
         print(f"\n⚠️  劣化検知: {degradation['message']}")
 
     # stats を JSON 保存（API から参照）
-    stats_file = os.path.expanduser('~/portfolio-bot/signal_stats.json')
+    stats_file = os.path.join(_BASE_DIR, 'signal_stats.json')
     stats_data = {
         'updated_at': datetime.now().strftime('%Y-%m-%d %H:%M'),
         'total_records': len(history),

@@ -5,9 +5,9 @@ scenario_playbook.json のキーワードとマッチング。
 Telegram は高重要度・高確度のケースだけ送信。
 
 crontab (1日3回):
-  0 7  * * 1-5  cd ~/portfolio-bot && venv/bin/python geopolitical_monitor.py
-  0 12 * * 1-5  cd ~/portfolio-bot && venv/bin/python geopolitical_monitor.py
-  0 18 * * 1-5  cd ~/portfolio-bot && venv/bin/python geopolitical_monitor.py
+  0 7  * * 1-5  cd "$ALMANAC_DIR" && venv/bin/python geopolitical_monitor.py
+  0 12 * * 1-5  cd "$ALMANAC_DIR" && venv/bin/python geopolitical_monitor.py
+  0 18 * * 1-5  cd "$ALMANAC_DIR" && venv/bin/python geopolitical_monitor.py
 """
 
 import argparse

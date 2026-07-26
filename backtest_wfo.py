@@ -9,7 +9,12 @@ from itertools import product
 
 from almanac.runtime_config import get_env
 
-TICKERS_FILE = os.path.expanduser('~/portfolio-bot/tickers.json')
+# 状態ファイルはこのスクリプトの置き場所を基準に解決する。
+# (以前は ~/portfolio-bot 固定で、別の場所へ clone すると旧パスを読み書きしていた)
+_BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
+TICKERS_FILE = os.path.join(_BASE_DIR, 'tickers.json')
 BACKTEST_STATUS = "retired"
 RESEARCH_OPT_IN_ENV = "ALMANAC_ENABLE_LEGACY_WFO"
 
@@ -436,7 +441,7 @@ if __name__ == "__main__":
                 print(f"    {regime}: データ不足")
 
     # 保存
-    out = os.path.expanduser('~/portfolio-bot/backtest_wfo_results.json')
+    out = os.path.join(_BASE_DIR, 'backtest_wfo_results.json')
     with open(out, 'w', encoding='utf-8') as f:
         json.dump(results, f, indent=2, ensure_ascii=False, default=str)
     print(f"\n結果保存: {out}")

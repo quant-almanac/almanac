@@ -6,9 +6,14 @@ from datetime import datetime
 from generate_dashboard import generate as update_dashboard
 import time
 
+# 状態ファイルはこのスクリプトの置き場所を基準に解決する。
+# (以前は ~/portfolio-bot 固定で、別の場所へ clone すると旧パスを読み書きしていた)
+_BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
 TELEGRAM_TOKEN = os.environ['TELEGRAM_TOKEN']
 TELEGRAM_CHAT_ID = os.environ['TELEGRAM_CHAT_ID']
-HOLDINGS_FILE = os.path.expanduser('~/portfolio-bot/holdings.json')
+HOLDINGS_FILE = os.path.join(_BASE_DIR, 'holdings.json')
 
 def send_telegram(message):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
@@ -30,14 +35,14 @@ def save_holdings(holdings):
 
 def get_account_info():
     """口座情報を読み込む"""
-    filepath = os.path.expanduser('~/portfolio-bot/account.json')
+    filepath = os.path.join(_BASE_DIR, 'account.json')
     if not os.path.exists(filepath):
         return {"balance": 0, "risk_per_trade": 0.1}
     with open(filepath) as f:
         return json.load(f)
 
 def save_account_info(info):
-    filepath = os.path.expanduser('~/portfolio-bot/account.json')
+    filepath = os.path.join(_BASE_DIR, 'account.json')
     with open(filepath, 'w') as f:
         json.dump(info, f, indent=2)
 
@@ -84,7 +89,7 @@ def calc_position_size(price_jpy, account_info):
 def record_trade(action, ticker, price, shares, pnl_pct=None, pnl_amount=None):
     """売買履歴をCSVに記録"""
     import csv
-    filepath = os.path.expanduser('~/portfolio-bot/trade_history.csv')
+    filepath = os.path.join(_BASE_DIR, 'trade_history.csv')
     file_exists = os.path.exists(filepath)
     
     with open(filepath, 'a', newline='', encoding='utf-8') as f:
@@ -113,7 +118,7 @@ def cmd_buy(parts):
     # シグナルログから詳細情報を引き継ぎ
     signal_info = {}
     try:
-        log_path = os.path.expanduser('~/portfolio-bot/signals_log.json')
+        log_path = os.path.join(_BASE_DIR, 'signals_log.json')
         if os.path.exists(log_path):
             with open(log_path) as f:
                 logs = json.load(f)
@@ -212,7 +217,7 @@ def cmd_analyze(parts):
     
     try:
         import sys
-        sys.path.insert(0, os.path.expanduser('~/portfolio-bot'))
+        sys.path.insert(0, _BASE_DIR)
         from analyzer import get_stock_data, analyze_with_agents, get_macro_score, format_signal_message
         
         stock = get_stock_data(ticker)

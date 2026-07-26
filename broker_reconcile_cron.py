@@ -19,7 +19,7 @@ broker_reconcile_cron.py — 週次照合の cron wrapper
   python broker_reconcile_cron.py --from 2026-04-01 --to 2026-05-17 --notify
 
 crontab (週次):
-  0 9 * * 1 cd ~/portfolio-bot && venv/bin/python broker_reconcile_cron.py --notify >> logs/reconcile.log 2>&1
+  0 9 * * 1 cd "$ALMANAC_DIR" && venv/bin/python broker_reconcile_cron.py --notify >> logs/reconcile.log 2>&1
 """
 from __future__ import annotations
 

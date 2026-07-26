@@ -4,8 +4,13 @@ import os
 import time
 from datetime import datetime
 
-TICKERS_FILE = os.path.expanduser('~/portfolio-bot/tickers.json')
-RESULTS_FILE = os.path.expanduser('~/portfolio-bot/screen_results.json')
+# 状態ファイルはこのスクリプトの置き場所を基準に解決する。
+# (以前は ~/portfolio-bot 固定で、別の場所へ clone すると旧パスを読み書きしていた)
+_BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
+TICKERS_FILE = os.path.join(_BASE_DIR, 'tickers.json')
+RESULTS_FILE = os.path.join(_BASE_DIR, 'screen_results.json')
 
 def load_tickers():
     with open(TICKERS_FILE) as f:

@@ -1,7 +1,7 @@
 """
 expand_tickers.py — tickers.json をフル S&P 500 + 日経225 へ拡張するワンショットスクリプト
 
-実行: cd ~/portfolio-bot && python expand_tickers.py
+実行: cd "$ALMANAC_DIR" && python expand_tickers.py
 
 入力:
   - 既存 tickers.json (sp500_major / nikkei225_major / etf_list / short_scan_tickers / nasdaq100_extra)

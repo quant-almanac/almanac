@@ -12,7 +12,7 @@ Codex H4 への応答:
   既存ファイルがある場合は `.bak` で退避し、ダウンロード成功時のみ swap。
 
   cron 想定: 毎月 1 日 06:00
-    0 6 1 * * cd ~/portfolio-bot && venv/bin/python parquet_rebuilder.py monthly
+    0 6 1 * * cd "$ALMANAC_DIR" && venv/bin/python parquet_rebuilder.py monthly
 
 CLI:
   python parquet_rebuilder.py monthly                # 月次ジョブ (rebuild + heartbeat)
