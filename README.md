@@ -10,16 +10,6 @@ This repository is a **public, sanitized snapshot** of that system. Runtime data
 
 > **Project status:** this is an opinionated reference implementation and an evolving personal system, not a turnkey portfolio product or a stable public API. Start with the demo state, inspect the rules, and expect file schemas and operating procedures to change.
 
-> **Will it run anywhere?** The paths this document covers — Getting Started, and the documented schedule — resolve state relative to your checkout.
->
-> Some top-level scripts this document does not cover still carry the reference deployment path `~/portfolio-bot`. It shows up two ways. In most it is only a stale usage example in a comment, which is harmless; in others — `analyzer.py` and `start.sh` among them — the read/write path itself is fixed, so from a differently named checkout they touch the old location instead.
->
-> Check before running one:
->
-> ```bash
-> grep -rn 'portfolio-bot' --include='*.py' --include='*.sh' .
-> ```
-
 ## What it does
 
 The objective function is explicit and version-controlled ([`objective.md`](objective.md)): maximize **after-tax, after-fee, JPY-denominated time-weighted return**, benchmarked against a 60% global equity / 40% global bond blend, subject to hard risk limits (VaR, drawdown, VIX-based circuit breakers) enforced by a deterministic policy engine — not by an LLM's judgment call.

@@ -11,7 +11,8 @@ import pandas as pd
 import yfinance as yf
 
 # 状態ファイルはこのスクリプトの置き場所を基準に解決する。
-# (以前は ~/portfolio-bot 固定で、別の場所へ clone すると旧パスを読み書きしていた)
+# (以前は開発環境のパスが直書きされており、別の場所へ clone すると
+#  そちらのディレクトリを読み書きしていた)
 _BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 
