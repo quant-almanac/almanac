@@ -12,7 +12,13 @@ This repository is a **public, sanitized snapshot** of that system. Runtime data
 
 > **Will it run anywhere?** The paths this document covers — Getting Started, and the documented schedule — resolve state relative to your checkout.
 >
-> There is an exception. Some older, non-core utilities — legacy Telegram and reporting scripts, static-dashboard generation, backtest helpers — still have the reference deployment path `~/portfolio-bot` written into them. Inspect any top-level script this document does not mention before running it from a differently named checkout.
+> Some top-level scripts this document does not cover still carry the reference deployment path `~/portfolio-bot`. It shows up two ways. In most it is only a stale usage example in a comment, which is harmless; in others — `analyzer.py` and `start.sh` among them — the read/write path itself is fixed, so from a differently named checkout they touch the old location instead.
+>
+> Check before running one:
+>
+> ```bash
+> grep -rn 'portfolio-bot' --include='*.py' --include='*.sh' .
+> ```
 
 ## What it does
 
