@@ -312,6 +312,117 @@ That is the intended shape. A tuner that rarely fires is working; one that chang
 
 Degradation is explicit rather than silent. A timed-out tier marks the run degraded and says so in the output; a truncated LLM response is rejected instead of parsed; a stale input downgrades an action instead of being trusted; an unavailable safety module refuses the call rather than proceeding un-audited. The recurring principle is that the system would rather produce *no* recommendation than a confident wrong one.
 
+## The quant layer
+
+Everything above is about how AI suggestions are handled. This section is about **where the numbers come from** — the parts with no model in them at all.
+
+### Choosing weights
+
+Allocation runs through [PyPortfolioOpt](https://github.com/robertmartin8/PyPortfolioOpt), [Riskfolio-Lib](https://riskfolio-lib.readthedocs.io/) and [skfolio](https://skfolio.org/), with three objectives available.
+
+| Method | What it optimises |
+|---|---|
+| `max_sharpe` | Return per unit of risk |
+| `min_cvar` | The average loss in the worst cases |
+| `equal_risk` | Equal risk contribution from each holding |
+
+Black-Litterman then blends your own views into the market's implied returns.
+
+**There is a design failure here, and its correction.** Originally the Sonnet tier's (action, urgency) output was mapped to expected returns and injected straight into Black-Litterman as views. That is a loop: the same model's subjective confidence, dressed up as a number, handed back to the same model to reconsider. A review called it *confidence laundering*, which is exactly right — it produced quant-looking figures with no independent information in them.
+
+`bl_alpha_sources.py` now supplies three alpha sources that owe nothing to the LLM:
+
+- `analyst_consensus_alpha` — external analyst estimates
+- `momentum_alpha` — price momentum
+- `factor_beta_alpha` — factor betas
+
+### Measuring risk
+
+VaR and CVaR are computed **Cornish-Fisher** rather than plain. Ordinary VaR assumes returns are normal; real markets have fat tails. The Cornish-Fisher expansion corrects the quantile using skewness and kurtosis, so the tail is not understated.
+
+Volatility is forecast with **GJR-GARCH**, which lets downside moves raise expected volatility more than upside ones.
+
+On top of that, `ginn_model.py` implements **GINN (GARCH-Informed Neural Network, ICAIF 2024)** — the GARCH forecast acts as a physical constraint on an LSTM:
+
+```
+input:  [returns, σ_GARCH, VIX, regime] × 60 days
+model:  2-layer LSTM (hidden=64) + linear head
+loss:   MSE(σ_pred, |ε_t|) + 0.3 · MSE(σ_pred, σ_GARCH)
+```
+
+The second loss term is the point. An unconstrained network overfits; penalising divergence from the GARCH estimate pulls it back toward the statistical model.
+
+**Risk is computed on current holdings, not on the NAV series.** That series is short, and older accounting bugs contaminated part of it. `portfolio_risk_returns.py` instead reconstructs daily returns by applying **today's weights to historical market prices**:
+
+```
+portfolio_return_t = Σ wᵢ · rᵢ,t        wᵢ = current JPY market-value weight
+```
+
+That yields several hundred sessions of returns untouched by the accounting history.
+
+**The risk model is itself validated.** `risk_model_validation.py` stores each day's VaR forecast and runs a **Kupiec proportion-of-failures test** — checking statistically that days breaching the 95% VaR actually occur about 5% of the time. Too many breaches or too few both mean the model does not match reality.
+
+### Sizing
+
+`kelly_sizing.py` proposes position sizes at **half-Kelly**:
+
+```
+kelly = 0.5 × (p·b − q) / b
+  p = win rate, q = 1−p, b = average win ÷ average loss
+```
+
+Win rate and payoff ratio come per-ticker from the graded record of past recommendations (§11). Full Kelly is the theoretical growth-optimal bet but swings too hard in practice, so it is halved.
+
+### Adding on the way down
+
+`drawdown_dca_engine.py` exists for a specific problem: buy only after the bottom is confirmed and the rebound has already happened. Three tranches fire on different conditions.
+
+| | Driven by |
+|---|---|
+| T1 | Decay from the VIX peak |
+| T2 | Fear & Greed plus high-yield spreads (≥ 500bps) |
+| T3 | A combination of the above |
+
+Each is an AND of several signals, because any single indicator can be faked out.
+
+### Currency
+
+`fx_hedge_manager.py` derives a target hedge ratio from regime × VIX × USDJPY momentum × implied volatility. It deliberately avoids a fixed ratio, moving within **0–70%**, and clamps daily change to **±10%** so it cannot whipsaw.
+
+Three instruments: JPY-hedged ETFs (1655.T / 2040.T), futures, or simply holding more JPY.
+
+### Tax
+
+`tax_lot.py` rebuilds a **per-ticker lot timeline** — which shares were bought when and at what price — FIFO from the event ledger's trade history.
+
+The reason it exists: the holdings file carries only a weighted-average cost, which makes it impossible to sell one specific losing lot to realise a loss, or to pick lots that avoid consuming NISA allowance. Tracking lots individually makes those choices possible.
+
+`tax_optimizer.py` handles loss-harvest candidates, NISA headroom, and foreign tax credit simulation.
+
+### Attributing performance
+
+`factor_attribution.py` regresses monthly portfolio returns by **OLS** onto Fama-French-style factors built from ETF proxies, producing α, β and R²:
+
+```
+MKT = SPY               (the market)
+SMB = IWM − SPY         (small minus large)
+HML = IVE − IVW         (value minus growth)
+```
+
+The question it answers is whether returns came from skill (α) or from simply riding the market and a style tilt (β). The proxies are all buyable from Japan.
+
+### Regimes and their parameters
+
+Market state is classified with a hidden Markov model, and each regime carries its own parameters, generated by the **walk-forward optimisation** in `backtest_wfo.py` — repeatedly fitting on one window and validating on the next.
+
+**The limits are worth stating.** The bull regime uses whole-period parameters rather than regime-specific ones, to avoid overfitting on a small sample, and **the bear regime borrows the neutral regime's values outright** because there were not enough observations. It is not fully optimised per regime.
+
+### Also present
+
+- `technical_signals.py` — RSI, MACD, Bollinger Bands and volume across holdings and market ETFs
+- `rebalance_engine.py` — detects currency and sector drift, emits prioritised orders
+- `pair_screener.py` — long-short pair candidates
+
 ## The dashboard
 
 The current snapshot exposes 20 routes, split by purpose.
@@ -391,6 +502,14 @@ Terms used above, for readers who don't work in finance or haven't seen the hous
 | **Book-aware** | A call that includes the actual portfolio — holdings, quantities, P&L. The opposite carries only public or anonymized material |
 | **Tier** | One of the five analysis lanes (long / medium / swing / margin-long / short-sell). Also used for a model's grade |
 | **Red Team** | Models whose assigned job is to attack the conclusion and surface its weak points |
+| **Sharpe ratio** | Return earned per unit of risk. For the same profit, a smoother ride scores higher |
+| **Cornish-Fisher** | A correction to VaR. Plain VaR assumes returns are normal; this adjusts the quantile using skewness and kurtosis so the real fat tail is not understated |
+| **Kupiec POF test** | A statistical test of whether a VaR model is honest — do breaches of the 95% VaR actually happen about 5% of the time? |
+| **Half-Kelly** | Half the theoretically growth-optimal bet size. Full Kelly is correct in theory and too violent in practice |
+| **HMM (hidden Markov model)** | Infers a state you cannot observe directly — here, which market regime you are in — from data you can |
+| **Walk-forward optimisation** | Fit on one window, validate on the next, repeat. Avoids the overfitting you get from tuning on the whole history at once |
+| **Alpha / beta** | Beta is the return that came from moving with the market; alpha is what is left over. It separates the market's work from yours |
+| **HY spread** | The yield gap between high-yield corporate bonds and government bonds. It widens when credit stress rises |
 
 ## Architecture
 
