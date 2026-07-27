@@ -422,17 +422,29 @@ def _extract_bl_views(long_a: dict, medium_a: dict, short_a: dict, vix: float = 
     - Agent間の意見の分散（disagreement）
     - 予測信頼度（confidence_pct）の平均
     - シグナル数による不確実性スケーリング
-    """
-    ticker_views: dict[str, list[float]] = {}
-    ticker_confidence: dict[str, list[float]] = {}
 
-    for analysis in [long_a, medium_a, short_a]:
+    Stage 0C (evidence anti-circularity): n_signals / evidence_lineage_ids は
+    「同一ティア出力から派生した view」を複数の独立根拠として数えない。1つの
+    ティアの priority_actions に同じ ticker が複数回出現しても、そのティアからの
+    寄与は1件（1 lineage）にまとめる。3ティアはいずれも同じ shared_ctx を読む
+    ため厳密な意味での独立情報源ではないが、少なくとも「同一出力の重複」による
+    見かけ上の水増しは防ぐ。真に独立な alpha 源は bl_alpha_sources.py
+    (BL_USE_INDEPENDENT_ALPHA) を使うこと。
+    """
+    TIER_NAMES = ("long", "medium", "short")
+    ticker_lineage_views: dict[str, dict[str, float]] = {}
+    ticker_lineage_confidence: dict[str, dict[str, float]] = {}
+
+    for tier_name, analysis in zip(TIER_NAMES, [long_a, medium_a, short_a]):
         if not isinstance(analysis, dict):
             continue
         for action in analysis.get("priority_actions", []):
             ticker = action.get("ticker", "")
             if not ticker or ticker == "_cash":
                 continue
+            lineage_views = ticker_lineage_views.setdefault(ticker, {})
+            if tier_name in lineage_views:
+                continue  # このティアからは既に1件採用済み（同一lineageの重複カウント防止）
             atype   = str(action.get("type", "")).lower()
             urgency = str(action.get("urgency", "medium")).lower()
             # trim / rebalance は「配分調整」であり価格方向性の予測ではない
@@ -440,19 +452,24 @@ def _extract_bl_views(long_a: dict, medium_a: dict, short_a: dict, vix: float = 
             if atype in ("trim", "rebalance"):
                 continue
             ret = _vol_adjusted_return(atype, urgency, vix, regime_bull=regime_bull)
-            ticker_views.setdefault(ticker, []).append(ret)
+            lineage_views[tier_name] = ret
 
             # 予測信頼度を収集
             conf = action.get("confidence_pct")
             if conf is not None:
                 try:
-                    ticker_confidence.setdefault(ticker, []).append(float(conf))
+                    ticker_lineage_confidence.setdefault(ticker, {})[tier_name] = float(conf)
                 except (ValueError, TypeError):
                     pass
 
     import numpy as _np
     views_output: dict = {}
-    for ticker, view_list in ticker_views.items():
+    for ticker, lineage_views in ticker_lineage_views.items():
+        if not lineage_views:
+            continue
+        # long → medium → short の順で安定化（既存の bull/bear/macro の位置的意味を保つ）
+        lineages = [t for t in TIER_NAMES if t in lineage_views]
+        view_list = [lineage_views[t] for t in lineages]
         arr    = _np.array(view_list, dtype=float)
         mean_v = float(arr.mean())
 
@@ -465,22 +482,25 @@ def _extract_bl_views(long_a: dict, medium_a: dict, short_a: dict, vix: float = 
         agent_var = float(arr.var()) if len(view_list) > 1 else 0.02
 
         # 2. 信頼度による調整（高信頼 → 低分散）
-        conf_list = ticker_confidence.get(ticker, [])
+        conf_map = ticker_lineage_confidence.get(ticker, {})
+        conf_list = [conf_map[t] for t in lineages if t in conf_map]
         if conf_list:
             avg_confidence = sum(conf_list) / len(conf_list) / 100.0  # 0-1スケール
             confidence_factor = max(0.3, 1.0 - avg_confidence * 0.7)  # 高信頼→0.3倍, 低信頼→1.0倍
         else:
             confidence_factor = 1.0  # 信頼度データなし → 調整なし
 
-        # 3. シグナル数による調整（多い→低不確実性）
-        n_signals = len(view_list)
+        # 3. 独立lineage数による調整（多い→低不確実性）。同一ティアの重複は
+        # 上流で既に1件へ畳み込み済みなので、ここでの len(lineages) は
+        # 「本当に別ティアが確認した数」(最大3) を表す。
+        n_signals = len(lineages)
         signal_factor = 1.0 / max(1, n_signals ** 0.5)  # √n で分散を縮小
 
         # 最終Omega: agent分散 × 信頼度係数 × シグナル係数
         omega = max(agent_var * confidence_factor * signal_factor, 0.001)
 
         # n_signals=1 の場合は信頼度が低い → 分散を大きく設定
-        if len(view_list) == 1:
+        if n_signals == 1:
             omega = max(omega, 0.04)
 
         views_output[ticker] = {
@@ -491,6 +511,7 @@ def _extract_bl_views(long_a: dict, medium_a: dict, short_a: dict, vix: float = 
             "variance":   round(omega, 6),
             "n_signals":  n_signals,
             "avg_confidence": round(sum(conf_list) / len(conf_list), 1) if conf_list else None,
+            "evidence_lineage_ids": lineages,
         }
 
     # P2-27: BL_USE_INDEPENDENT_ALPHA で LLM 由来 view を独立 source に差し替え/混合する。
@@ -3311,7 +3332,19 @@ def _screen_candidate_has_bullish_support(candidate: dict) -> bool:
 
 
 def _load_bl_views_for_opus() -> str:
-    """Format BL views as a compact context string for Opus synthesis."""
+    """Format BL views as a compact context string for Opus synthesis.
+
+    Stage 0C (evidence anti-circularity): when independent_count == 0, every
+    view in bl_views.json was derived from the tier LLMs themselves (see
+    bl_alpha_sources.py's docstring on "confidence laundering" -- the same
+    LLM opinions quantified and reflected back as if they were a separate
+    quant confirmation). The "Black-Litterman / quantitative model" framing
+    implies external corroboration that does not exist in that case, so it
+    is only used when a genuine independent alpha source (BL_USE_INDEPENDENT_
+    ALPHA=1/mix) actually contributed. Otherwise the header is relabeled and
+    each line shows the raw tier-agreement count instead of Ω, so Opus can
+    see this is tier consensus, not an independently validated figure.
+    """
     views_path = BASE_DIR / "bl_views.json"
     if not views_path.exists():
         return ""
@@ -3323,12 +3356,20 @@ def _load_bl_views_for_opus() -> str:
         views = views_root.get("views", views_root)
         if not views:
             return ""
-        lines = ["【Black-Litterman LLMビュー（定量モデル期待リターン）】"]
+        independent_count = views_root.get("independent_count", 0) or 0
+        if independent_count:
+            lines = ["【Black-Litterman LLMビュー（定量モデル期待リターン、独立alpha源を含む）】"]
+        else:
+            lines = ["【ティア分析ビュー（Long/Medium/Short合成、独立検証なし・参考情報）】"]
         for ticker, v in list(views.items())[:10]:  # top 10
             if not isinstance(v, dict):
                 continue
             mean_pct = round(v.get("mean_view", 0) * 100, 1)
-            lines.append(f"  {ticker}: 期待リターン {mean_pct:+.1f}%（Ω={v.get('variance',0):.4f}）")
+            if independent_count:
+                lines.append(f"  {ticker}: 期待リターン {mean_pct:+.1f}%（Ω={v.get('variance',0):.4f}）")
+            else:
+                n_lineages = len(v.get("evidence_lineage_ids") or []) or v.get("n_signals", 0)
+                lines.append(f"  {ticker}: 期待リターン {mean_pct:+.1f}%（{n_lineages}/3ティア一致、独立検証なし）")
         return "\n".join(lines)
     except Exception:
         return ""
