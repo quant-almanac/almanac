@@ -3461,7 +3461,8 @@ def _synthesize(long_a: dict, medium_a: dict, short_positions_a: dict,
                 degraded_context: str = "",
                 currency_breakdown_whole: dict | None = None,
                 currency_breakdown_long: dict | None = None,
-                current_currency_policy: dict | None = None) -> dict:
+                current_currency_policy: dict | None = None,
+                decision_snapshot_id: str | None = None) -> dict:
 
     market_news_text = fmt_news_section(news)
     earnings_text = fmt_earnings_section(earnings)
@@ -3536,6 +3537,7 @@ def _synthesize(long_a: dict, medium_a: dict, short_positions_a: dict,
     chart_ctx_block = ""
     options_ctx_block = ""
     _chart_map: dict[str, dict] = {}
+    _opt_map: dict[str, dict] = {}
     if _gather_chart_context and _format_chart_for_prompt:
         try:
             _target_tickers = _collect_priority_tickers(
@@ -3559,6 +3561,37 @@ def _synthesize(long_a: dict, medium_a: dict, short_positions_a: dict,
                         print(f"⚠️ options_fetcher エラー: {_oe}")
         except Exception as _ce:
             print(f"⚠️ chart_analyzer エラー: {_ce}")
+
+    # Stage 1B: enriched_snapshot (base + オプション) を Opus 呼び出し直前に確定する。
+    # tier 段階の decision_snapshot と同じ decision_snapshot_id・別 stage="synthesis"
+    # で凍結し、tier→synthesis 間で入力がどう変わったかを事後追跡できるようにする。
+    # 監査目的の副作用であり、失敗しても synthesis 自体は止めない (fail-open)。
+    if decision_snapshot_id:
+        try:
+            from analysis_snapshot import build_base_snapshot, build_enriched_snapshot, freeze_decision_snapshot
+            import model_router as _model_router
+            _synth_base = build_base_snapshot(base_dir=BASE_DIR)
+            _synth_enriched = build_enriched_snapshot(_synth_base, options_by_ticker_raw=_opt_map)
+            _synth_code_revision = None
+            try:
+                import subprocess as _synth_sp
+                _synth_rev = _synth_sp.run(
+                    ["git", "rev-parse", "HEAD"], cwd=BASE_DIR,
+                    capture_output=True, text=True, timeout=5,
+                )
+                _synth_code_revision = _synth_rev.stdout.strip() or None
+            except Exception:
+                pass
+            freeze_decision_snapshot(
+                _synth_enriched,
+                decision_snapshot_id=decision_snapshot_id,
+                stage="synthesis",
+                code_revision=_synth_code_revision,
+                model_ids={"opus": _model_router.MODEL_REGISTRY.get("opus", "")},
+                base_dir=BASE_DIR,
+            )
+        except Exception as _snap_e:
+            print(f"⚠️ decision_snapshot(synthesis) 記録失敗: {_snap_e}")
 
     # 税務・持株会サマリー（Opus用）
     _tax_urgent = _extract_tax_urgent_actions({"tax_context": tax_context or {}})
@@ -9005,6 +9038,51 @@ def run_analysis(force: bool = False) -> dict:
         shared_ctx = shared_ctx + "\n\n" + beliefs_ctx
         print(f"  🧠 投資信念 {len(beliefs)}件をコンテキストに注入")
 
+    # Stage 1B: tier LLM 呼び出し開始と同時に decision_snapshot (tier段階) を確定する。
+    # data/shared_ctx の組み立てが完了した直後・最初の tier LLM 呼び出しより前に
+    # 凍結することで「この分析の判断根拠として何が真だったか」を監査可能にする。
+    # 確定後は書き換えない (analysis_snapshot.freeze_decision_snapshot の契約)。
+    # 監査目的の副作用であり、失敗しても分析自体は止めない (fail-open)。
+    _decision_snapshot_id: str | None = None
+    try:
+        import uuid as _snap_uuid
+        from analysis_snapshot import build_base_snapshot, build_enriched_snapshot, freeze_decision_snapshot
+        import model_router as _model_router
+        _decision_snapshot_id = str(_snap_uuid.uuid4())
+        _tier_base_snapshot = build_base_snapshot(base_dir=BASE_DIR)
+        _tier_enriched_snapshot = build_enriched_snapshot(_tier_base_snapshot)
+        _code_revision = None
+        try:
+            import subprocess as _snap_sp
+            _rev = _snap_sp.run(
+                ["git", "rev-parse", "HEAD"], cwd=BASE_DIR,
+                capture_output=True, text=True, timeout=5,
+            )
+            _code_revision = _rev.stdout.strip() or None
+        except Exception:
+            pass
+        _tunable_hash = None
+        _tunable_path = BASE_DIR / "tunable_params.json"
+        if _tunable_path.exists():
+            import hashlib as _snap_hashlib
+            _tunable_hash = _snap_hashlib.sha256(_tunable_path.read_bytes()).hexdigest()
+        import hashlib as _snap_hashlib2
+        freeze_decision_snapshot(
+            _tier_enriched_snapshot,
+            decision_snapshot_id=_decision_snapshot_id,
+            stage="tier",
+            code_revision=_code_revision,
+            model_ids={
+                "sonnet": _model_router.MODEL_REGISTRY.get("sonnet", ""),
+                "deepseek": _model_router.MODEL_REGISTRY.get("deepseek", ""),
+            },
+            prompt_hashes={"shared_ctx": _snap_hashlib2.sha256(shared_ctx.encode("utf-8")).hexdigest()},
+            tunable_snapshot_hash=_tunable_hash,
+            base_dir=BASE_DIR,
+        )
+    except Exception as _snap_e:
+        print(f"  ⚠️ decision_snapshot(tier) 記録失敗: {_snap_e}")
+
     _TIER_WORKERS = max(1, min(4, _env_int("ALMANAC_TIER_MAX_WORKERS", 2)))
     _TIER_CALL_TIMEOUT = _tier_llm_timeout_seconds()
     write_progress(5, 8, f"🤖 ティア分析中（並列{_TIER_WORKERS}本）",
@@ -9616,6 +9694,7 @@ def run_analysis(force: bool = False) -> dict:
             currency_breakdown_whole=data.get("currency_breakdown_whole"),
             currency_breakdown_long=data.get("currency_breakdown_long"),
             current_currency_policy=data.get("current_currency_policy"),
+            decision_snapshot_id=_decision_snapshot_id,
         )
         if _is_synthesis_failure(synthesis):
             raise RuntimeError(synthesis.get("error") or "final synthesis failed")
@@ -9681,6 +9760,7 @@ def run_analysis(force: bool = False) -> dict:
                             currency_breakdown_whole=data.get("currency_breakdown_whole"),
                             currency_breakdown_long=data.get("currency_breakdown_long"),
                             current_currency_policy=data.get("current_currency_policy"),
+                            decision_snapshot_id=_decision_snapshot_id,
                         )
                         if _is_synthesis_failure(synthesis):
                             raise RuntimeError(synthesis.get("error") or "fallback synthesis failed")
@@ -9896,6 +9976,15 @@ def run_analysis(force: bool = False) -> dict:
                 _action["analysis_id"] = _asl_analysis_id
     except Exception:
         pass
+
+    # Stage 1B: analysis_id (action/ログ結合用) と decision_snapshot_id
+    # (analysis_snapshot.decision_snapshot_state.json への参照) を紐付ける。
+    # 2つの ID が別モジュールで独立発行されているのは意図的 (1B の
+    # decision_snapshot は tier LLM 呼び出し開始時点、analysis_id は
+    # synthesis 完了後に発行される) — ここで橋渡しするだけで、どちらの
+    # 発行タイミングも変更しない。
+    if _decision_snapshot_id:
+        synthesis["decision_snapshot_id"] = _decision_snapshot_id
 
     # F3: tier_generated ステージを記録（各一次ティアが生成したアクション）。
     # 同一 analysis_id で opus_raw / policy / final と join できる。
