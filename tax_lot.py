@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -439,3 +440,192 @@ def portfolio_lot_snapshot(
             for l in opens
         ]
     return {"lots": lots_by_ticker}
+
+
+# ============================================================
+# Stage 5A: CostBasisEstimate — 総平均法に準ずる方法との dual-run 比較
+# ============================================================
+#
+# 単一の計算結果を強制しない: 消費先ごとに入力の権威が違う。証券会社の
+# 値が使えるならそれが税務表示の権威、台帳計算 (FIFO / 総平均法いずれも)
+# は照合値。本節は FIFO (build_lots が既に実装) と「総平均法に準ずる方法」
+# の見積り (method="total_average_like") を同じ凍結済み event_ledger
+# スナップショットから並行計算し、差分を比較できるようにする。
+#
+# 副作用は一切無い (action_state.json 書き込み・通知・永続化のいずれも
+# 行わない) — Stage 5A の合格条件そのもの。7つの下流消費先
+# (tax_harvest_scanner.py / tax_optimizer.py / analyst/__init__.py /
+# performance.py / nisa_migration_planner.py / espp_plan_manager.py /
+# rebalance_engine.py) への配線は Stage 5B 以降で行う。
+#
+# 確認のお願い: 実装後の数値は証券会社の年間取引報告書と突き合わせて
+# ください。総平均法に準ずる方法には証券会社ごとの計算期間の取り扱い等
+# 細目があり、本実装はそれを完全再現するものではありません。
+
+@dataclass(frozen=True)
+class CostBasisEstimate:
+    """取得原価の1つの見積り。source/method の組で権威度が変わる —
+    呼び出し側が単一の「正しい値」として扱わず、reconciled/
+    data_quality_issues を必ず確認すること。"""
+    amount_jpy: float
+    source: str    # "broker_report" | "event_ledger" | "manual_opening"
+    method: str    # "broker_reported" | "total_average_like"
+    as_of: str
+    reconciled: bool = False
+    data_quality_issues: tuple[str, ...] = field(default_factory=tuple)
+
+
+def compute_total_average_cost_basis(
+    ticker: str,
+    *,
+    db_path: Optional[Path] = None,
+    until: Optional[str] = None,
+) -> Dict[str, CostBasisEstimate]:
+    """総平均法に準ずる方法での取得原価を account 別に見積る。
+
+    build_lots() と同じ event_ledger ソース (trade/split/merge, occurred_at
+    昇順) を使うが、消費ルールが異なる: FIFO は lot ごとに個別追跡するが、
+    総平均法は BUY のたびに
+        新平均 = (残数量×旧平均 + 買付数量×買付単価) / (残数量+買付数量)
+    で平均を更新し、SELL では平均単価を変えずに残数量だけ減らす
+    (総平均法の定義そのもの — 売却は平均を動かさない)。
+
+    データ不整合 (fx 欠落・残高不足の SELL 等) は例外を投げず
+    data_quality_issues に記録し、その口座を fail-closed (結果から除外)
+    にする — 1銘柄の1口座のデータ不備で他の集計まで壊さない。
+    """
+    from event_ledger import query_events
+
+    events = query_events(
+        ticker=ticker,
+        types=["trade", "split", "merge"],
+        date_to=(until + "T23:59:59" if until and "T" not in until else until),
+        db_path=db_path,
+    )
+
+    state: Dict[str, dict] = {}
+    excluded_accounts: set = set()
+    shared_issues: List[str] = []
+
+    for ev in events:
+        etype = (ev.get("event_type") or "").lower()
+
+        if etype in ("split", "merge"):
+            ratio = _split_ratio(ev)
+            if ratio is None or ratio <= 0:
+                shared_issues.append(
+                    f"split/merge event {ev.get('event_id')} に有効な比率が無く全account調整をスキップ"
+                )
+                continue
+            for acct_state in state.values():
+                if acct_state["qty"] > 1e-9:
+                    acct_state["qty"] *= ratio
+                    acct_state["avg_cost_jpy"] /= ratio
+            continue
+
+        direction = (ev.get("direction") or "").lower()
+        qty       = float(ev.get("quantity") or 0)
+        price     = float(ev.get("price") or 0)
+        currency  = (ev.get("currency") or "JPY").upper()
+        fx        = ev.get("fx_rate_usdjpy")
+        if qty <= 0 or price <= 0:
+            continue
+        account = ev.get("account")
+        occurred_at = ev.get("occurred_at") or ""
+
+        if direction == "buy":
+            if currency == "USD" and (fx is None or float(fx) <= 0):
+                excluded_accounts.add(account)
+                shared_issues.append(
+                    f"account={account!r}: USD BUY event {ev.get('event_id')} に "
+                    "fx_rate_usdjpy が無いため除外"
+                )
+                continue
+            cps_jpy = price * float(fx) if currency == "USD" and fx else price
+            acct_state = state.setdefault(
+                account, {"avg_cost_jpy": 0.0, "qty": 0.0, "last_event_at": occurred_at},
+            )
+            old_qty, old_avg = acct_state["qty"], acct_state["avg_cost_jpy"]
+            new_qty = old_qty + qty
+            acct_state["avg_cost_jpy"] = (
+                (old_qty * old_avg + qty * cps_jpy) / new_qty if new_qty > 1e-12 else cps_jpy
+            )
+            acct_state["qty"] = new_qty
+            acct_state["last_event_at"] = occurred_at
+
+        elif direction == "sell":
+            acct_state = state.get(account)
+            if acct_state is None or acct_state["qty"] < qty - 1e-9:
+                excluded_accounts.add(account)
+                shared_issues.append(
+                    f"account={account!r}: SELL event {ev.get('event_id')} ({qty}株) を賄う"
+                    "残高が総平均法計算に見つからないため除外"
+                )
+                continue
+            acct_state["qty"] -= qty  # 総平均法の定義: 売却は平均単価を変えない
+            acct_state["last_event_at"] = occurred_at
+
+    result: Dict[str, CostBasisEstimate] = {}
+    for account, acct_state in state.items():
+        if account in excluded_accounts or acct_state["qty"] <= 1e-9:
+            continue
+        result[account] = CostBasisEstimate(
+            amount_jpy=round(acct_state["qty"] * acct_state["avg_cost_jpy"], 2),
+            source="event_ledger",
+            method="total_average_like",
+            as_of=acct_state["last_event_at"] or datetime.now().isoformat(),
+            reconciled=False,
+            data_quality_issues=tuple(shared_issues),
+        )
+    return result
+
+
+def compare_old_new_cost_basis(
+    ticker: str,
+    *,
+    db_path: Optional[Path] = None,
+    until: Optional[str] = None,
+) -> dict:
+    """FIFO (既存 build_lots) と総平均法に準ずる方法 (新) の取得原価を、
+    同じ凍結済み event_ledger スナップショットから account 別に比較する。
+
+    副作用なし・永続化なし — 純粋関数。呼び出し側 (compute_tax_harvest 等)
+    がこの結果をどう使うか (レポート出力 / 何もしない) を別途決める。
+    """
+    fifo_state = build_lots(ticker, db_path=db_path, until=until)
+    fifo_by_account: Dict[str, float] = {}
+    for lot in fifo_state.open_lots:
+        if lot.remaining_qty > 1e-9:
+            fifo_by_account[lot.account] = (
+                fifo_by_account.get(lot.account, 0.0) + lot.remaining_cost_jpy
+            )
+
+    total_avg_by_account = compute_total_average_cost_basis(ticker, db_path=db_path, until=until)
+
+    accounts = sorted({str(a) for a in fifo_by_account} | {str(a) for a in total_avg_by_account}, key=str)
+    rows = []
+    for account in accounts:
+        fifo_amount = fifo_by_account.get(account)
+        estimate = total_avg_by_account.get(account)
+        total_avg_amount = estimate.amount_jpy if estimate else None
+        rows.append({
+            "ticker": ticker,
+            "account": account,
+            "fifo_cost_basis_jpy": round(fifo_amount, 2) if fifo_amount is not None else None,
+            "total_average_cost_basis_jpy": total_avg_amount,
+            "diff_jpy": (
+                round(total_avg_amount - fifo_amount, 2)
+                if (total_avg_amount is not None and fifo_amount is not None) else None
+            ),
+            "total_average_data_quality_issues": list(estimate.data_quality_issues) if estimate else [],
+        })
+
+    return {
+        "ticker": ticker,
+        "rows": rows,
+        "compared_at": datetime.now().isoformat(),
+        "note": (
+            "total_average_cost_basis_jpy は method='total_average_like' の見積りです。"
+            "証券会社の年間取引報告書と必ず突き合わせてください。"
+        ),
+    }

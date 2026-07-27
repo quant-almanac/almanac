@@ -321,3 +321,123 @@ def test_split_with_only_quantity_raises(tmp_db):
                     event_id="qonly", db_path=tmp_db)
     with pytest.raises(ValueError, match="split_ratio"):
         tl.build_lots("X", db_path=tmp_db)
+
+
+# ────────────────────────────────────────────────────────
+# Stage 5A: CostBasisEstimate / 総平均法に準ずる方法 dual-run
+# ────────────────────────────────────────────────────────
+
+
+def test_total_average_single_buy_equals_buy_price(tmp_db):
+    _add_buy(tmp_db, ticker="AAPL", qty=10, price=150, date="2026-01-10")
+    result = tl.compute_total_average_cost_basis("AAPL", db_path=tmp_db)
+    est = result["特定"]
+    assert est.amount_jpy == pytest.approx(1500)  # 10 * 150
+    assert est.method == "total_average_like"
+    assert est.source == "event_ledger"
+    assert est.reconciled is False
+
+
+def test_total_average_two_buys_are_weighted(tmp_db):
+    """(10*100 + 10*200) / 20 = 150"""
+    _add_buy(tmp_db, ticker="AAPL", qty=10, price=100, date="2026-01-10")
+    _add_buy(tmp_db, ticker="AAPL", qty=10, price=200, date="2026-02-10")
+    result = tl.compute_total_average_cost_basis("AAPL", db_path=tmp_db)
+    est = result["特定"]
+    assert est.amount_jpy == pytest.approx(20 * 150)  # 3000
+
+
+def test_total_average_sell_does_not_change_average(tmp_db):
+    """総平均法の定義そのもの: 売却は平均単価を動かさない。10株@100 →
+    4株売却 → 残6株の平均は依然100 (FIFOのように「残ったlotの単価」が
+    変わるわけではない)。"""
+    _add_buy(tmp_db, ticker="AAPL", qty=10, price=100, date="2026-01-10")
+    _add_sell(tmp_db, ticker="AAPL", qty=4, price=999, date="2026-02-01")
+    result = tl.compute_total_average_cost_basis("AAPL", db_path=tmp_db)
+    est = result["特定"]
+    assert est.amount_jpy == pytest.approx(6 * 100)  # 600, 単価100のまま
+
+
+def test_total_average_recomputes_only_on_next_buy(tmp_db):
+    """買い→売り→買いの順で、平均は2回目の買い時点でのみ更新される。
+    10株@100 → 6株売却(残4株@100) → 6株@200購入 →
+    新平均 = (4*100 + 6*200)/10 = 160"""
+    _add_buy(tmp_db, ticker="AAPL", qty=10, price=100, date="2026-01-10")
+    _add_sell(tmp_db, ticker="AAPL", qty=6, price=999, date="2026-02-01")
+    _add_buy(tmp_db, ticker="AAPL", qty=6, price=200, date="2026-03-01")
+    result = tl.compute_total_average_cost_basis("AAPL", db_path=tmp_db)
+    est = result["特定"]
+    assert est.amount_jpy == pytest.approx(10 * 160)  # 1600
+
+
+def test_total_average_excludes_account_with_insufficient_balance(tmp_db):
+    """total_average 計算内でのみ賄えない SELL (5株買って10株売却) は
+    例外を投げず、その account を結果から除外し issue を記録する
+    (1銘柄1口座のデータ不備で他の集計まで壊さない)。"""
+    _add_buy(tmp_db, ticker="AAPL", qty=5, price=100, date="2026-01-10")
+    _add_sell(tmp_db, ticker="AAPL", qty=10, price=999, date="2026-02-01")
+    result = tl.compute_total_average_cost_basis("AAPL", db_path=tmp_db)
+    assert "特定" not in result
+
+
+def test_total_average_applies_split_ratio(tmp_db):
+    """2:1 split で数量2倍・平均単価半分 (取得総額は不変)。"""
+    import event_ledger as el
+    _add_buy(tmp_db, ticker="Z", qty=10, price=150, date="2026-01-10")
+    el.append_event(event_type="split", occurred_at="2026-02-01T08:00:00",
+                    ticker="Z", raw_payload={"ratio": 2.0}, account="特定",
+                    event_id="r1", db_path=tmp_db)
+    result = tl.compute_total_average_cost_basis("Z", db_path=tmp_db)
+    est = result["特定"]
+    assert est.amount_jpy == pytest.approx(10 * 150)  # 総額不変 (1500)
+
+
+def test_total_average_separates_accounts(tmp_db):
+    _add_buy(tmp_db, ticker="AAPL", qty=10, price=100, date="2026-01-10", account="特定")
+    _add_buy(tmp_db, ticker="AAPL", qty=5, price=300, date="2026-01-15", account="持株会")
+    result = tl.compute_total_average_cost_basis("AAPL", db_path=tmp_db)
+    assert result["特定"].amount_jpy == pytest.approx(1000)
+    assert result["持株会"].amount_jpy == pytest.approx(1500)
+
+
+def test_compare_old_new_matches_when_no_sells(tmp_db):
+    """売却が無ければ FIFO と総平均法は (単一lotなので) 一致する。"""
+    _add_buy(tmp_db, ticker="AAPL", qty=10, price=150, date="2026-01-10")
+    cmp_result = tl.compare_old_new_cost_basis("AAPL", db_path=tmp_db)
+    row = cmp_result["rows"][0]
+    assert row["fifo_cost_basis_jpy"] == pytest.approx(1500)
+    assert row["total_average_cost_basis_jpy"] == pytest.approx(1500)
+    assert row["diff_jpy"] == pytest.approx(0)
+
+
+def test_compare_old_new_diverges_with_mixed_lots_and_partial_sell(tmp_db):
+    """本題: FIFO と総平均法が実際に異なる数値を出すケース。
+    10株@100 + 10株@200 → 5株売却。
+    FIFO: 古いlot(100円)から5株消費 → 残り 5株@100 + 10株@200 = 500+2000=2500
+    総平均法: 平均=(10*100+10*200)/20=150 → 売却後も平均不変、残15株 → 15*150=2250
+    差分 = 2250 - 2500 = -250"""
+    _add_buy(tmp_db, ticker="AAPL", qty=10, price=100, date="2026-01-01")
+    _add_buy(tmp_db, ticker="AAPL", qty=10, price=200, date="2026-02-01")
+    _add_sell(tmp_db, ticker="AAPL", qty=5, price=999, date="2026-03-01")
+
+    cmp_result = tl.compare_old_new_cost_basis("AAPL", db_path=tmp_db)
+    row = cmp_result["rows"][0]
+    assert row["fifo_cost_basis_jpy"] == pytest.approx(2500)
+    assert row["total_average_cost_basis_jpy"] == pytest.approx(2250)
+    assert row["diff_jpy"] == pytest.approx(-250)
+    assert "証券会社の年間取引報告書" in cmp_result["note"]
+
+
+def test_compare_old_new_is_side_effect_free(tmp_db, tmp_path, monkeypatch):
+    """本題 (Stage 5A の合格条件): 比較関数は action_state.json も
+    通知も一切触らない — 純粋関数であること。"""
+    import action_state_tracker as ast
+
+    state_path = tmp_path / "action_state.json"
+    monkeypatch.setattr(ast, "STATE_FILE", state_path)
+
+    _add_buy(tmp_db, ticker="AAPL", qty=10, price=100, date="2026-01-10")
+    tl.compare_old_new_cost_basis("AAPL", db_path=tmp_db)
+    tl.compute_total_average_cost_basis("AAPL", db_path=tmp_db)
+
+    assert not state_path.exists()  # 一切書き込まれていない

@@ -41,7 +41,7 @@ def _default_price_provider(ticker: str, currency: str) -> tuple[Optional[float]
     return price, fx
 
 
-def scan_tax_harvest(
+def compute_tax_harvest(
     *,
     min_loss_jpy: float = 30_000,
     lots_snapshot: Optional[dict] = None,
@@ -51,7 +51,12 @@ def scan_tax_harvest(
     recommend_func: Callable[..., dict] = recommend_sell_lots,
     db_path: Optional[Path] = None,
 ) -> dict:
-    """Return tax-loss candidates. No orders are created or submitted."""
+    """純粋: 損出し候補を計算するだけ。action_state への登録・通知・
+    ファイル永続化のいずれも行わない (Stage 5A の副作用分離)。
+
+    候補には recommendation_id がまだ付いていない — register_actions() が
+    action_state_tracker への登録と同時に付与する。
+    """
 
     snapshot = lots_snapshot if lots_snapshot is not None else portfolio_lot_snapshot(db_path=db_path)
     provider = price_provider or _default_price_provider
@@ -97,23 +102,6 @@ def scan_tax_harvest(
             is_japan = ticker.endswith(".T")
             estimated_tax_saving_jpy = round(abs(estimated_loss) * tax_rate)
 
-            # 候補ごとに action_state_tracker へ登録し、recommendation_id を発行する。
-            # 既存の pending/filled/cancelled/expired ライフサイクル・dedup をそのまま流用し、
-            # 損出し専用の別台帳は作らない。
-            act_for_tracking = {
-                "ticker": ticker,
-                "type": TAX_HARVEST_ACTION_TYPE,
-                "urgency": "medium" if abs(estimated_loss) >= min_loss_jpy * 3 else "low",
-                "action": f"損出し候補: {ticker} {round(quantity, 2)}株 ({account})",
-                "reason": f"含み損¥{estimated_loss:,.0f}・推定節税¥{estimated_tax_saving_jpy:,.0f}",
-                "account": account,
-            }
-            ast.record_recommendations([act_for_tracking], source="tax_harvest_scanner")
-            bucket = ast.account_bucket_for_action(act_for_tracking)
-            recommendation_id = ast._make_id(
-                ticker, TAX_HARVEST_ACTION_TYPE, datetime.now().isoformat(), bucket,
-            )
-
             candidates.append({
                 "ticker": ticker,
                 "account": account,
@@ -122,10 +110,10 @@ def scan_tax_harvest(
                 "currency": currency,
                 "estimated_loss_jpy": round(estimated_loss),
                 "estimated_tax_saving_jpy": estimated_tax_saving_jpy,
+                "urgency": "medium" if abs(estimated_loss) >= min_loss_jpy * 3 else "low",
                 "substitutes": _lookup_substitutes(ticker, is_japan, substitutes)[:3],
                 "lot_plan": plan.get("plan", []),
                 "human_execution_only": True,
-                "recommendation_id": recommendation_id,
             })
 
     candidates.sort(key=lambda row: row["estimated_loss_jpy"])
@@ -140,6 +128,64 @@ def scan_tax_harvest(
         "warning": REPURCHASE_WARNING,
         "execution": "display_and_notify_only",
     }
+
+
+def register_actions(report: dict) -> dict:
+    """report の各 candidate を action_state_tracker へ登録し、
+    recommendation_id を付与した新しい report を返す (元の report は
+    変更しない — 副作用はこの関数1箇所に集約する)。
+
+    既存の pending/filled/cancelled/expired ライフサイクル・dedup を
+    そのまま流用し、損出し専用の別台帳は作らない。
+    """
+    import copy
+
+    report = copy.deepcopy(report)
+    for row in report.get("candidates", []):
+        act_for_tracking = {
+            "ticker": row["ticker"],
+            "type": TAX_HARVEST_ACTION_TYPE,
+            "urgency": row.get("urgency", "low"),
+            "action": f"損出し候補: {row['ticker']} {round(row['quantity'], 2)}株 ({row['account']})",
+            "reason": (
+                f"含み損¥{row['estimated_loss_jpy']:,.0f}・"
+                f"推定節税¥{row['estimated_tax_saving_jpy']:,.0f}"
+            ),
+            "account": row["account"],
+        }
+        ast.record_recommendations([act_for_tracking], source="tax_harvest_scanner")
+        bucket = ast.account_bucket_for_action(act_for_tracking)
+        row["recommendation_id"] = ast._make_id(
+            row["ticker"], TAX_HARVEST_ACTION_TYPE, datetime.now().isoformat(), bucket,
+        )
+    return report
+
+
+def scan_tax_harvest(**kwargs) -> dict:
+    """後方互換 wrapper: compute_tax_harvest() + register_actions() を1回で行う。
+
+    既存の呼び出し元 (cron 経由の main()、既存テスト) は
+    「計算すると同時に action_state へ登録される」動作に依存しているため、
+    この関数のシグネチャ・副作用は変更しない。新しい呼び出し元は
+    compute_tax_harvest() だけを呼んで登録タイミングを自分で制御できる。
+    """
+    report = compute_tax_harvest(**kwargs)
+    return register_actions(report)
+
+
+def publish_report(report: dict, *, report_path: Path | str = DEFAULT_REPORT_PATH) -> None:
+    """report を JSONL へ追記する。副作用はこれだけに限定する。"""
+    append_jsonl_safe(Path(report_path), report)
+
+
+def send_notification(report: dict, *, send: Optional[Callable[[str], None]] = None) -> None:
+    """report を Telegram へ送る。副作用はこれだけに限定する。"""
+    sender = send
+    if sender is None:
+        from telegram_bot import _send
+
+        sender = _send
+    sender(format_telegram(report))
 
 
 def format_telegram(report: dict) -> str:
@@ -166,15 +212,13 @@ def run_scan(
     send: Optional[Callable[[str], None]] = None,
     **scan_kwargs,
 ) -> dict:
+    """既存の cron 呼び出し (main() 経由、--notify 付き) を変えない
+    thin wrapper。実体は compute→register→publish→notify の4ステップに
+    分離済み (Stage 5A)。"""
     report = scan_tax_harvest(**scan_kwargs)
-    append_jsonl_safe(Path(report_path), report)
+    publish_report(report, report_path=report_path)
     if notify:
-        sender = send
-        if sender is None:
-            from telegram_bot import _send
-
-            sender = _send
-        sender(format_telegram(report))
+        send_notification(report, send=send)
     return report
 
 

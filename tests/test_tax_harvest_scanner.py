@@ -112,3 +112,114 @@ def test_skip_and_execute_lifecycle_via_existing_update_status(tmp_path, monkeyp
     state = ast._load()
     assert state["actions"][rec_id]["status"] == "filled"
     assert state["actions"][rec_id]["filled_at"] is not None
+
+
+# ---------------------------------------------------------------------------
+# Stage 5A: 副作用分離 (compute_tax_harvest / register_actions / publish_report
+# / send_notification) — scan_tax_harvest / run_scan は後方互換 wrapper
+# ---------------------------------------------------------------------------
+
+
+def test_compute_tax_harvest_never_touches_action_state(tmp_path, monkeypatch):
+    """本題: compute_tax_harvest() は純粋。action_state.json に一切書き込まない。"""
+    state_path = tmp_path / "action_state.json"
+    monkeypatch.setattr(ast, "STATE_FILE", state_path)
+
+    report = ths.compute_tax_harvest(
+        min_loss_jpy=1_000,
+        lots_snapshot=_lots_snapshot(),
+        price_provider=_price_provider,
+        recommend_func=_recommend_func,
+    )
+
+    assert report["candidate_count"] == 1
+    assert "recommendation_id" not in report["candidates"][0]  # register_actions がまだ付与していない
+    assert not state_path.exists()
+
+
+def test_register_actions_is_the_only_side_effecting_step(tmp_path, monkeypatch):
+    state_path = tmp_path / "action_state.json"
+    monkeypatch.setattr(ast, "STATE_FILE", state_path)
+
+    report = ths.compute_tax_harvest(
+        min_loss_jpy=1_000,
+        lots_snapshot=_lots_snapshot(),
+        price_provider=_price_provider,
+        recommend_func=_recommend_func,
+    )
+    assert not state_path.exists()
+
+    registered = ths.register_actions(report)
+    assert state_path.exists()
+    assert "recommendation_id" in registered["candidates"][0]
+
+    # register_actions は引数の report を書き換えない (deepcopy を返す)
+    assert "recommendation_id" not in report["candidates"][0]
+
+
+def test_scan_tax_harvest_reproduces_old_combined_behavior(tmp_path, monkeypatch):
+    """後方互換: scan_tax_harvest() は compute+register を1回で行い、
+    既存の cron 呼び出しと既存テスト (このファイルの他のテスト) が期待する
+    「呼ぶと同時に action_state に登録される」動作を変えない。"""
+    state_path = tmp_path / "action_state.json"
+    monkeypatch.setattr(ast, "STATE_FILE", state_path)
+
+    report = ths.scan_tax_harvest(
+        min_loss_jpy=1_000,
+        lots_snapshot=_lots_snapshot(),
+        price_provider=_price_provider,
+        recommend_func=_recommend_func,
+    )
+    assert "recommendation_id" in report["candidates"][0]
+    state = ast._load()
+    assert report["candidates"][0]["recommendation_id"] in state["actions"]
+
+
+def test_publish_report_only_writes_the_report_file(tmp_path, monkeypatch):
+    state_path = tmp_path / "action_state.json"
+    monkeypatch.setattr(ast, "STATE_FILE", state_path)
+    report_path = tmp_path / "reports.jsonl"
+
+    report = ths.compute_tax_harvest(
+        min_loss_jpy=1_000,
+        lots_snapshot=_lots_snapshot(),
+        price_provider=_price_provider,
+        recommend_func=_recommend_func,
+    )
+    ths.publish_report(report, report_path=report_path)
+
+    assert report_path.exists()
+    assert not state_path.exists()  # publish_report は action_state に触れない
+
+
+def test_send_notification_only_calls_sender(tmp_path):
+    sent = []
+    report = {"candidates": [], "total_estimated_tax_saving_jpy": 0}
+    ths.send_notification(report, send=sent.append)
+    assert len(sent) == 1
+    assert "対象候補はありません" in sent[0]
+
+
+def test_run_scan_still_composes_all_four_steps(tmp_path, monkeypatch):
+    """run_scan() は既存 CLI (main() --notify) の後方互換を保ったまま
+    compute→register→publish→notify の4ステップを合成する。"""
+    state_path = tmp_path / "action_state.json"
+    monkeypatch.setattr(ast, "STATE_FILE", state_path)
+    report_path = tmp_path / "reports.jsonl"
+    sent = []
+
+    report = ths.run_scan(
+        report_path=report_path,
+        notify=True,
+        send=sent.append,
+        min_loss_jpy=1_000,
+        lots_snapshot=_lots_snapshot(),
+        price_provider=_price_provider,
+        recommend_func=_recommend_func,
+    )
+
+    assert "recommendation_id" in report["candidates"][0]  # register
+    assert report_path.exists()                            # publish
+    assert len(sent) == 1                                   # notify
+    state = ast._load()
+    assert report["candidates"][0]["recommendation_id"] in state["actions"]  # register 確認
