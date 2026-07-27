@@ -8,7 +8,9 @@ from datetime import date
 from pathlib import Path
 from typing import Any
 
+from execution_safety import canonical_account, canonical_broker, canonical_owner
 from nisa_allocator import score_nisa_placement
+from position_identity import NisaCapacityIdentity, position_identity_for_holding
 
 BASE_DIR = Path(__file__).parent
 TAX_RATE = 0.20315
@@ -96,13 +98,18 @@ def _taxable_candidates(
     holdings: dict[str, Any],
     lots_by_ticker: dict[str, list[dict[str, Any]]],
     fx_rate_usdjpy: float | None = None,
-) -> list[dict[str, Any]]:
+) -> tuple[list[dict[str, Any]], list[str]]:
     candidates: list[dict[str, Any]] = []
+    issues: list[str] = []
     for key, holding in holdings.items():
         if not isinstance(holding, dict) or key.startswith("CASH_"):
             continue
         account = str(holding.get("account") or "")
         if "NISA" in account or account in {"持株会", "信用"}:
+            continue
+        position = position_identity_for_holding(holding, key=key)
+        if position is None:
+            issues.append(f"position_identity_unknown:{key}")
             continue
         ticker = str(holding.get("ticker") or key)
         scored = score_nisa_placement({**holding, "key": key, "ticker": ticker})
@@ -121,12 +128,29 @@ def _taxable_candidates(
             currency=currency,
             fx=fx,
         )
-        lots = [
-            lot
-            for lot in lots_by_ticker.get(ticker, [])
-            if lot.get("account") == account and float(lot.get("remaining_qty") or 0) > 0
+        raw_lots = list(lots_by_ticker.get(ticker, []))
+        account_lots = [
+            lot for lot in raw_lots
+            if canonical_account(lot.get("account")) == position.account
+            and float(lot.get("remaining_qty") or 0) > 0
         ]
+        lots = [
+            lot for lot in account_lots
+            if canonical_owner(lot.get("owner")) == position.owner
+            and canonical_broker(lot.get("broker")) == position.broker
+        ]
+        cost_basis_source = "identity_scoped_tax_lot"
+        cost_basis_verified = bool(lots)
+        ambiguous_account_lots = [
+            lot for lot in account_lots
+            if not canonical_owner(lot.get("owner"))
+            or not canonical_broker(lot.get("broker"))
+        ]
+        if ambiguous_account_lots:
+            issues.append(f"tax_lot_identity_unverified:{position.key}")
         if not lots:
+            issues.append(f"tax_lot_missing_for_position:{position.key}")
+            cost_basis_source = "holding_entry_price_fallback"
             lots = [{
                 "lot_id": f"holding:{key}",
                 "purchase_date": holding.get("entry_date") or "",
@@ -140,6 +164,8 @@ def _taxable_candidates(
                     raw_is_native_price=True,
                 ),
                 "account": account,
+                "owner": position.owner,
+                "broker": position.broker,
             }]
         for lot in lots:
             quantity = float(lot.get("remaining_qty") or 0)
@@ -157,13 +183,20 @@ def _taxable_candidates(
             candidates.append({
                 "ticker": ticker,
                 "name": holding.get("name") or ticker,
+                "owner": position.owner,
+                "source_broker": position.broker,
                 "source_account": account,
+                "source_account_id": position.account,
+                "canonical_instrument_id": position.canonical_instrument_id,
+                "position_identity": position.key,
                 "lot_id": lot.get("lot_id"),
                 "purchase_date": lot.get("purchase_date"),
                 "remaining_qty": quantity,
                 "current_price_jpy": current_price_jpy,
                 "gain_per_share_jpy": gain_per_share,
                 "nisa_score": float(scored["score"]),
+                "cost_basis_source": cost_basis_source,
+                "cost_basis_verified": cost_basis_verified,
             })
     candidates.sort(
         key=lambda row: (
@@ -172,7 +205,25 @@ def _taxable_candidates(
             row["purchase_date"] or "",
         )
     )
-    return candidates
+    return candidates, sorted(set(issues))
+
+
+def _nisa_capacity_identity(
+    nisa_data: dict[str, Any],
+    *,
+    owner: str,
+    tax_year: int,
+) -> NisaCapacityIdentity | None:
+    broker = canonical_broker((nisa_data.get(owner) or {}).get("broker"))
+    if not broker:
+        return None
+    return NisaCapacityIdentity(
+        owner=owner,
+        broker=broker,
+        account=canonical_account("NISA成長投資枠"),
+        nisa_type="growth",
+        tax_year=tax_year,
+    )
 
 
 def build_migration_plan(
@@ -187,7 +238,7 @@ def build_migration_plan(
     """Allocate taxable lots across future NISA growth capacity."""
     current_year = date.today().year
     start = start_year or current_year
-    candidates = _taxable_candidates(
+    candidates, data_quality_issues = _taxable_candidates(
         holdings,
         lots_by_ticker or {},
         fx_rate_usdjpy=fx_rate_usdjpy,
@@ -196,10 +247,25 @@ def build_migration_plan(
     remaining = [dict(row) for row in candidates]
     for year in range(start, start + max(1, years)):
         for person in ("husband", "wife"):
+            capacity_identity = _nisa_capacity_identity(
+                nisa_data,
+                owner=person,
+                tax_year=year,
+            )
+            if capacity_identity is None:
+                data_quality_issues.append(f"nisa_capacity_identity_unknown:{person}:{year}")
+                continue
             capacity = _growth_capacity(nisa_data, person, year, current_year)
             for row in remaining:
                 if capacity <= 0:
                     break
+                # owner と broker の両方が一致する移管元だけを、同じ本人の
+                # NISA capacity に割り当てる。
+                if (
+                    row["owner"] != person
+                    or row["source_broker"] != capacity_identity.broker
+                ):
+                    continue
                 qty_available = float(row["remaining_qty"])
                 if qty_available <= 1e-9:
                     continue
@@ -211,10 +277,18 @@ def build_migration_plan(
                 moves.append({
                     "year": year,
                     "person": person,
+                    "source_owner": row["owner"],
+                    "source_broker": row["source_broker"],
                     "ticker": row["ticker"],
                     "name": row["name"],
                     "source_account": row["source_account"],
+                    "source_account_id": row["source_account_id"],
+                    "position_identity": row["position_identity"],
+                    "destination_owner": capacity_identity.owner,
+                    "destination_broker": capacity_identity.broker,
                     "destination_account": "NISA成長投資枠",
+                    "destination_account_id": capacity_identity.account,
+                    "nisa_capacity_identity": capacity_identity.key,
                     "lot_id": row["lot_id"],
                     "purchase_date": row["purchase_date"],
                     "quantity": round(qty, 6),
@@ -222,6 +296,8 @@ def build_migration_plan(
                     "estimated_realized_gain_jpy": round(realized, 0),
                     "estimated_tax_jpy": round(max(0.0, realized) * TAX_RATE, 0),
                     "nisa_score": row["nisa_score"],
+                    "cost_basis_source": row["cost_basis_source"],
+                    "cost_basis_verified": row["cost_basis_verified"],
                     "human_execution_only": True,
                 })
                 row["remaining_qty"] -= qty
@@ -231,9 +307,9 @@ def build_migration_plan(
         "start_year": start,
         "years": years,
         "fx_rate_usdjpy": round(float(fx_rate_usdjpy), 4) if fx_rate_usdjpy else None,
-        "actionable": True,
+        "actionable": not data_quality_issues,
         "tax_lot_source": "provided",
-        "data_quality_issues": [],
+        "data_quality_issues": sorted(set(data_quality_issues)),
         "human_execution_only": True,
         "display_only": True,
         "moves": moves,
@@ -319,7 +395,9 @@ def build_plan_from_files(root: Path = BASE_DIR, years: int = 3) -> dict[str, An
     if tax_lot_issue:
         plan["actionable"] = False
         plan["tax_lot_source"] = "holding_fallback_due_to_error"
-        plan["data_quality_issues"] = [tax_lot_issue]
+        plan["data_quality_issues"] = sorted(set(
+            list(plan.get("data_quality_issues") or []) + [tax_lot_issue]
+        ))
     else:
         plan["tax_lot_source"] = "tax_lot" if lots else "none"
     return plan

@@ -174,6 +174,7 @@ export interface Allocation {
   risk_warnings: string[]
   stop_loss_alerts: string[]
   ginn_vol: Record<string, number>
+  ginn_vol_model: Record<string, string>
   margin_health?: string
   margin_summary?: string
 }
@@ -530,6 +531,7 @@ export interface HoldingIntel {
   tier?: string
   stop_loss?: string
   ginn_vol?: number
+  ginn_vol_model?: string
 }
 
 export interface BenchmarkData {

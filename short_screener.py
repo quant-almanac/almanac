@@ -673,6 +673,7 @@ def screen_candidates(
     include_holdings: bool             = True,
     us_only:          bool             = False,
     morning:          bool             = False,
+    short_universe_output_path: Path | None = None,
 ) -> dict:
     """
     空売り候補をスクリーニングして返す。
@@ -881,7 +882,11 @@ def screen_candidates(
     try:
         from short_universe import build_short_universe, apply_shortability_gate
         cand_tickers = [c['ticker'] for c in candidates]
-        universe = build_short_universe(cand_tickers, write=True)
+        universe = build_short_universe(
+            cand_tickers,
+            write=True,
+            output_path=short_universe_output_path,
+        )
         candidates = [apply_shortability_gate(c, universe) for c in candidates]
     except Exception as exc:
         # gate 失敗時は fail-closed: 全候補 shortable=false に倒す

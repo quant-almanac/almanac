@@ -440,8 +440,8 @@ def forecast_ginn_result(
     """
     GINNで翌日の予測ボラティリティを返す（年率換算）。モデル境界の中央安全ゲート。
 
-    manifest (ginn_meta.json) の無いモデル、または昇格基準 (現状は
-    n_test > 0) を満たさないモデルは default-deny で GARCH へフォールバック
+    manifest (ginn_meta.json) の無いモデル、または事前固定した validation
+    昇格基準を満たさないモデルは default-deny で GARCH へフォールバック
     する。ALMANAC_DISABLE_GINN=1 は基準を満たしたモデルがあっても常に
     GARCH へ落とす一方向の kill switch。
 

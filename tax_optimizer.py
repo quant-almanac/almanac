@@ -314,6 +314,7 @@ def compute_nisa_quota_restoration(person: str, as_of_year: Optional[int] = None
 def detect_nisa_foreign_tax_leak(
     dividend_yield_threshold: float = 0.015,
     holdings: Optional[dict] = None,
+    fx_rate_usdjpy: Optional[float] = None,
 ) -> dict:
     """
     NISA 口座内の US 高配当銘柄を検出し、年間の米国源泉税流出額を試算する。
@@ -324,6 +325,8 @@ def detect_nisa_foreign_tax_leak(
     Args:
         dividend_yield_threshold: この利回り（小数、例 0.015 = 1.5%）超なら警告
         holdings: None なら自動ロード
+        fx_rate_usdjpy: 凍結済み評価コンテキストの為替。None の場合のみ
+            runtime cache を参照する。テスト・dual-run は明示値を渡す。
 
     Returns:
         {
@@ -372,8 +375,11 @@ def detect_nisa_foreign_tax_leak(
         if shares <= 0 or price <= 0:
             continue
 
-        from utils import get_fx_rate_cached
-        fx, _ = get_fx_rate_cached()
+        if fx_rate_usdjpy is None:
+            from utils import get_fx_rate_cached
+            fx, _ = get_fx_rate_cached()
+        else:
+            fx = float(fx_rate_usdjpy)
         value_jpy = shares * price * fx
         annual_div_jpy  = value_jpy * dy
         annual_leak_jpy = annual_div_jpy * US_DIVIDEND_WITHHOLDING  # 10%

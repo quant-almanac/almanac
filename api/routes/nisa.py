@@ -64,15 +64,8 @@ async def get_nisa():
         from nisa_allocator import build_placement_proposals
         data["placement_proposals"] = build_placement_proposals(data, holdings)
         try:
-            from nisa_migration_planner import build_migration_plan
-            from tax_lot import portfolio_lot_snapshot
-            lots = portfolio_lot_snapshot().get("lots", {})
-            data["migration_plan"] = build_migration_plan(
-                nisa_data=data,
-                holdings=holdings,
-                lots_by_ticker=lots,
-                years=3,
-            )
+            from nisa_migration_planner import build_plan_from_files
+            data["migration_plan"] = build_plan_from_files(root=BASE_DIR, years=3)
         except Exception as exc:
             data["migration_plan"] = {
                 "human_execution_only": True,

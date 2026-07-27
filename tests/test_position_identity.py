@@ -60,7 +60,12 @@ def test_parse_note_sync_date_returns_none_when_unparseable(note):
 def test_holding_and_action_identities_match_for_the_same_real_position():
     """holdings.json 側 (日本語表記) と action 側 (canonical英語) が
     同じ実ポジションを指す場合、同じ PositionIdentity になること。"""
-    holding_entry = {"ticker": "AVGO", "account": "一般", "broker": "楽天証券"}
+    holding_entry = {
+        "ticker": "AVGO",
+        "account": "一般",
+        "broker": "楽天証券",
+        "owner": "husband",
+    }
     action = {"ticker": "AVGO", "execution_owner": "husband",
               "execution_broker": "rakuten", "execution_account": "一般"}
 
@@ -82,6 +87,22 @@ def test_wife_owner_inferred_from_account_label():
 def test_missing_fields_return_none_not_a_guess():
     assert pi.position_identity_for_holding({"ticker": "AVGO"}) is None
     assert pi.position_identity_for_action({"ticker": "AVGO"}) is None
+
+
+def test_owner_inference_requires_positive_evidence():
+    assert pi.infer_owner_from_holding("妻特定") == "wife"
+    assert pi.infer_owner_from_holding("特定", key="AAA_WIFE") == "wife"
+    assert pi.infer_owner_from_holding("夫特定") == "husband"
+    assert pi.infer_owner_from_holding("特定", key="AAA_HUSBAND") == "husband"
+    assert pi.infer_owner_from_holding("特定") is None
+
+
+def test_holding_with_unknown_owner_fails_closed():
+    assert pi.position_identity_for_holding({
+        "ticker": "AVGO",
+        "account": "特定",
+        "broker": "楽天証券",
+    }) is None
 
 
 # ---------------------------------------------------------------------------
@@ -161,7 +182,7 @@ def test_stale_sell_action_is_review_not_blocked(tmp_path):
     """本件の直接再現: 売り系 (trim) には旧コードで鮮度チェックが皆無だった。"""
     now = datetime(2026, 7, 27, 18, 0, tzinfo=JST)
     _write_holdings(tmp_path, {
-        "AVGO_ippan": {"ticker": "AVGO", "account": "一般", "broker": "楽天証券",
+        "AVGO_ippan": {"ticker": "AVGO", "account": "一般", "broker": "楽天証券", "owner": "husband",
                        "note": "楽天CSV保有同期 2026-07-14", "shares": 27.0},
     })
     (tmp_path / "account.json").write_text("{}", encoding="utf-8")
@@ -191,7 +212,7 @@ def test_buy_action_also_gets_position_level_freshness_check(tmp_path):
     チェックも additive に効くこと。"""
     now = datetime(2026, 7, 27, 18, 0, tzinfo=JST)
     _write_holdings(tmp_path, {
-        "AVGO_ippan": {"ticker": "AVGO", "account": "一般", "broker": "楽天証券",
+        "AVGO_ippan": {"ticker": "AVGO", "account": "一般", "broker": "楽天証券", "owner": "husband",
                        "note": "楽天CSV保有同期 2026-07-14"},
     })
     (tmp_path / "account.json").write_text(json.dumps({"balance": 1_000_000}), encoding="utf-8")
@@ -216,7 +237,7 @@ def test_fresh_holding_produces_no_freshness_reason(tmp_path):
     """誤検知の防止: 今日同期されたポジションには position_broker_sync_* が出ない。"""
     now = datetime(2026, 7, 27, 18, 0, tzinfo=JST)
     _write_holdings(tmp_path, {
-        "AVGO_ippan": {"ticker": "AVGO", "account": "一般", "broker": "楽天証券",
+        "AVGO_ippan": {"ticker": "AVGO", "account": "一般", "broker": "楽天証券", "owner": "husband",
                        "note": "楽天CSV保有同期 2026-07-27", "shares": 27.0},
     })
     (tmp_path / "account.json").write_text("{}", encoding="utf-8")
@@ -264,7 +285,7 @@ def test_severity_never_escalates_to_blocked_from_this_check_alone(tmp_path, not
     頼らない)。"""
     now = datetime(2026, 7, 27, 18, 0, tzinfo=JST)
     _write_holdings(tmp_path, {
-        "AVGO_ippan": {"ticker": "AVGO", "account": "一般", "broker": "楽天証券",
+        "AVGO_ippan": {"ticker": "AVGO", "account": "一般", "broker": "楽天証券", "owner": "husband",
                        "note": note, "shares": 27.0},
     })
     (tmp_path / "account.json").write_text("{}", encoding="utf-8")

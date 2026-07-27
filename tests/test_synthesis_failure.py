@@ -48,7 +48,7 @@ def test_swing_prompt_includes_deterministic_jp_only_candidates_without_ai_comme
         return {"health": "good", "summary": "ok", "priority_actions": []}
 
     monkeypatch.setattr(analyst, "call_tier_analysis", fake_tier_call)
-    monkeypatch.setattr(analyst, "_compute_ginn_vol", lambda tickers: ("", {}))
+    monkeypatch.setattr(analyst, "_compute_ginn_vol", lambda tickers: ("", {}, {}))
     monkeypatch.setattr(analyst, "_fmt_technical_state", lambda tickers, state: "")
     monkeypatch.setattr(analyst, "_fmt_social_sentiment", lambda tickers, state: "")
     monkeypatch.setattr(analyst, "fmt_news_section", lambda news, tickers=None: "")

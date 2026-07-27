@@ -44,25 +44,54 @@ PROTECTED_STATE = (
 )
 
 
-@pytest.fixture(scope="session", autouse=True)
-def _protect_production_state():
-    snapshot = {}
+def _state_snapshot() -> dict[Path, bytes | None]:
+    snapshot: dict[Path, bytes | None] = {}
     for rel in PROTECTED_STATE:
-        f = ROOT / rel
-        if f.is_file():
-            try:
-                snapshot[f] = f.read_bytes()
-            except OSError:
-                pass
-    yield
-    restored = []
-    for f, data in snapshot.items():
+        path = ROOT / rel
         try:
-            if f.read_bytes() != data:
-                f.write_bytes(data)
-                restored.append(str(f.relative_to(ROOT)))
+            snapshot[path] = path.read_bytes() if path.is_file() else None
+        except OSError:
+            snapshot[path] = None
+    return snapshot
+
+
+def _restore_changed_state(snapshot: dict[Path, bytes | None]) -> list[str]:
+    restored: list[str] = []
+    for path, original in snapshot.items():
+        try:
+            current = path.read_bytes() if path.is_file() else None
+            if current == original:
+                continue
+            if original is None:
+                if path.exists():
+                    path.unlink()
+            else:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(original)
+            restored.append(str(path.relative_to(ROOT)))
         except OSError:
             continue
+    return restored
+
+
+@pytest.fixture(autouse=True)
+def _fail_test_that_mutates_production_state():
+    """Restore and fail the exact test that touched repository state."""
+    snapshot = _state_snapshot()
+    yield
+    restored = _restore_changed_state(snapshot)
+    if restored:
+        pytest.fail(
+            "test mutated repository state (restored): "
+            + ", ".join(sorted(restored))
+        )
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _protect_production_state():
+    snapshot = _state_snapshot()
+    yield
+    restored = _restore_changed_state(snapshot)
     if restored:
         import warnings
         warnings.warn(

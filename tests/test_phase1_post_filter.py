@@ -1796,6 +1796,8 @@ def test_playbook_injector_replaces_model_supplied_attestation(monkeypatch):
         return default
 
     monkeypatch.setattr(analyst, "load_json", _load)
+    import utils
+    monkeypatch.setattr(utils, "get_fx_rate_cached", lambda *_args, **_kwargs: (150.0, "fixture"))
     fake = {
         "ticker": "FAKE",
         "type": "buy",

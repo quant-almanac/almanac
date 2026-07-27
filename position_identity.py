@@ -92,6 +92,23 @@ def canonical_instrument_id(ticker: str) -> str:
     return str(ticker or "").strip().upper()
 
 
+def infer_owner_from_holding(
+    account_raw: str | None,
+    *,
+    key: str | None = None,
+) -> Optional[str]:
+    """Infer owner only from a positive owner marker.
+
+    Missing ``_WIFE`` is not evidence that a record belongs to the husband.
+    Ambiguous records return None so execution and NISA planning fail closed.
+    """
+    if "妻" in str(account_raw or "") or (key and "_WIFE" in key.upper()):
+        return "wife"
+    if "夫" in str(account_raw or "") or (key and "_HUSBAND" in key.upper()):
+        return "husband"
+    return None
+
+
 def position_identity_for_holding(entry: dict, *, key: str | None = None) -> Optional[PositionIdentity]:
     """holdings.json のエントリから PositionIdentity を作る。
 
@@ -105,10 +122,9 @@ def position_identity_for_holding(entry: dict, *, key: str | None = None) -> Opt
     ticker/account/broker のいずれかが欠落、または正規化後に owner/broker/
     account のいずれかが空文字になるレコードは fail-closed で None を返す
     (推測で埋めない)。owner フィールド自体を持たない既存レコードが大半
-    なため、account名の「妻」表記や key の "_WIFE" サフィックスから
-    推定できる場合のみ補う。それ以外は本アプリの既定運用者 (夫名義) と
-    する — これは既存コードベース全体の前提 (CASH_JPY=夫, CASH_JPY_SBI_WIFE=妻)
-    と揃えたものであり、本 module が新たに導入する推測ではない。
+    なため、account名の「妻/夫」表記や key の "_WIFE/_HUSBAND"
+    サフィックスから確認できる場合のみ補う。それ以外は fail-closed で
+    None を返す。
     """
     from execution_safety import canonical_account, canonical_broker, canonical_owner
 
@@ -120,7 +136,9 @@ def position_identity_for_holding(entry: dict, *, key: str | None = None) -> Opt
 
     owner_raw = entry.get("owner")
     if not owner_raw:
-        owner_raw = "wife" if ("妻" in str(account_raw) or (key and "_WIFE" in key.upper())) else "husband"
+        owner_raw = infer_owner_from_holding(account_raw, key=key)
+    if not owner_raw:
+        return None
 
     owner = canonical_owner(owner_raw)
     broker = canonical_broker(broker_raw)

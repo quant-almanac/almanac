@@ -420,15 +420,16 @@ class TestDcaCashFix:
 
     def test_estimate_cash_returns_none_when_no_file(self, monkeypatch, tmp_path):
         import drawdown_dca_engine as dca
+        import portfolio_manager
         monkeypatch.setattr(dca, "BASE_DIR", tmp_path)
-        # portfolio_manager を封じる
+        # Freeze the fallback too so tests never update the live account FX.
         monkeypatch.setattr(
-            "drawdown_dca_engine.BASE_DIR", tmp_path, raising=False
+            portfolio_manager,
+            "build_portfolio_snapshot",
+            lambda: {"cash_jpy": None},
         )
-        # portfolio_manager がない場合の None fallback
         result = dca._estimate_cash_jpy()
-        # ファイルなし → None を返すか portfolio_manager fallback
-        assert result is None or isinstance(result, float)
+        assert result is None
 
     def test_persist_uses_atomic_write(self, monkeypatch, tmp_path):
         import drawdown_dca_engine as dca
@@ -460,7 +461,18 @@ class TestDcaCashFix:
         sys.modules["macro_fetcher"].classify_panic = lambda x: {}
         sys.modules.setdefault("vix_tracker", type(sys)("vix_tracker"))
         sys.modules["vix_tracker"].get_vix_context = lambda: {}
-        result = dca.generate_ladder_signals(cash_jpy=1000000.0, dry_run=True)
+        result = dca.generate_ladder_signals(
+            cash_jpy=1000000.0,
+            dry_run=True,
+            cash_breakdown={
+                "jpy": 1_000_000.0,
+                "usd": 0.0,
+                "usd_jpy": 0.0,
+                "total_jpy": 1_000_000.0,
+                "fx_rate": 150.0,
+                "source": "fixture",
+            },
+        )
         assert "freshness_date" in result
         assert result["freshness_date"] == date.today().isoformat()
 

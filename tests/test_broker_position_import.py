@@ -60,6 +60,8 @@ def test_build_reconciled_holdings_updates_and_adds(tmp_path):
     assert next_holdings["GS_MMF_USD"]["shares"] == 4018.77
     assert "GLD_NISA" in next_holdings
     assert next_holdings["GLD_NISA"]["account"] == "NISA成長投資枠"
+    assert next_holdings["GLD_NISA"]["owner"] == "husband"
+    assert next_holdings["6762.T"]["owner"] == "husband"
     assert "ABNB" in next_holdings
     assert next_holdings["CASH_JPY"]["shares"] == 1000
     assert next_holdings["1489_WIFE"]["shares"] == 150

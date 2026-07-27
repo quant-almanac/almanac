@@ -10,13 +10,15 @@ from nisa_migration_planner import build_migration_plan, build_plan_from_files
 def test_nisa_migration_uses_low_gain_lot_and_never_executes() -> None:
     plan = build_migration_plan(
         nisa_data={
-            "husband": {"growth_limit_annual": 2_400_000},
-            "wife": {"growth_limit_annual": 2_400_000},
+            "husband": {"growth_limit_annual": 2_400_000, "broker": "楽天証券"},
+            "wife": {"growth_limit_annual": 2_400_000, "broker": "SBI証券"},
         },
         holdings={
             "AAA": {
                 "ticker": "AAA",
                 "account": "特定",
+                "owner": "husband",
+                "broker": "楽天証券",
                 "currency": "JPY",
                 "shares": 20,
                 "current_price": 100_000,
@@ -33,6 +35,8 @@ def test_nisa_migration_uses_low_gain_lot_and_never_executes() -> None:
                     "remaining_qty": 10,
                     "cost_per_share_jpy": 20_000,
                     "account": "特定",
+                    "owner": "husband",
+                    "broker": "楽天証券",
                 },
                 {
                     "lot_id": "low-gain",
@@ -40,6 +44,8 @@ def test_nisa_migration_uses_low_gain_lot_and_never_executes() -> None:
                     "remaining_qty": 10,
                     "cost_per_share_jpy": 95_000,
                     "account": "特定",
+                    "owner": "husband",
+                    "broker": "楽天証券",
                 },
             ]
         },
@@ -56,13 +62,15 @@ def test_nisa_migration_uses_low_gain_lot_and_never_executes() -> None:
 def test_nisa_migration_uses_portfolio_fx_for_usd_holdings() -> None:
     plan = build_migration_plan(
         nisa_data={
-            "husband": {"growth_limit_annual": 2_400_000},
-            "wife": {"growth_limit_annual": 2_400_000},
+            "husband": {"growth_limit_annual": 2_400_000, "broker": "楽天証券"},
+            "wife": {"growth_limit_annual": 2_400_000, "broker": "SBI証券"},
         },
         holdings={
             "AAA": {
                 "ticker": "AAA",
                 "account": "特定",
+                "owner": "husband",
+                "broker": "楽天証券",
                 "currency": "USD",
                 "shares": 10,
                 "current_price": 200.0,
@@ -87,13 +95,15 @@ def test_nisa_migration_missing_usd_fx_fails_closed() -> None:
     try:
         build_migration_plan(
             nisa_data={
-                "husband": {"growth_limit_annual": 2_400_000},
-                "wife": {"growth_limit_annual": 2_400_000},
+                "husband": {"growth_limit_annual": 2_400_000, "broker": "楽天証券"},
+                "wife": {"growth_limit_annual": 2_400_000, "broker": "SBI証券"},
             },
             holdings={
                 "AAA": {
                     "ticker": "AAA",
                     "account": "特定",
+                    "owner": "husband",
+                    "broker": "楽天証券",
                     "currency": "USD",
                     "shares": 10,
                     "current_price": 200.0,
@@ -116,8 +126,8 @@ def test_nisa_migration_missing_usd_fx_fails_closed() -> None:
 def test_nisa_migration_file_loader_uses_account_fx_read_only(tmp_path, monkeypatch) -> None:
     (tmp_path / "nisa_portfolio.json").write_text(
         json.dumps({
-            "husband": {"growth_limit_annual": 2_400_000},
-            "wife": {"growth_limit_annual": 2_400_000},
+            "husband": {"growth_limit_annual": 2_400_000, "broker": "楽天証券"},
+            "wife": {"growth_limit_annual": 2_400_000, "broker": "SBI証券"},
         }),
         encoding="utf-8",
     )
@@ -126,6 +136,8 @@ def test_nisa_migration_file_loader_uses_account_fx_read_only(tmp_path, monkeypa
             "AAA": {
                 "ticker": "AAA",
                 "account": "特定",
+                "owner": "husband",
+                "broker": "楽天証券",
                 "currency": "USD",
                 "shares": 10,
                 "current_price": 200.0,
@@ -153,8 +165,8 @@ def test_nisa_migration_file_loader_uses_account_fx_read_only(tmp_path, monkeypa
 def test_nisa_migration_file_loader_uses_local_parquet_current_price(tmp_path, monkeypatch) -> None:
     (tmp_path / "nisa_portfolio.json").write_text(
         json.dumps({
-            "husband": {"growth_limit_annual": 2_400_000},
-            "wife": {"growth_limit_annual": 2_400_000},
+            "husband": {"growth_limit_annual": 2_400_000, "broker": "楽天証券"},
+            "wife": {"growth_limit_annual": 2_400_000, "broker": "SBI証券"},
         }),
         encoding="utf-8",
     )
@@ -163,6 +175,8 @@ def test_nisa_migration_file_loader_uses_local_parquet_current_price(tmp_path, m
             "AAA": {
                 "ticker": "AAA",
                 "account": "特定",
+                "owner": "husband",
+                "broker": "楽天証券",
                 "currency": "JPY",
                 "shares": 10,
                 "entry_price": 100.0,
@@ -197,8 +211,8 @@ def test_nisa_migration_file_loader_uses_local_parquet_current_price(tmp_path, m
 def test_nisa_migration_file_loader_surfaces_tax_lot_failure(tmp_path, monkeypatch) -> None:
     (tmp_path / "nisa_portfolio.json").write_text(
         json.dumps({
-            "husband": {"growth_limit_annual": 2_400_000},
-            "wife": {"growth_limit_annual": 2_400_000},
+            "husband": {"growth_limit_annual": 2_400_000, "broker": "楽天証券"},
+            "wife": {"growth_limit_annual": 2_400_000, "broker": "SBI証券"},
         }),
         encoding="utf-8",
     )
@@ -207,6 +221,8 @@ def test_nisa_migration_file_loader_surfaces_tax_lot_failure(tmp_path, monkeypat
             "AAA": {
                 "ticker": "AAA",
                 "account": "特定",
+                "owner": "husband",
+                "broker": "楽天証券",
                 "currency": "JPY",
                 "shares": 10,
                 "current_price": 200.0,
@@ -230,19 +246,22 @@ def test_nisa_migration_file_loader_surfaces_tax_lot_failure(tmp_path, monkeypat
 
     assert plan["actionable"] is False
     assert plan["tax_lot_source"] == "holding_fallback_due_to_error"
-    assert plan["data_quality_issues"] == ["tax_lot_snapshot_error: ledger mismatch"]
+    assert "tax_lot_snapshot_error: ledger mismatch" in plan["data_quality_issues"]
+    assert any(issue.startswith("tax_lot_missing_for_position:") for issue in plan["data_quality_issues"])
 
 
 def test_nisa_migration_jpy_fund_units_use_nav_per_10000() -> None:
     plan = build_migration_plan(
         nisa_data={
-            "husband": {"growth_limit_annual": 2_400_000},
-            "wife": {"growth_limit_annual": 2_400_000},
+            "husband": {"growth_limit_annual": 2_400_000, "broker": "楽天証券"},
+            "wife": {"growth_limit_annual": 2_400_000, "broker": "SBI証券"},
         },
         holdings={
             "FUND": {
                 "ticker": "FUND",
                 "account": "特定",
+                "owner": "husband",
+                "broker": "楽天証券",
                 "currency": "JPY",
                 "unit": "口",
                 "shares": 10_000,
@@ -262,6 +281,233 @@ def test_nisa_migration_jpy_fund_units_use_nav_per_10000() -> None:
     assert plan["moves"][0]["market_value_jpy"] == 12_000
     assert plan["moves"][0]["estimated_realized_gain_jpy"] == 2_000
     assert plan["moves"][0]["estimated_tax_jpy"] == 406
+
+
+def test_nisa_migration_never_uses_husbands_holding_to_fill_wifes_nisa_capacity() -> None:
+    plan = build_migration_plan(
+        nisa_data={
+            "husband": {"growth_limit_annual": 2_400_000, "broker": "楽天証券"},
+            "wife": {"growth_limit_annual": 2_400_000, "broker": "SBI証券"},
+        },
+        holdings={
+            "AAA": {
+                "ticker": "AAA",
+                "account": "特定",
+                "owner": "husband",
+                "broker": "楽天証券",
+                "currency": "JPY",
+                "shares": 100,
+                "current_price": 100_000,
+                "expected_return_pct": 0.15,
+                "dividend_yield": 0.0,
+                "investment_type": "long",
+            },
+            "BBB": {
+                "ticker": "BBB",
+                "account": "妻特定",
+                "broker": "SBI証券",
+                "currency": "JPY",
+                "shares": 10,
+                "current_price": 50_000,
+                "expected_return_pct": 0.15,
+                "dividend_yield": 0.0,
+                "investment_type": "long",
+            },
+        },
+        lots_by_ticker={},
+        start_year=2027,
+        years=1,
+    )
+
+    aaa_moves = [m for m in plan["moves"] if m["ticker"] == "AAA"]
+    bbb_moves = [m for m in plan["moves"] if m["ticker"] == "BBB"]
+    assert aaa_moves
+    assert bbb_moves
+    assert all(m["person"] == "husband" for m in aaa_moves)
+    assert all(m["person"] == "wife" for m in bbb_moves)
+
+
+def test_nisa_migration_unknown_owner_is_non_actionable_and_not_assigned() -> None:
+    plan = build_migration_plan(
+        nisa_data={
+            "husband": {"growth_limit_annual": 2_400_000, "broker": "楽天証券"},
+            "wife": {"growth_limit_annual": 2_400_000, "broker": "SBI証券"},
+        },
+        holdings={
+            "UNKNOWN": {
+                "ticker": "UNKNOWN",
+                "account": "特定",
+                "broker": "楽天証券",
+                "currency": "JPY",
+                "shares": 10,
+                "current_price": 50_000,
+                "entry_price": 40_000,
+                "expected_return_pct": 0.15,
+                "dividend_yield": 0.0,
+                "investment_type": "long",
+            },
+        },
+        start_year=2027,
+        years=1,
+    )
+
+    assert plan["actionable"] is False
+    assert plan["moves"] == []
+    assert "position_identity_unknown:UNKNOWN" in plan["data_quality_issues"]
+
+
+def test_nisa_migration_does_not_mix_same_ticker_account_across_brokers() -> None:
+    plan = build_migration_plan(
+        nisa_data={
+            "husband": {"growth_limit_annual": 2_400_000, "broker": "楽天証券"},
+            "wife": {"growth_limit_annual": 2_400_000, "broker": "SBI証券"},
+        },
+        holdings={
+            "AAA_WIFE": {
+                "ticker": "AAA",
+                "account": "特定",
+                "owner": "wife",
+                "broker": "SBI証券",
+                "currency": "JPY",
+                "shares": 10,
+                "current_price": 100_000,
+                "expected_return_pct": 0.15,
+                "dividend_yield": 0.0,
+                "investment_type": "long",
+            },
+        },
+        lots_by_ticker={
+            "AAA": [
+                {
+                    "lot_id": "rakuten-husband",
+                    "purchase_date": "2025-01-01",
+                    "remaining_qty": 10,
+                    "cost_per_share_jpy": 99_000,
+                    "account": "特定",
+                    "owner": "husband",
+                    "broker": "楽天証券",
+                },
+                {
+                    "lot_id": "sbi-wife",
+                    "purchase_date": "2025-01-02",
+                    "remaining_qty": 10,
+                    "cost_per_share_jpy": 90_000,
+                    "account": "特定",
+                    "owner": "wife",
+                    "broker": "SBI証券",
+                },
+            ],
+        },
+        start_year=2027,
+        years=1,
+    )
+
+    assert [move["lot_id"] for move in plan["moves"]] == ["sbi-wife"]
+    move = plan["moves"][0]
+    assert move["source_owner"] == "wife"
+    assert move["source_broker"] == "sbi"
+    assert move["destination_owner"] == "wife"
+    assert move["destination_broker"] == "sbi"
+    assert move["position_identity"] == "wife|sbi|specific|AAA"
+    assert move["nisa_capacity_identity"] == "wife|sbi|nisa_growth|growth|2027"
+
+
+def test_nisa_migration_does_not_cross_brokers_for_same_owner() -> None:
+    plan = build_migration_plan(
+        nisa_data={
+            "husband": {"growth_limit_annual": 2_400_000, "broker": "楽天証券"},
+            "wife": {"growth_limit_annual": 2_400_000, "broker": "SBI証券"},
+        },
+        holdings={
+            "AAA": {
+                "ticker": "AAA",
+                "account": "特定",
+                "owner": "husband",
+                "broker": "SBI証券",
+                "currency": "JPY",
+                "shares": 10,
+                "current_price": 100_000,
+                "entry_price": 90_000,
+                "expected_return_pct": 0.15,
+                "dividend_yield": 0.0,
+                "investment_type": "long",
+            },
+        },
+        lots_by_ticker={},
+        start_year=2027,
+        years=1,
+    )
+
+    assert plan["moves"] == []
+
+
+def test_nisa_migration_legacy_lot_without_owner_broker_is_non_actionable() -> None:
+    plan = build_migration_plan(
+        nisa_data={
+            "husband": {"growth_limit_annual": 2_400_000, "broker": "楽天証券"},
+            "wife": {"growth_limit_annual": 2_400_000, "broker": "SBI証券"},
+        },
+        holdings={
+            "AAA": {
+                "ticker": "AAA",
+                "account": "特定",
+                "owner": "husband",
+                "broker": "楽天証券",
+                "currency": "JPY",
+                "shares": 10,
+                "current_price": 100_000,
+                "entry_price": 80_000,
+                "expected_return_pct": 0.15,
+                "dividend_yield": 0.0,
+                "investment_type": "long",
+            },
+        },
+        lots_by_ticker={
+            "AAA": [{
+                "lot_id": "legacy",
+                "purchase_date": "2025-01-01",
+                "remaining_qty": 10,
+                "cost_per_share_jpy": 90_000,
+                "account": "特定",
+            }],
+        },
+        start_year=2027,
+        years=1,
+    )
+
+    assert plan["actionable"] is False
+    assert "tax_lot_identity_unverified:husband|rakuten|specific|AAA" in plan["data_quality_issues"]
+    assert plan["moves"][0]["cost_basis_verified"] is False
+    assert plan["moves"][0]["cost_basis_source"] == "holding_entry_price_fallback"
+
+
+def test_nisa_migration_respects_explicit_owner_field_over_account_name_heuristic() -> None:
+    plan = build_migration_plan(
+        nisa_data={
+            "husband": {"growth_limit_annual": 2_400_000, "broker": "楽天証券"},
+            "wife": {"growth_limit_annual": 2_400_000, "broker": "SBI証券"},
+        },
+        holdings={
+            "CCC": {
+                "ticker": "CCC",
+                "account": "特定",
+                "owner": "wife",
+                "broker": "SBI証券",
+                "currency": "JPY",
+                "shares": 10,
+                "current_price": 50_000,
+                "entry_price": 40_000,
+                "expected_return_pct": 0.15,
+                "dividend_yield": 0.0,
+                "investment_type": "long",
+            },
+        },
+        start_year=2027,
+        years=1,
+    )
+
+    assert plan["moves"]
+    assert all(m["person"] == "wife" for m in plan["moves"])
 
 
 def test_employee_plan_is_fail_safe_without_configured_window() -> None:

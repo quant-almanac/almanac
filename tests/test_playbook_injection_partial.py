@@ -17,6 +17,12 @@ import rebalance_engine as re_engine
 import analyst
 
 
+@pytest.fixture(autouse=True)
+def _freeze_fx(monkeypatch):
+    import utils
+    monkeypatch.setattr(utils, "get_fx_rate_cached", lambda *_args, **_kwargs: (150.0, "fixture"))
+
+
 # ════════════════════════════════════════════════════════════
 # 1a. news fallback — priority=high は severity=medium を弱シグナル採用
 #     (2026-06 イラン停戦: medium/conf0.65 が除外され war_end 不発)

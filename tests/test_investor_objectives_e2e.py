@@ -389,6 +389,8 @@ def test_objective_16_cash_drag_high_cash_reaches_deployable_cash_context(monkey
     )
     monkeypatch.setattr(portfolio_manager, "_load_cash_state", lambda: {})
     monkeypatch.setattr(portfolio_manager, "_tp_pm", lambda _key, fallback: fallback)
+    import utils
+    monkeypatch.setattr(utils, "get_fx_rate_cached", lambda *_args, **_kwargs: (150.0, "fixture"))
 
     result = portfolio_manager.detect_cash_drag(
         {"total_jpy": 30_000_000, "positions": []},
@@ -463,6 +465,7 @@ def test_objective_09_overheat_bull_regime_surfaces_observe_only_contrarian_shor
         tickers=["7203.T"],
         regime="A_強気",
         include_holdings=False,
+        short_universe_output_path=tmp_path / "short_universe.json",
     )
     assert payload["candidates"], "gap at detect: BULL overheat fixture produced no short candidate"
     candidate = payload["candidates"][0]
@@ -512,7 +515,7 @@ def test_objective_06_stop_loss_breach_surfaces_to_swing_context_precondition(mo
         return {"health": "caution", "summary": "captured", "priority_actions": []}
 
     monkeypatch.setattr(analyst, "call_tier_analysis", fake_call)
-    monkeypatch.setattr(analyst, "_compute_ginn_vol", lambda _tickers: ("", {}))
+    monkeypatch.setattr(analyst, "_compute_ginn_vol", lambda _tickers: ("", {}, {}))
 
     result = analyst._analyze_short_positions(
         {

@@ -113,6 +113,12 @@ def test_build_today_includes_scenario_summary(monkeypatch):
         "evaluated_at": "2026-07-11T09:00:00+09:00",
     }
     monkeypatch.setattr(today, "_load", lambda name: state if name == "scenario_state.json" else {})
+    monkeypatch.setattr(
+        portfolio_manager,
+        "build_portfolio_snapshot",
+        lambda: {"positions": [], "total_jpy": 0},
+    )
+    monkeypatch.setattr(today, "_build_benchmark", lambda _guard: {})
 
     result = today._build_today()
 
@@ -127,6 +133,12 @@ def test_build_today_includes_scenario_summary(monkeypatch):
 
 def test_build_today_uses_missing_scenario_state_fallback(monkeypatch):
     monkeypatch.setattr(today, "_load", lambda _name: {})
+    monkeypatch.setattr(
+        portfolio_manager,
+        "build_portfolio_snapshot",
+        lambda: {"positions": [], "total_jpy": 0},
+    )
+    monkeypatch.setattr(today, "_build_benchmark", lambda _guard: {})
 
     result = today._build_today()
 
@@ -143,6 +155,10 @@ def test_build_today_separates_ready_orders_from_review_candidates(monkeypatch):
     analysis = {
         "as_of": "2026-07-14 07:00",
         "portfolio_total": 10_000_000,
+        "long_analysis": {
+            "ginn_vol": {"AVGO": 50.3},
+            "ginn_vol_model": {"AVGO": "GJR-GARCH(1,1)-skewt"},
+        },
         "synthesis": {
             "analysis_id": "analysis-0714",
             "priority_actions": [
@@ -197,6 +213,39 @@ def test_build_today_separates_ready_orders_from_review_candidates(monkeypatch):
     assert result["review_board"][1]["execution_block_reasons"][0]["code"] == "near_minimum_notional"
     assert result["execution_plan"]["summary"]["board_count"] == 1
     assert result["decision_summary"]["count_conservation_ok"] is True
+    assert result["allocation"]["ginn_vol"] == {"AVGO": 50.3}
+    assert result["allocation"]["ginn_vol_model"] == {
+        "AVGO": "GJR-GARCH(1,1)-skewt",
+    }
+    assert result["holdings_intel"]["AVGO"] == {
+        "ginn_vol": 50.3,
+        "ginn_vol_model": "GJR-GARCH(1,1)-skewt",
+    }
+
+
+def test_holdings_intel_preserves_each_tiers_actual_volatility_model():
+    result = today._build_holdings_intel(
+        {
+            "ginn_vol": {"AVGO": 50.3},
+            "ginn_vol_model": {"AVGO": "GJR-GARCH(1,1)-skewt"},
+        },
+        {
+            "ginn_vol": {"MSFT": 28.5},
+            "ginn_vol_model": {"MSFT": "GINN+GJR-GARCH"},
+        },
+        {},
+    )
+
+    assert result == {
+        "AVGO": {
+            "ginn_vol": 50.3,
+            "ginn_vol_model": "GJR-GARCH(1,1)-skewt",
+        },
+        "MSFT": {
+            "ginn_vol": 28.5,
+            "ginn_vol_model": "GINN+GJR-GARCH",
+        },
+    }
 
 
 def test_historical_non_ready_candidate_never_returns_as_executable_backlog(monkeypatch):

@@ -27,7 +27,7 @@ const TIER_COLOR: Record<string, string> = {
 /**
  * PORTFOLIO — 保有一覧（Home 統合）。
  * 行クリックで「その銘柄について AI が考えていること」を展開:
- * 保有ノート・ストップロス・GINN ボラ・30日チャート。
+ * 保有ノート・ストップロス・モデル別予測ボラ・30日チャート。
  */
 export default function PortfolioSection({
   intel,
@@ -171,7 +171,7 @@ function RowPair({
           <span style={{ color: OPS.dim, fontSize: 11.5, marginLeft: 8 }}>{p.name}</span>
           {info?.ginn_vol != null && info.ginn_vol >= 80 && (
             <span
-              title={`GINN 予測ボラ percentile ${info.ginn_vol.toFixed(0)}`}
+              title={`${info.ginn_vol_model ?? 'モデル不明'} 年率予測ボラ ${info.ginn_vol.toFixed(0)}%`}
               style={{ color: OPS.redSoft, fontSize: 11, fontFamily: OPS.mono, marginLeft: 8 }}
             >
               vol{info.ginn_vol.toFixed(0)}
@@ -247,7 +247,7 @@ function RowPair({
                 )}
                 {info?.ginn_vol != null && (
                   <p style={{ fontSize: 12, color: OPS.dim, margin: 0, fontFamily: OPS.mono }}>
-                    GINN 予測ボラ percentile: {info.ginn_vol.toFixed(1)}
+                    {info.ginn_vol_model ?? 'モデル不明'} 年率予測ボラ: {info.ginn_vol.toFixed(1)}%
                     {info.ginn_vol >= 80 && <span style={{ color: OPS.redSoft }}> — 高ボラ警戒</span>}
                   </p>
                 )}

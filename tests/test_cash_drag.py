@@ -4,6 +4,8 @@ import portfolio_manager as pm
 
 def _use_default_tunables(monkeypatch):
     monkeypatch.setattr(pm, "_tp_pm", lambda _key, fallback: fallback)
+    import utils
+    monkeypatch.setattr(utils, "get_fx_rate_cached", lambda *_args, **_kwargs: (150.0, "fixture"))
 
 
 def test_cash_drag_critical(monkeypatch):

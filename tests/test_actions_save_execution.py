@@ -109,6 +109,9 @@ def isolated(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(actions, "HISTORY_FILE",  history)
     monkeypatch.setattr(actions, "BASE_DIR",      tmp_path)
     monkeypatch.setattr(actions, "ANALYSIS_FILE", analysis)
+    monkeypatch.setattr(actions, "_get_fx_rate", lambda: 150.0)
+    import utils
+    monkeypatch.setattr(utils, "get_fx_rate_cached", lambda: (150.0, "fixture"))
     monkeypatch.setattr(event_ledger, "DB_PATH",  ledger_db)
     monkeypatch.setattr(margin_manager, "MARGIN_POS_FILE", margin_positions)
     monkeypatch.setattr(action_stage_log, "LOG_PATH", stage_log)

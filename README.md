@@ -22,7 +22,7 @@ The objective function is explicit and version-controlled ([`objective.md`](obje
 | **AI decision support** | Multi-model analysis (Claude + DeepSeek, cost-routed by task) for case-based decisions — trim, add, rebalance, tax-loss harvest — all gated by deterministic policy rules before anything reaches an order |
 | **Screening & signals** | Long-term JP/US fundamental screening, disclosure-driven catalyst detection (EDINET / TDnet / EDGAR filings), margin and short-sale candidate screening, insider-cluster and IPO tracking |
 | **Execution & guardrails** | Daily/monthly drawdown circuit breakers, VaR- and VIX-based trade blocking, an append-only event ledger plus reconciliation checks for an audit trail, open-order-aware position sizing |
-| **Tax & accounts** | FIFO/LIFO/loss-harvest/gain-minimize tax-lot strategies, NISA allocation tracking, employee-stock-plan concentration management |
+| **Tax & accounts** | Auditable inventory lots, a total-average cost-basis migration path, owner/account-scoped NISA planning, employee-stock-plan concentration management |
 | **Observability** | NAV/TWR performance tracking against benchmark (a Modified Dietz cash-flow-adjusted approximation, not a daily sub-period-exact TWR), with a verification page that reports actual measured performance rather than a fixed claim |
 
 ## What this assumes
@@ -356,7 +356,9 @@ model: 2-layer LSTM (hidden=64, dropout=0.1) + linear + Softplus
 loss:  MSE(σ_pred, |ε_t|) + 0.3 · MSE(σ_pred, σ_GARCH)
 ```
 
-The second term penalises divergence from the GARCH estimate. **It cannot be claimed to prevent overfitting**: during training VIX and regime are passed as constants (0.2 / 1.0) rather than real series, and the GARCH σ is a single per-ticker forecast broadcast across the window. Recent training runs held out no test set. Without a model, the code falls back to GARCH.
+The second term penalises divergence from the GARCH estimate. **It cannot be claimed to prevent overfitting**: during training VIX and regime are passed as constants (0.2 / 1.0) rather than real series, and the GARCH σ is a single per-ticker forecast broadcast across the window.
+
+Runtime use is fail-closed. A legacy model without validation metadata, or a candidate that fails the predeclared validation thresholds, is rejected and the forecast falls back to GJR-GARCH. The model name carried into tier artifacts, the Today API and the dashboard is the model actually used—not an unconditional “GINN” label. This safety gate does not make the research model validated; it prevents an unvalidated model from entering decisions.
 
 **Risk is computed on current holdings, not the NAV series.** That series is short and older accounting bugs contaminated part of it, so `portfolio_risk_returns.py` reconstructs daily returns by applying today's weights to historical prices.
 
@@ -401,6 +403,8 @@ Specific instrument codes are omitted here because the classification in the cod
 **The authoritative cost basis is the broker's and the tax authority's calculation** — for partial sales of the same security, Japan uses a weighted-average-based method. The internal lot view is not treated as establishing cost basis for tax.
 
 `tax_harvest_scanner.py` runs on a schedule and surfaces loss-harvest candidates for a human to act on. `tax_optimizer.py` covers NISA headroom and foreign tax credit simulation.
+
+NISA migration candidates keep owner, broker, account and instrument identity together. Missing identity data makes the plan non-actionable, and positions or tax lots with the same ticker at different brokers are not combined. The endpoint is advisory and human-execution-only.
 
 ### Attributing performance
 

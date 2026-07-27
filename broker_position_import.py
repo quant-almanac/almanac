@@ -211,6 +211,10 @@ def _apply_position_to_record(pos: BrokerPosition, existing: Optional[dict], *, 
         rec["current_nav"] = 1.0
     if "broker" not in rec:
         rec["broker"] = RAKUTEN_BROKER
+    # This importer is scoped to the primary Rakuten account. Record owner at
+    # the source boundary instead of asking downstream code to infer it.
+    if "owner" not in rec:
+        rec["owner"] = "husband"
     rec["note"] = f"楽天CSV保有同期 {as_of or ''}".strip()
     return rec
 

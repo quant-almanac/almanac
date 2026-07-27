@@ -22,6 +22,19 @@ def test_module_has_tranche_config(dca):
 def test_safe_when_no_signals(dca, tmp_path, monkeypatch):
     """必須入力が無くても例外で落ちない"""
     monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(dca, "BASE_DIR", tmp_path)
+    monkeypatch.setattr(
+        dca,
+        "_estimate_cash_breakdown",
+        lambda: {
+            "jpy": None,
+            "usd": None,
+            "usd_jpy": None,
+            "total_jpy": None,
+            "fx_rate": None,
+            "source": "fixture",
+        },
+    )
     # 主要 entrypoint を叩いて落ちないこと
     for fn_name in ("generate_ladder_signals", "evaluate", "scan"):
         fn = getattr(dca, fn_name, None)

@@ -10,7 +10,10 @@ def test_us_high_yield_in_nisa_flagged():
             'shares': 100, 'current_price': 110,
         },
     }
-    result = tx.detect_nisa_foreign_tax_leak(holdings=holdings)
+    result = tx.detect_nisa_foreign_tax_leak(
+        holdings=holdings,
+        fx_rate_usdjpy=150.0,
+    )
     assert result['leaks']
     assert result['total_leak_jpy'] > 0
     # Leak entries should reference VYM by ticker

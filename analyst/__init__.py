@@ -1411,18 +1411,21 @@ spy_above={data.get('regime', {}).get('spy_above')}, nk_above={data.get('regime'
 
 # ── ティア別 Sonnet 分析 ─────────────────────────────────
 
-def _compute_ginn_vol(tickers: list[str]) -> tuple[str, dict]:
+def _compute_ginn_vol(tickers: list[str]) -> tuple[str, dict, dict]:
     """
-    ティッカーリストに対してGINN強化GJR-GARCHボラティリティを推定する。
+    ティッカーリストに対してボラティリティを推定する（GINN 中央安全ゲートが
+    昇格条件を満たしたときだけ GINN+GJR-GARCH、それ以外は GJR-GARCH 単体）。
     data/ohlcv/{ticker}.parquetから日次リターンを読み込み、年率ボラを返す。
 
     Returns:
-        (prompt_str, ginn_vol_dict)
+        (prompt_str, ginn_vol_dict, ginn_vol_model_dict)
         prompt_str: プロンプト注入用テキスト（空文字の場合あり）
         ginn_vol_dict: {ticker: float} 年率ボラ%
+        ginn_vol_model_dict: {ticker: str} 実際に使われたモデル名
     """
     import pandas as _pd
     ginn_vol_dict: dict = {}
+    ginn_vol_model_dict: dict = {}
     lines: list[str] = []
     ohlcv_dir = BASE_DIR / "data" / "ohlcv"
     for ticker in tickers:
@@ -1454,13 +1457,14 @@ def _compute_ginn_vol(tickers: list[str]) -> tuple[str, dict]:
             vol_pct = round(result.get("forecast_vol", 0) * 100, 1)
             model = result.get("model", "GJR-GARCH")
             ginn_vol_dict[ticker] = vol_pct
+            ginn_vol_model_dict[ticker] = model
             lines.append(f"  {ticker}: {vol_pct:.1f}%年率（{model}）")
         except Exception:
             pass
     prompt_str = ""
     if lines:
-        prompt_str = "### GINN推定ボラティリティ（年率）\n" + "\n".join(lines)
-    return prompt_str, ginn_vol_dict
+        prompt_str = "### ボラティリティ推定（年率、モデルは行ごとに記載）\n" + "\n".join(lines)
+    return prompt_str, ginn_vol_dict, ginn_vol_model_dict
 
 
 def _fmt_technical_state(tickers: list[str], technical_state: dict) -> str:
@@ -1745,7 +1749,7 @@ def _analyze_long(data: dict, shared_ctx: str = "") -> dict:
 
     # GINN-enhanced volatility per position
     _long_tickers = [p["ticker"] for p in positions]
-    _ginn_vol_str, _ginn_vol_dict = _compute_ginn_vol(_long_tickers)
+    _ginn_vol_str, _ginn_vol_dict, _ginn_vol_model_dict = _compute_ginn_vol(_long_tickers)
 
     # テクニカル状態を抽出（Long保有銘柄のみ）
     long_tickers = [p.get("ticker", p.get("symbol", "")) for p in positions]
@@ -1841,6 +1845,7 @@ Longティアとして以下のJSON形式で分析してください:
         if not isinstance(result, dict) or not result:
             raise RuntimeError("Sonnet returned empty result (possible max_tokens truncation)")
         result["ginn_vol"] = _ginn_vol_dict
+        result["ginn_vol_model"] = _ginn_vol_model_dict
         # Fix H (2026-04-20): 観測性 — 使用モデル ID を記録
         try:
             from model_router import get_model as _gm
@@ -1850,7 +1855,7 @@ Longティアとして以下のJSON形式で分析してください:
         return result
     except Exception as e:
         print(f"  ⚠️ Long分析エラー: {e}")
-        return {"error": str(e), "health": "caution", "summary": "分析エラー", "priority_actions": [], "ginn_vol": _ginn_vol_dict}
+        return {"error": str(e), "health": "caution", "summary": "分析エラー", "priority_actions": [], "ginn_vol": _ginn_vol_dict, "ginn_vol_model": _ginn_vol_model_dict}
 
 
 def _analyze_medium(data: dict, shared_ctx: str = "") -> dict:
@@ -1882,7 +1887,7 @@ def _analyze_medium(data: dict, shared_ctx: str = "") -> dict:
 
     # GINN-enhanced volatility per position
     _medium_tickers = [p["ticker"] for p in positions]
-    _ginn_vol_str, _ginn_vol_dict = _compute_ginn_vol(_medium_tickers)
+    _ginn_vol_str, _ginn_vol_dict, _ginn_vol_model_dict = _compute_ginn_vol(_medium_tickers)
 
     # テクニカル状態を抽出（Medium保有銘柄のみ）
     medium_tickers = [p.get("ticker", p.get("symbol", "")) for p in positions]
@@ -1962,6 +1967,7 @@ Mediumティアとして以下のJSON形式で分析してください:
         if not isinstance(result, dict) or not result:
             raise RuntimeError("Sonnet returned empty result (possible max_tokens truncation)")
         result["ginn_vol"] = _ginn_vol_dict
+        result["ginn_vol_model"] = _ginn_vol_model_dict
         # Fix H (2026-04-20): 観測性 — 使用モデル ID を記録
         try:
             from model_router import get_model as _gm
@@ -1971,7 +1977,7 @@ Mediumティアとして以下のJSON形式で分析してください:
         return result
     except Exception as e:
         print(f"  ⚠️ Medium分析エラー: {e}")
-        return {"error": str(e), "health": "caution", "summary": "分析エラー", "priority_actions": [], "ginn_vol": _ginn_vol_dict}
+        return {"error": str(e), "health": "caution", "summary": "分析エラー", "priority_actions": [], "ginn_vol": _ginn_vol_dict, "ginn_vol_model": _ginn_vol_model_dict}
 
 
 def _analyze_margin_long(data: dict, shared_ctx: str = "") -> dict:
@@ -2095,7 +2101,7 @@ def _analyze_short_positions(data: dict, shared_ctx: str = "") -> dict:
 
     # GINN-enhanced volatility per position
     _swing_tickers = [p["ticker"] for p in positions]
-    _ginn_vol_str, _ginn_vol_dict = _compute_ginn_vol(_swing_tickers)
+    _ginn_vol_str, _ginn_vol_dict, _ginn_vol_model_dict = _compute_ginn_vol(_swing_tickers)
 
     swing_tickers = [p.get("ticker", "") for p in positions]
     tech_text_swing = _fmt_technical_state(swing_tickers, data.get("technical_state", {}))
@@ -2240,6 +2246,7 @@ def _analyze_short_positions(data: dict, shared_ctx: str = "") -> dict:
         if not isinstance(result, dict) or not result or result.get("error"):
             raise RuntimeError(f"tier_analysis_short empty/error: {result.get('error') if isinstance(result, dict) else 'non-dict'}")
         result["ginn_vol"] = _ginn_vol_dict
+        result["ginn_vol_model"] = _ginn_vol_model_dict
         # Fix H (2026-04-20): 観測性 — 使用モデル ID を記録
         try:
             from model_router import get_model as _gm
@@ -2249,7 +2256,7 @@ def _analyze_short_positions(data: dict, shared_ctx: str = "") -> dict:
         return result
     except Exception as e:
         print(f"  ⚠️ Short_Positions分析エラー: {e}")
-        return {"error": str(e), "health": "caution", "summary": "分析エラー", "priority_actions": [], "ginn_vol": _ginn_vol_dict}
+        return {"error": str(e), "health": "caution", "summary": "分析エラー", "priority_actions": [], "ginn_vol": _ginn_vol_dict, "ginn_vol_model": _ginn_vol_model_dict}
 
 
 def _analyze_short_selling(data: dict, shared_ctx: str = "") -> dict:
@@ -2274,7 +2281,7 @@ def _analyze_short_selling(data: dict, shared_ctx: str = "") -> dict:
     short_sell_tickers = [c.get("ticker", "") for c in data.get("screening", {}).get("short_candidates", [])[:10] if c.get("ticker")]
     social_text_short = _fmt_social_sentiment(short_sell_tickers, data.get("social_sentiment", {}))
     ss_tickers = [c.get("ticker", "") for c in data["screening"].get("short_candidates", [])[:8]]
-    _ginn_vol_str_ss, _ = _compute_ginn_vol(ss_tickers)
+    _ginn_vol_str_ss, _, _ = _compute_ginn_vol(ss_tickers)
 
     prompt = f"""## 空売り戦略 + 信用建玉管理の専門分析
 ※この一次判断は空売り（ショートセリング）と信用建玉リスクを担当する。投機ロングポジションは別ティアが担当。

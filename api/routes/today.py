@@ -198,7 +198,7 @@ def _ticker_prefix(s: str) -> str | None:
 
 
 def _build_holdings_intel(long_a: dict, medium_a: dict, synthesis: dict) -> dict:
-    """銘柄ごとの AI 見解を集約: 保有ノート + ストップロス + GINN ボラ。"""
+    """銘柄ごとの AI 見解を集約: 保有ノート + ストップロス + 予測ボラ。"""
     intel: dict[str, dict] = {}
     for tier_key, tier in (("long", long_a), ("medium", medium_a)):
         for note in tier.get("hold_notes") or []:
@@ -210,9 +210,14 @@ def _build_holdings_intel(long_a: dict, medium_a: dict, synthesis: dict) -> dict
         t = _ticker_prefix(s)
         if t:
             intel.setdefault(t, {})["stop_loss"] = s
-    for t, v in (long_a.get("ginn_vol") or {}).items():
-        if isinstance(v, (int, float)):
-            intel.setdefault(t, {})["ginn_vol"] = v
+    for tier in (long_a, medium_a):
+        model_by_ticker = tier.get("ginn_vol_model") or {}
+        for t, v in (tier.get("ginn_vol") or {}).items():
+            if isinstance(v, (int, float)) and "ginn_vol" not in intel.setdefault(t, {}):
+                intel[t]["ginn_vol"] = v
+                model = model_by_ticker.get(t)
+                if isinstance(model, str) and model.strip():
+                    intel[t]["ginn_vol_model"] = model.strip()
     return intel
 
 
@@ -1318,6 +1323,7 @@ def _build_today() -> dict:
         }
 
     ginn = long_a.get("ginn_vol") or {}
+    ginn_model = long_a.get("ginn_vol_model") or {}
     allocation = {
         "currency": {
             "current_usd_pct": round(usd_ratio * 100, 1) if usd_ratio else None,
@@ -1336,6 +1342,7 @@ def _build_today() -> dict:
         "risk_warnings": synthesis.get("risk_warnings") or long_a.get("risk_warnings") or [],
         "stop_loss_alerts": synthesis.get("stop_loss_alerts") or long_a.get("stop_loss_alerts") or [],
         "ginn_vol": ginn,
+        "ginn_vol_model": ginn_model,
         "margin_health": synthesis.get("margin_health") or long_a.get("margin_health"),
         "margin_summary": synthesis.get("margin_summary") or long_a.get("margin_summary"),
     }
