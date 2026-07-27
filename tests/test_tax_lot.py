@@ -196,6 +196,46 @@ def test_realized_pnl_year_aggregation(tmp_db):
     assert "NISA成長投資枠" in r["by_account"]
 
 
+def test_realized_pnl_year_v2_separates_nisa_from_taxable(tmp_db):
+    """Stage 5B: NISA は除外でなく分離。同じシナリオで v1 は 400 に
+    混ざっていた +500 (課税) と -100 (NISA) を v2 は分けて返す
+    (プラン記載の canonical 例と同じ数字: 500 / -100 / 400)。"""
+    _add_buy(tmp_db,  ticker="A", qty=10, price=100, date="2026-01-10")
+    _add_sell(tmp_db, ticker="A", qty=10, price=150, date="2026-04-10")  # +500 (特定)
+    _add_buy(tmp_db,  ticker="B", qty=5,  price=200, date="2026-02-10", account="NISA成長投資枠")
+    _add_sell(tmp_db, ticker="B", qty=5,  price=180, date="2026-05-10", account="NISA成長投資枠")  # -100 (NISA)
+
+    r = tl.realized_pnl_in_year_v2(2026, db_path=tmp_db)
+    assert r["schema_version"] == 2
+    assert r["realized_jpy"] == pytest.approx(400)
+    assert r["realized_jpy_semantics"] == "legacy_mixed_accounts_deprecated"
+    assert r["economic_realized_pnl_jpy"] == pytest.approx(400)
+    assert r["taxable_realized_pnl_jpy"] == pytest.approx(500)
+    assert r["nisa_realized_pnl_jpy"] == pytest.approx(-100)
+    # economic = taxable + nisa (恒等式)
+    assert r["taxable_realized_pnl_jpy"] + r["nisa_realized_pnl_jpy"] == pytest.approx(
+        r["economic_realized_pnl_jpy"]
+    )
+
+
+def test_realized_pnl_year_v2_all_taxable_has_zero_nisa(tmp_db):
+    _add_buy(tmp_db,  ticker="A", qty=10, price=100, date="2026-01-10")
+    _add_sell(tmp_db, ticker="A", qty=10, price=150, date="2026-04-10")
+    r = tl.realized_pnl_in_year_v2(2026, db_path=tmp_db)
+    assert r["nisa_realized_pnl_jpy"] == 0.0
+    assert r["taxable_realized_pnl_jpy"] == pytest.approx(500)
+
+
+def test_realized_pnl_year_v2_does_not_change_legacy_function(tmp_db):
+    """既存 consumer (api/routes/performance.py) への破壊的変更を避けるため、
+    realized_pnl_in_year() 自体の戻り値 shape は変えていないこと。"""
+    _add_buy(tmp_db,  ticker="A", qty=10, price=100, date="2026-01-10")
+    _add_sell(tmp_db, ticker="A", qty=10, price=150, date="2026-04-10")
+    legacy = tl.realized_pnl_in_year(2026, db_path=tmp_db)
+    assert "schema_version" not in legacy
+    assert set(legacy.keys()) == {"year", "realized_jpy", "by_account", "by_ticker", "trade_count"}
+
+
 # ────────────────────────────────────────────────────────
 # portfolio_lot_snapshot
 # ────────────────────────────────────────────────────────

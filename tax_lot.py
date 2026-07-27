@@ -406,6 +406,51 @@ def realized_pnl_in_year(
     }
 
 
+def realized_pnl_in_year_v2(
+    year: int,
+    *,
+    tickers: Optional[List[str]] = None,
+    db_path: Optional[Path] = None,
+) -> dict:
+    """Stage 5B: realized_pnl_in_year() の加算的 v2 schema。
+
+    旧 realized_jpy は口座を問わず全 realized_trades を合算しており、
+    NISA 口座の損益と課税口座の損益が同じ数字に混ざっていた。NISA の
+    利益は非課税、NISA の損失は課税口座の利益と損益通算できない ——
+    「除外」ではなく「分離」しないと確定申告の実務と合わない。
+
+    realized_pnl_in_year() 自体は既存 consumer (api/routes/performance.py)
+    に破壊的変更を与えないため変更しない。本関数はその出力を包み、
+    account 名に "NISA" を含むかどうかで taxable/nisa を分ける
+    (tax_harvest_scanner.py の NISA 除外判定と同じ規約)。
+    """
+    legacy = realized_pnl_in_year(year, tickers=tickers, db_path=db_path)
+
+    taxable_total = 0.0
+    nisa_total = 0.0
+    for account, amount in legacy["by_account"].items():
+        if "NISA" in str(account):
+            nisa_total += amount
+        else:
+            taxable_total += amount
+
+    return {
+        "schema_version": 2,
+        "year": year,
+        # 旧フィールドは互換のため残すが、課税対象額と誤解されないよう
+        # semantics を明示する。新規コードは economic/taxable/nisa の
+        # 3フィールドを権威として使うこと。
+        "realized_jpy": legacy["realized_jpy"],
+        "realized_jpy_semantics": "legacy_mixed_accounts_deprecated",
+        "economic_realized_pnl_jpy": legacy["realized_jpy"],
+        "taxable_realized_pnl_jpy": round(taxable_total, 2),
+        "nisa_realized_pnl_jpy": round(nisa_total, 2),
+        "by_account": legacy["by_account"],
+        "by_ticker": legacy["by_ticker"],
+        "trade_count": legacy["trade_count"],
+    }
+
+
 # ============================================================
 # Snapshot of all open lots (for UI / audit)
 # ============================================================
