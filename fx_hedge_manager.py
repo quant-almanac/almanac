@@ -1,11 +1,25 @@
 """
 A-4: Dynamic FX Hedge Manager
 -----------------------------
-regime × VIX × USDJPY モメンタム × IV で目標ヘッジ比率を計算し、
-受動的（JPY ヘッジ付き ETF: 1655.T / 2040.T）/ 能動的（先物）/ 簡易（JPY 積み増し）
-の提案を返す。固定比率を避け、状況依存で 0〜70% レンジで動く。
+regime × VIX × IV で目標ヘッジ比率を計算し、受動的（JPY ヘッジ付き ETF）/
+能動的（先物）の提案を返す。固定比率を避け、状況依存で 0〜70% レンジで動く。
 
 whipsaw 防止のため日次変更幅 ±10% にクランプ。
+
+Stage 3 是正 (2026-07): 以下は配線しない (このモジュールは現状どこからも
+import されていない、スタンドアロン CLI 専用)。
+  - 「簡易（JPY 積み増し）」を提案手段から削除した。通貨配分の変更であって
+    ヘッジ overlay ではなく、実装もされていなかったため。
+  - usdjpy_mom_1m は検証済み係数もバックテストも無いため比率計算に使わない
+    (受け取って何もしない no-op 分岐だったものを削除。パラメータ自体は
+    後方互換のため残すが、inputs への記録のみで比率には影響しない —
+    delegate 前提の破壊的 API 変更を避けるため)。
+  - 商品リストを JPX・発行体資料 (2026-07 時点) で再確認して是正:
+    1655.T は「円建て」であって「円ヘッジ」ではない (無ヘッジ) ため除外。
+    2631.T も無ヘッジ (ヘッジ版は 2632.T) のため除外し 2632.T に差し替え。
+    1545.T は無ヘッジ (ヘッジ版は 2845) のため除外。
+    2040.T は NYダウ2倍ブルの ETN (レバレッジ商品) であり、為替ヘッジ目的の
+    素朴な JPY ヘッジ付き ETF ではないため除外。
 """
 from __future__ import annotations
 
@@ -26,17 +40,22 @@ MAX_DAILY_DELTA = 0.10   # 日次変更幅
 JPY_WEAKNESS_VS_90SMA = 0.08   # 90 日 SMA +8% 超 → +10%
 JPY_WEAKNESS_VS_5Y    = 0.25   # 5 年平均 +25% 超 → +10%
 
-# 受動的ヘッジ候補（JPY ヘッジ付き ETF）
+# 受動的ヘッジ候補（JPY ヘッジ付き ETF。2026-07 に JPX・発行体資料で確認済み）
 PASSIVE_HEDGE_ETFS = {
-    'sp500':    ['1655.T', '2634.T'],   # iシェアーズ S&P500 JPYヘッジ
-    'nasdaq':   ['2631.T'],
-    'developed':['2040.T'],
-    'sector':   ['1545.T'],
+    'sp500':  ['2634.T'],   # NEXT FUNDS S&P500指数(為替ヘッジあり)
+    'nasdaq': ['2632.T'],   # MAXISナスダック100上場投信(為替ヘッジあり)
 }
 
 # アクティブヘッジ候補
+#
+# 6J (CME 日本円先物) は「USD per JPY」建て — 一般的な「USDJPY」相場
+# （JPY per USD）とは逆向きの気配値。円高（USDJPY 下落）で 6J は上昇するため、
+# USD 資産の円高ヘッジとして機能させるには 6J は買い建てが正しい
+# (他の2命令「USDJPY 売」とは表記上の建玉方向が逆になるが、経済的には
+# 同一方向のヘッジ)。旧「6J 先物売」は方向が逆で、ヘッジどころか
+# 損失を増幅させる誤りだった。
 ACTIVE_HEDGE_INSTRUMENTS = [
-    'CME 6J 先物売（標準サイズ 12.5M JPY）',
+    'CME 6J 先物買い（標準サイズ 12.5M JPY、USDJPY建てとは逆気配のため買いが円高ヘッジ）',
     'くりっく365 USDJPY 売',
     'IG 証券 / GMOクリック USDJPY 売（CFD）',
 ]
@@ -108,7 +127,11 @@ def compute_target_hedge_ratio(
         vix:             VIX 指数
         usdjpy:          USD/JPY スポット
         usdjpy_iv_1m:    USDJPY 1 ヶ月 IV（小数、0.12 = 12%）
-        usdjpy_mom_1m:   USDJPY 月次モメンタム（小数、-0.05 = -5%）
+        usdjpy_mom_1m:   [非推奨・比率計算には使用しない] USDJPY 月次モメンタム
+                         （小数、-0.05 = -5%）。検証済み係数もバックテストも
+                         無いため比率へは反映しない。inputs への記録のみ。
+                         後方互換のため signature には残すが、将来的に
+                         有効なモデルへ差し替わるまで無効のまま。
         usdjpy_sma_90d:  USDJPY 90 日 SMA
         usdjpy_avg_5y:   USDJPY 5 年平均
         current_hedge_ratio: 前回の目標比率（whipsaw 防止用）
@@ -120,7 +143,7 @@ def compute_target_hedge_ratio(
           'base_target':          regime ベース,
           'addons':               {reason: +値, ...},
           'rationale':            人間可読説明,
-          'method':               受動 / 能動 / 簡易の提案,
+          'method':               受動 / 能動の提案,
           'inputs':               入力サマリ,
           'delta_vs_prev':        前回からの変化,
         }
@@ -141,11 +164,6 @@ def compute_target_hedge_ratio(
         if ratio_vs_5y >= JPY_WEAKNESS_VS_5Y:
             addons[f'JPY 5y avg +{ratio_vs_5y*100:.1f}%'] = 0.10
 
-    # Crisis + 月次モメンタム < -5%（円急騰）は既に base=0.6 だが、さらに重症度表現
-    if (regime or '').lower() == 'crisis' and usdjpy_mom_1m <= -0.05:
-        # base を 0.60 として加算 0 に留める（上限 0.70 は後段）
-        pass
-
     raw_target = base + sum(addons.values())
     clamped = max(MIN_HEDGE, min(MAX_HEDGE, raw_target))
 
@@ -163,7 +181,7 @@ def compute_target_hedge_ratio(
 
     smoothed = round(max(MIN_HEDGE, min(MAX_HEDGE, smoothed)), 4)
 
-    # 受動 / 能動 / 簡易の提案
+    # 受動 / 能動の提案
     method = _recommend_method(smoothed, regime, usdjpy_iv_1m)
 
     # rationale
