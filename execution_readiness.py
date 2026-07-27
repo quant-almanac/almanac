@@ -408,6 +408,50 @@ def classify_execution_readiness(
     ticker = str(action.get("ticker") or "")
     risk_increasing = action_type in RISK_INCREASING
 
+    # Stage 0B: PositionIdentity 単位の鮮度チェック。
+    #
+    # 旧 portfolio_snapshot_health() (下記) はファイル全体の更新時刻と
+    # 無関係な銘柄の約定を見て「全ポジション新鮮」と誤判定しうる
+    # (2026-07-27 インシデント: LLY の約定で AVGO/XLF が ready 判定された)。
+    # さらに risk_increasing (買い系) でしか評価されず、売り系には鮮度
+    # チェックが一切無かった。ここでは対象ポジション固有の証券会社同期日
+    # (holdings.json の note) だけを見る。
+    #
+    # 運用判断: ポートフォリオ全体の同期が実際に長期間止まっている場合が
+    # あり (実測 35/39 ポジションが72h超)、これを blocked にすると発注機能が
+    # 事実上停止する。stale/degraded/unknown はいずれも review 止まりとし、
+    # 人間の確認を促すに留める — 自動で止めない。
+    if action_type in EXIT_ACTION_TYPES or risk_increasing:
+        from position_identity import position_identity_for_action, position_freshness
+
+        position = position_identity_for_action(action)
+        if position is not None:
+            freshness = position_freshness(position, base_dir=base_dir, now=now)
+            if freshness["status"] == "stale":
+                add(
+                    "review",
+                    "position_broker_sync_stale",
+                    f"{ticker} の証券会社同期が{freshness.get('age_hours')}時間前"
+                    f"（{freshness.get('synced_at')}）のままです。最新の保有・"
+                    "残高を確認してから執行してください",
+                    **freshness,
+                )
+            elif freshness["status"] == "degraded":
+                add(
+                    "review",
+                    "position_broker_sync_degraded",
+                    f"{ticker} の証券会社同期がやや古い状態です"
+                    f"（{freshness.get('synced_at')}）",
+                    **freshness,
+                )
+            elif freshness["status"] == "unknown":
+                add(
+                    "review",
+                    "position_broker_sync_unknown",
+                    f"{ticker} の証券会社同期日を確認できません",
+                    **freshness,
+                )
+
     if action_type in EXIT_ACTION_TYPES and not (
         action.get("holding_scope_unresolved") or action.get("holding_scope_ambiguous")
     ):
