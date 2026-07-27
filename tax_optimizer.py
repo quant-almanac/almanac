@@ -411,6 +411,30 @@ def detect_nisa_foreign_tax_leak(
 # 損出し分析
 # ============================================================
 
+def _cost_basis_crosscheck_for_candidate(*, ticker: str, account: str) -> dict:
+    """Stage 5C: event_ledger 起点の FIFO / 総平均法に準ずる方法の取得原価を
+    候補の追加情報として返す。失敗・データ無しは例外を投げず available=False
+    で fail-closed に表現する (呼び出し元の候補選定・既存数値には影響しない)。
+    """
+    try:
+        from tax_lot import compare_old_new_cost_basis
+        comparison = compare_old_new_cost_basis(ticker)
+        for row in comparison.get('rows', []):
+            if row.get('account') == account:
+                if row.get('fifo_cost_basis_jpy') is None and row.get('total_average_cost_basis_jpy') is None:
+                    return {'available': False, 'reason': 'event_ledger にこの口座の取引履歴なし'}
+                return {
+                    'available': True,
+                    'fifo_cost_basis_jpy': row.get('fifo_cost_basis_jpy'),
+                    'total_average_cost_basis_jpy': row.get('total_average_cost_basis_jpy'),
+                    'diff_jpy': row.get('diff_jpy'),
+                    'data_quality_issues': row.get('total_average_data_quality_issues') or [],
+                }
+        return {'available': False, 'reason': 'event_ledger にこの銘柄・口座の取引履歴なし'}
+    except Exception as _e:
+        return {'available': False, 'reason': f'突合計算失敗: {_e}'}
+
+
 def analyze_loss_harvest(
     snapshot: Optional[dict] = None,
     min_loss_jpy: float = 50_000,
@@ -463,7 +487,7 @@ def analyze_loss_harvest(
         # 同日再購入の注意（日本にウォッシュセールルールなし）
         same_day_repurchase = True
 
-        candidates.append({
+        candidate = {
             'key':                p['key'],
             'ticker':             p['ticker'],
             'name':               p['name'],
@@ -475,7 +499,20 @@ def analyze_loss_harvest(
             'tax_rate':           tax_rate,
             'same_day_repurchase': same_day_repurchase,
             'priority':           'high' if abs(loss) > 200_000 else 'medium',
-        })
+        }
+
+        # Stage 5C: event_ledger 起点の取得原価 (FIFO / 総平均法に準ずる方法) との
+        # 突合を追加情報として付与する。候補選定・tax_saving_jpy 自体は
+        # 従来通り holdings.json 由来の unrealized_jpy を使う (変更しない) —
+        # ここは cross-check の追加のみで、候補集合や既存の数値は一切変えない。
+        # event_ledger に取引履歴が無い銘柄 (現状 ABNB/MA/MNXACT/RTX/SLIM_ORCAN
+        # が該当) は available=False で明示し、無いものを 0 や holdings.json の
+        # 値で埋めない (review 対象として可視化するだけ)。
+        candidate['cost_basis_crosscheck'] = _cost_basis_crosscheck_for_candidate(
+            ticker=p['ticker'], account=account,
+        )
+
+        candidates.append(candidate)
         total_loss += loss
 
     candidates.sort(key=lambda x: x['unrealized_jpy'])   # 損失大きい順
