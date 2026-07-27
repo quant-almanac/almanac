@@ -443,10 +443,14 @@ def estimate_gjr_garch(returns: pd.Series, use_ginn: bool = True) -> dict:
 
         if use_ginn:
             try:
-                from ginn_model import forecast_ginn
-                ginn_vol = forecast_ginn(returns, garch_sigma=garch_forecast)
-                garch_forecast = ginn_vol
-                model_name = 'GINN+GJR-GARCH'
+                from ginn_model import forecast_ginn_result
+                ginn_result = forecast_ginn_result(returns, garch_sigma=garch_forecast)
+                garch_forecast = ginn_result["forecast_vol"]
+                # Stage 0A: 中央安全ゲートが実際に GINN を採用したときだけ
+                # ラベルを変える。内部フォールバックで GARCH 値を返した場合に
+                # 無条件で "GINN+GJR-GARCH" と表示していたのが今回の混入経路。
+                if ginn_result["used_model"] == "ginn":
+                    model_name = 'GINN+GJR-GARCH'
             except Exception:
                 pass  # GJR-GARCHフォールバック継続
 

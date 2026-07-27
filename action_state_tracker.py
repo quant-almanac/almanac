@@ -200,6 +200,16 @@ def _find_existing_pending(state: dict, dedup_key: str) -> str | None:
             continue
         if entry.get("status") not in {"pending", "reprice_required"}:
             continue
+        # Stage -1: 無効化された analysis/action_state の pending は再利用しない。
+        # 新分析は必ず新しい action state ID を作る (invalidated を pending へ戻さない)。
+        try:
+            from execution_invalidation import resolve_execution_invalidation
+            if resolve_execution_invalidation(
+                analysis_id=entry.get("analysis_id"), action_state_id=action_id
+            ) is not None:
+                continue
+        except Exception:
+            pass
         existing_key = _dedup_key(
             entry.get("ticker", ""),
             entry.get("action_type", ""),
@@ -451,6 +461,18 @@ def update_status(action_id: str, status: str, note: str = "") -> bool:
         entry["filled_at"] = now
         if not entry.get("placed_at"):
             entry["placed_at"] = now
+        try:
+            from execution_invalidation import (
+                resolve_execution_invalidation,
+                classify_fill_timing,
+            )
+            inv = resolve_execution_invalidation(
+                analysis_id=entry.get("analysis_id"), action_state_id=action_id
+            )
+            if inv is not None:
+                entry["fill_timing_vs_invalidation"] = classify_fill_timing(inv, now)
+        except Exception:
+            pass
     elif status == "cancelled":
         entry["cancelled_at"] = now
 
@@ -601,6 +623,20 @@ def sync_execution_status(
         entry["filled_at"] = now
         if not entry.get("placed_at"):
             entry["placed_at"] = now
+        # Stage -1: fill の事実は無効化後も拒否しない。ただし invalidated_at より
+        # 後の約定は AI 推薦由来として扱わず、区別できるよう印を付ける。
+        try:
+            from execution_invalidation import (
+                resolve_execution_invalidation,
+                classify_fill_timing,
+            )
+            inv = resolve_execution_invalidation(
+                analysis_id=entry.get("analysis_id"), action_state_id=entry.get("id")
+            )
+            if inv is not None:
+                entry["fill_timing_vs_invalidation"] = classify_fill_timing(inv, now)
+        except Exception:
+            pass
     elif target_status == "cancelled":
         entry["cancelled_at"] = now
     if note:
@@ -671,12 +707,29 @@ def check_new_position_block() -> dict:
 
 
 def get_all_pending(days_threshold: int = 0) -> list[dict]:
-    """全未発注アクションを返す（days_threshold営業日以上）。"""
+    """全未発注アクションを返す（days_threshold営業日以上）。
+
+    無効化された analysis/action_state (Stage -1) は除外する。これにより
+    通知 (advisory/critical) と次回分析プロンプト (format_pending_for_prompt)
+    の両方から、無効化済みの推奨が自動的に消える。
+    """
     state = _load()
+    try:
+        from execution_invalidation import resolve_execution_invalidation
+    except Exception:
+        resolve_execution_invalidation = None  # type: ignore[assignment]
     results = []
-    for entry in state["actions"].values():
+    for action_id, entry in state["actions"].items():
         if entry["status"] != "pending":
             continue
+        if resolve_execution_invalidation is not None:
+            try:
+                if resolve_execution_invalidation(
+                    analysis_id=entry.get("analysis_id"), action_state_id=action_id
+                ) is not None:
+                    continue
+            except Exception:
+                pass
         bdays = _business_days_since(entry["recommended_at"])
         if bdays >= days_threshold:
             results.append({**entry, "business_days_pending": bdays})

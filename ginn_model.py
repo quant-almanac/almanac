@@ -16,10 +16,11 @@ Cornish-Fisher VaR/CVaRの入力ボラティリティ精度を改善する。
 
 import argparse
 import json
+import os
 import sys
 import warnings
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timezone
 
 import numpy as np
 import pandas as pd
@@ -28,10 +29,57 @@ warnings.filterwarnings('ignore')
 
 BASE_DIR = Path(__file__).parent
 MODEL_PATH = BASE_DIR / 'models' / 'ginn_model.pt'
+META_PATH = BASE_DIR / 'models' / 'ginn_meta.json'
+SAFETY_LOG_PATH = BASE_DIR / 'logs' / 'ginn_safety_gate.jsonl'
 sys.path.insert(0, str(BASE_DIR))
 
 # モデルパスディレクトリ作成
 MODEL_PATH.parent.mkdir(exist_ok=True)
+
+# Stage 0A: 中央安全ゲート (2026-07-27 インシデント対応)。
+#
+# 2026-07-26 18:30 に学習したモデルが n_test=0 (訓練外評価なし) のまま
+# 06:24 の分析へ配線され、ボラティリティを GARCH 比 1.79〜3.00倍に
+# 膨らませて tier プロンプトへ混入した (AVGO/XLF が誤って ready 判定)。
+#
+# forecast_ginn() は従来ファイルの存在しかチェックせず、ginn_meta.json の
+# 中身 (n_test など) を一切見ていなかった。この関数がその穴を塞ぐ。
+MIN_VALIDATED_TEST_SAMPLES = 1  # 0A containment の最低ライン。
+# 4A で walk-forward validation の正式な昇格基準に置き換える (プレースホルダ)。
+
+
+def _log_safety_gate_event(event: dict) -> None:
+    """rejected legacy model のロード試行などを追記のみで記録する。"""
+    try:
+        SAFETY_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        event = {"ts": datetime.now(timezone.utc).isoformat(), **event}
+        with open(SAFETY_LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(json.dumps(event, ensure_ascii=False) + "\n")
+    except Exception:
+        pass  # 監査ログの失敗でフォールバック経路自体は止めない
+
+
+def _load_ginn_meta() -> dict | None:
+    if not META_PATH.exists():
+        return None
+    try:
+        data = json.loads(META_PATH.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else None
+    except (json.JSONDecodeError, OSError):
+        return None
+
+
+def _meets_promotion_criteria(meta: dict) -> tuple[bool, str | None]:
+    """manifest 無し / 未検証のモデルを default-deny する最低ライン。
+
+    現時点では n_test > 0 (訓練外評価が最低1件は存在する) のみを要求する。
+    4A で最低サンプル数・GARCH比の許容悪化率・モデル年齢等の正式な
+    昇格基準に置き換える。
+    """
+    n_test = meta.get("n_test")
+    if not isinstance(n_test, int) or n_test < MIN_VALIDATED_TEST_SAMPLES:
+        return False, f"unvalidated_n_test={n_test!r}"
+    return True, None
 
 # ============================================================
 # PyTorch モデル定義
@@ -288,14 +336,18 @@ def train_ginn(
     return {'success': True, 'loss': final_loss, 'n_samples': n_train, 'test_mse': test_mse}
 
 
-def forecast_ginn(
+def forecast_ginn_result(
     returns: pd.Series,
     garch_sigma: float,
     seq_len: int = 60,
-) -> float:
+) -> dict:
     """
-    GINNで翌日の予測ボラティリティを返す（年率換算）。
-    モデル未存在またはエラー時はgarch_sigmaをフォールバック。
+    GINNで翌日の予測ボラティリティを返す（年率換算）。モデル境界の中央安全ゲート。
+
+    manifest (ginn_meta.json) の無いモデル、または昇格基準 (現状は
+    n_test > 0) を満たさないモデルは default-deny で GARCH へフォールバック
+    する。ALMANAC_DISABLE_GINN=1 は基準を満たしたモデルがあっても常に
+    GARCH へ落とす一方向の kill switch。
 
     Args:
         returns: 直近リターン系列（60日以上）
@@ -303,19 +355,56 @@ def forecast_ginn(
         seq_len: シーケンス長
 
     Returns:
-        float: 年率換算ボラティリティ予測値
+        {
+          "forecast_vol":     float — 年率換算ボラティリティ予測値
+          "used_model":       "ginn" | "gjr_garch"
+          "fallback_reason":  str | None — used_model=="gjr_garch" の理由
+          "model_version":    str | None — 使用した GINN モデルの trained_at
+        }
     """
+    def _fallback(reason: str) -> dict:
+        return {
+            "forecast_vol": garch_sigma,
+            "used_model": "gjr_garch",
+            "fallback_reason": reason,
+            "model_version": None,
+        }
+
+    if os.environ.get("ALMANAC_DISABLE_GINN", "").strip().lower() in ("1", "true", "yes"):
+        return _fallback("disabled_by_env")
+
     if not MODEL_PATH.exists():
-        return garch_sigma  # フォールバック
+        return _fallback("model_file_missing")
+
+    meta = _load_ginn_meta()
+    if meta is None:
+        # manifest 無しの legacy model は default-deny。ファイルは削除しない
+        # (隔離であって破棄ではない) が、ロードせず監査ログへ記録する。
+        _log_safety_gate_event({
+            "event": "rejected_legacy_model_load",
+            "reason": "manifest_missing",
+            "model_path": str(MODEL_PATH),
+        })
+        return _fallback("manifest_missing")
+
+    ok, reason = _meets_promotion_criteria(meta)
+    if not ok:
+        _log_safety_gate_event({
+            "event": "rejected_legacy_model_load",
+            "reason": reason,
+            "model_path": str(MODEL_PATH),
+            "meta": meta,
+        })
+        return _fallback(reason)
 
     torch, nn = _get_torch()
     if torch is None:
-        return garch_sigma
+        return _fallback("torch_unavailable")
 
     try:
         ginn_obj = GINNModel(input_size=4, hidden_size=64, num_layers=2)
         if not ginn_obj.is_available():
-            return garch_sigma
+            return _fallback("model_unavailable")
 
         model = ginn_obj.model
         device = ginn_obj._device
@@ -324,7 +413,7 @@ def forecast_ginn(
 
         r = returns.dropna().tail(seq_len + 10)
         if len(r) < seq_len:
-            return garch_sigma
+            return _fallback("insufficient_returns_history")
 
         # 日次σ（年率→日次変換）
         garch_sigma_daily = garch_sigma / np.sqrt(252)
@@ -332,7 +421,7 @@ def forecast_ginn(
 
         X, _, _ = _build_sequences(r, garch_s, None, None, seq_len=seq_len)
         if len(X) == 0:
-            return garch_sigma
+            return _fallback("empty_input_sequence")
 
         x_tensor = torch.FloatTensor(X[-1:]).to(device)
 
@@ -345,11 +434,29 @@ def forecast_ginn(
         # 外れ値チェック: GARCHの0.3倍〜3倍の範囲に制限
         pred_annual = max(garch_sigma * 0.3, min(garch_sigma * 3.0, pred_annual))
 
-        return round(pred_annual, 4)
+        return {
+            "forecast_vol": round(pred_annual, 4),
+            "used_model": "ginn",
+            "fallback_reason": None,
+            "model_version": meta.get("trained_at"),
+        }
 
     except Exception as e:
         print(f"  GINN予測失敗（フォールバック）: {e}")
-        return garch_sigma
+        return _fallback(f"prediction_error:{type(e).__name__}")
+
+
+def forecast_ginn(
+    returns: pd.Series,
+    garch_sigma: float,
+    seq_len: int = 60,
+) -> float:
+    """互換 wrapper。既存の呼び出し元・CLI が float を期待するため残す。
+
+    新規コードは forecast_ginn_result() を使い、used_model で GARCH
+    フォールバックか GINN かを区別すること (この wrapper では区別できない)。
+    """
+    return forecast_ginn_result(returns, garch_sigma, seq_len)["forecast_vol"]
 
 
 # ============================================================

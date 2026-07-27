@@ -1052,6 +1052,22 @@ def _build_today() -> dict:
                 "code": a.get("filter_rule") or a.get("order_intent_decision") or "review_required",
                 "message": message,
             }]
+        # Stage -1: 無効化された分析/action_state はここで review へ強制する。
+        # action_state.json の原レコードは変更しない (overlay-only)。
+        try:
+            from execution_invalidation import (
+                resolve_execution_invalidation,
+                invalidation_block_reason,
+            )
+            inv = resolve_execution_invalidation(
+                analysis_id=synthesis.get("analysis_id"),
+                action_state_id=(entry or {}).get("id"),
+            )
+        except Exception:
+            inv = None
+        if inv is not None:
+            readiness = "review"
+            block_reasons = [invalidation_block_reason(inv)] + block_reasons
         lifecycle = _lifecycle_view(entry, a.get("expiry_minutes"))
         if lifecycle.get("status") == "expired" and readiness == "ready":
             readiness = "review"

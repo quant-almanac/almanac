@@ -76,6 +76,7 @@ espp_plan.json
 credit_card_plans.json
 trade_history.csv
 action_*.json
+execution_invalidation_state.json
 agent_briefing.json
 agent_reliability.json
 ai_*.json
