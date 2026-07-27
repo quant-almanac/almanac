@@ -52,3 +52,80 @@ def test_fallback_insufficient_history():
     # 例外的に許可する場合の観察用 size (0.5%、cap 内)
     assert r['size_pct'] == k.FALLBACK_SIZE_PCT
     assert r['size_pct'] <= k.CAPS_BY_ITYPE['swing']
+
+
+# ---------------------------------------------------------------------------
+# Stage 6A: buy/add/dca のみを母集団にする + (analysis_id,ticker,direction) dedup
+# ---------------------------------------------------------------------------
+
+
+def _rec(ticker, type_, outcome_pct, *, analysis_id=None, verified=True):
+    return {
+        'ticker': ticker, 'type': type_, 'outcome_pct': outcome_pct,
+        'verified': verified, 'analysis_id': analysis_id,
+    }
+
+
+def test_sell_type_recommendations_are_excluded_from_kelly_population():
+    """本題: sell/trim/stop_loss/take_profit を符号反転して混ぜていた旧実装
+    は、新規エントリーのサイジング根拠として不適切な母集団を作っていた。"""
+    recs = [
+        _rec('AVGO', 'buy', 5.0, analysis_id='a1'),
+        _rec('AVGO', 'sell', -3.0, analysis_id='a2'),   # 除外されるべき
+        _rec('AVGO', 'trim', 2.0, analysis_id='a3'),    # 除外されるべき
+        _rec('AVGO', 'stop_loss', -8.0, analysis_id='a4'),  # 除外されるべき
+        _rec('AVGO', 'take_profit', 4.0, analysis_id='a5'),  # 除外されるべき
+    ]
+    stats = k.aggregate_ticker_stats(recs, min_trades=1)
+    assert stats['AVGO']['n'] == 1  # buy の1件のみ
+
+
+def test_buy_add_dca_are_all_included():
+    recs = [
+        _rec('NVDA', 'buy', 5.0, analysis_id='a1'),
+        _rec('NVDA', 'add', 3.0, analysis_id='a2'),
+        _rec('NVDA', 'dca', -1.0, analysis_id='a3'),
+    ]
+    stats = k.aggregate_ticker_stats(recs, min_trades=1)
+    assert stats['NVDA']['n'] == 3
+
+
+def test_duplicate_analysis_id_ticker_is_deduped():
+    """本題: 同一 analysis_id からの重複ログ行は母集団を水増ししない。"""
+    recs = [
+        _rec('AVGO', 'buy', 5.0, analysis_id='same-analysis'),
+        _rec('AVGO', 'buy', 5.0, analysis_id='same-analysis'),  # 重複
+        _rec('AVGO', 'buy', 3.0, analysis_id='different-analysis'),
+    ]
+    stats = k.aggregate_ticker_stats(recs, min_trades=1)
+    assert stats['AVGO']['n'] == 2  # 重複1件を除いた2件
+
+
+def test_missing_analysis_id_is_not_deduped_away():
+    """analysis_id の無い古いログ行は dedup キーを構成できないため、
+    fail-open で常に採用する (過去ログを一律で捨てない)。"""
+    recs = [
+        _rec('AVGO', 'buy', 5.0, analysis_id=None),
+        _rec('AVGO', 'buy', 3.0, analysis_id=None),
+    ]
+    stats = k.aggregate_ticker_stats(recs, min_trades=1)
+    assert stats['AVGO']['n'] == 2
+
+
+def test_stats_entries_carry_direction_and_horizon():
+    recs = [_rec('AVGO', 'buy', 5.0, analysis_id='a1')]
+    stats = k.aggregate_ticker_stats(recs, min_trades=1)
+    assert stats['AVGO']['direction'] == 'buy'
+    assert stats['AVGO']['horizon'] == '5d'
+
+
+def test_recommendation_kelly_stats_is_an_alias():
+    """名称は recommendation_kelly 系にして実売買の勝率と誤認させない
+    (プラン契約)。"""
+    assert k.recommendation_kelly_stats is k.aggregate_ticker_stats
+
+
+def test_unverified_entries_are_still_excluded():
+    recs = [_rec('AVGO', 'buy', 5.0, analysis_id='a1', verified=False)]
+    stats = k.aggregate_ticker_stats(recs, min_trades=1)
+    assert 'AVGO' not in stats

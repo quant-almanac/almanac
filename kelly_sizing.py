@@ -15,6 +15,31 @@ ai_recommendation_log.json の verified outcomes から銘柄別
 
 負の Kelly（EV ≤ 0）は entry reject。
 履歴 < MIN_TRADES なら固定 3% fallback（aggressive スタンスに合わせた中位）。
+
+Stage 6A (2026-07): この統計は「AI推奨シグナルの的中率」であって
+「実際に執行した売買の勝率」ではない — 呼び出し側・表示側は
+recommendation_kelly_stats() の名前が示す通り、これを実売買の
+パフォーマンス指標として提示してはならない。現状の入力統計には
+以下の是正を実施済み:
+  - buy/add/dca のみを母集団にする (sell/trim/stop_loss/take_profit を
+    符号反転して混ぜていた旧実装は方向の違う判断を同一母集団として
+    扱っていた — 新規エントリーのサイジングに使う統計として不適切)
+  - (analysis_id, ticker, direction) で重複除去 (同一分析からの
+    重複ログ行が母集団を水増ししない)
+  - 統計キーを (ticker, direction, horizon) に拡張 (horizon は
+    現状 "5d" のみだが、tier別ホライズンを将来追加する際の構造を
+    先に用意する — recommendation_verifier.py 側の複数ホライズン
+    計測が実装されるまでは "5d" 固定)
+
+未着手 (このモジュール単体では解決できない、別途要対応):
+  - _log_recommendations() (analyst/__init__.py) が事後のログ時点で
+    改めて yfinance から価格を取得しており、tier LLM が実際に見た
+    凍結済み decision_price と異なりうる (Stage 1B の
+    decision_snapshot と統合する形で解消すべき)
+  - signal_evaluable / execution_eligible の2軸分離 (blocked を
+    一律除外すると「実行しやすかった推薦だけ残る」選択バイアスになる
+    という論点) は ai_recommendation_log.json 側にその判別に必要な
+    情報が十分あるか未検証
 """
 from __future__ import annotations
 
@@ -81,6 +106,16 @@ def kelly_fraction(
 # 履歴集計（verified outcomes から）
 # ============================================================
 
+# Stage 6A: 新規エントリーのサイジングに使ってよい action type。
+# take_profit は正の期待リターンを持つが「保有ポジションを閉じる/縮小する」
+# 決定であり、将来の新規 buy が成功するかどうかの情報を持たない。
+BUY_SIDE_TYPES = frozenset({'buy', 'add', 'dca'})
+
+# 現状 recommendation_verifier.py は 5 営業日ホライズンのみを計測する。
+# tier別 (long/medium/swing) ホライズンが実装されるまでの固定値。
+_SINGLE_HORIZON = '5d'
+
+
 def aggregate_ticker_stats(
     recs: Optional[list] = None,
     min_trades: int = MIN_TRADES_FOR_KELLY,
@@ -88,8 +123,18 @@ def aggregate_ticker_stats(
     """
     ai_recommendation_log.json の verified エントリから銘柄別統計を作る。
 
+    Stage 6A: 母集団を buy/add/dca のみに限定する (sell/trim/stop_loss/
+    take_profit を符号反転して混ぜていた旧実装は、方向の異なる判断を
+    同一母集団として扱っており、新規エントリーのサイジング根拠として
+    不適切だった)。(analysis_id, ticker, direction) で重複除去し、
+    同一分析からの重複ログ行が母集団を水増ししないようにする。
+
     Returns:
-        {ticker: {'win_rate', 'avg_win_pct', 'avg_loss_pct', 'n', 'sufficient'}}
+        {ticker: {'win_rate', 'avg_win_pct', 'avg_loss_pct', 'n', 'sufficient',
+                   'direction', 'horizon'}}
+
+    Note: この統計は「AI推奨シグナルの的中率」であり実売買の勝率ではない
+    (モジュール docstring 参照)。
     """
     if recs is None:
         try:
@@ -98,6 +143,7 @@ def aggregate_ticker_stats(
             recs = []
 
     by_ticker: dict = {}
+    seen_dedup_keys: set = set()
     for r in recs:
         if not r.get('verified'):
             continue
@@ -105,15 +151,24 @@ def aggregate_ticker_stats(
         if outcome is None:
             continue
         action_type = (r.get('type') or '').lower()
-        # buy/add系のみリターンの向きが素直に扱える。sell 系は向きを反転。
-        if action_type in ('sell', 'trim', 'stop_loss', 'take_profit'):
-            outcome = -float(outcome)
-        else:
-            outcome = float(outcome)
+        if action_type not in BUY_SIDE_TYPES:
+            continue
 
         ticker = (r.get('ticker') or '').upper()
         if not ticker:
             continue
+
+        # (analysis_id, ticker, direction) で重複除去。analysis_id が
+        # 無い古いログ行は dedup キーを構成できないため常に採用する
+        # (fail-open — 過去ログを一律で捨てない)。
+        analysis_id = r.get('analysis_id')
+        if analysis_id:
+            dedup_key = (analysis_id, ticker, 'buy')
+            if dedup_key in seen_dedup_keys:
+                continue
+            seen_dedup_keys.add(dedup_key)
+
+        outcome = float(outcome)
         slot = by_ticker.setdefault(ticker, {'wins': [], 'losses': []})
         if outcome > 0:
             slot['wins'].append(outcome / 100.0)    # % → 小数
@@ -134,8 +189,16 @@ def aggregate_ticker_stats(
             'avg_loss_pct': round(avg_loss, 4),
             'n':            n,
             'sufficient':   n >= min_trades,
+            'direction':    'buy',
+            'horizon':      _SINGLE_HORIZON,
         }
     return result
+
+
+# Stage 6A: この統計は実売買の勝率ではなく AI 推奨シグナルの的中率である
+# ことを名前で明示するエイリアス。内部実装は aggregate_ticker_stats() と
+# 同一 (後方互換のため元の名前も残す)。
+recommendation_kelly_stats = aggregate_ticker_stats
 
 
 # ============================================================
