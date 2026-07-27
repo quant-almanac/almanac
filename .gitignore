@@ -88,6 +88,8 @@ bl_views.json
 calibration_report.json
 calibrated_thresholds.json
 guard_state.json
+hedge_target.json
+hedge_target_shadow.json
 macro_state.json
 currency_policy_state.json
 market_*.json

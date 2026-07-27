@@ -24,6 +24,7 @@ import されていない、スタンドアロン CLI 専用)。
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -80,6 +81,26 @@ def _save_state(state: dict) -> None:
     tmp.replace(HEDGE_STATE)
 
 
+def _resolve_previous_business_date_target(state: dict, *, today_str: str) -> float:
+    """Stage 7B: 冪等化の核心。
+
+    旧実装は current_hedge_ratio 未指定時に state['last_target'] を
+    そのまま基準値として使っていたが、persist_target() は呼ぶたびに
+    last_target を更新するため、同日3回実行すると実質 3×MAX_DAILY_DELTA
+    (±30pt) まで動いてしまっていた。
+
+    「前営業日確定値」は評価日が変わった時だけ更新する: 今日すでに
+    評価済みなら記録済みの previous_business_date_target をそのまま返し、
+    今日初めての評価なら前回の today_smoothed_target (2段フォールバックで
+    旧 last_target) を新しい基準として採用する。
+    """
+    last_evaluated_at = state.get('last_evaluated_at')
+    last_evaluated_date = str(last_evaluated_at)[:10] if last_evaluated_at else None
+    if last_evaluated_date == today_str:
+        return float(state.get('previous_business_date_target', state.get('last_target', 0.0)))
+    return float(state.get('today_smoothed_target', state.get('last_target', 0.0)))
+
+
 # ============================================================
 # core: target 比率の算出
 # ============================================================
@@ -118,6 +139,7 @@ def compute_target_hedge_ratio(
     usdjpy_sma_90d: Optional[float] = None,
     usdjpy_avg_5y: Optional[float] = None,
     current_hedge_ratio: Optional[float] = None,
+    now: Optional[datetime] = None,
 ) -> dict:
     """
     目標ヘッジ比率を算出する。
@@ -167,10 +189,14 @@ def compute_target_hedge_ratio(
     raw_target = base + sum(addons.values())
     clamped = max(MIN_HEDGE, min(MAX_HEDGE, raw_target))
 
-    # 日次変化幅クランプ
+    now = now or datetime.now()
+    today_str = now.strftime('%Y-%m-%d')
+
+    # 日次変化幅クランプ。Stage 7B: 評価日単位で冪等化した基準値を使う
+    # (_resolve_previous_business_date_target 参照)。
     if current_hedge_ratio is None:
         state = _load_state()
-        current_hedge_ratio = float(state.get('last_target', 0.0))
+        current_hedge_ratio = _resolve_previous_business_date_target(state, today_str=today_str)
 
     delta = clamped - current_hedge_ratio
     if abs(delta) > MAX_DAILY_DELTA:
@@ -211,7 +237,10 @@ def compute_target_hedge_ratio(
             'usdjpy_sma_90d':  usdjpy_sma_90d,
             'usdjpy_avg_5y':   usdjpy_avg_5y,
         },
-        'as_of': datetime.now().isoformat(),
+        # Stage 7B: 評価日単位の冪等化に必要なフィールド。
+        'previous_business_date_target': round(current_hedge_ratio, 4),
+        'evaluation_date': today_str,
+        'as_of': now.isoformat(),
     }
     return result
 
@@ -252,18 +281,155 @@ def _recommend_method(target: float, regime: str, iv: float) -> dict:
     }
 
 
-def persist_target(result: dict) -> None:
-    """次回日次変化幅クランプのため state を保存"""
-    state = _load_state()
-    state['last_target'] = result['target_hedge_ratio']
-    state.setdefault('history', []).append({
+def persist_target(result: dict, *, state: Optional[dict] = None, save: bool = True) -> dict:
+    """次回日次変化幅クランプのため state を保存する。
+
+    Stage 7B: 評価日単位で冪等化する。同じ evaluation_date で複数回
+    呼ばれても previous_business_date_target は動かさず、履歴も追加せず
+    最後のエントリを上書きする — 同日3回実行しても履歴は1件分のまま、
+    次の営業日の基準値も1回分しか進まない。
+    """
+    state = state if state is not None else _load_state()
+    eval_date = result.get('evaluation_date') or datetime.now().strftime('%Y-%m-%d')
+    last_evaluated_at = state.get('last_evaluated_at')
+    last_evaluated_date = str(last_evaluated_at)[:10] if last_evaluated_at else None
+    is_new_business_date = last_evaluated_date != eval_date
+
+    state['previous_business_date_target'] = result.get(
+        'previous_business_date_target',
+        state.get('previous_business_date_target', state.get('last_target', 0.0)),
+    )
+    state['today_raw_target'] = result['raw_target']
+    state['today_smoothed_target'] = result['target_hedge_ratio']
+    state['last_target'] = result['target_hedge_ratio']  # 後方互換 (旧フィールド)
+    state['last_evaluated_at'] = result['as_of']
+
+    history_entry = {
         'as_of':  result['as_of'],
         'target': result['target_hedge_ratio'],
         'inputs': result['inputs'],
-    })
-    # 直近 60 件のみ保持
-    state['history'] = state['history'][-60:]
-    _save_state(state)
+    }
+    history = state.setdefault('history', [])
+    if is_new_business_date or not history:
+        history.append(history_entry)
+    else:
+        history[-1] = history_entry  # 同一評価日の再実行: 追加せず更新
+    state['history'] = history[-60:]
+
+    if save:
+        _save_state(state)
+    return state
+
+
+# ============================================================
+# Stage 7B: 影実行 (shadow execution)
+# ============================================================
+#
+# モードは off / shadow / advisory の3つ。自動発注しないモードを
+# enforce と呼ばない (プランの契約)。shadow/advisory は本番 state
+# (hedge_target.json) を一切書き換えず、専用の shadow state ファイルに
+# だけ記録する。
+
+HEDGE_MODE_OFF = 'off'
+HEDGE_MODE_SHADOW = 'shadow'
+HEDGE_MODE_ADVISORY = 'advisory'
+VALID_HEDGE_MODES = (HEDGE_MODE_OFF, HEDGE_MODE_SHADOW, HEDGE_MODE_ADVISORY)
+
+SHADOW_HEDGE_STATE = BASE_DIR / 'hedge_target_shadow.json'  # 本番 state と分離
+
+
+def _load_shadow_state() -> dict:
+    if SHADOW_HEDGE_STATE.exists():
+        try:
+            return json.loads(SHADOW_HEDGE_STATE.read_text(encoding='utf-8'))
+        except Exception:
+            pass
+    return {'last_target': 0.0, 'history': []}
+
+
+def _save_shadow_state(state: dict) -> None:
+    tmp = SHADOW_HEDGE_STATE.with_suffix('.tmp')
+    tmp.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding='utf-8')
+    tmp.replace(SHADOW_HEDGE_STATE)
+
+
+def run_hedge_shadow(
+    regime: str, vix: float, usdjpy: float,
+    *, mode: str = HEDGE_MODE_SHADOW, now: Optional[datetime] = None, **kwargs,
+) -> dict:
+    """影実行本体。mode='off' なら何もしない。'shadow'/'advisory' は
+    本番 persist_target()/hedge_target.json を一切呼ばず、専用の
+    shadow state (hedge_target_shadow.json) にのみ冪等に記録する —
+    actual notional (本番の target_hedge_ratio) を変えない。
+    """
+    if mode not in VALID_HEDGE_MODES:
+        raise ValueError(f'不正な mode: {mode!r} (有効値: {VALID_HEDGE_MODES})')
+    if mode == HEDGE_MODE_OFF:
+        return {'mode': mode, 'skipped': True}
+
+    now = now or datetime.now()
+    shadow_state = _load_shadow_state()
+    today_str = now.strftime('%Y-%m-%d')
+    current = _resolve_previous_business_date_target(shadow_state, today_str=today_str)
+
+    result = compute_target_hedge_ratio(
+        regime, vix, usdjpy, current_hedge_ratio=current, now=now, **kwargs,
+    )
+    result['mode'] = mode
+
+    # persist_target() (本番用) は使わない — shadow_state への書き込みに限定する。
+    persist_target(result, state=shadow_state, save=False)
+    _save_shadow_state(shadow_state)
+
+    return result
+
+
+# ============================================================
+# Stage 7B: vehicle 別 adapter (置換 vs overlay)
+# ============================================================
+
+# ヘッジ付き ETF (2634/2632) は overlay ではなく「置換」— 対応する無ヘッジ
+# 資産の保有額までしか機能しない (2634 は無ヘッジ S&P500 保有額まで、
+# 2632 は無ヘッジ NASDAQ100 保有額まで)。対応資産の保有額が不明なら
+# unavailable として fail-closed する (0 円分の置換ができると憶測しない)。
+REPLACEMENT_VEHICLES = {
+    '2634.T': 'S&P500 無ヘッジ保有',
+    '2632.T': 'NASDAQ100 無ヘッジ保有',
+}
+
+
+@dataclass(frozen=True)
+class VehicleAdapterResult:
+    vehicle: str
+    adapter_kind: str  # "replacement" | "overlay" | "unavailable"
+    replaceable_up_to_jpy: Optional[float]
+    reason: Optional[str]
+
+
+def resolve_vehicle_adapter(
+    vehicle: str, *, corresponding_unhedged_holding_jpy: Optional[float] = None,
+) -> VehicleAdapterResult:
+    """先物・FX (ACTIVE_HEDGE_INSTRUMENTS) は保有を維持した overlay。
+    ヘッジ付き ETF (REPLACEMENT_VEHICLES) は overlay でなく置換であり、
+    対応する無ヘッジ資産の保有額を超えては機能しない。"""
+    if vehicle in REPLACEMENT_VEHICLES:
+        if corresponding_unhedged_holding_jpy is None:
+            return VehicleAdapterResult(
+                vehicle=vehicle, adapter_kind='unavailable', replaceable_up_to_jpy=None,
+                reason=f'{REPLACEMENT_VEHICLES[vehicle]}の保有額が不明なため置換可否を判定できない',
+            )
+        return VehicleAdapterResult(
+            vehicle=vehicle, adapter_kind='replacement',
+            replaceable_up_to_jpy=round(max(0.0, corresponding_unhedged_holding_jpy), 0), reason=None,
+        )
+    if vehicle in ACTIVE_HEDGE_INSTRUMENTS:
+        return VehicleAdapterResult(
+            vehicle=vehicle, adapter_kind='overlay', replaceable_up_to_jpy=None, reason=None,
+        )
+    return VehicleAdapterResult(
+        vehicle=vehicle, adapter_kind='unavailable', replaceable_up_to_jpy=None,
+        reason='未知の hedge vehicle',
+    )
 
 
 # ============================================================

@@ -1,4 +1,8 @@
 """T16: dynamic FX hedge regime × VIX matrix"""
+from datetime import datetime
+
+import pytest
+
 import fx_hedge_manager as fx
 
 
@@ -111,3 +115,132 @@ def test_active_hedge_6j_direction_is_buy_not_sell():
     assert "6J" in text
     assert "6J 先物買い" in text or ("6J" in text and "買い" in text)
     assert "6J 先物売" not in text
+
+
+# ---------------------------------------------------------------------------
+# Stage 7B: 日次制約の評価日単位冪等化 (プラン必須テスト)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def _isolate_hedge_state(tmp_path, monkeypatch):
+    monkeypatch.setattr(fx, "HEDGE_STATE", tmp_path / "hedge_target.json")
+    monkeypatch.setattr(fx, "SHADOW_HEDGE_STATE", tmp_path / "hedge_target_shadow.json")
+    return tmp_path
+
+
+def test_three_calls_same_day_advance_only_one_delta_worth():
+    """本題 (プラン必須テスト): 同日3回実行しても実質1回分 (±10pt) しか
+    動かない。旧実装は persist_target が呼ぶたびに last_target を更新して
+    いたため、同日3回で最大±30pt動いてしまっていた。"""
+    day1 = datetime(2026, 7, 27, 9, 0, 0)
+
+    # crisis (base=60%) を3回連続で評価・保存する。初期値0%から始まる。
+    r1 = fx.compute_target_hedge_ratio('crisis', 40, 155, now=day1)
+    fx.persist_target(r1)
+    r2 = fx.compute_target_hedge_ratio('crisis', 40, 155, now=datetime(2026, 7, 27, 12, 0, 0))
+    fx.persist_target(r2)
+    r3 = fx.compute_target_hedge_ratio('crisis', 40, 155, now=datetime(2026, 7, 27, 18, 0, 0))
+    fx.persist_target(r3)
+
+    # 3回とも同じ結果になる (冪等) — 1回目のクランプ (0% → 10%) を超えて進まない
+    assert r1['target_hedge_ratio'] == pytest.approx(0.10)
+    assert r2['target_hedge_ratio'] == pytest.approx(0.10)
+    assert r3['target_hedge_ratio'] == pytest.approx(0.10)
+
+
+def test_next_business_day_advances_at_most_one_delta_from_previous_close():
+    """本題 (プラン必須テスト): 翌営業日は前営業日確定値から最大10pt。"""
+    day1 = datetime(2026, 7, 27, 9, 0, 0)
+    day2 = datetime(2026, 7, 28, 9, 0, 0)
+
+    r1 = fx.compute_target_hedge_ratio('crisis', 40, 155, now=day1)
+    fx.persist_target(r1)
+    assert r1['target_hedge_ratio'] == pytest.approx(0.10)  # 0% → 10% (1日目)
+
+    r2 = fx.compute_target_hedge_ratio('crisis', 40, 155, now=day2)
+    fx.persist_target(r2)
+    assert r2['target_hedge_ratio'] == pytest.approx(0.20)  # 10% → 20% (2日目、+10ptのみ)
+    assert r2['previous_business_date_target'] == pytest.approx(0.10)
+
+
+def test_rerunning_same_snapshot_does_not_duplicate_history():
+    """本題 (プラン必須テスト): 同一 snapshot (同一評価日) の再実行で
+    履歴を重複追加しない。"""
+    day1 = datetime(2026, 7, 27, 9, 0, 0)
+    for hour in (9, 12, 18):
+        r = fx.compute_target_hedge_ratio('crisis', 40, 155, now=datetime(2026, 7, 27, hour, 0, 0))
+        fx.persist_target(r)
+
+    state = fx._load_state()
+    assert len(state['history']) == 1  # 3回実行しても履歴は1件のまま
+
+
+def test_shadow_mode_off_does_nothing():
+    result = fx.run_hedge_shadow('crisis', 40, 155, mode=fx.HEDGE_MODE_OFF)
+    assert result == {'mode': fx.HEDGE_MODE_OFF, 'skipped': True}
+
+
+def test_shadow_mode_invalid_raises():
+    with pytest.raises(ValueError, match="mode"):
+        fx.run_hedge_shadow('crisis', 40, 155, mode='enforce')  # enforce は許可しない
+
+
+def test_shadow_execution_never_touches_actual_state():
+    """本題 (プラン必須テスト): shadow が actual notional (本番 state) を変えない。"""
+    now = datetime(2026, 7, 27, 9, 0, 0)
+    fx.run_hedge_shadow('crisis', 40, 155, mode=fx.HEDGE_MODE_SHADOW, now=now)
+
+    assert not fx.HEDGE_STATE.exists()          # 本番 state は一切作られない
+    assert fx.SHADOW_HEDGE_STATE.exists()        # shadow state だけが作られる
+
+
+def test_shadow_execution_does_not_read_actual_state_as_baseline():
+    """影実行と本番実行は別々の基準値を持つ (state が完全分離)。"""
+    now1 = datetime(2026, 7, 27, 9, 0, 0)
+    r_actual = fx.compute_target_hedge_ratio('crisis', 40, 155, now=now1)
+    fx.persist_target(r_actual)  # 本番 state: 0% → 10%
+
+    now2 = datetime(2026, 7, 28, 9, 0, 0)
+    r_shadow = fx.run_hedge_shadow('crisis', 40, 155, mode=fx.HEDGE_MODE_SHADOW, now=now2)
+    # shadow は本番の10%を基準にせず、shadow 独自の0%から始まる
+    assert r_shadow['previous_business_date_target'] == pytest.approx(0.0)
+
+
+def test_shadow_advisory_mode_also_isolated():
+    now = datetime(2026, 7, 27, 9, 0, 0)
+    result = fx.run_hedge_shadow('crisis', 40, 155, mode=fx.HEDGE_MODE_ADVISORY, now=now)
+    assert result['mode'] == fx.HEDGE_MODE_ADVISORY
+    assert not fx.HEDGE_STATE.exists()
+
+
+# ---------------------------------------------------------------------------
+# Stage 7B: vehicle 別 adapter (置換 vs overlay)
+# ---------------------------------------------------------------------------
+
+
+def test_hedged_etf_is_replacement_not_overlay():
+    result = fx.resolve_vehicle_adapter('2634.T', corresponding_unhedged_holding_jpy=1_000_000)
+    assert result.adapter_kind == 'replacement'
+    assert result.replaceable_up_to_jpy == pytest.approx(1_000_000)
+
+
+def test_hedged_etf_without_corresponding_holding_is_unavailable():
+    """本題: 対応する無ヘッジ資産の保有額が不明なら unavailable
+    (0円分の置換ができると憶測しない)。"""
+    result = fx.resolve_vehicle_adapter('2634.T', corresponding_unhedged_holding_jpy=None)
+    assert result.adapter_kind == 'unavailable'
+    assert result.replaceable_up_to_jpy is None
+    assert result.reason is not None
+
+
+def test_futures_fx_instrument_is_overlay():
+    instrument = fx.ACTIVE_HEDGE_INSTRUMENTS[0]
+    result = fx.resolve_vehicle_adapter(instrument)
+    assert result.adapter_kind == 'overlay'
+    assert result.replaceable_up_to_jpy is None
+
+
+def test_unknown_vehicle_is_unavailable():
+    result = fx.resolve_vehicle_adapter('UNKNOWN_TICKER')
+    assert result.adapter_kind == 'unavailable'
