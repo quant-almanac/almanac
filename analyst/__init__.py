@@ -10118,6 +10118,11 @@ def run_analysis(force: bool = False) -> dict:
                 earnings_blackout_tickers = _blackout_tickers,
                 portfolio_integrity = data.get("portfolio_integrity") if isinstance(data, dict) else None,
             )
+            # Stage 6B: 反実仮想 (Kelly影実行) は raw actions (policy 適用前) を
+            # 使う。次行で synthesis["priority_actions"] が accepted へ置換される
+            # ため、その前に参照を確保しておく (deepcopy は kelly_shadow 側で行う)。
+            _raw_actions_for_kelly_shadow = list(synthesis["priority_actions"])
+
             _pe_decision = apply_policy_gate(synthesis["priority_actions"], _pe_ctx)
 
             # 反映: accepted で priority_actions を置換、rejected / modified を監査用に保存
@@ -10143,6 +10148,46 @@ def run_analysis(force: bool = False) -> dict:
 
             print(f"  ✓ Policy Engine: accepted={len(_pe_decision.accepted)} "
                   f"rejected={len(_pe_decision.rejected)} modified={len(_pe_decision.modified)}")
+
+            # Stage 6B: Kelly 反実仮想の影実行。実経路と同一の凍結 context
+            # (_pe_ctx・portfolio_total・保有額) を再利用し、新規データ取得は
+            # 行わない。副作用 (action_state 登録・ログ追記・execution_plan
+            # 更新・通知・priority_actions の変更) は一切行わない — 結果は
+            # synthesis の別フィールドへ観測専用として格納するだけ。
+            # 失敗しても実経路には一切影響しない (fail-open)。
+            try:
+                from kelly_shadow import run_kelly_shadow
+                from kelly_sizing import aggregate_ticker_stats as _kelly_agg_stats
+
+                _kelly_holdings_by_ticker: dict = {}
+                for _pos in (data.get("positions") or []) if isinstance(data, dict) else []:
+                    _t = _pos.get("ticker")
+                    if _t:
+                        _kelly_holdings_by_ticker[_t] = _kelly_holdings_by_ticker.get(_t, 0.0) + float(_pos.get("value_jpy") or 0)
+
+                _kelly_shadow_decision = run_kelly_shadow(
+                    _raw_actions_for_kelly_shadow,
+                    _pe_ctx,
+                    portfolio_total_jpy=float((data.get("portfolio_total") if isinstance(data, dict) else None) or 0),
+                    current_holdings_by_ticker=_kelly_holdings_by_ticker,
+                    kelly_stats=_kelly_agg_stats(),
+                )
+                synthesis["kelly_shadow_decision"] = {
+                    "accepted_count": len(_kelly_shadow_decision.accepted),
+                    "rejected_count": len(_kelly_shadow_decision.rejected),
+                    "modified_count": len(_kelly_shadow_decision.modified),
+                    "capped_count": _kelly_shadow_decision.capped_count,
+                    "non_actionable_count": _kelly_shadow_decision.non_actionable_count,
+                    "note": "観測専用 (影実行) — 実際の priority_actions には一切反映されていない",
+                }
+                print(
+                    f"  🌓 Kelly影実行: accepted={len(_kelly_shadow_decision.accepted)} "
+                    f"capped={_kelly_shadow_decision.capped_count} "
+                    f"non_actionable={_kelly_shadow_decision.non_actionable_count}"
+                )
+            except Exception as _kelly_shadow_e:
+                print(f"  ⚠️ Kelly影実行スキップ (実経路には影響なし): {_kelly_shadow_e}")
+
             # action_stage_log: policy_accepted / policy_rejected を記録
             if _asl_analysis_id:
                 try:
