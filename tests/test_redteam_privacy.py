@@ -179,6 +179,48 @@ def test_judge_pseudonymizes_tickers_and_restores(monkeypatch) -> None:
     assert "T1" not in report
 
 
+def test_r1_judge_transport_requests_json_output(monkeypatch) -> None:
+    import sys
+    from types import SimpleNamespace
+
+    captured: dict = {}
+
+    class _Completions:
+        def create(self, **kwargs):
+            captured.update(kwargs)
+            return SimpleNamespace(
+                choices=[SimpleNamespace(
+                    message=SimpleNamespace(
+                        content='{"contradictions":[]}',
+                        reasoning_content="private reasoning",
+                    ),
+                )],
+                usage=SimpleNamespace(prompt_tokens=12, completion_tokens=34),
+            )
+
+    class _Client:
+        def __init__(self, **kwargs):
+            captured["client"] = kwargs
+            self.chat = SimpleNamespace(completions=_Completions())
+
+    monkeypatch.setitem(sys.modules, "openai", SimpleNamespace(OpenAI=_Client))
+
+    raw, usage = analyst._r1_judge_transport(
+        base_url="https://example.invalid",
+        api_key="test",
+        model_id="deepseek-reasoner",
+        system="Return JSON.",
+        user='{"request":"judge"}',
+        max_tokens=4096,
+        temperature=0.0,
+    )
+
+    assert raw == '{"contradictions":[]}'
+    assert usage == {"input_tokens": 12, "output_tokens": 34}
+    assert captured["max_tokens"] == 4096
+    assert captured["response_format"] == {"type": "json_object"}
+
+
 # ---------------------------------------------------------------------------
 # Public market context excludes book (R-round P1: shared_ctx stress/risk leak)
 # ---------------------------------------------------------------------------

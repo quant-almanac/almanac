@@ -2829,6 +2829,11 @@ def _r1_judge_transport(*, base_url: str, api_key: str, model_id: str,
         model=model_id,
         messages=[{"role": "user", "content": f"{system}\n\n{user}"}],
         max_tokens=max_tokens,
+        # DeepSeek reasoning tokens and final content share max_tokens.
+        # Request JSON mode so the final content is machine-parseable once
+        # reasoning completes; the prompt already contains "JSON" and the
+        # exact target object required by the API contract.
+        response_format={"type": "json_object"},
     )
     _msg = resp.choices[0].message
     raw = _msg.content or ""
@@ -2926,25 +2931,31 @@ def _judge_sonnet_outputs(long_a: dict, medium_a: dict,
             api_key=key,
             model_id="deepseek-reasoner",
             role="judge",
-            max_tokens=2000,
+            # The previous 2,000-token ceiling was repeatedly exhausted by
+            # reasoning before the final JSON began.  DeepSeek counts both
+            # reasoning_content and content against this shared limit.
+            max_tokens=4096,
             transport=_r1_judge_transport,
         )
         raw = res.content or ""
         # 複数パターンで JSON 抽出を試みる
-        judge = None
-        for _pat in [
-            r"```(?:json)?\s*(\{.*?\})\s*```",   # コードブロック
-            r"(\{[^{}]*\"contradictions\"[^{}]*\})",  # contradictions キーを含む
-            r"(\{.*?\})\s*$",                     # 末尾のJSONオブジェクト
-            r"(\{.*\})",                           # 最初のJSONオブジェクト
-        ]:
-            _m = _re.search(_pat, raw, _re.DOTALL)
-            if _m:
-                try:
-                    judge = json.loads(_m.group(1))
-                    break
-                except json.JSONDecodeError:
-                    continue
+        try:
+            judge = json.loads(raw)
+        except json.JSONDecodeError:
+            judge = None
+            for _pat in [
+                r"```(?:json)?\s*(\{.*?\})\s*```",   # コードブロック
+                r"(\{[^{}]*\"contradictions\"[^{}]*\})",  # contradictions キーを含む
+                r"(\{.*?\})\s*$",                     # 末尾のJSONオブジェクト
+                r"(\{.*\})",                           # 最初のJSONオブジェクト
+            ]:
+                _m = _re.search(_pat, raw, _re.DOTALL)
+                if _m:
+                    try:
+                        judge = json.loads(_m.group(1))
+                        break
+                    except json.JSONDecodeError:
+                        continue
         if judge:
             # 擬名ラベル (T1, T2, ...) を実 ticker に復元する。
             _pseudo_re = _re.compile(r"\bT(\d+)\b")
