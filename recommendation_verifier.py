@@ -1,7 +1,8 @@
 """
 recommendation_verifier.py
-AI推奨事後検証エンジン。ai_recommendation_log.jsonの未検証エントリを
-yfinanceで一括検証し、アクション種別×緊急度の勝率テーブルを生成する。
+AI推奨事後検証エンジン。ai_recommendation_log.json の各エントリへ
+5/20/60 営業日の結果を到達した順に追記し、アクション種別×緊急度の
+勝率テーブルを生成する。
 
 呼び出し方:
     from recommendation_verifier import verify_recommendations, format_accuracy_context
@@ -102,43 +103,48 @@ def verify_recommendations() -> dict:
             entries: list[dict] = json.load(f)
 
         now = datetime.now(tz=timezone.utc)
-        max_horizon_days = max(VERIFICATION_HORIZONS) + 10  # Calendar days buffer
-        cutoff = now - timedelta(days=max_horizon_days)
+        horizon_keys = {f"{horizon}d" for horizon in VERIFICATION_HORIZONS}
 
-        # 最大ホライズン以上前かつ未検証のエントリを抽出（5日ホライズンのフォールバックのため5日も対象）
-        cutoff_5d = now - timedelta(days=5)
-        to_verify = []
-        for entry in entries:
-            if entry.get("verified"):
-                continue
+        def _entry_as_of(entry: dict) -> datetime | None:
             as_of_str = entry.get("as_of", "")
             if not as_of_str:
-                continue
+                return None
             try:
                 as_of = datetime.fromisoformat(as_of_str)
-                # tzなしの場合はUTCとみなす
                 if as_of.tzinfo is None:
                     as_of = as_of.replace(tzinfo=timezone.utc)
+                return as_of
             except ValueError:
+                return None
+
+        # verified は「最初の 5d 結果を得た」を意味する。20d/60d が未到達なら
+        # verified=true の行も再訪し、既存結果を保持したまま不足分だけ追記する。
+        cutoff_5d = now - timedelta(days=5)
+        to_verify: list[tuple[dict, datetime]] = []
+        for entry in entries:
+            existing_horizons = entry.get("horizons")
+            if not isinstance(existing_horizons, dict):
+                existing_horizons = {}
+            if horizon_keys.issubset(existing_horizons):
+                continue
+            as_of = _entry_as_of(entry)
+            if as_of is None:
                 continue
             if as_of <= cutoff_5d:
                 to_verify.append((entry, as_of))
 
-        # 既検証エントリで benchmark_horizons が未記録のものを back-fill 対象に
+        # ベンチマークも既存値を保持し、不足 horizon がある行を再訪する。
         to_backfill: list[tuple[dict, datetime]] = []
         for entry in entries:
             if not entry.get("verified"):
                 continue
-            if "benchmark_horizons" in entry:
+            existing_benchmark = entry.get("benchmark_horizons")
+            if not isinstance(existing_benchmark, dict):
+                existing_benchmark = {}
+            if horizon_keys.issubset(existing_benchmark):
                 continue
-            as_of_str = entry.get("as_of", "")
-            if not as_of_str:
-                continue
-            try:
-                as_of = datetime.fromisoformat(as_of_str)
-                if as_of.tzinfo is None:
-                    as_of = as_of.replace(tzinfo=timezone.utc)
-            except ValueError:
+            as_of = _entry_as_of(entry)
+            if as_of is None:
                 continue
             to_backfill.append((entry, as_of))
 
@@ -156,7 +162,7 @@ def verify_recommendations() -> dict:
             # 一括取得
             raw = yf.download(
                 tickers_to_download,
-                period="3mo",
+                period="6mo",
                 auto_adjust=True,
                 progress=False,
                 threads=True,
@@ -224,43 +230,75 @@ def verify_recommendations() -> dict:
                 else:
                     base_price = float(entry["price_at_rec"])
 
-                # マルチホライズン検証
-                horizons_result = {}
+                # マルチホライズン検証。過去に確定した値は再計算せず、
+                # 到達した不足 horizon のみを追記する。
+                existing_horizons = entry.get("horizons")
+                horizons_result = (
+                    dict(existing_horizons)
+                    if isinstance(existing_horizons, dict)
+                    else {}
+                )
+                added_horizon = False
                 for horizon in VERIFICATION_HORIZONS:
+                    horizon_key = f"{horizon}d"
+                    if horizon_key in horizons_result:
+                        continue
                     if len(series_after) > horizon:
                         price_hd = float(series_after.iloc[horizon])
                         outcome_pct_h = (price_hd - base_price) / base_price * 100
-                        horizons_result[f"{horizon}d"] = {
+                        horizons_result[horizon_key] = {
                             "price": round(price_hd, 4),
                             "outcome_pct": round(outcome_pct_h, 2),
                         }
+                        added_horizon = True
                     elif horizon == 5 and len(series_after) >= 3:
                         # Fallback: use latest available for 5d
                         price_hd = float(series_after.iloc[min(5, len(series_after) - 1)])
                         outcome_pct_h = (price_hd - base_price) / base_price * 100
-                        horizons_result[f"{horizon}d"] = {
+                        horizons_result[horizon_key] = {
                             "price": round(price_hd, 4),
                             "outcome_pct": round(outcome_pct_h, 2),
                         }
+                        added_horizon = True
 
                 if "5d" in horizons_result:
+                    was_verified = bool(entry.get("verified"))
                     entry["verified"] = True
-                    entry["verified_at"] = now.isoformat()
+                    if not was_verified:
+                        entry["verified_at"] = now.isoformat()
+                        total_newly_verified += 1
                     entry["price_verified"] = horizons_result["5d"]["price"]
                     entry["outcome_pct"] = horizons_result["5d"]["outcome_pct"]
                     entry["horizons"] = horizons_result
+                    if added_horizon:
+                        entry["horizons_updated_at"] = now.isoformat()
                     bench_h = _compute_benchmark_horizons(as_of)
                     if bench_h:
-                        entry["benchmark_horizons"] = bench_h
-                        entry["benchmark_outcome_pct"] = bench_h.get("5d")
-                    total_newly_verified += 1
+                        existing_benchmark = entry.get("benchmark_horizons")
+                        merged_benchmark = (
+                            dict(existing_benchmark)
+                            if isinstance(existing_benchmark, dict)
+                            else {}
+                        )
+                        for key, value in bench_h.items():
+                            merged_benchmark.setdefault(key, value)
+                        entry["benchmark_horizons"] = merged_benchmark
+                        entry["benchmark_outcome_pct"] = merged_benchmark.get("5d")
 
             # 既検証エントリへ benchmark_horizons を back-fill
             for entry, as_of in to_backfill:
                 bench_h = _compute_benchmark_horizons(as_of)
                 if bench_h:
-                    entry["benchmark_horizons"] = bench_h
-                    entry["benchmark_outcome_pct"] = bench_h.get("5d")
+                    existing_benchmark = entry.get("benchmark_horizons")
+                    merged_benchmark = (
+                        dict(existing_benchmark)
+                        if isinstance(existing_benchmark, dict)
+                        else {}
+                    )
+                    for key, value in bench_h.items():
+                        merged_benchmark.setdefault(key, value)
+                    entry["benchmark_horizons"] = merged_benchmark
+                    entry["benchmark_outcome_pct"] = merged_benchmark.get("5d")
 
             # アトミック保存
             atomic_write_json(LOG_PATH, entries)

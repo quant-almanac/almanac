@@ -29,6 +29,8 @@ recommendation_kelly_stats() の名前が示す通り、これを実売買の
   - 統計キーを (ticker, direction, horizon) に拡張。検証器が保存する
     5/20/60営業日を swing/medium/long に対応させ、必要ホライズンが
     未観測の推薦は母集団へ入れない
+  - analysis_id と signal_evaluable が明示された新契約の行だけを使う。
+    旧ログは安全に重複除去・入力品質判定できないため監査表示専用とする
 
 解消済み (2026-07-28):
   - _log_recommendations() は凍結済み decision_price（無ければ
@@ -147,7 +149,10 @@ def aggregate_ticker_stats(
     for r in recs:
         if not r.get('verified'):
             continue
-        if r.get('signal_evaluable') is False:
+        # Stage 6A migration boundary: legacy rows have neither a stable
+        # analysis identity nor an explicit input-quality decision.  Counting
+        # them would silently fail open and can inflate n with repeated runs.
+        if r.get('signal_evaluable') is not True:
             continue
         outcome = r.get('outcome_pct')
         if outcome is None:
@@ -173,15 +178,15 @@ def aggregate_ticker_stats(
         if outcome is None:
             continue
 
-        # (analysis_id, ticker, direction) で重複除去。analysis_id が
-        # 無い古いログ行は dedup キーを構成できないため常に採用する
-        # (fail-open — 過去ログを一律で捨てない)。
+        # (analysis_id, ticker, direction) で重複除去。analysis_id の無い
+        # legacy 行は監査用に保持するが sizing 母集団には入れない。
         analysis_id = r.get('analysis_id')
-        if analysis_id:
-            dedup_key = (analysis_id, ticker, 'buy', horizon)
-            if dedup_key in seen_dedup_keys:
-                continue
-            seen_dedup_keys.add(dedup_key)
+        if not analysis_id:
+            continue
+        dedup_key = (analysis_id, ticker, 'buy', horizon)
+        if dedup_key in seen_dedup_keys:
+            continue
+        seen_dedup_keys.add(dedup_key)
 
         outcome = float(outcome)
         slot = by_group.setdefault((ticker, horizon), {'wins': [], 'losses': []})

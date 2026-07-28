@@ -61,6 +61,7 @@ def test_fallback_insufficient_history():
 
 def _rec(ticker, type_, outcome_pct, *, analysis_id=None, verified=True, **extra):
     extra.setdefault('tier', 'swing')
+    extra.setdefault('signal_evaluable', True)
     return {
         'ticker': ticker, 'type': type_, 'outcome_pct': outcome_pct,
         'verified': verified, 'analysis_id': analysis_id,
@@ -103,15 +104,20 @@ def test_duplicate_analysis_id_ticker_is_deduped():
     assert stats['AVGO']['n'] == 2  # 重複1件を除いた2件
 
 
-def test_missing_analysis_id_is_not_deduped_away():
-    """analysis_id の無い古いログ行は dedup キーを構成できないため、
-    fail-open で常に採用する (過去ログを一律で捨てない)。"""
+def test_missing_analysis_id_legacy_rows_are_excluded():
+    """analysis_id の無い旧ログは安全に重複除去できないため監査専用。"""
     recs = [
         _rec('AVGO', 'buy', 5.0, analysis_id=None),
         _rec('AVGO', 'buy', 3.0, analysis_id=None),
     ]
     stats = k.aggregate_ticker_stats(recs, min_trades=1)
-    assert stats['AVGO']['n'] == 2
+    assert 'AVGO' not in stats
+
+
+def test_missing_signal_evaluable_legacy_rows_are_excluded():
+    rec = _rec('AVGO', 'buy', 5.0, analysis_id='legacy')
+    rec.pop('signal_evaluable')
+    assert 'AVGO' not in k.aggregate_ticker_stats([rec], min_trades=1)
 
 
 def test_stats_entries_carry_direction_and_horizon():
