@@ -114,6 +114,12 @@ _FACTOR_SKIP_TICKERS = {
 }
 
 
+def _is_factor_skip_ticker(value: object) -> bool:
+    """Exclude synthetic cash buckets, including owner/broker-specific variants."""
+    ticker = str(value or "").strip()
+    return ticker in _FACTOR_SKIP_TICKERS or ticker.startswith("CASH_")
+
+
 def _estimate_portfolio_monthly_returns(
     holdings: dict,
     months: int = 36,
@@ -133,7 +139,7 @@ def _estimate_portfolio_monthly_returns(
     total = 0.0
     for key, info in holdings.items():
         ticker = info.get('ticker') or key
-        if ticker in _FACTOR_SKIP_TICKERS or key in _FACTOR_SKIP_TICKERS:
+        if _is_factor_skip_ticker(ticker) or _is_factor_skip_ticker(key):
             continue
         shares = float(info.get('shares', 0))
         price  = float(info.get('current_price', info.get('entry_price', 0)) or 0)

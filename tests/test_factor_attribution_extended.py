@@ -113,6 +113,34 @@ def test_estimate_returns_none_when_all_skip_tickers(monkeypatch) -> None:
     assert result is None
 
 
+def test_estimate_skips_owner_specific_cash_bucket(monkeypatch) -> None:
+    """Synthetic CASH_* variants must never be sent to yfinance."""
+    calls: list[str] = []
+
+    def fake_fetch(ticker, months=36):
+        calls.append(ticker)
+        return _make_series()
+
+    monkeypatch.setattr(fa, "_fetch_monthly_returns", fake_fetch)
+    holdings = {
+        "CASH_JPY_SBI_WIFE": {
+            "ticker": "CASH_JPY_SBI_WIFE",
+            "shares": 500000,
+            "entry_price": 1.0,
+            "currency": "JPY",
+        },
+        "NVDA": {
+            "ticker": "NVDA",
+            "shares": 10,
+            "entry_price": 500.0,
+            "currency": "USD",
+        },
+    }
+    result = fa._estimate_portfolio_monthly_returns(holdings)
+    assert result is not None
+    assert calls == ["NVDA"]
+
+
 def test_estimate_returns_none_when_fetch_fails(monkeypatch) -> None:
     """If _fetch_monthly_returns always returns None, output is None."""
     monkeypatch.setattr(fa, "_fetch_monthly_returns", lambda t, m=36: None)
