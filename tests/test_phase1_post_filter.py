@@ -721,6 +721,72 @@ def test_exit_action_resolves_duplicate_ticker_by_tier_and_account(monkeypatch):
     assert "実保有80株" in action["execution_note"]
 
 
+def test_deterministic_exit_sizing_keeps_all_quantity_surfaces_consistent(monkeypatch):
+    _silence_external_filters(monkeypatch)
+    monkeypatch.setattr(tunable_params, "get", _tp_get)
+    synthesis = {
+        "analysis_id": "analysis-sizing-contract",
+        "decision_snapshot_hash": "snapshot-sizing-contract",
+        "overall_stance": "neutral",
+        "priority_actions": [{
+            "ticker": "XLF",
+            "tier": "Medium",
+            "type": "trim",
+            "amount_hint": "20株",
+            "action": "Medium層のXLF 55株のうち20株を売却",
+            "reason": "Medium層の構造化ドリフトを解消する。",
+            "execution_account": "特定",
+            "execution_owner": "husband",
+            "execution_broker": "rakuten",
+            "decision_price": 57.52,
+            "currency": "USD",
+        }],
+    }
+    positions = [{
+        "key": "XLF",
+        "ticker": "XLF",
+        "current_price": 57.52,
+        "currency": "USD",
+        "shares": 80,
+        "value_jpy": 753_498,
+        "investment_type": "medium",
+        "account": "特定",
+        "owner": "husband",
+        "broker": "rakuten",
+    }]
+    rebalance_medium = {
+        "positions": [{
+            "ticker": "XLF",
+            "position_identity_key": "husband|rakuten|specific|XLF",
+            "actual_pct": 18.5,
+            "target_pct": 5.7,
+            "value_jpy": 753_498,
+            "shares": 80,
+        }],
+    }
+
+    result = analyst._phase1_post_filter(
+        synthesis,
+        30_000_000,
+        fx_rate=163.78,
+        positions=positions,
+        rebalance_medium=rebalance_medium,
+    )
+
+    action = result["priority_actions"][0]
+    assert action["amount_hint"] == "55株"
+    assert action["requested_sell_quantity"] == 55
+    assert action["quantity"] == 55
+    assert action["holding_shares_before"] == 80
+    assert action["holding_shares_after"] == 25
+    assert action["exit_sizing_quantity_basis"] == "medium_sleeve_quantity"
+    assert action["exit_sizing_sleeve_quantity"] == 80
+    assert "55株売却" in action["action"]
+    assert "保有80株→売却後25株" in action["action"]
+    assert "20株" not in action["action"]
+    assert "残25株" in action["execution_note"]
+
+
 def test_exit_action_uses_exact_execution_account_and_marks_oversell() -> None:
     action = {
         "ticker": "AVGO",

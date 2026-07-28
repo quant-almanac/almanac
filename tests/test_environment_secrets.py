@@ -1,7 +1,12 @@
 import os
+from pathlib import Path
+import subprocess
 
 import llm_adapters
 from utils import load_environment_secrets
+
+
+ROOT = Path(__file__).resolve().parent.parent
 
 
 def test_load_environment_secrets_reads_export_file_without_overriding(tmp_path, monkeypatch):
@@ -61,3 +66,27 @@ def test_legacy_secrets_file_override_still_loads(tmp_path, monkeypatch):
 
     assert loaded == {"DEEPSEEK_API_KEY"}
     assert os.environ["DEEPSEEK_API_KEY"] == "legacy-file"
+
+
+def test_run_with_secrets_exports_plain_shell_assignments(tmp_path):
+    secrets = tmp_path / ".almanac_secrets"
+    secrets.write_text(
+        "PLAIN_SECRET=visible-to-child\n"
+        "export EXPORTED_SECRET=also-visible\n",
+        encoding="utf-8",
+    )
+
+    completed = subprocess.run(
+        [
+            str(ROOT / "run_with_secrets.sh"),
+            "/bin/sh",
+            "-c",
+            'printf "%s|%s" "$PLAIN_SECRET" "$EXPORTED_SECRET"',
+        ],
+        env={**os.environ, "HOME": str(tmp_path)},
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+
+    assert completed.stdout == "visible-to-child|also-visible"

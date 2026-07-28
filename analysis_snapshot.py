@@ -178,6 +178,22 @@ def _parse_timestamp_value(value: object) -> Optional[datetime]:
     """Parse one source timestamp into the naive local form used by this module."""
     if value in (None, ""):
         return None
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        try:
+            epoch = float(value)
+            # Accept Unix seconds and milliseconds, but reject counters and
+            # other small numeric fields.  A source timestamp before 2000 is
+            # not plausible for this system and would otherwise turn values
+            # such as ``scanned: 86`` into 1970-era provenance.
+            if epoch < 946_684_800:
+                return None
+            if epoch >= 10_000_000_000:
+                epoch /= 1000.0
+            if epoch < 946_684_800:
+                return None
+            return datetime.fromtimestamp(epoch)
+        except (OSError, OverflowError, TypeError, ValueError):
+            return None
     s = str(value).replace("Z", "+00:00")
     for parser in (
         lambda x: datetime.fromisoformat(x),
@@ -248,10 +264,14 @@ def build_base_snapshot(*, base_dir: Path = BASE_DIR, now: Optional[datetime] = 
         base_dir / "technical_state.json", ts_keys=("cached_at",), max_age_hours=8.0,
         now=now, source_label="technical_state.json",
     )
-    # FX レートは account.json 経由 (utils.get_fx_rate_cached) で解決されるため
-    # account.json の鮮度をそのまま流用する。専用の FX レートファイルは無い。
+    # FX レートは account.json 経由 (utils.get_fx_rate_cached) で解決される。
+    # Account balance の日付ではなく、レート固有の取得時刻を権威にする。
+    # これを last_updated だけで判定すると、同日取得した最新レートでも
+    # 日付の00:00を起点に24時間超と誤認しうる。
     fx = _provenance_for_file(
-        base_dir / "account.json", ts_keys=("last_updated",), max_age_hours=24.0,
+        base_dir / "account.json",
+        ts_keys=("fx_rate_usdjpy_as_of", "last_updated"),
+        max_age_hours=24.0,
         now=now, source_label="account.json(fx_rate_usdjpy)",
     )
     macro = _provenance_for_file(
@@ -264,7 +284,7 @@ def build_base_snapshot(*, base_dir: Path = BASE_DIR, now: Optional[datetime] = 
     )
 
     screening_files = [
-        (base_dir / "short_candidates.json", ("generated_at", "scanned")),
+        (base_dir / "short_candidates.json", ("generated_at", "as_of")),
         (base_dir / "margin_long_candidates.json", ("generated_at",)),
         (base_dir / "long_term_screen_results.json", ("as_of",)),
     ]

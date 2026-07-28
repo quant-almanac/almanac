@@ -602,9 +602,11 @@ MOM = MTUM − SPY   QMJ = QUAL − SPY      LVOL = SPLV − SPY  ほか
 - **フロントエンド** — Next.js 16（App Router）/ React 19 / TypeScript。ポートフォリオ・スクリーニング・リスク・シナリオ・戦略・信用取引・NISA・AI判断支援・執行ログ・成績検証を1つの画面にまとめています。
 - **プライバシー層** — ALMANAC はローカルで動きますが、AI機能の一部は保有銘柄・数量・損益・配分といった情報を外部のAIへ送ります。開示情報の抽出、匿名化した審判役、外部の批判役、一部の分析通信は、`almanac/llm_safety.py` で公開・匿名化データかを検査します。公開情報だけを扱うスクリーナーはベンダーへ直接接続し、粗い呼び出し検査の許可リストに明示しているため、保有情報を渡さないことは個別レビューにも依存します。保有情報を含む経路は、分析本体・チャット・判断支援・ガードレール通知・Anthropic の批判役で、いずれもプライバシー関門により制御しています。
 
+この概要を支えるエンドツーエンドの契約は [システム仕様](docs/SYSTEM_SPEC.ja.md)、ルート直下の全 Python モジュールの責務と運用状態は [モジュール一覧](docs/MODULE_CATALOG.ja.md) に記載しています。`scripts/check_docs_consistency.py` は日英の節構成、README のリンク、モジュール網羅性を同期検査します。
+
 ## 設定（Configuration）
 
-`.env.example` は設定の雛形です。コマンドラインで分析を動かすときの認証情報は、環境変数として渡すか、`run_with_secrets.sh` 経由で `~/.almanac_secrets` から読み込みます。FastAPI の書き込み認証はこれとは別で、`ALMANAC_API_KEY` または `~/.config/almanac/api_key` を読みます。
+`.env.example` は設定の雛形です。コマンドラインで分析を動かすときの認証情報は、環境変数として渡すか、`run_with_secrets.sh` 経由で `~/.almanac_secrets` から読み込みます。ラッパーは通常の `KEY=value` と明示的な `export KEY=value` のどちらも子プロセスへ export します。FastAPI の書き込み認証はこれとは別で、`ALMANAC_API_KEY` または `~/.config/almanac/api_key` を読みます。
 
 **バックエンドとCLIは、リポジトリ直下の `.env` を読み込みません。** Next.js 側は通常どおり `frontend/.env.local` を使います。コードを眺めるだけ、読み取り専用のAPIを叩くだけ、デモ状態のダッシュボードを見るだけなら、設定は何も要りません。
 
@@ -803,6 +805,7 @@ venv/bin/python nav_backfill.py --days 30 --apply
 ```bash
 venv/bin/python -m pytest tests/ -q
 python scripts/check_public_safety.py
+python scripts/check_docs_consistency.py
 git diff --check
 
 cd frontend
@@ -827,7 +830,7 @@ event_ledger.py           追記のみの監査記録と整合性チェック
 objective.md              バージョン管理された目的と上限の定義
 ```
 
-トップレベルにあるその他の `.py` は、パッケージというより単機能のモジュール（スクリーナー、データ取得、リスク計算、税務ツールなど）です。詳細は各ファイル冒頭の説明を読んでください。
+トップレベルにあるその他の `.py` は、パッケージというより単機能のモジュール（スクリーナー、データ取得、リスク計算、税務ツールなど）です。docstring だけを稼働中の挙動の証拠にはしないでください。全モジュールの役割と状態は [モジュール一覧](docs/MODULE_CATALOG.ja.md) に整理し、実運用上の権威はテストと実行成果物に置いています。
 
 ## 免責事項
 

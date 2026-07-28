@@ -763,6 +763,11 @@ def calculate_medium_drift(snapshot: dict) -> dict:
             "account":    account,
             "owner":      owner,
             "broker":     broker,
+            # The weight fields below are Medium-sleeve weights, so retain the
+            # matching sleeve quantity as their quantity-conversion basis.
+            # PositionIdentity intentionally excludes the internal tier and can
+            # therefore resolve to a larger physical broker position.
+            "shares":     float(p.get("shares") or 0),
             "position_identity_key": (
                 position_identity.key if position_identity is not None else None
             ),

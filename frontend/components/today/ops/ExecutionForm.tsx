@@ -93,9 +93,7 @@ export default function ExecutionForm({ row, onClose, historical = false, fundin
   const [saving, setSaving] = useState(false)
   const [result, setResult] = useState<{ ok: boolean; message: string } | null>(null)
   const [recordedId, setRecordedId] = useState<string | null>(null) // 記録済み → 修正対象
-  const idempotencyKey = useRef(
-    globalThis.crypto?.randomUUID?.() ?? `execution-${Date.now()}-${Math.random().toString(16).slice(2)}`,
-  )
+  const idempotencyKey = useRef<string | null>(null)
 
   const isMargin = direction === 'margin_buy' || direction === 'short' || direction === 'cover'
   const isRiskIncreasing = direction === 'buy' || direction === 'margin_buy'
@@ -104,6 +102,9 @@ export default function ExecutionForm({ row, onClose, historical = false, fundin
   const editMode = recordedId != null
 
   async function handleSave() {
+    idempotencyKey.current ??=
+      globalThis.crypto?.randomUUID?.() ??
+      `execution-${Date.now()}-${Math.random().toString(16).slice(2)}`
     setSaving(true)
     setResult(null)
     try {

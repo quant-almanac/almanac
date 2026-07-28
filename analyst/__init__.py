@@ -7089,17 +7089,38 @@ def _phase1_post_filter(
             return action
 
         holding = _holding_info_for_action(action, holdings_price_map)
-        current_qty = float(holding.get("shares") or action.get("holding_shares_before") or 0)
-        if current_qty <= 0:
+        physical_current_qty = float(
+            holding.get("shares") or action.get("holding_shares_before") or 0
+        )
+        if physical_current_qty <= 0:
             action["exit_sizing_status"] = "review"
             action["exit_sizing_reason"] = "対象口座の現在数量を確定できない"
             return action
+        # actual_pct / target_pct are Medium-sleeve weights.  Convert their
+        # gap with the quantity from that same sleeve, not an aggregate broker
+        # position that may share PositionIdentity across internal tiers.
+        try:
+            sleeve_current_qty = float(report.get("shares") or 0)
+        except (TypeError, ValueError):
+            sleeve_current_qty = 0.0
+        if sleeve_current_qty <= 0:
+            unit_jpy = _unit_jpy_for_action(action)
+            try:
+                sleeve_value_jpy = float(report.get("value_jpy") or 0)
+            except (TypeError, ValueError):
+                sleeve_value_jpy = 0.0
+            if unit_jpy > 0 and sleeve_value_jpy > 0:
+                sleeve_current_qty = sleeve_value_jpy / unit_jpy
+        if sleeve_current_qty <= 0:
+            # Backward-compatible fallback for reports written before the
+            # explicit shares field was added.
+            sleeve_current_qty = physical_current_qty
         lot_size = float(trading_unit_for_ticker(ticker) if ticker.endswith(".T") else 1)
         # There is no validated fractional max-step policy in the current
         # configuration.  Do not invent one (the previous 25% constant had no
         # authority); the physical position quantity is the only hard bound.
         # The existing downstream single-action notional cap remains in force.
-        max_step_qty = current_qty
+        max_step_qty = min(physical_current_qty, sleeve_current_qty)
         pending_qty = 0.0
         pending_scope_unknown = False
         for row in open_execution_intents.get((ticker, "sell"), []):
@@ -7136,7 +7157,7 @@ def _phase1_post_filter(
             plan_item_id=str(action.get("plan_item_id") or f"drift:{ticker}"),
             analysis_id=str(action.get("analysis_id") or "pending-analysis"),
             snapshot_hash=str(action.get("decision_snapshot_hash") or "missing-snapshot"),
-            current_qty=current_qty,
+            current_qty=sleeve_current_qty,
             current_weight=float(report.get("actual_pct") or 0) / 100.0,
             target_weight=float(report.get("target_pct") or 0) / 100.0,
             band=float(MEDIUM_DRIFT_TRIGGER),
@@ -7151,16 +7172,53 @@ def _phase1_post_filter(
         action["exit_sizing_evaluation_key"] = result.evaluation_key
         action["exit_sizing_steps"] = [dict(step) for step in result.steps]
         action["exit_sizing_is_revision"] = result.is_revision_of_pending
-        action["exit_sizing_max_step_basis"] = "current_position_quantity"
+        action["exit_sizing_quantity_basis"] = "medium_sleeve_quantity"
+        action["exit_sizing_sleeve_quantity"] = sleeve_current_qty
+        action["exit_sizing_physical_quantity"] = physical_current_qty
+        action["exit_sizing_max_step_basis"] = (
+            "min(physical_position_quantity,medium_sleeve_quantity)"
+        )
         if abs(result.final_qty) > 0:
             final_qty = (
                 int(abs(result.final_qty))
                 if float(result.final_qty).is_integer()
                 else abs(result.final_qty)
             )
+            remaining_qty = max(0, physical_current_qty - float(final_qty))
+            original_action = str(action.get("action") or "")
+            original_note = str(action.get("execution_note") or "")
             action["requested_sell_quantity"] = final_qty
             action["quantity"] = final_qty
+            action["holding_shares_before"] = (
+                int(physical_current_qty)
+                if physical_current_qty.is_integer()
+                else physical_current_qty
+            )
+            action["holding_shares_after"] = (
+                int(remaining_qty) if remaining_qty.is_integer() else remaining_qty
+            )
+            action.pop("holding_quantity_exceeds_account", None)
+            action.pop("holding_quantity_shortfall", None)
             _rewrite_action_shares(action, final_qty)
+            label = quantity_label_for_ticker(ticker)
+            action["exit_sizing_original_action"] = original_action
+            if original_note:
+                action["exit_sizing_original_execution_note"] = original_note
+            actual_pct = float(report.get("actual_pct") or 0)
+            target_pct = float(report.get("target_pct") or 0)
+            before_display = action["holding_shares_before"]
+            after_display = action["holding_shares_after"]
+            action["action"] = (
+                f"{ticker}を{final_qty}{label}売却"
+                f"（保有{before_display}{label}→売却後{after_display}{label}、"
+                f"Medium層 {actual_pct:.1f}%→目標{target_pct:.1f}%の"
+                "構造化ドリフトに基づく決定論的数量）"
+            )
+            action["execution_note"] = (
+                f"決定論的exit sizing: Medium層数量{sleeve_current_qty:g}{label}を"
+                f"比率換算し、実保有{physical_current_qty:g}{label}から"
+                f"{final_qty}{label}売却・残{remaining_qty:g}{label}"
+            )
         return action
 
     def _is_core_fund_or_etf(action: dict) -> bool:
@@ -7431,12 +7489,22 @@ def _phase1_post_filter(
 
     def _rewrite_action_shares(action: dict, target_shares: int) -> None:
         label = quantity_label_for_ticker(action.get("ticker"))
-        action["amount_hint"] = f"{target_shares}{label}"
+        old_hint = str(action.get("amount_hint") or "")
+        new_hint = f"{target_shares}{label}"
+        action["amount_hint"] = new_hint
         body = str(action.get("action") or "")
         if body:
-            updated = re.sub(r"\d[\d,]*\s*(?:株|口)", f"{target_shares}{label}", body, count=1)
+            if old_hint and old_hint in body:
+                updated = body.replace(old_hint, new_hint, 1)
+            else:
+                updated = re.sub(
+                    r"\d[\d,]*\s*(?:株|口)",
+                    new_hint,
+                    body,
+                    count=1,
+                )
             if updated == body:
-                updated = f"{body}（{target_shares}{label}へ調整）"
+                updated = f"{body}（{new_hint}へ調整）"
             action["action"] = updated
 
     def _maybe_resize_kabu_mini_over_cap(action: dict, estimated_jpy: float) -> float:

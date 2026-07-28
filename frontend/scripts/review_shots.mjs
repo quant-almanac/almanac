@@ -1,7 +1,7 @@
 /* ALMANAC Phase 0.5+1 レビュー用: ヘッドレスChrome(CDP)で6幅スクショ+操作検証 */
-const { spawn } = require('node:child_process');
-const fs = require('node:fs');
-const path = require('node:path');
+import { spawn } from 'node:child_process';
+import fs from 'node:fs';
+import path from 'node:path';
 
 const CHROME = '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
 const OUT = process.argv[2];
@@ -44,7 +44,11 @@ async function main() {
     if (msg.id && pending.has(msg.id)) {
       const { res, rej } = pending.get(msg.id);
       pending.delete(msg.id);
-      msg.error ? rej(new Error(JSON.stringify(msg.error))) : res(msg.result);
+      if (msg.error) {
+        rej(new Error(JSON.stringify(msg.error)));
+      } else {
+        res(msg.result);
+      }
     } else if (msg.method === 'Runtime.exceptionThrown') {
       exceptions.push(msg.params?.exceptionDetails?.exception?.description || JSON.stringify(msg.params).slice(0, 300));
     }

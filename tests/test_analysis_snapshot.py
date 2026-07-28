@@ -59,6 +59,22 @@ def test_extract_timestamp_missing_file_is_none(tmp_path):
     assert snap._extract_json_timestamp(tmp_path / "nope.json", ("generated_at",)) is None
 
 
+def test_extract_timestamp_accepts_unix_seconds_and_milliseconds(tmp_path):
+    seconds = 1_785_256_745.0
+    _write(tmp_path, "seconds.json", {"as_of": seconds})
+    _write(tmp_path, "milliseconds.json", {"as_of": seconds * 1000})
+
+    expected = datetime.fromtimestamp(seconds)
+    assert snap._extract_json_timestamp(tmp_path / "seconds.json", ("as_of",)) == expected
+    assert snap._extract_json_timestamp(tmp_path / "milliseconds.json", ("as_of",)) == expected
+
+
+def test_extract_timestamp_rejects_small_numeric_counters(tmp_path):
+    _write(tmp_path, "counter.json", {"scanned": 86})
+
+    assert snap._extract_json_timestamp(tmp_path / "counter.json", ("scanned",)) is None
+
+
 def test_freshness_status_thresholds():
     now = datetime(2026, 7, 27, 12, 0, 0)
     assert snap._freshness_status(None, now=now, max_age_hours=24) == "unknown"
@@ -95,6 +111,25 @@ def test_base_snapshot_all_seven_categories_present(tmp_path):
         assert prov.artifact_hash != snap._MISSING_HASH
 
 
+def test_base_snapshot_fx_uses_rate_timestamp_before_account_date(tmp_path):
+    now = datetime(2026, 7, 29, 1, 45, 0)
+    rate_as_of = datetime(2026, 7, 29, 1, 30, 0)
+    _write(
+        tmp_path,
+        "account.json",
+        {
+            "last_updated": "2026-07-28",
+            "fx_rate_usdjpy": 163.67,
+            "fx_rate_usdjpy_as_of": rate_as_of.timestamp(),
+        },
+    )
+
+    base = snap.build_base_snapshot(base_dir=tmp_path, now=now)
+
+    assert base.fx.source_as_of == rate_as_of.isoformat()
+    assert base.fx.freshness_status == "fresh"
+
+
 def test_base_snapshot_missing_files_are_unknown_not_fresh(tmp_path):
     """存在しないファイルを暗黙に fresh 扱いしない (fail-closed)。"""
     now = datetime(2026, 7, 27, 12, 0, 0)
@@ -116,6 +151,30 @@ def test_screening_takes_the_oldest_of_its_component_files(tmp_path):
     base = snap.build_base_snapshot(base_dir=tmp_path, now=now)
     assert base.screening.source_as_of == "2026-07-20T10:00:00"
     assert base.screening.freshness_status == "stale"  # 7日前 > 72h
+
+
+def test_screening_uses_short_as_of_not_scanned_count(tmp_path):
+    now = datetime(2026, 7, 29, 2, 0, 0)
+    _write(
+        tmp_path,
+        "short_candidates.json",
+        {"as_of": "2026-07-28 18:30", "scanned": 86},
+    )
+    _write(
+        tmp_path,
+        "margin_long_candidates.json",
+        {"generated_at": "2026-07-28 19:16"},
+    )
+    _write(
+        tmp_path,
+        "long_term_screen_results.json",
+        {"as_of": "2026-07-27 07:03"},
+    )
+
+    base = snap.build_base_snapshot(base_dir=tmp_path, now=now)
+
+    assert base.screening.source_as_of == "2026-07-27T07:03:00"
+    assert base.screening.freshness_status == "degraded"
 
 
 def test_base_snapshot_hash_changes_when_file_content_changes(tmp_path):

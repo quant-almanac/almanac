@@ -561,9 +561,11 @@ Terms used above, for readers who don't work in finance or haven't seen the hous
 - **Frontend** — Next.js 16 (App Router) / React 19 / TypeScript. A single console covering portfolio, screening, risk, scenarios, strategy, margin, NISA, AI decision support, execution log, and a performance-verification page.
 - **Privacy layer** — ALMANAC runs locally, but some configured AI features do send portfolio context (holdings, quantities, P&L, allocation) to an external LLM. Disclosure extraction, the pseudonymized judge, external Red Team legs, and selected analyzer transports validate their public/anonymized payload through `almanac/llm_safety.py`. Public-only screeners use direct provider adapters and are explicitly allowlisted by the coarse call-site test, so their no-book contract still depends on call-site review. Book-aware paths include tier/final analysis, chat, decision support, guardrail alerts, and the Anthropic Red Team leg; each is controlled by a privacy gate.
 
+For the end-to-end contracts behind this overview, see the [system specification](docs/SYSTEM_SPEC.md). The [module catalog](docs/MODULE_CATALOG.md) maps every root-level Python module to its responsibility and operational status. `scripts/check_docs_consistency.py` keeps the English/Japanese section structure, README links, and module coverage in sync.
+
 ## Configuration
 
-Use `.env.example` as a template. CLI analysis secrets are supplied through the process environment or `~/.almanac_secrets` (via `run_with_secrets.sh`). FastAPI write authentication separately reads `ALMANAC_API_KEY` or `~/.config/almanac/api_key`. The backend and CLI do **not** load a repository-root `.env`; the Next.js frontend uses `frontend/.env.local` in the normal way. Nothing is required just to read the code, use the read-only API, or inspect the demo dashboard.
+Use `.env.example` as a template. CLI analysis secrets are supplied through the process environment or `~/.almanac_secrets` (via `run_with_secrets.sh`). The wrapper exports both plain `KEY=value` assignments and explicit `export KEY=value` assignments to the child process. FastAPI write authentication separately reads `ALMANAC_API_KEY` or `~/.config/almanac/api_key`. The backend and CLI do **not** load a repository-root `.env`; the Next.js frontend uses `frontend/.env.local` in the normal way. Nothing is required just to read the code, use the read-only API, or inspect the demo dashboard.
 
 **Required only for the corresponding external workflows**
 
@@ -754,6 +756,7 @@ venv/bin/python nav_backfill.py --days 30 --apply
 ```bash
 venv/bin/python -m pytest tests/ -q
 python scripts/check_public_safety.py
+python scripts/check_docs_consistency.py
 git diff --check
 
 cd frontend
@@ -778,7 +781,7 @@ event_ledger.py           append-only audit events and integrity checks
 objective.md              version-controlled objective and hard constraints
 ```
 
-Most other top-level `.py` files are single-purpose modules — screeners, data fetchers, the policy and risk engines, tax tooling — rather than parts of a package. See individual file docstrings for details.
+Most other top-level `.py` files are single-purpose modules — screeners, data fetchers, policy and risk engines, and tax tooling — rather than parts of a package. Do not treat a docstring alone as proof of live behavior: the exhaustive [module catalog](docs/MODULE_CATALOG.md) records each module's role and status, while tests and runtime artifacts remain the operational authority.
 
 ## Disclaimer
 

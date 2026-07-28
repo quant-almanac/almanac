@@ -1,3 +1,5 @@
+/* App Router root layout is the single global document for these font links. */
+/* eslint-disable @next/next/no-page-custom-font */
 import type { Metadata } from 'next'
 import './globals.css'
 import ClientLayout from '@/components/ClientLayout'

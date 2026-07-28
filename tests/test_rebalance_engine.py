@@ -169,6 +169,8 @@ def test_medium_drift_propagates_position_identity_to_reports_and_actions(monkey
     monkeypatch.setattr(re, "MEDIUM_TARGET_WEIGHTS", {"AVGO": 0.2, "XLF": 0.8})
     avgo = _position("AVGO", "USD", "Technology", "medium", 800_000)
     xlf = _position("XLF", "USD", "Financial Services", "medium", 200_000)
+    avgo["shares"] = 8
+    xlf["shares"] = 20
     for row in (avgo, xlf):
         row.update(owner="husband", broker="rakuten", account="一般")
 
@@ -177,6 +179,7 @@ def test_medium_drift_propagates_position_identity_to_reports_and_actions(monkey
     avgo_action = next(a for a in result["actions"] if a["ticker"] == "AVGO")
 
     assert avgo_report["position_identity_key"] == "husband|rakuten|general|AVGO"
+    assert avgo_report["shares"] == 8
     assert avgo_action["position_identity_key"] == avgo_report["position_identity_key"]
     assert avgo_action["owner"] == "husband"
     assert avgo_action["broker"] == "rakuten"

@@ -1,6 +1,6 @@
 'use client'
 
-import { useState, useEffect, Suspense } from 'react'
+import { useState, Suspense } from 'react'
 import { useSearchParams } from 'next/navigation'
 import useSWR from 'swr'
 import { fetcher, apiFetch, type DecisionLog } from '@/lib/api'
@@ -33,21 +33,16 @@ function DecisionPageInner() {
   const { data: logs } = useSWR<DecisionLog[]>('/api/decision/log', fetcher, { revalidateOnFocus: false })
   const searchParams = useSearchParams()
 
-  const [caseType, setCaseType] = useState<string>('A')
-  const [ticker, setTicker]     = useState('')
+  const [caseType, setCaseType] = useState<string>(() => {
+    const value = searchParams.get('case')
+    return value && value in CASE_LABELS ? value : 'A'
+  })
+  const [ticker, setTicker]     = useState(() => searchParams.get('ticker') ?? '')
   const [signal, setSignal]     = useState('買い')
   const [strategy, setStrategy] = useState('短期モメンタム')
   const [reason, setReason]     = useState('')
   const [question, setQuestion] = useState('')
   const [person, setPerson]     = useState('husband')
-
-  // URL パラメータで case/ticker を事前入力（他ページの「AI相談」ボタン対応）
-  useEffect(() => {
-    const caseParam = searchParams.get('case')
-    const tickerParam = searchParams.get('ticker')
-    if (caseParam && caseParam in CASE_LABELS) setCaseType(caseParam)
-    if (tickerParam) setTicker(tickerParam)
-  }, [searchParams])
 
   const [analyzing, setAnalyzing]   = useState(false)
   const [judging, setJudging]       = useState(false)
