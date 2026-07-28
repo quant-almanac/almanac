@@ -9296,6 +9296,34 @@ def run_analysis(force: bool = False) -> dict:
     print("📊 データ収集中…")
     data = gather_data()
 
+    # Approved investment-policy limits are live in observation mode first.
+    # Household concentration aggregates the same instrument across accounts,
+    # but never mutates actions until the shadow breaches have been reviewed.
+    try:
+        from investment_policy import evaluate_concentration_policy
+        from rebalance_engine import EMPLOYER_STOCK_TICKERS
+
+        data["investment_policy_observation"] = evaluate_concentration_policy(
+            data.get("positions") or [],
+            portfolio_total_jpy=data.get("portfolio_total"),
+            employer_tickers=EMPLOYER_STOCK_TICKERS,
+        )
+        print(
+            "  📏 集中上限 shadow: "
+            f"breaches={data['investment_policy_observation'].get('breach_count', 0)} "
+            f"status={data['investment_policy_observation'].get('status')}"
+        )
+    except Exception as _investment_policy_error:
+        data["investment_policy_observation"] = {
+            "mode": "shadow",
+            "status": "review",
+            "action_effect": "none",
+            "issues": [
+                f"investment_policy_observation_error:"
+                f"{type(_investment_policy_error).__name__}"
+            ],
+        }
+
     # ガード状態を注入（ガードレール違反時にSonnet/Opusに伝達）
     _guard_path = BASE_DIR / "guard_state.json"
     if _guard_path.exists():
@@ -10192,6 +10220,9 @@ def run_analysis(force: bool = False) -> dict:
     if isinstance(synthesis, dict):
         _apply_degraded_mode(synthesis, _degraded_info)
         synthesis["fx_hedge_shadow_decision"] = _fx_hedge_shadow_observation
+        synthesis["investment_policy_observation"] = (
+            data.get("investment_policy_observation") or {}
+        )
         synthesis["currency_basis_context"] = {
             "whole_portfolio": data.get("currency_breakdown_whole") or data.get("currency_breakdown", {}),
             "long_tier": data.get("currency_breakdown_long", {}),

@@ -131,6 +131,34 @@ def test_build_today_includes_scenario_summary(monkeypatch):
     }
 
 
+def test_build_today_includes_investment_policy_observation(monkeypatch):
+    observation = {
+        "mode": "shadow",
+        "status": "review",
+        "breach_count": 1,
+        "action_effect": "none",
+    }
+    analysis = {
+        "as_of": "2026-07-28 07:00",
+        "synthesis": {"investment_policy_observation": observation},
+    }
+    monkeypatch.setattr(
+        today,
+        "_load",
+        lambda name: analysis if name == "ai_portfolio_analysis.json" else {},
+    )
+    monkeypatch.setattr(
+        portfolio_manager,
+        "build_portfolio_snapshot",
+        lambda: {"positions": [], "total_jpy": 0},
+    )
+    monkeypatch.setattr(today, "_build_benchmark", lambda _guard: {})
+
+    result = today._build_today()
+
+    assert result["investment_policy_observation"] == observation
+
+
 def test_build_today_uses_missing_scenario_state_fallback(monkeypatch):
     monkeypatch.setattr(today, "_load", lambda _name: {})
     monkeypatch.setattr(

@@ -1501,6 +1501,15 @@ def _build_today() -> dict:
         "benchmark": benchmark,
         "execution_plan": execution_plan,
         "scenario_summary": scenario_summary,
+        "investment_policy_observation": (
+            synthesis.get("investment_policy_observation")
+            or {
+                "mode": "shadow",
+                "status": "not_available",
+                "action_effect": "none",
+                "issues": ["analysis_predates_investment_policy_observation"],
+            }
+        ),
         "holdings_intel": holdings_intel,
         "pulse": {"vix": macro.get("vix")},
     }
