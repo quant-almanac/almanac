@@ -16,12 +16,12 @@ SCENARIOS = {
         "icon": "🚀",
         "color": "#22C55E",
         "description": "S&P500・日経ともに50日MAより上。リスクオン。",
-        "cash_ratio_target": 0,
+        "cash_ratio_target": 3,
         "long_bias": True,
         "short_allowed": False,
         "leverage_allowed": True,
         "actions": [
-            "攻めモードでは現金比率を0〜3%まで圧縮",
+            "攻めモードでは現金比率3%を目安に維持",
             "Longコアポジションを維持・積み増し",
             "Mediumポジションは利益確定ラインを引き上げ",
             "新規エントリーはモメンタム銘柄優先",
@@ -39,12 +39,12 @@ SCENARIOS = {
         "icon": "⚖️",
         "color": "#6366F1",
         "description": "混在シグナル。S&P500またはNK225の一方が50日MA未満。",
-        "cash_ratio_target": 15,
+        "cash_ratio_target": 12,
         "long_bias": True,
         "short_allowed": True,
         "leverage_allowed": False,
         "actions": [
-            "現金比率を10〜15%に維持",
+            "現金比率12%を目安に維持",
             "LongコアはDCA継続（SLIM系・インデックス）",
             "Mediumポジションは高値でトリム",
             "空売りスクリーニングで超割高銘柄を監視",
@@ -61,12 +61,12 @@ SCENARIOS = {
         "icon": "🐻",
         "color": "#F59E0B",
         "description": "S&P500・日経ともに50日MA未満。リスクオフ傾向。",
-        "cash_ratio_target": 30,
+        "cash_ratio_target": 20,
         "long_bias": False,
         "short_allowed": True,
         "leverage_allowed": False,
         "actions": [
-            "現金比率を25〜35%に引き上げ",
+            "現金比率20%を目安に維持",
             "MediumポジションはStop-Lossで整理",
             "Longコアは損切りなし・DCA停止",
             "空売り候補を積極スクリーニング",
@@ -84,14 +84,14 @@ SCENARIOS = {
         "icon": "🚨",
         "color": "#EF4444",
         "description": "急落・地政学リスク・金融危機。守りを最優先。",
-        "cash_ratio_target": 50,
+        "cash_ratio_target": 30,
         "long_bias": False,
         "short_allowed": True,
         "leverage_allowed": False,  # 底値打ち確認後でも原則禁止（手動オーバーライド時のみ許可）
         "actions": [
-            "現金比率を40〜60%まで引き上げ",
-            "Mediumポジションを全て売却",
-            "Longコアはドローダウン-40%でDCA再開検討",
+            "急落後に機械的な換金売りで現金比率を引き上げない",
+            "既に確保した現金をactive DCA trancheだけで段階投入",
+            "個別仮説崩壊・信用リスク・上限超過の売却だけを別途評価",
             "信用買いは全て解消",
             "VIX > 40で底値シグナル監視開始",
             "底値確認後：レバレッジETF・空売り利益で再エントリー",
@@ -100,15 +100,15 @@ SCENARIOS = {
         "opportunity": {
             "medium_risk": ["ゴールド・短期国債", "ディフェンシブ（ヘルスケア・生活必需品）"],
             "high_risk": [
-                "底値打ち確認後：NVDA/AVGO大量買い増し",
-                "レバレッジETF（QQQ3x相当）",
+                "底値打ち確認後：高確信度候補をDCAで段階買い",
+                "非レバレッジの広範インデックス",
                 "底値圏での空売り利確→ロング転換",
                 "超割安バリュー株の仕込み",
             ],
         },
         "crisis_protocol": [
-            "1. VIX > 30: 新規禁止・現金比率35%へ",
-            "2. VIX > 40: 現金50%へ・空売りポジション追加",
+            "1. VIX > 30: 裁量的な新規買いを止め、既存現金を維持",
+            "2. VIX > 40: 換金売りをせず、active DCA trancheの条件を確認",
             "3. 主要指数-20%: 底値スクリーニング開始",
             "4. VIX < 30 + 主要指数反転: Long再構築フェーズ",
         ],
@@ -229,7 +229,6 @@ def _apply_tunable_cash_target(scenario_key: str, scenario: dict) -> dict:
         "BULL": "target_cash_pct_aggressive",
         "NEUTRAL": "target_cash_pct_neutral",
         "BEAR": "target_cash_pct_defensive",
-        "CRASH": "target_cash_pct_defensive",
     }
     key = key_map.get(scenario_key)
     if key:
@@ -259,7 +258,8 @@ def detect_scenario(regime: dict, guard: dict) -> str:
     spy_above = regime.get("spy_above", True)
     nk_above = regime.get("nk_above", True)
 
-    if daily_pnl < -5 or monthly_pnl < -10:
+    # behavioral_guard stores decimal ratios: -0.05 == -5%.
+    if daily_pnl <= -0.05 or monthly_pnl <= -0.10:
         return "CRASH"
     if spy_above and nk_above:
         return "BULL"

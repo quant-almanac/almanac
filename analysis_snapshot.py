@@ -312,6 +312,7 @@ def build_base_snapshot_from_data(
             "market_meta": data.get("market_meta"),
             "regime": data.get("regime"),
             "scenario": data.get("scenario"),
+            "market_regime_v2": data.get("market_regime_v2"),
         },
         "news": {
             "feed": data.get("news"),

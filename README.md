@@ -429,7 +429,23 @@ MOM = MTUM − SPY   QMJ = QUAL − SPY      LVOL = SPLV − SPY   …
 
 ### Regimes
 
-**The operating regime is a deterministic classification** — 50-day moving averages on SPY and the Nikkei, VIX, and a macro score (`alert.py`). An HMM exists as a separate risk signal but is not the authority for the operating regime.
+**The operating classifier is deterministic and market-specific.** `market_regime_v2.py` scores the US and Japan separately on five levels: strong bull, mild bull, neutral, mild bear and strong bear. It also records whether the score is improving, stable or deteriorating, while an independent shock overlay catches abrupt stress.
+
+The score combines each index's distance from its 50- and 200-day moving averages, **market breadth** (the percentage of the allowed screening universe above those averages), VIX, the high-yield credit spread and US interest rates. Breadth is accepted only when each market has at least 20 instruments with enough valid closing prices; the denominator is the post-restriction `tickers.json` universe actually downloaded for that run, not missing names counted as weak.
+
+Rates are a modifier, not a market-timing switch. The inputs are the nominal and inflation-adjusted US 10-year yields, 5- and 20-observation changes, 10-year expected inflation and the 10Y–3M curve. A fast rise or a persistently restrictive real yield reduces the equity score; falling yields help only when credit is not already signalling stress. The same US-rate block is explicitly treated as a global equity discount-rate modifier, not mislabeled as a Japanese rate series.
+
+Normal changes require confirmation on two distinct evaluation dates; a shock is immediate. When data coverage is incomplete, v2 is review-only and the legacy four-state scenario remains unchanged. An HMM remains a separate risk signal and is not counted as an independent confirmation of inputs already used by v2.
+
+| Level | Tactical cash target | New-buy size cap | Leverage |
+|---|---:|---:|---|
+| Strong bull | 3% | 1.00× | Allowed only if every other gate passes |
+| Mild bull | 7% | 0.75× | Off |
+| Neutral | 12% | 0.50× | Off |
+| Mild bear | 20% | 0.25× | Off |
+| Strong bear | 30% | 0× discretionary; active deterministic DCA only | Off |
+
+These are recommendation and sizing-policy limits, not broker orders. In a crash, 30% is a ceiling for cash already held, **not an instruction to sell after the fall to raise cash**. Existing tactical cash may be deployed only through an active DCA tranche; thesis failure, credit risk and hard concentration limits are evaluated separately.
 
 The parameters in `regime_params.py` started from an older walk-forward optimisation and have since been **updated by hand**. The generator, `backtest_wfo.py`, is now **retired** — it exits unless explicitly enabled.
 
@@ -535,6 +551,9 @@ Terms used above, for readers who don't work in finance or haven't seen the hous
 | **Alpha / beta** | Beta is the return that came from moving with the market; alpha is what is left over. It separates the market's work from yours |
 | **OLS regression** | Ordinary least squares: the straight-line fit used here to estimate factor exposures and the unexplained residual |
 | **HY spread** | The yield gap between high-yield corporate bonds and government bonds. It widens when credit stress rises |
+| **Market breadth** | How much of the market participates in a move — here, the percentage of eligible screened instruments above a moving average |
+| **Real yield** | A bond yield after expected inflation is removed. A high real yield raises the discount rate applied to future corporate earnings |
+| **Hysteresis** | Requiring a changed signal to persist before changing state, so a one-day wobble does not repeatedly flip the policy |
 
 ## Architecture
 
@@ -572,6 +591,7 @@ Use `.env.example` as a template. CLI analysis secrets are supplied through the 
 | `ALMANAC_CLEAN_NAV_SINCE`, `ALMANAC_MIN_CLEAN_DAYS` | Narrows the performance-measurement window, so periods with known-dirty data are excluded from the result |
 | `ALMANAC_PRIVACY_MODE` | Controls call-site-gated *book-aware* external LLM calls — see the scope below |
 | `ALMANAC_BUDGET_MODE` | Routed Claude tier policy: `eco`, `normal` (default), or `premium`; fixed utility calls and external-provider roles are unchanged |
+| `ALMANAC_MARKET_REGIME_V2_MODE` | `off`, `shadow`, or `advisory` (default). Advisory applies the five-level recommendation and sizing limits but never submits broker orders |
 | `ALMANAC_MODEL_OVERRIDE_<ROLE>` | Per-role routing override for controlled testing or rollback; the value is a registry key such as `sonnet`, not a provider model ID |
 
 ### Privacy mode

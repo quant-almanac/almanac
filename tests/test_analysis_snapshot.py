@@ -144,6 +144,22 @@ def test_in_memory_payload_hash_changes_even_when_artifact_is_unchanged(tmp_path
     assert first.holdings.payload_hash != second.holdings.payload_hash
 
 
+def test_base_snapshot_freezes_market_regime_v2_payload(tmp_path):
+    now = datetime(2026, 7, 27, 12, 0, 0)
+    first = snap.build_base_snapshot_from_data(
+        {"market_regime_v2": {"policy_version": "v1", "portfolio": {"score": 10}}},
+        base_dir=tmp_path,
+        now=now,
+    )
+    second = snap.build_base_snapshot_from_data(
+        {"market_regime_v2": {"policy_version": "v1", "portfolio": {"score": 20}}},
+        base_dir=tmp_path,
+        now=now,
+    )
+
+    assert first.macro.payload_hash != second.macro.payload_hash
+
+
 # ---------------------------------------------------------------------------
 # build_enriched_snapshot
 # ---------------------------------------------------------------------------

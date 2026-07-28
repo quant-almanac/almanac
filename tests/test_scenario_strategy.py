@@ -8,7 +8,7 @@ def test_bull_scenario_allows_leverage_but_not_shorts():
     assert bull["long_bias"] is True
     assert bull["leverage_allowed"] is True
     assert bull["short_allowed"] is False
-    assert bull["cash_ratio_target"] == 0
+    assert bull["cash_ratio_target"] == 3
 
 
 def test_bull_strategy_uses_aggressive_cash_target(monkeypatch):
@@ -28,6 +28,24 @@ def test_bull_strategy_uses_aggressive_cash_target(monkeypatch):
     assert strategy["scenario"] == "BULL"
     assert strategy["cash_ratio_target"] == 0
     assert strategy["leverage_allowed"] is True
+
+
+def test_crash_does_not_raise_cash_after_the_drop():
+    crash = SCENARIOS["CRASH"]
+
+    assert crash["cash_ratio_target"] == 30
+    assert all("40〜60%" not in row for row in crash["actions"])
+    assert any("換金売り" in row for row in crash["actions"])
+
+
+def test_guard_decimal_loss_ratio_triggers_crash():
+    assert (
+        scenario_strategy.detect_scenario(
+            {"spy_above": True, "nk_above": True},
+            {"daily_pnl_pct": -0.051, "monthly_pnl_pct": -0.02},
+        )
+        == "CRASH"
+    )
 
 
 def test_stale_regime_falls_back_to_fresh_screen_market_meta(tmp_path, monkeypatch):

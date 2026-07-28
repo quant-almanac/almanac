@@ -795,29 +795,93 @@ def load_tickers():
     return data['all']
 
 def get_market_meta():
-    """地合いメタ情報：S&P500・日経225の50日線との位置関係"""
+    """地合いメタ情報：S&P500・日経225の50/200日線と変化率。"""
     meta = {}
     try:
-        spy = yf.Ticker('SPY').history(period='3mo')
+        spy = yf.Ticker('SPY').history(period='1y')
+        if len(spy['Close'].dropna()) < 200:
+            raise ValueError("SPY history has fewer than 200 valid closes")
         sp_ma50 = spy['Close'].rolling(50).mean().iloc[-1]
+        sp_ma200 = spy['Close'].rolling(200).mean().iloc[-1]
         sp_price = spy['Close'].iloc[-1]
         meta['sp500'] = '上' if sp_price > sp_ma50 else '下'
         meta['sp500_price'] = round(float(sp_price), 2)
         meta['sp500_ma50'] = round(float(sp_ma50), 2)
+        meta['sp500_ma200'] = round(float(sp_ma200), 2)
+        meta['sp500_vs_ma50_pct'] = round((float(sp_price) / float(sp_ma50) - 1) * 100, 2)
+        meta['sp500_vs_ma200_pct'] = round((float(sp_price) / float(sp_ma200) - 1) * 100, 2)
     except:
         meta['sp500'] = '不明'
 
     try:
-        nk = yf.Ticker('^N225').history(period='3mo')
+        nk = yf.Ticker('^N225').history(period='1y')
+        if len(nk['Close'].dropna()) < 200:
+            raise ValueError("Nikkei history has fewer than 200 valid closes")
         nk_ma50 = nk['Close'].rolling(50).mean().iloc[-1]
+        nk_ma200 = nk['Close'].rolling(200).mean().iloc[-1]
         nk_price = nk['Close'].iloc[-1]
         meta['nikkei'] = '上' if nk_price > nk_ma50 else '下'
         meta['nikkei_price'] = round(float(nk_price), 0)
         meta['nikkei_ma50'] = round(float(nk_ma50), 0)
+        meta['nikkei_ma200'] = round(float(nk_ma200), 0)
+        meta['nikkei_vs_ma50_pct'] = round((float(nk_price) / float(nk_ma50) - 1) * 100, 2)
+        meta['nikkei_vs_ma200_pct'] = round((float(nk_price) / float(nk_ma200) - 1) * 100, 2)
     except:
         meta['nikkei'] = '不明'
 
     return meta
+
+
+def _compute_market_breadth(hist_all: dict) -> dict:
+    """Compute breadth from the exact allowed universe downloaded for this run.
+
+    Counts are explicit: ``eligible_ma50``/``eligible_ma200`` are tickers with
+    enough valid Close observations in the post-restriction screening
+    universe.  Missing histories are not silently counted below an MA.
+    """
+    counts = {
+        "us": {
+            "eligible_ma50": 0,
+            "above_ma50": 0,
+            "eligible_ma200": 0,
+            "above_ma200": 0,
+        },
+        "jp": {
+            "eligible_ma50": 0,
+            "above_ma50": 0,
+            "eligible_ma200": 0,
+            "above_ma200": 0,
+        },
+    }
+    for ticker, hist in (hist_all or {}).items():
+        market = "jp" if str(ticker).endswith(".T") else "us"
+        try:
+            close = hist["Close"].dropna()
+        except Exception:
+            continue
+        if len(close) >= 50:
+            counts[market]["eligible_ma50"] += 1
+            if float(close.iloc[-1]) > float(close.rolling(50).mean().iloc[-1]):
+                counts[market]["above_ma50"] += 1
+        if len(close) >= 200:
+            counts[market]["eligible_ma200"] += 1
+            if float(close.iloc[-1]) > float(close.rolling(200).mean().iloc[-1]):
+                counts[market]["above_ma200"] += 1
+
+    for market, row in counts.items():
+        row["above_ma50_pct"] = (
+            round(row["above_ma50"] / row["eligible_ma50"] * 100, 2)
+            if row["eligible_ma50"] else None
+        )
+        row["above_ma200_pct"] = (
+            round(row["above_ma200"] / row["eligible_ma200"] * 100, 2)
+            if row["eligible_ma200"] else None
+        )
+        row["universe_basis"] = (
+            "insider/restriction-filtered tickers.json universe with "
+            "sufficient valid Close observations"
+        )
+    return counts
 
 def get_credit_ratio(ticker):
     """日本株の信用倍率取得（yfinanceでは取得不可のため暫定でNoneを返す）"""
@@ -1275,6 +1339,7 @@ def run_full_screen(
     print("OHLCV 一括ダウンロード中...")
     hist_all = _bulk_download(tickers)
     print(f"  取得成功: {len(hist_all)}/{len(tickers)} 銘柄")
+    market_meta["breadth"] = _compute_market_breadth(hist_all)
 
     # 戦略別バケット
     buckets = {

@@ -1270,12 +1270,54 @@ def _extract_data_freshness_score(data_freshness_context: str) -> float | None:
 
 
 # ── Phase 2B: レジーム合意ゲート ────────────────────────────────────
-def _compute_regime_consensus(data: dict) -> str:
+def _compute_regime_consensus(data: dict, *, public_only: bool = False) -> str:
     """
-    HMM・macro_score・VIX・SPY-MA50 の4指標からレジーム合意度を計算し
-    Shared Context注入用テキストを生成する（Phase 2B）。
+    Market Regime v2 を優先し、未配線時だけ旧4指標の合意度を返す。
+    v2 の旧HMM/macro/MA50派生値は同じ lineage として重複加点しない。
     """
     try:
+        v2 = data.get("market_regime_v2")
+        if (
+            isinstance(v2, dict)
+            and isinstance(v2.get("portfolio"), dict)
+            and v2["portfolio"].get("eligible")
+        ):
+            markets = v2.get("markets") or {}
+            policy = v2.get("policy") or {}
+            shock = v2.get("shock") or {}
+            if public_only:
+                return "\n".join([
+                    "【Market Regime v2（公開市場データのみ）】",
+                    "  "
+                    f"US={((markets.get('US') or {}).get('committed_label') or 'unknown')} "
+                    f"score={((markets.get('US') or {}).get('score'))} / "
+                    f"JP={((markets.get('JP') or {}).get('committed_label') or 'unknown')} "
+                    f"score={((markets.get('JP') or {}).get('score'))}",
+                    "  "
+                    f"shock={bool(shock.get('active'))} / "
+                    "US長期金利（グローバル株式discount modifier）="
+                    f"{((markets.get('US') or {}).get('rate_regime') or {}).get('status')}",
+                ])
+            return "\n".join([
+                "【Market Regime v2（決定論的・金利/credit/breadth込み）】",
+                "  "
+                f"US={((markets.get('US') or {}).get('committed_label') or 'unknown')} "
+                f"score={((markets.get('US') or {}).get('score'))} / "
+                f"JP={((markets.get('JP') or {}).get('committed_label') or 'unknown')} "
+                f"score={((markets.get('JP') or {}).get('score'))}",
+                "  "
+                f"portfolio={v2['portfolio'].get('committed_label')} "
+                f"phase={v2['portfolio'].get('phase')} "
+                f"shock={bool(shock.get('active'))} / "
+                "US長期金利（グローバル株式discount modifier）="
+                f"{((markets.get('US') or {}).get('rate_regime') or {}).get('status')}",
+                "  "
+                f"cash_target={policy.get('cash_target_pct')}% "
+                f"cash_action={policy.get('cash_action')} "
+                f"buy_size_multiplier={policy.get('buy_size_multiplier')}",
+                "  同じlineageの旧HMM/macro/MA50ラベルを独立した追加根拠として数えない。",
+            ])
+
         regime_raw = data.get("regime", {})
         macro_meta = data.get("market_meta", {})
 
@@ -1391,10 +1433,13 @@ def _build_shared_market_context(data: dict) -> str:
 ## マーケット環境（リアルタイム指標 / 全ティア共通）
 VIX: {mm.get('vix','不明')} ({mm.get('vix_level','')})
 米10年金利: {mm.get('us10y_yield',{}).get('value','不明')}% (前日比{mm.get('us10y_yield',{}).get('change_pct','?')}%) / 米2年金利: {mm.get('us2y_yield',{}).get('value','不明')}%
-イールドカーブ: スプレッド{mm.get('yield_curve_spread','不明')}% → {mm.get('yield_curve_status','')}
+米3カ月金利: {mm.get('us3m_yield',{}).get('value','不明')}% / 米10年実質金利: {mm.get('real10y_yield',{}).get('value','不明')}% / 10年期待インフレ: {mm.get('breakeven_10y',{}).get('value','不明')}%
+金利変化: 10Y 5日={mm.get('yield_10y_change_5d_bps','不明')}bps / 20日={mm.get('yield_10y_change_20d_bps','不明')}bps / 実質10Y 20日={mm.get('real_yield_10y_change_20d_bps','不明')}bps
+イールドカーブ: {mm.get('yield_curve_status','')} / {mm.get('yield_curve_status_10y_3m','')}
 ドル指数(DXY): {mm.get('dxy',{}).get('value','不明')} (前日比{mm.get('dxy',{}).get('change_pct','?')}%)
 原油: ${mm.get('crude_oil',{}).get('value','不明')} (前日比{mm.get('crude_oil',{}).get('change_pct','?')}%) / 金: ${mm.get('gold',{}).get('value','不明')}
-S&P500 vs MA50: {mm.get('sp500_vs_ma50_pct','不明')}% / 日経 vs MA50: {mm.get('nikkei_vs_ma50_pct','不明')}%
+S&P500 vs MA50/MA200: {mm.get('sp500_vs_ma50_pct','不明')}% / {mm.get('sp500_vs_ma200_pct','不明')}% / 日経 vs MA50/MA200: {mm.get('nikkei_vs_ma50_pct','不明')}% / {mm.get('nikkei_vs_ma200_pct','不明')}%
+市場の広がり: US MA50上={((mm.get('breadth') or {}).get('us') or {}).get('above_ma50_pct','不明')}%・MA200上={((mm.get('breadth') or {}).get('us') or {}).get('above_ma200_pct','不明')}% / JP MA50上={((mm.get('breadth') or {}).get('jp') or {}).get('above_ma50_pct','不明')}%・MA200上={((mm.get('breadth') or {}).get('jp') or {}).get('above_ma200_pct','不明')}%
 日経225: {mm.get('nikkei',{}).get('value','不明')} (前日比{mm.get('nikkei',{}).get('change_pct','?')}%)
 
 ## マーケットレジーム
@@ -1441,7 +1486,7 @@ def _build_public_market_context(data: dict) -> str:
         sentiment_bias = "強気優勢" if pos > neg * 1.3 else ("弱気優勢" if neg > pos * 1.3 else "中立")
         nss_text = f"\n## FinBERTニュース感情集計（過去24h / {nss.get('as_of','')}）\n強気{pos}件 / 弱気{neg}件 / 中立{neu}件（計{total}件） → {sentiment_bias}"
 
-    regime_consensus_text = _compute_regime_consensus(data)
+    regime_consensus_text = _compute_regime_consensus(data, public_only=True)
 
     return f"""## 本日の日付: {today}
 ※ニュース記事の日付を必ず本日日付と照合すること。過去イベントを「今後の予定」として戦略に組み込まないこと。
@@ -1449,10 +1494,13 @@ def _build_public_market_context(data: dict) -> str:
 ## マーケット環境（リアルタイム指標 / 公開情報のみ）
 VIX: {mm.get('vix','不明')} ({mm.get('vix_level','')})
 米10年金利: {mm.get('us10y_yield',{}).get('value','不明')}% (前日比{mm.get('us10y_yield',{}).get('change_pct','?')}%) / 米2年金利: {mm.get('us2y_yield',{}).get('value','不明')}%
-イールドカーブ: スプレッド{mm.get('yield_curve_spread','不明')}% → {mm.get('yield_curve_status','')}
+米3カ月金利: {mm.get('us3m_yield',{}).get('value','不明')}% / 米10年実質金利: {mm.get('real10y_yield',{}).get('value','不明')}% / 10年期待インフレ: {mm.get('breakeven_10y',{}).get('value','不明')}%
+金利変化: 10Y 5日={mm.get('yield_10y_change_5d_bps','不明')}bps / 20日={mm.get('yield_10y_change_20d_bps','不明')}bps / 実質10Y 20日={mm.get('real_yield_10y_change_20d_bps','不明')}bps
+イールドカーブ: {mm.get('yield_curve_status','')} / {mm.get('yield_curve_status_10y_3m','')}
 ドル指数(DXY): {mm.get('dxy',{}).get('value','不明')} (前日比{mm.get('dxy',{}).get('change_pct','?')}%)
 原油: ${mm.get('crude_oil',{}).get('value','不明')} (前日比{mm.get('crude_oil',{}).get('change_pct','?')}%) / 金: ${mm.get('gold',{}).get('value','不明')}
-S&P500 vs MA50: {mm.get('sp500_vs_ma50_pct','不明')}% / 日経 vs MA50: {mm.get('nikkei_vs_ma50_pct','不明')}%
+S&P500 vs MA50/MA200: {mm.get('sp500_vs_ma50_pct','不明')}% / {mm.get('sp500_vs_ma200_pct','不明')}% / 日経 vs MA50/MA200: {mm.get('nikkei_vs_ma50_pct','不明')}% / {mm.get('nikkei_vs_ma200_pct','不明')}%
+市場の広がり: US MA50上={((mm.get('breadth') or {}).get('us') or {}).get('above_ma50_pct','不明')}%・MA200上={((mm.get('breadth') or {}).get('us') or {}).get('above_ma200_pct','不明')}% / JP MA50上={((mm.get('breadth') or {}).get('jp') or {}).get('above_ma50_pct','不明')}%・MA200上={((mm.get('breadth') or {}).get('jp') or {}).get('above_ma200_pct','不明')}%
 日経225: {mm.get('nikkei',{}).get('value','不明')} (前日比{mm.get('nikkei',{}).get('change_pct','?')}%)
 
 ## マーケットレジーム
@@ -10235,6 +10283,7 @@ def run_analysis(force: bool = False) -> dict:
         synthesis["investment_policy_observation"] = (
             data.get("investment_policy_observation") or {}
         )
+        synthesis["market_regime_v2"] = data.get("market_regime_v2") or {}
         synthesis["currency_basis_context"] = {
             "whole_portfolio": data.get("currency_breakdown_whole") or data.get("currency_breakdown", {}),
             "long_tier": data.get("currency_breakdown_long", {}),
@@ -10538,6 +10587,7 @@ def run_analysis(force: bool = False) -> dict:
                 _policy_macro["scenario_key"] = (data.get("scenario") or {}).get("key")
                 _policy_macro["regime"] = (data.get("regime") or {}).get("regime")
                 _policy_macro["regime_bull_confirmed"] = bool(_regime_bull_confirmed)
+                _policy_macro["market_regime_v2"] = data.get("market_regime_v2") or {}
 
             _policy_risk = dict(data.get("risk") or {}) if isinstance(data, dict) else {}
             _guard_state = data.get("guard_state") if isinstance(data, dict) else None
@@ -10842,6 +10892,7 @@ def run_analysis(force: bool = False) -> dict:
     result = {
         "as_of":             datetime.now().strftime("%Y-%m-%d %H:%M"),
         "scenario_key":      data["scenario"].get("key", "NEUTRAL"),
+        "market_regime_v2":  data.get("market_regime_v2", {}),
         "portfolio_total":   data["portfolio_total"],
         "currency_breakdown": data.get("currency_breakdown", {}),
         "currency_breakdowns": {

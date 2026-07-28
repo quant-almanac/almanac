@@ -15,7 +15,7 @@ from vix_classification import vix_macro_status
 BASE_DIR = Path(__file__).parent
 CACHE_FILE = BASE_DIR / "macro_state.json"
 CACHE_TTL = 3600 * 6  # 6時間（fallback）
-CACHE_SCHEMA_VERSION = 2
+CACHE_SCHEMA_VERSION = 3
 
 def _get_cache_ttl() -> int:
     """tunable_params: macro_cache_hours を優先。なければ CACHE_TTL。"""
@@ -31,6 +31,9 @@ FRED_SERIES = {
     "fed_rate":     "FEDFUNDS",    # FF金利（%）
     "yield_10y":    "DGS10",       # 10年債利回り（%）
     "yield_2y":     "DGS2",        # 2年債利回り（%）
+    "yield_3m":     "DGS3MO",      # 3カ月債利回り（%）
+    "real_yield_10y": "DFII10",    # 10年TIPS実質利回り（%）
+    "breakeven_10y": "T10YIE",     # 10年期待インフレ率（%）
     # Headline CPI YoY is conventionally reported from the not-seasonally
     # adjusted all-items index.  CPIAUCSL made the stored figure difficult to
     # reconcile with the BLS release.
@@ -157,15 +160,40 @@ def _fetch_fred() -> dict | None:
             except Exception:
                 result["hy_oas_bps"] = None
 
+        # Regime v2: use changes over valid FRED observations rather than
+        # calendar-day offsets, and store all changes in basis points.
+        for key in ("yield_10y", "real_yield_10y"):
+            series = series_cache.get(key)
+            if series is None:
+                continue
+            clean = series.dropna()
+            for lookback in (5, 20):
+                field = f"{key}_change_{lookback}d_bps"
+                if len(clean) <= lookback:
+                    result[field] = None
+                    continue
+                result[field] = round(
+                    (float(clean.iloc[-1]) - float(clean.iloc[-1 - lookback])) * 100,
+                    1,
+                )
+
         # イールドスプレッド（10Y - 2Y）
         y10 = result.get("yield_10y")
         y2  = result.get("yield_2y")
+        y3m = result.get("yield_3m")
         if y10 is not None and y2 is not None:
             result["yield_spread"] = round(y10 - y2, 3)
+            result["yield_spread_10y_2y"] = result["yield_spread"]
             result["yield_inverted"] = result["yield_spread"] < 0
         else:
             result["yield_spread"] = None
+            result["yield_spread_10y_2y"] = None
             result["yield_inverted"] = False
+        result["yield_spread_10y_3m"] = (
+            round(y10 - y3m, 3)
+            if y10 is not None and y3m is not None
+            else None
+        )
 
         return result
 
@@ -281,7 +309,11 @@ def get_macro_context() -> dict:
           fed_rate:         float|None  # FF金利（%）
           yield_10y:        float|None  # 10年債利回り（%）
           yield_2y:         float|None  # 2年債利回り（%）
+          yield_3m:         float|None  # 3カ月債利回り（%）
+          real_yield_10y:   float|None  # 10年TIPS実質利回り（%）
+          breakeven_10y:    float|None  # 10年期待インフレ率（%）
           yield_spread:     float|None  # イールドスプレッド（10Y-2Y, %）
+          yield_spread_10y_3m: float|None
           yield_inverted:   bool        # True = 逆イールド
           cpi_yoy:          float|None  # CPI前年比（%）
           unemp_rate:       float|None  # 失業率（%）
@@ -325,8 +357,13 @@ def get_macro_context() -> dict:
     # FRED なし: VIX だけ取得してデフォルト返却
     vix_val = _fetch_vix()
     result = {
-        "fed_rate": None, "yield_10y": None, "yield_2y": None,
-        "yield_spread": None, "yield_inverted": False,
+        "fed_rate": None, "yield_10y": None, "yield_2y": None, "yield_3m": None,
+        "real_yield_10y": None, "breakeven_10y": None,
+        "yield_10y_change_5d_bps": None, "yield_10y_change_20d_bps": None,
+        "real_yield_10y_change_5d_bps": None,
+        "real_yield_10y_change_20d_bps": None,
+        "yield_spread": None, "yield_spread_10y_2y": None,
+        "yield_spread_10y_3m": None, "yield_inverted": False,
         "cpi_yoy": None, "unemp_rate": None,
         "hy_oas_bps": None,
         "macro_adj": 0, "source": "default",
@@ -385,6 +422,15 @@ def format_macro_summary(ctx: dict) -> str:
     lines = []
     if ctx.get("fed_rate") is not None:
         lines.append(f"FF金利: {ctx['fed_rate']:.2f}%")
+    if ctx.get("yield_10y") is not None:
+        lines.append(
+            f"米10Y: {ctx['yield_10y']:.2f}%"
+            f" ({ctx.get('yield_10y_change_5d_bps', '不明')}bps/5観測日)"
+        )
+    if ctx.get("real_yield_10y") is not None:
+        lines.append(f"米実質10Y: {ctx['real_yield_10y']:.2f}%")
+    if ctx.get("breakeven_10y") is not None:
+        lines.append(f"米10Y期待インフレ: {ctx['breakeven_10y']:.2f}%")
     if ctx.get("yield_spread") is not None:
         inv = " ⚠️逆イールド" if ctx.get("yield_inverted") else ""
         lines.append(f"イールドスプレッド(10Y-2Y): {ctx['yield_spread']:+.2f}%{inv}")
@@ -482,7 +528,12 @@ if __name__ == "__main__":
     print(f"FF金利:         {ctx.get('fed_rate')} %")
     print(f"10年債:         {ctx.get('yield_10y')} %")
     print(f"2年債:          {ctx.get('yield_2y')} %")
-    print(f"イールドスプレッド: {ctx.get('yield_spread')} % (逆イールド: {ctx.get('yield_inverted')})")
+    print(f"3カ月債:        {ctx.get('yield_3m')} %")
+    print(f"実質10年債:     {ctx.get('real_yield_10y')} %")
+    print(f"10年期待インフレ: {ctx.get('breakeven_10y')} %")
+    print(f"10Y変化:        {ctx.get('yield_10y_change_5d_bps')}bps/5観測日, {ctx.get('yield_10y_change_20d_bps')}bps/20観測日")
+    print(f"イールドスプレッド10Y-2Y: {ctx.get('yield_spread_10y_2y')} % (逆イールド: {ctx.get('yield_inverted')})")
+    print(f"イールドスプレッド10Y-3M: {ctx.get('yield_spread_10y_3m')} %")
     print(f"CPI前年比:      {ctx.get('cpi_yoy')} %")
     print(f"失業率:          {ctx.get('unemp_rate')} %")
     print(f"VIX:             {ctx.get('vix')} (status: {ctx.get('vix_status')}, capitulation: {ctx.get('vix_capitulation')}, fear: {ctx.get('vix_fear')})")

@@ -88,6 +88,92 @@ def test_actual_dd_stage_blocks_buy_when_synthetic_dd_missing():
     assert d.rejected[0]["rule"] == "_rule_dd_stage"
 
 
+def test_market_regime_mild_bull_caps_us_buy_to_075():
+    ctx = pe.PolicyContext(
+        market_regime_mode="advisory",
+        market_regime_levels={"US": 1, "JP": -1},
+        market_regime_buy_multipliers={"US": 0.75, "JP": 0.25},
+    )
+    action = _action("buy", ticker="AAPL")
+    action.update({"shares": 4, "amount_hint": "4株"})
+
+    d = pe.apply_policy_gate([action], ctx)
+
+    assert len(d.accepted) == 1
+    assert d.accepted[0]["shares"] == 3
+    assert d.accepted[0]["policy_market_regime"]["market"] == "US"
+
+
+def test_market_regime_uses_jp_level_for_jp_ticker():
+    ctx = pe.PolicyContext(
+        market_regime_mode="advisory",
+        market_regime_levels={"US": 2, "JP": -1},
+        market_regime_buy_multipliers={"US": 1.0, "JP": 0.25},
+    )
+    action = _action("buy", ticker="1489.T")
+    action.update({"shares": 8, "amount_hint": "8口"})
+
+    d = pe.apply_policy_gate([action], ctx)
+
+    assert len(d.accepted) == 1
+    assert d.accepted[0]["shares"] == 2
+    assert d.accepted[0]["policy_market_regime"]["market"] == "JP"
+
+
+def test_market_regime_blocks_margin_buy_outside_strong_bull():
+    ctx = pe.PolicyContext(
+        market_regime_mode="advisory",
+        market_regime_levels={"US": 1},
+        market_regime_buy_multipliers={"US": 0.75},
+    )
+
+    d = pe.apply_policy_gate([_action("margin_buy", ticker="AAPL")], ctx)
+
+    assert len(d.rejected) == 1
+    assert d.rejected[0]["rule"] == "_rule_market_regime_size"
+
+
+def test_market_regime_strong_bear_allows_only_active_dca_ladder():
+    ctx = pe.PolicyContext(
+        market_regime_mode="advisory",
+        market_regime_levels={"US": -2},
+        market_regime_buy_multipliers={"US": 0.0},
+        allow_dca_tranche=True,
+        actual_trading_allowed=True,
+    )
+    buy = _action("buy", ticker="AAPL")
+    dca = _action("dca", ticker="AAPL")
+    dca.update({"source": "dca_ladder", "shares": 8, "amount_hint": "8株"})
+
+    d = pe.apply_policy_gate([buy, dca], ctx)
+
+    assert len(d.rejected) == 1
+    assert d.rejected[0]["action"]["type"] == "buy"
+    assert len(d.accepted) == 1
+    assert d.accepted[0]["type"] == "dca"
+    assert d.accepted[0]["shares"] == 2
+
+
+def test_context_builder_wires_eligible_market_regime_contract():
+    ctx = pe.build_context_from_synthesis_inputs(
+        macro={
+            "market_regime_v2": {
+                "mode": "advisory",
+                "portfolio": {"eligible": True},
+                "shock": {"active": False},
+                "policy": {
+                    "market_levels": {"US": 1, "JP": -1},
+                    "market_buy_size_multipliers": {"US": 0.75, "JP": 0.25},
+                },
+            }
+        }
+    )
+
+    assert ctx.market_regime_mode == "advisory"
+    assert ctx.market_regime_levels == {"US": 1, "JP": -1}
+    assert ctx.market_regime_buy_multipliers["JP"] == 0.25
+
+
 def test_actual_dd_stage_allows_dca_ladder_exception_half_size():
     ctx = pe.PolicyContext(
         current_dd=None,
@@ -581,6 +667,26 @@ def test_size_adj_applied_to_real_quantities():
     assert acc["shares"] == 2
     assert acc["amount_hint"] == "2株"
     assert "policy_size_applied" in acc
+
+
+def test_size_adj_keeps_estimated_notional_consistent_with_rounded_quantity():
+    ctx = pe.PolicyContext(current_dd=-0.06)
+    a = _action("buy")
+    a["amount_hint"] = "12株"
+    a["shares"] = 12
+    a["estimated_notional_jpy"] = 41_088
+
+    d = pe.apply_policy_gate([a], ctx)
+
+    assert len(d.accepted) == 1
+    acc = d.accepted[0]
+    assert acc["shares"] == 6
+    assert acc["amount_hint"] == "6株"
+    assert acc["estimated_notional_jpy"] == 20_544
+    assert acc["policy_size_applied"]["estimated_notional_jpy"] == {
+        "from": 41_088,
+        "to": 20_544,
+    }
 
 
 def test_size_adj_collapse_rejects_sub_share():

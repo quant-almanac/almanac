@@ -50,6 +50,10 @@ class PolicyContext:
 
     # Macro
     vix: Optional[float] = None
+    market_regime_mode: Optional[str] = None
+    market_regime_levels: dict = field(default_factory=dict)
+    market_regime_buy_multipliers: dict = field(default_factory=dict)
+    market_regime_shock_active: bool = False
 
     # Leverage
     leverage_status: Optional[str] = None   # 'safe' | 'warning' | 'deleverage' | 'emergency'
@@ -247,6 +251,63 @@ def _rule_dd_stage(action: dict, ctx: PolicyContext):
     return None
 
 
+def _rule_market_regime_size(action: dict, ctx: PolicyContext):
+    """Apply the approved per-market Regime v2 entry-size contract."""
+    atype = str(action.get("type") or "").lower()
+    if atype not in _BUY_TYPES or ctx.market_regime_mode != "advisory":
+        return None
+
+    ticker = str(action.get("ticker") or "")
+    market = "JP" if ticker.endswith(".T") else "US"
+    level_raw = ctx.market_regime_levels.get(market)
+    multiplier_raw = ctx.market_regime_buy_multipliers.get(market)
+    try:
+        level = int(level_raw)
+        multiplier = max(0.0, min(1.0, float(multiplier_raw)))
+    except (TypeError, ValueError):
+        return None
+
+    dca_exception = (
+        _is_dca_ladder_action(action)
+        and ctx.allow_dca_tranche
+        and ctx.actual_trading_allowed is True
+    )
+    if atype == "margin_buy" and level < 2:
+        return (
+            "reject",
+            f"Market Regime v2 {market} level={level} では新規レバレッジ禁止。"
+            " margin_buy は strong_bull かつ他の全ゲート通過時だけ許容。",
+        )
+    if ctx.market_regime_shock_active or level <= -2:
+        if not dca_exception:
+            return (
+                "reject",
+                f"Market Regime v2 {market} level={level} "
+                f"shock={ctx.market_regime_shock_active} のため裁量的な新規buy停止。"
+                " activeなdeterministic DCA trancheのみ再評価可能。",
+            )
+        multiplier = 0.25
+
+    if multiplier >= 1.0:
+        return None
+    modified = dict(action)
+    if modified.get("urgency") == "high" and level <= 0:
+        modified["urgency"] = "medium"
+    modified["policy_size_adj"] = min(_current_size_adj(modified), multiplier)
+    modified["policy_market_regime"] = {
+        "market": market,
+        "level": level,
+        "size_multiplier": multiplier,
+        "shock": ctx.market_regime_shock_active,
+    }
+    return (
+        "modify",
+        modified,
+        f"Market Regime v2 {market} level={level} → "
+        f"entry size上限 {multiplier:.2f}x",
+    )
+
+
 def _rule_leverage_block(action: dict, ctx: PolicyContext):
     """
     leverage_status が warning/deleverage/emergency のときに新規信用建てを全 reject。
@@ -372,6 +433,7 @@ RULES: List[Rule] = [
     _rule_ledger_integrity,
     _rule_var_budget,
     _rule_dd_stage,
+    _rule_market_regime_size,
     _rule_leverage_block,
     _rule_earnings_blackout,
     _rule_cvar_unstable,
@@ -445,6 +507,31 @@ def _scale_size_field(raw, factor: float, *, unit: int = 1) -> Tuple[object, boo
 
 
 _SIZE_FIELDS = ("amount_hint", "shares", "quantity", "amount")
+_NOTIONAL_FIELDS = ("estimated_notional_jpy", "notional_jpy", "amount_jpy")
+
+
+def _numeric_ratio(before, after) -> Optional[float]:
+    """Return the actual size ratio after lot rounding, if both are numeric."""
+    def _extract(value):
+        if isinstance(value, bool) or value is None:
+            return None
+        if isinstance(value, (int, float)):
+            return float(value)
+        if not isinstance(value, str):
+            return None
+        match = re.search(r"[\d,]+(?:\.\d+)?", value)
+        if not match:
+            return None
+        try:
+            return float(match.group(0).replace(",", ""))
+        except ValueError:
+            return None
+
+    old_value = _extract(before)
+    new_value = _extract(after)
+    if old_value is None or new_value is None or old_value <= 0:
+        return None
+    return max(0.0, min(1.0, new_value / old_value))
 
 
 def _is_kabu_mini_cash_buy(action: dict) -> bool:
@@ -486,15 +573,35 @@ def _apply_size_adj(action: dict) -> Tuple[dict, Optional[str]]:
     out = dict(action)
     applied = {}
     collapsed_fields: List[str] = []
+    actual_ratios: List[float] = []
     for fld in _SIZE_FIELDS:
         if fld not in out:
             continue
-        new_val, collapsed = _scale_size_field(out[fld], factor, unit=unit)
-        if new_val != out[fld]:
-            applied[fld] = {"from": out[fld], "to": new_val}
+        old_val = out[fld]
+        new_val, collapsed = _scale_size_field(old_val, factor, unit=unit)
+        if new_val != old_val:
+            applied[fld] = {"from": old_val, "to": new_val}
             out[fld] = new_val
+            ratio = _numeric_ratio(old_val, new_val)
+            if ratio is not None:
+                actual_ratios.append(ratio)
         if collapsed:
             collapsed_fields.append(fld)
+    # Keep audit/funding notionals consistent with the final rounded quantity.
+    # The smallest observed ratio is conservative when multiple size fields
+    # have different lot-rounding effects.
+    effective_ratio = min(actual_ratios) if actual_ratios else factor
+    for fld in _NOTIONAL_FIELDS:
+        if fld not in out:
+            continue
+        try:
+            old_notional = float(out[fld])
+        except (TypeError, ValueError):
+            continue
+        new_notional = int(round(old_notional * effective_ratio))
+        if new_notional != out[fld]:
+            applied[fld] = {"from": out[fld], "to": new_notional}
+            out[fld] = new_notional
     if applied:
         out["policy_size_applied"] = applied
         out["policy_size_final"] = True  # 後段の単元丸めで増額しない印
@@ -632,6 +739,16 @@ def build_context_from_synthesis_inputs(
     macro = macro or {}
     leverage_health = leverage_health or {}
     portfolio_integrity = portfolio_integrity or {}
+    regime_v2 = (
+        macro.get("market_regime_v2")
+        if isinstance(macro.get("market_regime_v2"), dict)
+        else {}
+    )
+    regime_policy = (
+        regime_v2.get("policy")
+        if isinstance(regime_v2.get("policy"), dict)
+        else {}
+    )
 
     # VaR / DD の単位検出:
     #   コードベースの慣習として risk[*] は % 表示で保存される (例 0.8 = 0.8%)。
@@ -714,6 +831,19 @@ def build_context_from_synthesis_inputs(
         cvar_1d_95        = cvar_decimal,
         current_dd        = dd_decimal,
         vix               = (float(macro["vix"]) if macro.get("vix") is not None else None),
+        market_regime_mode = (
+            str(regime_v2.get("mode"))
+            if regime_v2.get("mode") is not None
+            and bool((regime_v2.get("portfolio") or {}).get("eligible"))
+            else None
+        ),
+        market_regime_levels = dict(regime_policy.get("market_levels") or {}),
+        market_regime_buy_multipliers = dict(
+            regime_policy.get("market_buy_size_multipliers") or {}
+        ),
+        market_regime_shock_active = bool(
+            (regime_v2.get("shock") or {}).get("active")
+        ),
         leverage_status   = (leverage_health.get("status") if isinstance(leverage_health, dict) else None),
         data_freshness    = freshness_score,
         cvar_unstable     = bool(risk.get("cvar_unstable", False)),

@@ -461,7 +461,9 @@ def gather_market_indicators() -> dict:
     FETCH_MAP = {
         "^VIX":     ("vix",          "恐怖指数"),
         "^TNX":     ("us10y_yield",  "米10年金利(%)"),
-        "^IRX":     ("us2y_yield",   "米2年金利(%)"),
+        # ^IRX is the 13-week Treasury rate, not the 2-year rate.  The true
+        # 2-year series is added from FRED:DGS2 below.
+        "^IRX":     ("us3m_yield",   "米3カ月金利(%)"),
         "DX-Y.NYB": ("dxy",          "ドル指数"),
         "CL=F":     ("crude_oil",    "原油(USD)"),
         "GC=F":     ("gold",         "金(USD)"),
@@ -471,23 +473,83 @@ def gather_market_indicators() -> dict:
     result: dict = {}
     for symbol, (key, label) in FETCH_MAP.items():
         try:
-            hist = yf.Ticker(symbol).history(period="5d")
+            hist = yf.Ticker(symbol).history(period="1mo")
             if hist.empty:
                 continue
             price = round(float(hist["Close"].iloc[-1]), 2)
             prev  = round(float(hist["Close"].iloc[-2]), 2) if len(hist) >= 2 else price
             chg   = round((price - prev) / prev * 100, 2) if prev else 0.0
             result[key] = {"value": price, "change_pct": chg, "label": label}
+            if key in {"us10y_yield", "us3m_yield"}:
+                for lookback in (5, 20):
+                    result[key][f"change_{lookback}d_bps"] = (
+                        round((price - float(hist["Close"].iloc[-1 - lookback])) * 100, 1)
+                        if len(hist) > lookback else None
+                    )
         except Exception:
             pass
 
-    y10 = result.get("us10y_yield", {}).get("value")
-    y2  = result.get("us2y_yield",  {}).get("value")
-    if y10 and y2:
-        result["yield_curve_spread"] = round(y10 - y2, 3)
+    macro_ctx: dict = {}
+    try:
+        from macro_fetcher import get_macro_context
+        macro_ctx = get_macro_context() or {}
+    except Exception:
+        macro_ctx = {}
+
+    def _fred_rate(key: str, label: str) -> None:
+        value = macro_ctx.get(key)
+        if value is None:
+            return
+        result[key] = {
+            "value": round(float(value), 3),
+            "label": label,
+            "source": (macro_ctx.get("series_provenance") or {}).get(key, {}).get(
+                "source", f"macro_state:{key}"
+            ),
+            "observation_date": (
+                (macro_ctx.get("series_provenance") or {}).get(key, {}).get(
+                    "observation_date"
+                )
+            ),
+        }
+
+    _fred_rate("yield_2y", "米2年金利(%)")
+    _fred_rate("real_yield_10y", "米10年実質金利(%)")
+    _fred_rate("breakeven_10y", "米10年期待インフレ率(%)")
+    if "yield_2y" in result:
+        result["us2y_yield"] = result["yield_2y"]
+    if "real_yield_10y" in result:
+        result["real10y_yield"] = result["real_yield_10y"]
+
+    y10_fred = macro_ctx.get("yield_10y")
+    y2_fred = macro_ctx.get("yield_2y")
+    y3m_fred = macro_ctx.get("yield_3m")
+    if y10_fred is not None and y2_fred is not None:
+        spread_10y2y = round(float(y10_fred) - float(y2_fred), 3)
+        result["yield_curve_spread_10y_2y"] = spread_10y2y
+        result["yield_curve_spread"] = spread_10y2y
         result["yield_curve_status"] = (
-            "逆イールド（景気後退シグナル）" if y10 < y2 else "正常"
+            f"逆イールド（10Y-2Y {spread_10y2y:+.3f}%）"
+            if spread_10y2y < 0
+            else f"正常（10Y-2Y {spread_10y2y:+.3f}%）"
         )
+    if y10_fred is not None and y3m_fred is not None:
+        spread_10y3m = round(float(y10_fred) - float(y3m_fred), 3)
+        result["yield_curve_spread_10y_3m"] = spread_10y3m
+        result["yield_curve_status_10y_3m"] = (
+            f"逆イールド（10Y-3M {spread_10y3m:+.3f}%）"
+            if spread_10y3m < 0
+            else f"正常（10Y-3M {spread_10y3m:+.3f}%）"
+        )
+    for field in (
+        "yield_10y_change_5d_bps",
+        "yield_10y_change_20d_bps",
+        "real_yield_10y_change_5d_bps",
+        "real_yield_10y_change_20d_bps",
+        "hy_oas_bps",
+    ):
+        if macro_ctx.get(field) is not None:
+            result[field] = macro_ctx[field]
 
     vix_val = result.get("vix", {}).get("value")
     if vix_val:
@@ -1915,14 +1977,23 @@ def gather_data() -> dict:
         market_meta = {
             "sp500_price": mm.get("sp500_price"),
             "sp500_ma50": mm.get("sp500_ma50"),
+            "sp500_ma200": mm.get("sp500_ma200"),
             "sp500_vs_ma50_pct": round(
                 (mm.get("sp500_price", 0) / mm.get("sp500_ma50", 1) - 1) * 100, 2
             ) if mm.get("sp500_ma50") else None,
+            "sp500_vs_ma200_pct": round(
+                (mm.get("sp500_price", 0) / mm.get("sp500_ma200", 1) - 1) * 100, 2
+            ) if mm.get("sp500_ma200") else None,
             "nikkei_price": mm.get("nikkei_price"),
             "nikkei_ma50": mm.get("nikkei_ma50"),
+            "nikkei_ma200": mm.get("nikkei_ma200"),
             "nikkei_vs_ma50_pct": round(
                 (mm.get("nikkei_price", 0) / mm.get("nikkei_ma50", 1) - 1) * 100, 2
             ) if mm.get("nikkei_ma50") else None,
+            "nikkei_vs_ma200_pct": round(
+                (mm.get("nikkei_price", 0) / mm.get("nikkei_ma200", 1) - 1) * 100, 2
+            ) if mm.get("nikkei_ma200") else None,
+            "breadth": mm.get("breadth") if isinstance(mm.get("breadth"), dict) else {},
             "meta_text": screen_meta_raw.get("meta_text", ""),
         }
 
@@ -1970,6 +2041,104 @@ def gather_data() -> dict:
 
     _exec.shutdown(wait=False, cancel_futures=True)  # ハングスレッドをバックグラウンドに解放
     print("  ✅ 市場データ取得完了")
+
+    # ── Stage 1C: multi-level Market Regime v2 ──────────────────────
+    # All external collection is complete before this deterministic
+    # classification.  The resulting dict is frozen into DecisionSnapshot by
+    # analyst.run_analysis, so tier, synthesis and policy consume one result.
+    market_regime_v2: dict = {}
+    try:
+        import hashlib as _regime_hashlib
+
+        from market_regime_v2 import (
+            apply_policy_to_legacy_scenario,
+            evaluate_and_record,
+        )
+
+        _macro_v2 = load_json(BASE_DIR / "macro_state.json", {})
+        _vix_v2 = load_json(BASE_DIR / "vix_state.json", {})
+        for _field in (
+            "vix",
+            "hy_oas_bps",
+            "yield_10y_change_5d_bps",
+            "yield_10y_change_20d_bps",
+            "real_yield_10y_change_5d_bps",
+            "real_yield_10y_change_20d_bps",
+            "yield_curve_spread_10y_3m",
+        ):
+            if market_meta.get(_field) is not None:
+                _macro_v2[_field] = market_meta.get(_field)
+        if isinstance(market_meta.get("real10y_yield"), dict):
+            _macro_v2["real_yield_10y"] = market_meta["real10y_yield"].get("value")
+        if (
+            _macro_v2.get("yield_spread_10y_3m") is None
+            and isinstance(_vix_v2.get("yields"), dict)
+        ):
+            _macro_v2["yield_spread_10y_3m"] = _vix_v2["yields"].get(
+                "spread_10y_3m"
+            )
+
+        _market_values = {"US": 0.0, "JP": 0.0}
+        for _position in positions:
+            if not isinstance(_position, dict):
+                continue
+            _ticker = str(_position.get("ticker") or "")
+            if not _ticker or _ticker.startswith("CASH_"):
+                continue
+            try:
+                _value_jpy = max(0.0, float(_position.get("value_jpy") or 0))
+            except (TypeError, ValueError):
+                continue
+            _market_values["JP" if _ticker.endswith(".T") else "US"] += _value_jpy
+
+        _regime_input_payload = {
+            "market_meta": market_meta,
+            "macro": _macro_v2,
+            "guard": guard,
+            "market_weights": _market_values,
+        }
+        _regime_input_hash = _regime_hashlib.sha256(
+            json.dumps(
+                _regime_input_payload,
+                sort_keys=True,
+                default=str,
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        market_regime_v2 = evaluate_and_record(
+            market_meta=market_meta,
+            macro=_macro_v2,
+            guard=guard,
+            vix_state=_vix_v2,
+            market_weights=_market_values,
+            input_snapshot_hash=_regime_input_hash,
+            now=now,
+            base_dir=BASE_DIR,
+        )
+        market_regime_v2["regime_input_hash"] = _regime_input_hash
+        scenario = apply_policy_to_legacy_scenario(scenario, market_regime_v2)
+        print(
+            "  🧭 Market Regime v2: "
+            f"US={market_regime_v2['markets']['US']['committed_label']} / "
+            f"JP={market_regime_v2['markets']['JP']['committed_label']} / "
+            f"portfolio={market_regime_v2['portfolio']['committed_label']} "
+            f"phase={market_regime_v2['portfolio']['phase']} "
+            f"applied={scenario.get('market_regime_v2_applied', False)}"
+        )
+    except Exception as _regime_v2_error:
+        market_regime_v2 = {
+            "mode": "advisory",
+            "status": "review",
+            "action_effect": "none",
+            "issues": [
+                f"market_regime_v2_error:{type(_regime_v2_error).__name__}"
+            ],
+        }
+        print(
+            "  ⚠️ Market Regime v2 unavailable; legacy scenario retained "
+            f"({_regime_v2_error})"
+        )
 
     # ── JP equity 比率 (持株会除外, 2026-07-07) ──
     # 持株会 (9999.T) は売買自由度が低く月次積立で自動増加するため、日本株
@@ -2033,6 +2202,7 @@ def gather_data() -> dict:
         "signals_generated_at": signals_generated_at,
         "screen_candidates": screen_candidates,
         "scenario": scenario,
+        "market_regime_v2": market_regime_v2,
         "regime": regime,
         "guard": guard,
         "margin": margin,
