@@ -225,6 +225,8 @@ def test_final_synthesis_prompt_exposes_cash_amounts():
 
     assert "現金残高（口座別・攻めモード判定の最重要入力）" in source
     assert "deployable_cash_to_target_jpy" in source
+    assert "protected_cash_reserve_jpy" in source
+    assert "all_system_cash_is_surplus" in source
     assert "具体的な金額は省略" not in source
 
 

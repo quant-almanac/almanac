@@ -1,6 +1,9 @@
 from copy import deepcopy
 
-from investment_policy import evaluate_concentration_policy
+from investment_policy import (
+    cash_deployment_policy,
+    evaluate_concentration_policy,
+)
 
 
 def _position(
@@ -98,3 +101,14 @@ def test_observation_does_not_mutate_input_positions():
     evaluate_concentration_policy(positions, portfolio_total_jpy=10_000_000)
 
     assert positions == original
+
+
+def test_all_confirmed_system_cash_is_surplus_but_operational_reservations_remain():
+    policy = cash_deployment_policy()
+
+    assert policy == {
+        "all_system_cash_is_surplus": True,
+        "protected_cash_reserve_jpy": 0,
+        "tactical_cash_retention_allowed": True,
+        "operational_reservations_still_required": True,
+    }

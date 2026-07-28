@@ -19,6 +19,23 @@ POSITION_CAPS_BY_TIER = {
     "swing": 0.02,
 }
 EMPLOYER_POSITION_CAP = 0.10
+PROTECTED_CASH_RESERVE_JPY = 0
+
+
+def cash_deployment_policy() -> dict:
+    """Return the explicit boundary between surplus and tactical cash.
+
+    Every confirmed cash balance loaded into this deployment belongs to the
+    investment portfolio. A market-regime target may still retain tactical
+    cash, and operational reservations such as open orders, settlement,
+    collateral and taxes remain unavailable for a new order.
+    """
+    return {
+        "all_system_cash_is_surplus": True,
+        "protected_cash_reserve_jpy": PROTECTED_CASH_RESERVE_JPY,
+        "tactical_cash_retention_allowed": True,
+        "operational_reservations_still_required": True,
+    }
 
 
 def evaluate_concentration_policy(
@@ -108,6 +125,7 @@ def evaluate_concentration_policy(
             **POSITION_CAPS_BY_TIER,
             "employer_stock": EMPLOYER_POSITION_CAP,
         },
+        "cash_deployment_policy": cash_deployment_policy(),
         "positions": rows,
         "breaches": breaches,
         "breach_count": len(breaches),

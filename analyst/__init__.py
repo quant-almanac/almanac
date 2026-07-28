@@ -3642,15 +3642,27 @@ def _synthesize(long_a: dict, medium_a: dict, short_positions_a: dict,
 
     _cash_ctx = dict(cash_info or {})
     try:
+        from investment_policy import cash_deployment_policy
+
+        _cash_policy = cash_deployment_policy()
         _total_cash = float(_cash_ctx.get("total_cash_jpy") or 0)
         _portfolio_total = float(portfolio_total or 0)
         _target_cash_pct = float(scenario.get("cash_ratio_target") or 0)
         _target_cash_jpy = _portfolio_total * _target_cash_pct / 100.0
+        _protected_cash_jpy = float(
+            _cash_policy.get("protected_cash_reserve_jpy") or 0
+        )
         _cash_ctx.update({
             "cash_ratio_pct": round(_total_cash / _portfolio_total * 100, 1) if _portfolio_total > 0 else None,
             "target_cash_pct": _target_cash_pct,
             "target_cash_jpy": round(_target_cash_jpy),
-            "deployable_cash_to_target_jpy": round(max(0.0, _total_cash - _target_cash_jpy)),
+            "protected_cash_reserve_jpy": round(_protected_cash_jpy),
+            "all_system_cash_is_surplus": bool(
+                _cash_policy.get("all_system_cash_is_surplus")
+            ),
+            "deployable_cash_to_target_jpy": round(
+                max(0.0, _total_cash - _target_cash_jpy - _protected_cash_jpy)
+            ),
         })
     except Exception:
         pass

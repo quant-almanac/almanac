@@ -16,6 +16,8 @@ The objective function is explicit and version-controlled ([`objective.md`](obje
 
 The checked-in default is not “every product is off.” It separates **always-on measurement** from **authority to change an action**: cash securities and non-leveraged funds are active; margin and short candidates are conditional on the safety gates; options are analysis signals only; half-Kelly sizing and FX hedging run in shadow; tax basis runs in comparison mode; and GINN is rejected unless a validated model has been promoted, falling back to GJR-GARCH. The execution-plan gate starts in observe mode, and none of these modes can place a broker order. The complete activation contract is in [`objective.md`](objective.md#8-機能商品の有効化契約).
 
+Every confirmed cash balance loaded into this deployment is treated as surplus investment capital; the protected lifestyle reserve inside ALMANAC is JPY 0. Market-regime rules may still retain tactical cash, and the zero reserve does not bypass the existing account, freshness, order-intent, settlement, tax, fee or collateral checks. Any household emergency reserve belongs outside the accounts represented here.
+
 > **Time-weighted return (TWR)** strips out the effect of deposits and withdrawals. Paying in on payday makes the account bigger without the investing having been any good; TWR removes that, so what is left reflects the decisions rather than the cash flow. Unfamiliar terms used below are collected in the [Glossary](#glossary).
 
 | Area | What it does |
