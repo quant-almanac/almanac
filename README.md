@@ -18,7 +18,7 @@ The objective function is explicit and version-controlled ([`objective.md`](obje
 
 | Area | What it does |
 |---|---|
-| **Portfolio & risk** | Black-Litterman optimization with LLM-generated views, GJR-GARCH volatility modeling, market-regime detection (bull / neutral / bear / crash), concentration and human-capital-exposure limits |
+| **Portfolio & risk** | Optional Black-Litterman optimization with independent alpha views, GJR-GARCH volatility modeling, market-regime detection (bull / neutral / bear / crash), concentration and human-capital-exposure limits |
 | **AI decision support** | Multi-model analysis (Claude + DeepSeek, cost-routed by task) for case-based decisions — trim, add, rebalance, tax-loss harvest — all gated by deterministic policy rules before anything reaches an order |
 | **Screening & signals** | Long-term JP/US fundamental screening, disclosure-driven catalyst detection (EDINET / TDnet / EDGAR filings), margin and short-sale candidate screening, insider-cluster and IPO tracking |
 | **Execution & guardrails** | Daily/monthly drawdown circuit breakers, VaR- and VIX-based trade blocking, an append-only event ledger plus reconciliation checks for an audit trail, open-order-aware position sizing |
@@ -53,7 +53,7 @@ flowchart TD
     C --> C2["Margin-long / Short-sell<br/>DeepSeek V4 Pro"]
     C1 --> D["Red Team<br/>Claude Haiku · DeepSeek · Groq · Gemini · Qwen"]
     C2 --> D
-    D --> E["Disagreement score<br/>+ Black-Litterman views"]
+    D --> E["Disagreement score<br/>+ optional independent Black-Litterman views"]
     E --> F["Optional judge<br/>DeepSeek-R1"]
     F --> G["Final synthesis<br/>Claude Opus"]
     G --> H["Deterministic post-processing<br/>routing · size · limit context"]
@@ -67,6 +67,8 @@ Each stage exists for a reason:
 
 **Freshness first.** Every input the gate depends on — the macro-event calendar, technical state, VIX, earnings proximity, scenario snapshot — is checked *before* analysis starts and refreshed when its own staleness rule requires it. A stale calendar would otherwise be silently read as "no important events coming up," which is the difference between an earnings blackout firing and not firing. Refresh failures are printed rather than swallowed, and the readiness gate treats a missing calendar as `review`, not as "clear."
 
+The analysis then freezes a two-stage **decision snapshot**. The base snapshot contains holdings, cash, prices, FX, macro, news and screening data; after the held and candidate tickers are known, an enriched snapshot adds their chart and options payloads. Every tier and the final synthesis receive the same content hash, source timestamps and payload hashes, and external re-fetches are forbidden after the enriched snapshot is sealed. A separate execution-quote snapshot may refresh price, spread and market status just before an order, but it may only reprice or downgrade an action—not rewrite the investment thesis or confidence.
+
 **Five specialists, not one generalist.** The portfolio is split by holding intent — long-term core, medium-term, swing — plus two credit-side lanes (margin-long, short-sell). Each gets its own analysis with its own prompt and its own risk vocabulary. They run in parallel with a per-call timeout, and a tier that times out degrades that lane rather than failing the whole run.
 
 **Adversarial review.** The tier outputs go to a Red Team of *different* model families whose job is to attack the reasoning. A Claude Haiku leg can use book-aware context; the external legs use only public or anonymized material and may run through DeepSeek, Groq, Gemini, and Qwen when their keys are configured. Using different vendors is deliberate — models from the same family tend to share blind spots. A disagreement score between agents is computed and carried forward, so downstream stages can see where the analysts diverged instead of only seeing a merged consensus.
@@ -77,7 +79,7 @@ The normal path forces the model to answer through a declared tool, so what come
 
 On top of that, **a response truncated by the token limit is rejected outright** rather than accepted as a partial answer, so a half-finished list is never mistaken for a conclusion.
 
-**Context before synthesis, execution detail after.** News, catalyst, chart, and options context can be gathered before or during synthesis when it can affect the judgment. After structured proposals come back, deterministic code adds routing, size, and limit-price context before the policy gate.
+**Decision context is frozen before the tier models; execution detail comes after.** News, catalyst, chart and options inputs that can affect judgment are collected into the enriched decision snapshot before any tier LLM is called. After structured proposals come back, deterministic code adds routing, sizing and limit-price context before the policy gate. Every sourced claim carries either external provenance (URL and publication/observation/retrieval times), snapshot provenance, or derived provenance linking it to input claim IDs and a calculation version. Missing or unverifiable provenance downgrades an action to review.
 
 ### 2. What runs when
 
@@ -335,11 +337,11 @@ Allocation runs through [PyPortfolioOpt](https://github.com/robertmartin8/PyPort
 
 **Black-Litterman (Optional)** — runs only when explicitly selected.
 
-There is a design failure here, and a correction that is **not finished**. Originally the Sonnet tier's (action, urgency) output was mapped to expected returns and injected straight in as views: the same model's subjective confidence, dressed up as a number and handed back to itself. A review called it *confidence laundering*.
+There was a design failure here. Originally the Sonnet tier's (action, urgency) output was mapped to expected returns and injected straight in as views: the same model's subjective confidence, dressed up as a number and handed back to itself. A review called it *confidence laundering*.
 
-`bl_alpha_sources.py` implements three alpha sources independent of the LLM — analyst consensus, momentum, factor beta. **They are not on by default.** `BL_USE_INDEPENDENT_ALPHA` defaults to `"0"`, meaning LLM-derived views only (a backward-compatible mode that down-weights them with a large Ω); `"1"` uses independent sources alone, `"mix"` combines them.
+`bl_alpha_sources.py` implements three sources independent of the tier LLM output — analyst consensus, momentum and factor beta. **They are not on by default.** `BL_USE_INDEPENDENT_ALPHA` defaults to `"0"`; in that mode the tier-derived values remain in `bl_views.json` only as an audit artifact and are excluded from both the final Opus prompt and Black-Litterman optimization. `"1"` uses independent sources alone; `"mix"` may retain tier-derived rows in the artifact, but only rows marked `is_independent=true` are consumed.
 
-So the default path today **is still the structure the review objected to.** The alternative exists; it is not the default.
+The same lineage is never counted twice. When `independent_count=0`, no Black-Litterman corroboration block is added to the final prompt and the optimizer falls back to its market prior rather than recycling the previous LLM output.
 
 ### Measuring risk
 
@@ -360,11 +362,13 @@ The second term penalises divergence from the GARCH estimate. **It cannot be cla
 
 Runtime use is fail-closed. A legacy model without validation metadata, or a candidate that fails the predeclared validation thresholds, is rejected and the forecast falls back to GJR-GARCH. The model name carried into tier artifacts, the Today API and the dashboard is the model actually used—not an unconditional “GINN” label. This safety gate does not make the research model validated; it prevents an unvalidated model from entering decisions.
 
+Training writes a versioned candidate bundle (`model.pt` plus a manifest), but current candidates are deliberately non-promotable: training uses per-ticker normalisation statistics while inference cannot yet load and route the same scaler artifact. The central gate therefore reports `inference_contract_incomplete` and keeps GJR-GARCH active. Model and manifest checksums are both verified before a bundle can be read. Rolling-origin walk-forward validation and post-promotion forward measurement are also not implemented yet; their manifest fields remain empty and must not be read as final out-of-sample evidence.
+
 **Risk is computed on current holdings, not the NAV series.** That series is short and older accounting bugs contaminated part of it, so `portfolio_risk_returns.py` reconstructs daily returns by applying today's weights to historical prices.
 
 **The VaR model is validated.** `risk_model_validation.py` stores each day's forecast and runs a **Kupiec proportion-of-failures test** — do breaches of the 95% VaR occur about 5% of the time? It covers the Cornish-Fisher VaR built from clean daily P&L, not the risk stack as a whole.
 
-### Sizing (Unwired)
+### Sizing (Shadow only)
 
 `kelly_sizing.py` proposes sizes at **half-Kelly**:
 
@@ -372,7 +376,7 @@ Runtime use is fail-closed. A legacy model without validation metadata, or a can
 kelly = 0.5 × (p·b − q) / b     p = win rate, b = average win ÷ average loss
 ```
 
-p and b come per-ticker from the graded record of past recommendations (§11), requiring at least five observations. **Its only callers are the CLI and tests** — it does not size real orders.
+p and b come from graded **buy/add/DCA recommendation signals**, not executed trades. Duplicate recommendations from the same analysis are removed, statistics are separated into 5-, 20- and 60-business-day horizons, and at least 20 observations are required for the requested horizon. A counterfactual shadow path applies the cap before the same policy rules and records what would have changed; it never mutates the real action, action state, execution plan or notifications. Signal statistics remain ticker/direction/horizon scoped, while the current holding used for sizing is resolved by owner + broker + account + instrument. Missing identity or an unproven zero holding makes the shadow cap unobservable rather than assuming zero.
 
 ### Adding on the way down
 
@@ -388,13 +392,13 @@ T3 is not a combination of T1 and T2; it is a distinct capitulation-reversal con
 
 All tranches additionally pass sector-breadth, volume, a five-day cooldown, an annual budget cap (15% of net worth) and per-currency cash checks.
 
-### Currency (Unwired)
+### Currency (Components and shadow only)
 
 `fx_hedge_manager.py` computes a target hedge ratio between **0 and 70%** from regime, VIX, implied volatility and the USDJPY level, clamping change from the previous target to **±10 points** to prevent whipsaw.
 
-**It is not wired into the decision pipeline** — it is a standalone CLI. USDJPY momentum is passed in but does not materially affect the computed ratio.
+The hedge manager and economic-exposure resolver are wired into the analysis run as an **observation-only shadow lane**, not into action sizing or order creation. Hedge targets can run only in `off`, `shadow` or `advisory`; shadow state is separate from actual holdings and is not advanced when product classification or broker-reconciled hedge notional is missing. The older AI 58/42-style currency-allocation recommendation is also observation-only: rebalance continues to receive the static target until look-through economic exposure and broker-reconciled hedge notional are authoritative. Listing currency alone is never treated as economic currency.
 
-Specific instrument codes are omitted here because the classification in the code itself is wrong.
+Specific instrument codes are intentionally omitted here because product classifications can change and must be checked against issuer or exchange material; the code records the source and confirmation date for each classified instrument.
 
 ### Tax
 
@@ -403,6 +407,8 @@ Specific instrument codes are omitted here because the classification in the cod
 **The authoritative cost basis is the broker's and the tax authority's calculation** — for partial sales of the same security, Japan uses a weighted-average-based method. The internal lot view is not treated as establishing cost basis for tax.
 
 `tax_harvest_scanner.py` runs on a schedule and surfaces loss-harvest candidates for a human to act on. `tax_optimizer.py` covers NISA headroom and foreign tax credit simulation.
+
+The API uses a mode-independent v2 schema separating economic, taxable and NISA realised P&L. A `legacy|compare|total_average` flag changes the calculation source, not the response shape. The total-average-like path is account-level and fail-closed on missing FX or incomplete history; until owner-and-broker scope and broker reconciliation are complete, it remains comparison/advisory data and specific-lot selection is not actionable.
 
 NISA migration candidates keep owner, broker, account and instrument identity together. Missing identity data makes the plan non-actionable, and positions or tax lots with the same ticker at different brokers are not combined. The endpoint is advisory and human-execution-only.
 
@@ -457,9 +463,9 @@ Reading requires no API key. Authentication applies only to writes — recording
 
 ### Tests
 
-At this snapshot, pytest collects **2,706 tests across 202 files** (`pytest tests/ -q --collect-only` is the authoritative count).
+At this snapshot, pytest collects **2,923 tests across 213 `test_*.py` files**. The count basis is `pytest tests/ -q --collect-only` for cases and `find tests -type f -name 'test_*.py'` for files.
 
-The composition matters more than the count: **13 files are named for the invariant they hold down** — safety, gating, policy, guard, integrity, privacy. A sample:
+The composition matters more than the count: **14 files are named for the invariant they hold down** — specifically, filenames containing `safety`, `gating`, `policy`, `guard`, `integrity`, or `privacy`. A sample:
 
 | File | What it protects |
 |---|---|
@@ -496,10 +502,14 @@ Terms used above, for readers who don't work in finance or haven't seen the hous
 | **Modified Dietz** | An approximation of TWR: cash flows during the period are weighted by when they landed |
 | **VaR (value at risk)** | A one-day loss threshold estimated to be exceeded on roughly 5% of modeled days; it is not a maximum-loss guarantee |
 | **CVaR** | The average loss *given* that you have already blown through VaR — the mean of the worst cases |
+| **Expected Shortfall** | Another name for CVaR: the average loss inside the tail beyond the VaR threshold |
 | **Drawdown** | How far below its previous peak the portfolio currently sits |
 | **VIX** | The market's expectation of near-term US equity volatility. Higher means a more unstable market |
-| **Black-Litterman** | A way to combine the market's implied view with your own views to produce allocations. Here, the views come from the LLM analysis |
+| **Black-Litterman** | A way to combine the market's implied view with additional return views. ALMANAC consumes only rows marked as independent; tier-LLM-derived rows are audit-only |
 | **GJR-GARCH** | A volatility model that allows downside moves to raise expected volatility more than upside moves — the asymmetry real markets show |
+| **GINN** | A research neural network whose volatility forecast is trained both on realised moves and on a GARCH estimate; ALMANAC keeps it out of decisions until its validation and inference contracts are complete |
+| **LSTM** | A neural-network layer designed for sequences, so earlier observations can influence a later forecast |
+| **Softplus** | A smooth output transformation that keeps a predicted volatility above zero |
 | **Regime** | Which state the market is in (bull / neutral / bear / crash). The same action can be reasonable in one and reckless in another |
 | **DCA** | Buying in scheduled instalments instead of all at once |
 | **NISA** | Japan's tax-exempt investment allowance. It is capped, so the remaining headroom has to be tracked |
@@ -515,9 +525,11 @@ Terms used above, for readers who don't work in finance or haven't seen the hous
 | **Cornish-Fisher** | A correction to VaR. Plain VaR assumes returns are normal; this adjusts the quantile using skewness and kurtosis so the real fat tail is not understated |
 | **Kupiec POF test** | A statistical test of whether a VaR model is honest — do breaches of the 95% VaR actually happen about 5% of the time? |
 | **Half-Kelly** | Half the theoretically growth-optimal bet size. Full Kelly is correct in theory and too violent in practice |
+| **Shadow execution** | Running a proposed rule beside the live path and recording the counterfactual result without changing actions, orders, notifications or production state |
 | **HMM (hidden Markov model)** | Infers a state you cannot observe directly — here, which market regime you are in — from data you can |
 | **Walk-forward optimisation** | Fit on one window, validate on the next, repeat. Avoids the overfitting you get from tuning on the whole history at once |
 | **Alpha / beta** | Beta is the return that came from moving with the market; alpha is what is left over. It separates the market's work from yours |
+| **OLS regression** | Ordinary least squares: the straight-line fit used here to estimate factor exposures and the unexplained residual |
 | **HY spread** | The yield gap between high-yield corporate bonds and government bonds. It widens when credit stress rises |
 
 ## Architecture

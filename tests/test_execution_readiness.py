@@ -113,6 +113,7 @@ def test_wife_sbi_estimated_cash_is_not_buying_power(tmp_path):
         "limit_price": 3_382,
         "execution_owner": "wife",
         "execution_broker": "sbi",
+        "execution_account": "NISA成長投資枠",
     }, base_dir=tmp_path)
 
     assert result["readiness"] == "blocked"
@@ -138,11 +139,72 @@ def test_confirmed_wife_sbi_cash_must_cover_requested_notional(tmp_path):
         "limit_price": 3_382,
         "execution_owner": "wife",
         "execution_broker": "sbi",
+        "execution_account": "NISA成長投資枠",
     }, base_dir=tmp_path)
 
     assert result["readiness"] == "blocked"
     assert result["reasons"][0]["code"] == "cash_balance_insufficient"
     assert result["reasons"][0]["requested_cash"] == 67_640
+
+
+def test_cash_buy_requires_complete_account_resource_identity(tmp_path):
+    result = evaluate_cash_buying_power({
+        "ticker": "1489.T",
+        "type": "buy",
+        "quantity": 1,
+        "limit_price": 3_000,
+        "execution_owner": "wife",
+        "execution_broker": "sbi",
+    }, base_dir=tmp_path)
+
+    assert result["readiness"] == "blocked"
+    assert result["reasons"][0]["code"] == "cash_resource_identity_missing"
+
+
+def test_cash_buy_requires_fresh_identity_scoped_balance(tmp_path):
+    now = datetime(2026, 7, 28, 9, 0, tzinfo=JST)
+    action = {
+        "ticker": "1489.T",
+        "type": "buy",
+        "quantity": 1,
+        "limit_price": 3_000,
+        "execution_owner": "wife",
+        "execution_broker": "sbi",
+        "execution_account": "NISA成長投資枠",
+    }
+    row = {
+        "ticker": "CASH_JPY_SBI_WIFE",
+        "shares": 50_000,
+        "currency": "JPY",
+        "balance_status": "confirmed",
+        "reconciliation_required": False,
+    }
+    (tmp_path / "holdings.json").write_text(json.dumps({
+        "CASH_JPY_SBI_WIFE": row,
+    }), encoding="utf-8")
+
+    unknown = evaluate_cash_buying_power(action, base_dir=tmp_path, now=now)
+    assert unknown["readiness"] == "blocked"
+    assert unknown["reasons"][0]["code"] == "cash_resource_freshness_unknown"
+
+    row["broker_reconciled_at"] = "2026-07-24T09:00:00+09:00"
+    (tmp_path / "holdings.json").write_text(json.dumps({
+        "CASH_JPY_SBI_WIFE": row,
+    }), encoding="utf-8")
+    stale = evaluate_cash_buying_power(action, base_dir=tmp_path, now=now)
+    assert stale["readiness"] == "blocked"
+    assert stale["reasons"][0]["code"] == "cash_resource_stale"
+
+    row["broker_reconciled_at"] = "2026-07-28T08:00:00+09:00"
+    (tmp_path / "holdings.json").write_text(json.dumps({
+        "CASH_JPY_SBI_WIFE": row,
+    }), encoding="utf-8")
+    fresh = evaluate_cash_buying_power(action, base_dir=tmp_path, now=now)
+    assert fresh["readiness"] == "ready"
+    assert (
+        fresh["account_resource_identity"]
+        == "wife|sbi|nisa_growth|JPY|cash"
+    )
 
 
 def test_exit_quantity_over_requested_account_inventory_is_blocked(tmp_path):
@@ -244,7 +306,8 @@ def test_exit_route_text_matching_specific_account_stays_ready(tmp_path):
         "limit_price": 410.5,
     }, base_dir=tmp_path, now=now)
 
-    assert result["execution_readiness"] == "ready"
+    assert result["execution_readiness"] == "review"
+    assert any(row["code"] == "position_identity_unknown" for row in result["execution_block_reasons"])
     assert "execution_route_text_conflict" not in {
         row["code"] for row in result["execution_block_reasons"]
     }
@@ -266,7 +329,8 @@ def test_exit_route_without_account_words_does_not_false_positive(tmp_path):
         "limit_price": 410.5,
     }, base_dir=tmp_path, now=now)
 
-    assert result["execution_readiness"] == "ready"
+    assert result["execution_readiness"] == "review"
+    assert any(row["code"] == "position_identity_unknown" for row in result["execution_block_reasons"])
 
 
 def test_nonexistent_nisa_holding_claim_is_blocked(tmp_path):
@@ -398,8 +462,19 @@ def test_unadjusted_price_series_blocks_buy(tmp_path):
 def test_execution_plan_would_filter_is_review_not_ready(tmp_path):
     now = datetime(2026, 7, 14, 6, 0, tzinfo=JST)
     _write_base(tmp_path, now)
+    (tmp_path / "account.json").write_text(json.dumps({
+        "last_updated": now.isoformat(), "usd_balance": 10_000,
+    }), encoding="utf-8")
+    (tmp_path / "holdings.json").write_text(json.dumps({
+        "XLF_fixture": {
+            "ticker": "XLF", "owner": "husband", "broker": "楽天証券",
+            "account": "一般", "note": "楽天CSV保有同期 2026-07-14",
+        },
+    }), encoding="utf-8")
     result = classify_execution_readiness({
         "ticker": "XLF", "type": "buy", "order_type": "limit", "limit_price": 55,
+        "quantity": 1, "execution_owner": "husband",
+        "execution_broker": "rakuten", "execution_account": "一般",
         "execution_plan_would_filter": True,
     }, base_dir=tmp_path, now=now)
     assert result["execution_readiness"] == "review"
@@ -577,7 +652,6 @@ def test_date_only_snapshot_timestamp_uses_file_mtime(tmp_path):
         "ticker": "XLF", "type": "buy", "order_type": "limit", "limit_price": 56,
     }, base_dir=tmp_path, now=now)
 
-    assert result["execution_readiness"] == "ready"
     assert not any(
         row["code"].startswith("portfolio_snapshot_")
         for row in result["execution_block_reasons"]
@@ -632,7 +706,8 @@ def test_nyse_sunday_morning_plan_waits_for_same_jst_day_open_without_blocking(t
         "amount_hint": "1株", "holding_shares_before": 10, "requested_sell_quantity": 1,
     }, base_dir=tmp_path, now=now)
 
-    assert result["execution_readiness"] == "ready"
+    assert result["execution_readiness"] == "review"
+    assert any(row["code"] == "position_identity_unknown" for row in result["execution_block_reasons"])
     assert result["market_quote_confirmation_required"] is True
     assert result["expiry_starts_at"] == "2026-07-20T13:30:00+00:00"
     assert result["market_session"]["next_session_date"] == "2026-07-20"
@@ -652,7 +727,8 @@ def test_nyse_after_close_plan_remains_ready_and_ttl_starts_at_next_open(tmp_pat
         "amount_hint": "1株", "holding_shares_before": 10, "requested_sell_quantity": 1,
     }, base_dir=tmp_path, now=now)
 
-    assert result["execution_readiness"] == "ready"
+    assert result["execution_readiness"] == "review"
+    assert any(row["code"] == "position_identity_unknown" for row in result["execution_block_reasons"])
     assert result["market_session"]["status"] == "trading_day"
     assert result["market_session"]["reason"] == "after_regular_session"
     assert result["market_session"]["next_session_date"] == "2026-07-21"
@@ -669,7 +745,8 @@ def test_jpx_preopen_plan_is_ready_for_commute_order(tmp_path):
         "amount_hint": "1口", "holding_shares_before": 10, "requested_sell_quantity": 1,
     }, base_dir=tmp_path, now=now)
 
-    assert result["execution_readiness"] == "ready"
+    assert result["execution_readiness"] == "review"
+    assert any(row["code"] == "position_identity_unknown" for row in result["execution_block_reasons"])
     assert result["market_order_window"] == "before_regular_session"
     assert result["expiry_starts_at"] == "2026-07-21T00:00:00+00:00"
     assert result["expiry_ends_at"] == "2026-07-21T06:30:00+00:00"
@@ -725,3 +802,26 @@ def test_replay_2026_07_14_keeps_4063_and_robo_off_the_execution_board(tmp_path)
     assert "market_order_low_urgency" in codes_4063
     assert "market_order_spread_too_wide" in codes_robo
     assert sum(row["execution_readiness"] == "ready" for row in rows) == 0
+
+
+def test_unverified_claim_provenance_downgrades_ready_action_to_review(tmp_path):
+    now = datetime(2026, 7, 21, 6, 15, tzinfo=JST)
+    _write_base(tmp_path, now, ticker="1489.T")
+    result = classify_execution_readiness({
+        "ticker": "1489.T",
+        "type": "sell",
+        "order_type": "limit",
+        "limit_price": 2_950,
+        "amount_hint": "1口",
+        "holding_shares_before": 10,
+        "requested_sell_quantity": 1,
+        "confidence_evidence_verified": False,
+        "claim_ids": ["snapshot:action:1"],
+        "unverified_numeric_claims": ["利上げ確率35.8%"],
+    }, base_dir=tmp_path, now=now)
+    assert result["execution_readiness"] == "review"
+    reason = next(
+        row for row in result["execution_block_reasons"]
+        if row["code"] == "claim_provenance_unverified"
+    )
+    assert reason["claim_ids"] == ["snapshot:action:1"]

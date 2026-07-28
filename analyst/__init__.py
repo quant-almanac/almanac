@@ -205,6 +205,38 @@ def _collect_priority_tickers(*tier_analyses, positions_raw=None, max_tickers: i
     return ordered[:max_tickers]
 
 
+def _collect_snapshot_tickers(data: dict, max_tickers: int = 30) -> list[str]:
+    """Collect the deterministic pre-tier market-data universe."""
+    seen: set[str] = set()
+    ordered: list[str] = []
+
+    def _push(value) -> None:
+        ticker = str(value or "").strip()
+        if not ticker or ticker in seen or is_pseudo_market_ticker(ticker):
+            return
+        seen.add(ticker)
+        ordered.append(ticker)
+
+    for row in data.get("positions") or []:
+        if isinstance(row, dict):
+            _push(row.get("ticker"))
+    for row in data.get("screen_candidates") or []:
+        if isinstance(row, dict):
+            _push(row.get("ticker"))
+    screening = data.get("screening") or {}
+    for key in (
+        "short_candidates", "margin_long_candidates", "jp_screen_candidates",
+        "long_term_candidates",
+    ):
+        for row in screening.get(key) or []:
+            if isinstance(row, dict):
+                _push(row.get("ticker"))
+    for row in data.get("pending_orders") or []:
+        if isinstance(row, dict):
+            _push(row.get("ticker"))
+    return ordered[:max_tickers]
+
+
 # ── tunable_params 制約コンテキスト（AI に目標値・上限を伝達）──
 
 def _fmt_tunable_limits_context() -> str:
@@ -285,6 +317,20 @@ def _fmt_tunable_limits_context() -> str:
 
 # ── 税務・NISA・持株会コンテキスト整形 ──────────────────────
 
+def _loss_harvest_verification_tag(candidate: dict) -> str:
+    """損出し候補の表示額が台帳由来の取得原価と突合済みかを短く示す。
+
+    候補選定や金額自体は変更せず、AI が未確認額を確定値として扱わない
+    ようにするための Stage 5C の表示契約。
+    """
+    crosscheck = candidate.get("cost_basis_crosscheck") or {}
+    if not crosscheck.get("available"):
+        return "台帳未確認"
+    if crosscheck.get("data_quality_issues"):
+        return "台帳確認済・品質懸念あり"
+    return "台帳確認済"
+
+
 def _fmt_tax_context(data: dict) -> str:
     """税務・NISA・持株会の状況をプロンプト用テキストに整形する"""
     lines = []
@@ -316,7 +362,10 @@ def _fmt_tax_context(data: dict) -> str:
             deadline_note = f"（期限まで{days}日）" if days >= 0 else ""
             lines.append(
                 f"損出し候補{deadline_note}: {len(candidates)}銘柄 / 節税効果¥{saving:,.0f} "
-                + " | ".join(f"{c['ticker']}({c['unrealized_jpy']:,.0f}円)" for c in candidates[:3])
+                + " | ".join(
+                    f"{c['ticker']}({c['unrealized_jpy']:,.0f}円・{_loss_harvest_verification_tag(c)})"
+                    for c in candidates[:3]
+                )
             )
         elif not candidates:
             lines.append("損出し候補: なし（含み損銘柄なし）")
@@ -512,6 +561,8 @@ def _extract_bl_views(long_a: dict, medium_a: dict, short_a: dict, vix: float = 
             "n_signals":  n_signals,
             "avg_confidence": round(sum(conf_list) / len(conf_list), 1) if conf_list else None,
             "evidence_lineage_ids": lineages,
+            "source_kind": "llm_consensus",
+            "is_independent": False,
         }
 
     # P2-27: BL_USE_INDEPENDENT_ALPHA で LLM 由来 view を独立 source に差し替え/混合する。
@@ -526,6 +577,11 @@ def _extract_bl_views(long_a: dict, medium_a: dict, short_a: dict, vix: float = 
         try:
             from bl_alpha_sources import compute_independent_views
             indep = compute_independent_views(tickers=list(views_output.keys()) or [])
+            indep = {
+                ticker: {**view, "is_independent": True}
+                for ticker, view in indep.items()
+                if isinstance(view, dict)
+            }
             independent_count = len(indep)
             if bl_mode == "mix":
                 # independent 優先、LLM は欠落を補完
@@ -3364,20 +3420,19 @@ def _load_bl_views_for_opus() -> str:
         if not views:
             return ""
         independent_count = views_root.get("independent_count", 0) or 0
-        if independent_count:
-            lines = ["【Black-Litterman LLMビュー（定量モデル期待リターン、独立alpha源を含む）】"]
-        else:
-            lines = ["【ティア分析ビュー（Long/Medium/Short合成、独立検証なし・参考情報）】"]
+        if not independent_count:
+            # tier 本文は既に Opus へ直接渡している。同じ出力を数値へ写像して
+            # 再注入すると、名称を変えても confidence laundering になる。
+            return ""
+        lines = ["【Black-Littermanビュー（独立alpha源のみ）】"]
         for ticker, v in list(views.items())[:10]:  # top 10
             if not isinstance(v, dict):
                 continue
+            if v.get("is_independent") is not True:
+                continue
             mean_pct = round(v.get("mean_view", 0) * 100, 1)
-            if independent_count:
-                lines.append(f"  {ticker}: 期待リターン {mean_pct:+.1f}%（Ω={v.get('variance',0):.4f}）")
-            else:
-                n_lineages = len(v.get("evidence_lineage_ids") or []) or v.get("n_signals", 0)
-                lines.append(f"  {ticker}: 期待リターン {mean_pct:+.1f}%（{n_lineages}/3ティア一致、独立検証なし）")
-        return "\n".join(lines)
+            lines.append(f"  {ticker}: 期待リターン {mean_pct:+.1f}%（Ω={v.get('variance',0):.4f}）")
+        return "\n".join(lines) if len(lines) > 1 else ""
     except Exception:
         return ""
 
@@ -3469,13 +3524,22 @@ def _synthesize(long_a: dict, medium_a: dict, short_positions_a: dict,
                 currency_breakdown_whole: dict | None = None,
                 currency_breakdown_long: dict | None = None,
                 current_currency_policy: dict | None = None,
-                decision_snapshot_id: str | None = None) -> dict:
+                decision_snapshot_id: str | None = None,
+                decision_snapshot_hash: str | None = None,
+                decision_enriched_snapshot=None,
+                decision_snapshot_issues: list[dict] | None = None,
+                frozen_chart_map: dict | None = None,
+                frozen_options_map: dict | None = None,
+                frozen_web_news: str = "",
+                frozen_catalyst_context: str = "",
+                frozen_beliefs_context: str = "") -> dict:
 
     market_news_text = fmt_news_section(news)
     earnings_text = fmt_earnings_section(earnings)
 
-    print("🌐 Web検索で最新市場ニュース取得中…")
-    web_news = fetch_web_search_news()
+    # Stage 1B: external/context inputs are acquired once before the first tier
+    # call.  Synthesis must not create a second, later market view.
+    web_news = frozen_web_news
 
     history_text = load_history_context()
     today = datetime.now().strftime("%Y-%m-%d（%A）")
@@ -3490,8 +3554,8 @@ def _synthesize(long_a: dict, medium_a: dict, short_positions_a: dict,
 
     # BLビュー・投資信念コンテキスト（Opus用）
     bl_context = _load_bl_views_for_opus()
-    catalyst_ctx = _load_catalyst_context_for_opus(scenario)
-    beliefs_ctx = _format_beliefs_context(_load_beliefs())
+    catalyst_ctx = frozen_catalyst_context
+    beliefs_ctx = frozen_beliefs_context
     # v5.1: 執行品質コンテキスト（Implementation Shortfall 学習）
     exec_quality_ctx = _format_execution_quality_for_prompt(_load_execution_quality_summary())
     agent_reliability_ctx = _format_agent_reliability_for_prompt()
@@ -3543,62 +3607,25 @@ def _synthesize(long_a: dict, medium_a: dict, short_positions_a: dict,
     # v5.1: チャート派生指標（指値判断・No-Trade判定用） + オプション市場センチメント
     chart_ctx_block = ""
     options_ctx_block = ""
-    _chart_map: dict[str, dict] = {}
-    _opt_map: dict[str, dict] = {}
-    if _gather_chart_context and _format_chart_for_prompt:
-        try:
-            _target_tickers = _collect_priority_tickers(
-                long_a, medium_a, short_positions_a, margin_long_a, short_selling_a,
-                positions_raw=positions_raw,
-                max_tickers=30,
-            )
-            if _target_tickers:
-                print(f"📊 chart_analyzer: {len(_target_tickers)} ticker の指値文脈を構築…")
-                _chart_map = _gather_chart_context(_target_tickers, intraday=True, max_tickers=30)
-                chart_ctx_block = _format_chart_for_prompt(_chart_map)
-                # Phase 3: オプションシグナルも同じターゲットセットで取得（24h キャッシュ活用）
-                if _get_option_signals and _format_options_for_prompt:
-                    try:
-                        # SPY を必ず混ぜる（指数レベルの過熱判定用）
-                        _opt_targets = ["SPY"] + [t for t in _target_tickers if t != "SPY"][:14]
-                        print(f"📊 options_fetcher: {len(_opt_targets)} ticker のオプションシグナル取得…")
-                        _opt_map = _get_option_signals(_opt_targets, max_n=15)
-                        options_ctx_block = _format_options_for_prompt(_opt_map)
-                    except Exception as _oe:
-                        print(f"⚠️ options_fetcher エラー: {_oe}")
-        except Exception as _ce:
-            print(f"⚠️ chart_analyzer エラー: {_ce}")
+    _chart_map: dict[str, dict] = dict(frozen_chart_map or {})
+    _opt_map: dict[str, dict] = dict(frozen_options_map or {})
+    if _chart_map and _format_chart_for_prompt:
+        chart_ctx_block = _format_chart_for_prompt(_chart_map)
+    if _opt_map and _format_options_for_prompt:
+        options_ctx_block = _format_options_for_prompt(_opt_map)
 
-    # Stage 1B: enriched_snapshot (base + オプション) を Opus 呼び出し直前に確定する。
-    # tier 段階の decision_snapshot と同じ decision_snapshot_id・別 stage="synthesis"
-    # で凍結し、tier→synthesis 間で入力がどう変わったかを事後追跡できるようにする。
-    # 監査目的の副作用であり、失敗しても synthesis 自体は止めない (fail-open)。
     if decision_snapshot_id:
-        try:
-            from analysis_snapshot import build_base_snapshot, build_enriched_snapshot, freeze_decision_snapshot
-            import model_router as _model_router
-            _synth_base = build_base_snapshot(base_dir=BASE_DIR)
-            _synth_enriched = build_enriched_snapshot(_synth_base, options_by_ticker_raw=_opt_map)
-            _synth_code_revision = None
-            try:
-                import subprocess as _synth_sp
-                _synth_rev = _synth_sp.run(
-                    ["git", "rev-parse", "HEAD"], cwd=BASE_DIR,
-                    capture_output=True, text=True, timeout=5,
-                )
-                _synth_code_revision = _synth_rev.stdout.strip() or None
-            except Exception:
-                pass
-            freeze_decision_snapshot(
-                _synth_enriched,
-                decision_snapshot_id=decision_snapshot_id,
-                stage="synthesis",
-                code_revision=_synth_code_revision,
-                model_ids={"opus": _model_router.MODEL_REGISTRY.get("opus", "")},
-                base_dir=BASE_DIR,
-            )
-        except Exception as _snap_e:
-            print(f"⚠️ decision_snapshot(synthesis) 記録失敗: {_snap_e}")
+        if decision_enriched_snapshot is None:
+            raise RuntimeError("decision snapshot authority missing before synthesis")
+        from analysis_snapshot import freeze_decision_snapshot
+        import model_router as _model_router
+        freeze_decision_snapshot(
+            decision_enriched_snapshot,
+            decision_snapshot_id=decision_snapshot_id,
+            stage="synthesis",
+            model_ids={"opus": _model_router.MODEL_REGISTRY.get("opus", "")},
+            base_dir=BASE_DIR,
+        )
 
     # 税務・持株会サマリー（Opus用）
     _tax_urgent = _extract_tax_urgent_actions({"tax_context": tax_context or {}})
@@ -3839,7 +3866,8 @@ VIX={market_meta.get('vix','不明')} {market_meta.get('vix_level','')} / 米10Y
   * `RECENT_OWN_RECS` セクションで自分の直近 14 日の推奨履歴が提供されている場合: 同一銘柄に逆方向（buy ↔ sell/trim）の推奨を出すときは、reason フィールドに「市況の何が有意に変化したか（VIX 急騰、決算サプライズ、規制発表など）」を **必ず明示** すること。市況が同一なら推奨を出さない（=自己矛盾の禁止）。
   * `EARNINGS_BLACKOUT` セクションで決算 5 営業日以内の銘柄リストが提供されている場合: その銘柄への buy/add/dca 推奨は出さない（trim/hold は許可）。決算後 1 営業日以降に再評価。
   * `DONE_LIST` セクションで直近 7 日の発注/約定済みアクションが提供されている場合: 同一 ticker × 同方向（buy or sell）の重複推奨は禁止。例: 7751.T を 100 株 buy 済みなら同銘柄への新規 buy/add は出さない（trim 方向は可）。「自動積立」設定済みの SLIM_*/IFREE_* も同じく追加 dca 提案禁止。
-  * **損出し候補との矛盾禁止**: `tax_context.loss_harvest.candidates` に含まれる銘柄に buy/add/dca を提案してはならない（節税効果を捨てるため矛盾）。代わりに trim/sell で確定損益を取り、12/26 期限までに損益通算を完了させること。買い直しは 30 日以上空けてから別途検討。
+  * **損出し候補との矛盾禁止**: `tax_context.loss_harvest.candidates` に含まれる銘柄に buy/add/dca を提案してはならない。候補は総平均法に準ずる取得価額で計算し、同日買い戻しは取得価額が再計算されうるため避ける。米国の wash-sale 30日ルールや固定日付を日本口座へ流用しない。
+  * **損出し候補の金額検証状態（Stage 5C）**: 各候補には「台帳確認済」「台帳未確認」「台帳確認済・品質懸念あり」のタグが付く。「台帳未確認」は表示額が台帳側の取得原価と未突合であることを意味するため、その金額で confidence や urgency を引き上げない。実行前に証券会社の表示額との照合を促すこと。
   * GLD・NVDA・AVGO 等の集中銘柄をターゲット比率まで縮小する場合: 「総株数何株 / 何回に分割 / 1 回あたり何株」を `action` フィールドで明示し、毎日 1〜5 株の細切れ発注は避けること。
 - **【v5.1: 執行方式 AI 決定（CHART_CONTEXT があるとき必須）】**
   * priority_actions の各エントリーに以下フィールドを必ず埋めること:
@@ -4067,6 +4095,14 @@ VIX={market_meta.get('vix','不明')} {market_meta.get('vix_level','')} / 米10Y
             for action in result_dict.get("priority_actions") or []:
                 if not isinstance(action, dict):
                     continue
+                if decision_snapshot_id:
+                    action["decision_snapshot_id"] = decision_snapshot_id
+                    action["decision_snapshot_hash"] = decision_snapshot_hash
+                    action["position_identity_required"] = True
+                if decision_snapshot_issues:
+                    action["decision_snapshot_freshness_issues"] = [
+                        dict(issue) for issue in decision_snapshot_issues
+                    ]
                 chart = _chart_map.get(str(action.get("ticker") or ""))
                 if not isinstance(chart, dict):
                     continue
@@ -4088,6 +4124,80 @@ VIX={market_meta.get('vix','不明')} {market_meta.get('vix_level','')} / 米10Y
                     action["quote_last"] = snapshot.get("last")
                     action["quote_as_of"] = snapshot.get("timestamp") or snapshot.get("as_of") or snapshot.get("ts")
 
+            result_dict["decision_snapshot_id"] = decision_snapshot_id
+            result_dict["decision_snapshot_hash"] = decision_snapshot_hash
+            result_dict["decision_snapshot_freshness_issues"] = [
+                dict(issue) for issue in (decision_snapshot_issues or [])
+            ]
+            if decision_snapshot_id and decision_enriched_snapshot is not None:
+                try:
+                    from claim_provenance import (
+                        build_action_claim,
+                        claim_to_dict,
+                        claims_from_decision_snapshot,
+                    )
+
+                    _claim_index: dict[str, object] = {}
+                    for _action_index, _action in enumerate(
+                        result_dict.get("priority_actions") or [], start=1
+                    ):
+                        if not isinstance(_action, dict):
+                            continue
+                        _ticker = str(_action.get("ticker") or "").upper()
+                        _snapshot_claims = claims_from_decision_snapshot(
+                            decision_enriched_snapshot,
+                            decision_snapshot_id=decision_snapshot_id,
+                            ticker=_ticker or None,
+                        )
+                        for _claim in _snapshot_claims:
+                            _claim_index[_claim.claim_id] = _claim
+                        _required_suffixes = (
+                            ":holdings", ":cash", ":prices", ":fx",
+                            f":options:{_ticker}" if _ticker else ":__none__",
+                        )
+                        _inputs = [
+                            _claim for _claim in _snapshot_claims
+                            if _claim.claim_id.endswith(_required_suffixes)
+                        ]
+                        _action_claim = build_action_claim(
+                            claim_id=(
+                                f"{decision_snapshot_id}:action:"
+                                f"{_action_index}:{_ticker or 'UNKNOWN'}"
+                            ),
+                            input_claims=_inputs,
+                            calculation_version="opus_synthesis_action_v1",
+                            evidence_lineage_id=f"analysis:{decision_snapshot_id}",
+                        )
+                        _claim_index[_action_claim.claim_id] = _action_claim
+                        _action["claim_ids"] = [_action_claim.claim_id]
+                        _claim_text = " ".join(
+                            str(_action.get(key) or "")
+                            for key in ("action", "reason")
+                        )
+                        _probability_claims = re.findall(
+                            r"(?:確率|probability|odds)[^%\n]{0,40}"
+                            r"\d+(?:\.\d+)?\s*%|"
+                            r"\d+(?:\.\d+)?\s*%[^。\n]{0,20}(?:確率|probability|odds)",
+                            _claim_text,
+                            flags=re.IGNORECASE,
+                        )
+                        if _probability_claims:
+                            _action["unverified_numeric_claims"] = _probability_claims
+                        _action["confidence_evidence_verified"] = bool(
+                            _action_claim.verified and not _probability_claims
+                        )
+                    result_dict["claim_provenance"] = [
+                        claim_to_dict(_claim)
+                        for _claim in _claim_index.values()
+                    ]
+                    result_dict["claim_provenance_schema_version"] = 1
+                except Exception as _claim_error:
+                    result_dict["claim_provenance_error"] = (
+                        f"{type(_claim_error).__name__}: {str(_claim_error)[:200]}"
+                    )
+                    for _action in result_dict.get("priority_actions") or []:
+                        if isinstance(_action, dict):
+                            _action["confidence_evidence_verified"] = False
             return result_dict
 
         except _anthropic.APIStatusError as e:
@@ -4515,6 +4625,39 @@ def _set_operational_stance(
     synthesis["operational_stance"] = state
 
 
+def _rebuild_readiness_narrative(synthesis: dict) -> None:
+    """Separate analytical themes from the executable plan after readiness."""
+    actions = [
+        action for action in (synthesis.get("priority_actions") or [])
+        if isinstance(action, dict)
+    ]
+    ready = [a for a in actions if a.get("execution_readiness") == "ready"]
+    conditional = [a for a in actions if a.get("execution_readiness") != "ready"]
+    original = str(synthesis.get("weekly_theme") or "").strip()
+    if original:
+        synthesis["weekly_theme_analytical"] = original
+    if ready:
+        labels = "、".join(
+            f"{a.get('ticker')} {a.get('type')}" for a in ready[:3]
+        )
+        synthesis["weekly_theme"] = f"実行可能: {labels}。分析テーマ: {original}"
+    else:
+        labels = "、".join(
+            f"{a.get('ticker')}({a.get('execution_readiness')})"
+            for a in conditional[:5]
+        ) or "候補なし"
+        synthesis["weekly_theme"] = (
+            f"実行可能なアクションなし。条件付き候補: {labels}。"
+            f"分析テーマ（非実行）: {original}"
+        )
+    synthesis["executable_plan_summary"] = {
+        "ready_count": len(ready),
+        "conditional_count": len(conditional),
+        "ready_tickers": [a.get("ticker") for a in ready],
+        "conditional_tickers": [a.get("ticker") for a in conditional],
+    }
+
+
 def _unit_price_for_notional(action: dict, price_info: dict | None = None) -> float:
     """Return the per-share price used for notional risk checks."""
     price_info = price_info or {}
@@ -4705,12 +4848,14 @@ def _cap_bounded_action(
 
 
 def _load_tax_loss_harvest_tickers(min_loss_jpy: float = 30_000) -> set:
-    """損出し候補の ticker セットを返す（Phase 3 #11: DCA/add との矛盾解消）。"""
+    """総平均法ベースの損出し候補 ticker を返す（副作用なし）。"""
     out: set = set()
     try:
-        from tax_optimizer import analyze_loss_harvest
-        r = analyze_loss_harvest(min_loss_jpy=min_loss_jpy)
+        from tax_harvest_scanner import compute_tax_harvest
+        r = compute_tax_harvest(min_loss_jpy=min_loss_jpy)
         for c in (r.get("candidates") or []):
+            if c.get("actionable_for_gate") is not True:
+                continue
             tk = c.get("ticker")
             if tk:
                 out.add(tk)
@@ -6469,6 +6614,7 @@ def _phase1_post_filter(
     positions: list | None = None,
     cash_info: dict | None = None,
     execution_plan: dict | None = None,
+    rebalance_medium: dict | None = None,
     now: datetime | None = None,
 ) -> dict:
     """
@@ -6852,6 +6998,110 @@ def _phase1_post_filter(
         "1306.T", "1321.T", "1489.T", "1540.T",
     }
     _FUND_PREFIXES = ("SLIM_", "IFREE_", "NOMURA_", "MNXACT")
+
+    _medium_drift_by_position: dict[str, dict] = {}
+    if isinstance(rebalance_medium, dict):
+        for report in rebalance_medium.get("positions") or []:
+            if not isinstance(report, dict):
+                continue
+            identity_key = str(report.get("position_identity_key") or "")
+            if identity_key:
+                _medium_drift_by_position[identity_key] = report
+
+    def _apply_deterministic_exit_sizing(action: dict) -> dict:
+        if _direction_of(action.get("type")) != "sell":
+            return action
+        from position_identity import position_identity_for_action
+
+        identity = position_identity_for_action(action)
+        if identity is None:
+            action["exit_sizing_status"] = "review"
+            action["exit_sizing_reason"] = "PositionIdentity を確定できない"
+            return action
+
+        ticker = str(action.get("ticker") or "")
+        report = _medium_drift_by_position.get(identity.key)
+        if report is None:
+            action["exit_sizing_status"] = "review"
+            action["exit_sizing_reason"] = (
+                "PositionIdentity が一致する構造化 target/band が無いためAI数量を実行不可"
+            )
+            return action
+
+        holding = _holding_info_for_action(action, holdings_price_map)
+        current_qty = float(holding.get("shares") or action.get("holding_shares_before") or 0)
+        if current_qty <= 0:
+            action["exit_sizing_status"] = "review"
+            action["exit_sizing_reason"] = "対象口座の現在数量を確定できない"
+            return action
+        lot_size = float(trading_unit_for_ticker(ticker) if ticker.endswith(".T") else 1)
+        # There is no validated fractional max-step policy in the current
+        # configuration.  Do not invent one (the previous 25% constant had no
+        # authority); the physical position quantity is the only hard bound.
+        # The existing downstream single-action notional cap remains in force.
+        max_step_qty = current_qty
+        pending_qty = 0.0
+        pending_scope_unknown = False
+        for row in open_execution_intents.get((ticker, "sell"), []):
+            row_identity = position_identity_for_action(row)
+            if row_identity is None:
+                pending_scope_unknown = True
+                continue
+            if row_identity.key != identity.key:
+                continue
+            try:
+                # compute_exit_size() の pending は signed delta。注文記録の
+                # quantity は売却でも正のため、sell は負へ正規化する。
+                pending_qty -= abs(float(row.get("quantity") or 0))
+            except (TypeError, ValueError):
+                continue
+        if pending_scope_unknown:
+            action["exit_sizing_status"] = "review"
+            action["exit_sizing_reason"] = (
+                "同一tickerの既存注文にPositionIdentityがなく重複数量を確定できない"
+            )
+            return action
+
+        def _cost_basis(position, qty):
+            # The current total-average engine is account-keyed and cannot yet
+            # prove owner+broker scope.  Treat it as unknown instead of mixing
+            # two brokers that happen to use the same account label.
+            return None
+
+        from exit_sizing import compute_exit_size
+        from rebalance_engine import MEDIUM_DRIFT_TRIGGER
+        result = compute_exit_size(
+            position=identity,
+            normalized_direction="sell",
+            plan_item_id=str(action.get("plan_item_id") or f"drift:{ticker}"),
+            analysis_id=str(action.get("analysis_id") or "pending-analysis"),
+            snapshot_hash=str(action.get("decision_snapshot_hash") or "missing-snapshot"),
+            current_qty=current_qty,
+            current_weight=float(report.get("actual_pct") or 0) / 100.0,
+            target_weight=float(report.get("target_pct") or 0) / 100.0,
+            band=float(MEDIUM_DRIFT_TRIGGER),
+            max_step_qty=max_step_qty,
+            lot_size=lot_size,
+            pending_qty_same_intent=pending_qty,
+            cost_basis_resolver=_cost_basis,
+        )
+        action["exit_sizing_status"] = result.status
+        action["exit_sizing_reason"] = result.reason
+        action["exit_sizing_intent_key"] = result.intent_key
+        action["exit_sizing_evaluation_key"] = result.evaluation_key
+        action["exit_sizing_steps"] = [dict(step) for step in result.steps]
+        action["exit_sizing_is_revision"] = result.is_revision_of_pending
+        action["exit_sizing_max_step_basis"] = "current_position_quantity"
+        if abs(result.final_qty) > 0:
+            final_qty = (
+                int(abs(result.final_qty))
+                if float(result.final_qty).is_integer()
+                else abs(result.final_qty)
+            )
+            action["requested_sell_quantity"] = final_qty
+            action["quantity"] = final_qty
+            _rewrite_action_shares(action, final_qty)
+        return action
 
     def _is_core_fund_or_etf(action: dict) -> bool:
         # core 枠 (¥150万) への昇格は決定論的な ticker 判定のみ。asset_class 等の
@@ -7324,6 +7574,10 @@ def _phase1_post_filter(
             )
 
             a = enrich_action_routing(a, base_dir=BASE_DIR)
+            from position_identity import position_identity_for_action
+            _routed_identity = position_identity_for_action(a)
+            if _routed_identity is not None:
+                a["position_identity_key"] = _routed_identity.key
         except Exception as exc:
             a["routing_resolution_error"] = f"{type(exc).__name__}: {str(exc)[:160]}"
         ticker    = a.get("ticker") or ""
@@ -7331,6 +7585,7 @@ def _phase1_post_filter(
         atype_lc = str(a.get("type") or "").lower()
         a = _normalize_exit_action_against_holdings(a, holdings_price_map)
         a = _normalize_entry_action_against_holdings(a, holdings_price_map)
+        a = _apply_deterministic_exit_sizing(a)
         direction = _direction_of(a.get("type"))
         atype_lc = str(a.get("type") or "").lower()
 
@@ -8477,14 +8732,42 @@ def _log_recommendations(synthesis: dict, market_meta: dict) -> None:
         if not ticker:
             continue
 
-        # 推奨時の価格を yfinance から取得（ベストエフォート）
+        # 凍結済み decision snapshot の価格だけを使う。分析後に外部価格を
+        # 再取得すると、tier LLM が見た価格と Kelly の評価起点がずれる。
         price_at_rec = None
-        if not is_pseudo_market_ticker(ticker):
+        price_at_rec_source = None
+        for _field, _source in (
+            ("decision_price", "decision_price"),
+            ("limit_price", "limit_price"),
+        ):
+            _raw = a.get(_field)
+            if _raw in (None, ""):
+                continue
             try:
-                import yfinance as yf
-                price_at_rec = round(float(yf.Ticker(ticker).fast_info['lastPrice']), 2)
-            except Exception:
-                pass
+                price_at_rec = round(float(_raw), 2)
+                price_at_rec_source = _source
+                break
+            except (TypeError, ValueError):
+                continue
+        readiness = str(a.get("execution_readiness") or "review")
+        block_reasons = [
+            dict(row) for row in (a.get("execution_block_reasons") or [])
+            if isinstance(row, dict)
+        ]
+        block_codes = {str(row.get("code") or "") for row in block_reasons}
+        signal_evaluable = bool(
+            price_at_rec is not None
+            and not is_pseudo_market_ticker(ticker)
+            and not (
+                block_codes
+                & {
+                    "decision_snapshot_input_stale",
+                    "claim_provenance_unverified",
+                    "position_identity_unknown",
+                }
+            )
+        )
+        execution_eligible = readiness == "ready"
 
         entry = {
             "as_of":           as_of,
@@ -8503,6 +8786,13 @@ def _log_recommendations(synthesis: dict, market_meta: dict) -> None:
             "execution_broker": a.get("execution_broker"),
             "execution_position_keys": a.get("execution_position_keys") or [],
             "price_at_rec":    price_at_rec,
+            "price_at_rec_source": price_at_rec_source,
+            "signal_evaluable": signal_evaluable,
+            "execution_eligible": execution_eligible,
+            "execution_readiness": readiness,
+            "execution_block_reasons": block_reasons,
+            "decision_snapshot_hash": a.get("decision_snapshot_hash"),
+            "quote_as_of": a.get("quote_as_of"),
             "vix_at_rec":      market_meta.get("vix"),
             "us10y_at_rec":    market_meta.get("us10y_yield", {}).get("value"),
             "stance":          synthesis.get("overall_stance"),
@@ -9036,59 +9326,138 @@ def run_analysis(force: bool = False) -> dict:
     except Exception:
         data["rebalance_medium"] = {}
 
+    # Stage 1B: build the complete decision market-data lane before any tier
+    # model runs.  The deterministic universe is derived from holdings,
+    # screeners and open orders; it never depends on LLM output.
+    _decision_tickers = _collect_snapshot_tickers(data, max_tickers=30)
+    _decision_chart_map: dict[str, dict] = {}
+    _decision_opt_map: dict[str, dict] = {}
+    try:
+        if _decision_tickers and _gather_chart_context:
+            _decision_chart_map = _gather_chart_context(
+                _decision_tickers, intraday=True, max_tickers=30
+            )
+        if _get_option_signals:
+            _option_targets = ["SPY"] + [
+                ticker for ticker in _decision_tickers if ticker != "SPY"
+            ][:14]
+            _decision_opt_map = _get_option_signals(_option_targets, max_n=15)
+    except Exception as _market_snapshot_error:
+        raise RuntimeError(
+            f"decision market-data snapshot failed: {_market_snapshot_error}"
+        ) from _market_snapshot_error
+
+    print("🌐 Web検索で最新市場ニュース取得中…")
+    try:
+        _frozen_web_news = fetch_web_search_news() or ""
+    except Exception as _web_snapshot_error:
+        print(f"  ⚠️ Webニュース取得失敗（凍結値は空）: {_web_snapshot_error}")
+        _frozen_web_news = ""
+    data["web_search_news"] = _frozen_web_news
+
     shared_ctx = _build_shared_market_context(data)
+    if _decision_chart_map and _format_chart_for_prompt:
+        shared_ctx += "\n\n" + _format_chart_for_prompt(_decision_chart_map)
+    if _decision_opt_map and _format_options_for_prompt:
+        shared_ctx += "\n\n" + _format_options_for_prompt(_decision_opt_map)
 
     # FinCon Verbal Reinforcement: 過去の投資信念をShared Contextに注入
     beliefs = _load_beliefs()
+    _frozen_beliefs_context = _format_beliefs_context(beliefs) if beliefs else ""
+    data["beliefs_context"] = _frozen_beliefs_context
     if beliefs:
-        beliefs_ctx = _format_beliefs_context(beliefs)
-        shared_ctx = shared_ctx + "\n\n" + beliefs_ctx
+        shared_ctx = shared_ctx + "\n\n" + _frozen_beliefs_context
         print(f"  🧠 投資信念 {len(beliefs)}件をコンテキストに注入")
 
-    # Stage 1B: tier LLM 呼び出し開始と同時に decision_snapshot (tier段階) を確定する。
-    # data/shared_ctx の組み立てが完了した直後・最初の tier LLM 呼び出しより前に
-    # 凍結することで「この分析の判断根拠として何が真だったか」を監査可能にする。
-    # 確定後は書き換えない (analysis_snapshot.freeze_decision_snapshot の契約)。
-    # 監査目的の副作用であり、失敗しても分析自体は止めない (fail-open)。
+    # Catalyst context is synthesis-only, but still part of the same analysis
+    # input set.  Acquire it before the decision snapshot is frozen.
+    _frozen_catalyst_context = _load_catalyst_context_for_opus(data.get("scenario"))
+    data["catalyst_context"] = _frozen_catalyst_context
+
     _decision_snapshot_id: str | None = None
+    import uuid as _snap_uuid
+    from analysis_snapshot import (
+        build_base_snapshot_from_data,
+        build_enriched_snapshot,
+        decision_freshness_issues,
+        decision_snapshot_content_hash,
+        freeze_decision_snapshot,
+    )
+    import model_router as _model_router
+    _decision_snapshot_id = str(_snap_uuid.uuid4())
+    _tier_base_snapshot = build_base_snapshot_from_data(data, base_dir=BASE_DIR)
+    _tier_enriched_snapshot = build_enriched_snapshot(
+        _tier_base_snapshot,
+        options_by_ticker_raw=_decision_opt_map,
+    )
+    _decision_snapshot_issues = decision_freshness_issues(_tier_enriched_snapshot)
+    _decision_snapshot_hash = decision_snapshot_content_hash(_tier_enriched_snapshot)
+    _code_revision = None
     try:
-        import uuid as _snap_uuid
-        from analysis_snapshot import build_base_snapshot, build_enriched_snapshot, freeze_decision_snapshot
-        import model_router as _model_router
-        _decision_snapshot_id = str(_snap_uuid.uuid4())
-        _tier_base_snapshot = build_base_snapshot(base_dir=BASE_DIR)
-        _tier_enriched_snapshot = build_enriched_snapshot(_tier_base_snapshot)
-        _code_revision = None
-        try:
-            import subprocess as _snap_sp
-            _rev = _snap_sp.run(
-                ["git", "rev-parse", "HEAD"], cwd=BASE_DIR,
-                capture_output=True, text=True, timeout=5,
-            )
-            _code_revision = _rev.stdout.strip() or None
-        except Exception:
-            pass
-        _tunable_hash = None
-        _tunable_path = BASE_DIR / "tunable_params.json"
-        if _tunable_path.exists():
-            import hashlib as _snap_hashlib
-            _tunable_hash = _snap_hashlib.sha256(_tunable_path.read_bytes()).hexdigest()
-        import hashlib as _snap_hashlib2
-        freeze_decision_snapshot(
-            _tier_enriched_snapshot,
-            decision_snapshot_id=_decision_snapshot_id,
-            stage="tier",
-            code_revision=_code_revision,
-            model_ids={
-                "sonnet": _model_router.MODEL_REGISTRY.get("sonnet", ""),
-                "deepseek": _model_router.MODEL_REGISTRY.get("deepseek", ""),
-            },
-            prompt_hashes={"shared_ctx": _snap_hashlib2.sha256(shared_ctx.encode("utf-8")).hexdigest()},
-            tunable_snapshot_hash=_tunable_hash,
-            base_dir=BASE_DIR,
+        import subprocess as _snap_sp
+        _rev = _snap_sp.run(
+            ["git", "rev-parse", "HEAD"], cwd=BASE_DIR,
+            capture_output=True, text=True, timeout=5,
         )
-    except Exception as _snap_e:
-        print(f"  ⚠️ decision_snapshot(tier) 記録失敗: {_snap_e}")
+        _code_revision = _rev.stdout.strip() or None
+    except Exception:
+        pass
+    _tunable_hash = None
+    _tunable_path = BASE_DIR / "tunable_params.json"
+    if _tunable_path.exists():
+        import hashlib as _snap_hashlib
+        _tunable_hash = _snap_hashlib.sha256(_tunable_path.read_bytes()).hexdigest()
+    import hashlib as _snap_hashlib2
+    freeze_decision_snapshot(
+        _tier_enriched_snapshot,
+        decision_snapshot_id=_decision_snapshot_id,
+        stage="tier",
+        code_revision=_code_revision,
+        model_ids={
+            "sonnet": _model_router.MODEL_REGISTRY.get("sonnet", ""),
+            "deepseek": _model_router.MODEL_REGISTRY.get("deepseek", ""),
+        },
+        prompt_hashes={"shared_ctx": _snap_hashlib2.sha256(shared_ctx.encode("utf-8")).hexdigest()},
+        tunable_snapshot_hash=_tunable_hash,
+        base_dir=BASE_DIR,
+    )
+
+    # Stage 7A/7B: evaluate the FX hedge policy against the same frozen
+    # positions/macro inputs.  This is observation-only: unknown economic
+    # exposure or missing broker-reconciled actual hedge notional returns
+    # review and does not advance shadow state.
+    _fx_hedge_shadow_observation: dict = {}
+    try:
+        from fx_hedge_policy import evaluate_portfolio_hedge_shadow
+
+        _regime_text = str((data.get("regime") or {}).get("regime") or "neutral").lower()
+        _regime_key = (
+            "crisis" if any(token in _regime_text for token in ("crisis", "危機"))
+            else "bear" if any(token in _regime_text for token in ("bear", "弱気"))
+            else "bull" if any(token in _regime_text for token in ("bull", "強気"))
+            else "neutral"
+        )
+        _fx_market = data.get("market_meta") or {}
+        _fx_hedge_shadow_observation = evaluate_portfolio_hedge_shadow(
+            data.get("positions") or [],
+            regime=_regime_key,
+            vix=float(_fx_market.get("vix") or 20.0),
+            usdjpy=float(
+                _fx_market.get("usdjpy")
+                or (data.get("cash_info") or {}).get("fx_rate_usdjpy")
+                or 150.0
+            ),
+            usdjpy_iv_1m=float(_fx_market.get("usdjpy_iv_1m") or 0.10),
+            mode=str(os.environ.get("ALMANAC_FX_HEDGE_MODE", "shadow")).lower(),
+            decision_snapshot_hash=_decision_snapshot_hash,
+        )
+    except Exception as _fx_shadow_error:
+        _fx_hedge_shadow_observation = {
+            "mode": "shadow",
+            "status": "review",
+            "state_saved": False,
+            "issues": [f"fx_hedge_shadow_error:{type(_fx_shadow_error).__name__}"],
+        }
 
     _TIER_WORKERS = max(1, min(4, _env_int("ALMANAC_TIER_MAX_WORKERS", 2)))
     _TIER_CALL_TIMEOUT = _tier_llm_timeout_seconds()
@@ -9702,6 +10071,14 @@ def run_analysis(force: bool = False) -> dict:
             currency_breakdown_long=data.get("currency_breakdown_long"),
             current_currency_policy=data.get("current_currency_policy"),
             decision_snapshot_id=_decision_snapshot_id,
+            decision_snapshot_hash=_decision_snapshot_hash,
+            decision_enriched_snapshot=_tier_enriched_snapshot,
+            decision_snapshot_issues=_decision_snapshot_issues,
+            frozen_chart_map=_decision_chart_map,
+            frozen_options_map=_decision_opt_map,
+            frozen_web_news=_frozen_web_news,
+            frozen_catalyst_context=_frozen_catalyst_context,
+            frozen_beliefs_context=_frozen_beliefs_context,
         )
         if _is_synthesis_failure(synthesis):
             raise RuntimeError(synthesis.get("error") or "final synthesis failed")
@@ -9768,6 +10145,14 @@ def run_analysis(force: bool = False) -> dict:
                             currency_breakdown_long=data.get("currency_breakdown_long"),
                             current_currency_policy=data.get("current_currency_policy"),
                             decision_snapshot_id=_decision_snapshot_id,
+                            decision_snapshot_hash=_decision_snapshot_hash,
+                            decision_enriched_snapshot=_tier_enriched_snapshot,
+                            decision_snapshot_issues=_decision_snapshot_issues,
+                            frozen_chart_map=_decision_chart_map,
+                            frozen_options_map=_decision_opt_map,
+                            frozen_web_news=_frozen_web_news,
+                            frozen_catalyst_context=_frozen_catalyst_context,
+                            frozen_beliefs_context=_frozen_beliefs_context,
                         )
                         if _is_synthesis_failure(synthesis):
                             raise RuntimeError(synthesis.get("error") or "fallback synthesis failed")
@@ -9806,6 +10191,7 @@ def run_analysis(force: bool = False) -> dict:
 
     if isinstance(synthesis, dict):
         _apply_degraded_mode(synthesis, _degraded_info)
+        synthesis["fx_hedge_shadow_decision"] = _fx_hedge_shadow_observation
         synthesis["currency_basis_context"] = {
             "whole_portfolio": data.get("currency_breakdown_whole") or data.get("currency_breakdown", {}),
             "long_tier": data.get("currency_breakdown_long", {}),
@@ -10165,18 +10551,64 @@ def run_analysis(force: bool = False) -> dict:
             try:
                 from kelly_shadow import run_kelly_shadow
                 from kelly_sizing import aggregate_ticker_stats as _kelly_agg_stats
+                from position_identity import position_identity_for_holding
 
                 _kelly_holdings_by_ticker: dict = {}
-                for _pos in (data.get("positions") or []) if isinstance(data, dict) else []:
+                _kelly_holdings_by_position: dict = {}
+                _kelly_price_map: dict = {}
+                for _position_index, _pos in enumerate(
+                    (data.get("positions") or []) if isinstance(data, dict) else []
+                ):
                     _t = _pos.get("ticker")
                     if _t:
                         _kelly_holdings_by_ticker[_t] = _kelly_holdings_by_ticker.get(_t, 0.0) + float(_pos.get("value_jpy") or 0)
+                        _position_identity = position_identity_for_holding(
+                            _pos,
+                            key=str(_pos.get("key") or _position_index),
+                        )
+                        if _position_identity is not None:
+                            _kelly_holdings_by_position[_position_identity.key] = (
+                                _kelly_holdings_by_position.get(_position_identity.key, 0.0)
+                                + float(_pos.get("value_jpy") or 0)
+                            )
+                        _kelly_price_map.setdefault(_t, {
+                            "current_price": _pos.get("current_price") or _pos.get("price"),
+                            "currency": _pos.get("currency"),
+                        })
+                for _t, _chart in (_decision_chart_map or {}).items():
+                    if not isinstance(_chart, dict):
+                        continue
+                    _slot = _kelly_price_map.setdefault(_t, {})
+                    _slot["current_price"] = (
+                        (_chart.get("intraday_snapshot") or {}).get("last")
+                        or _chart.get("last_close")
+                        or _slot.get("current_price")
+                    )
+                    _slot.setdefault("currency", "JPY" if str(_t).endswith(".T") else "USD")
+                _kelly_fx = float(
+                    ((data.get("cash_info") or {}).get("fx_rate_usdjpy"))
+                    or ((data.get("market_meta") or {}).get("usdjpy"))
+                    or 150.0
+                )
+                _kelly_raw_actions: list[dict] = []
+                for _raw in _raw_actions_for_kelly_shadow:
+                    if not isinstance(_raw, dict):
+                        continue
+                    _counterfactual_raw = dict(_raw)
+                    _estimated = _estimate_action_jpy(
+                        _counterfactual_raw, _kelly_price_map, _kelly_fx,
+                    )
+                    if _estimated >= 0 and math.isfinite(_estimated):
+                        _counterfactual_raw["estimated_notional_jpy"] = round(_estimated)
+                    _kelly_raw_actions.append(_counterfactual_raw)
 
                 _kelly_shadow_decision = run_kelly_shadow(
-                    _raw_actions_for_kelly_shadow,
+                    _kelly_raw_actions,
                     _pe_ctx,
                     portfolio_total_jpy=float((data.get("portfolio_total") if isinstance(data, dict) else None) or 0),
                     current_holdings_by_ticker=_kelly_holdings_by_ticker,
+                    current_holdings_by_position=_kelly_holdings_by_position,
+                    require_position_identity=True,
                     kelly_stats=_kelly_agg_stats(),
                 )
                 synthesis["kelly_shadow_decision"] = {
@@ -10185,6 +10617,18 @@ def run_analysis(force: bool = False) -> dict:
                     "modified_count": len(_kelly_shadow_decision.modified),
                     "capped_count": _kelly_shadow_decision.capped_count,
                     "non_actionable_count": _kelly_shadow_decision.non_actionable_count,
+                    "evaluated_actions": [
+                        dict(action) for action in _kelly_shadow_decision.evaluated
+                        if isinstance(action, dict)
+                    ],
+                    "accepted_actions": [
+                        dict(action) for action in _kelly_shadow_decision.accepted
+                        if isinstance(action, dict)
+                    ],
+                    "rejected_actions": [
+                        dict(action) for action in _kelly_shadow_decision.rejected
+                        if isinstance(action, dict)
+                    ],
                     "note": "観測専用 (影実行) — 実際の priority_actions には一切反映されていない",
                 }
                 print(
@@ -10264,10 +10708,13 @@ def run_analysis(force: bool = False) -> dict:
             positions=data.get("positions"),
             cash_info=data.get("cash_info"),
             execution_plan=data.get("execution_plan"),
+            rebalance_medium=data.get("rebalance_medium"),
         )
     except Exception as _pe:
         _pf_quarantined = _quarantine_post_filter_failure(synthesis, _pe)
         print(f"  ⚠️ Phase1 post-filter エラー → fail-closed で {_pf_quarantined} 件を実行保留に隔離: {_pe}")
+    if isinstance(synthesis, dict):
+        _rebuild_readiness_narrative(synthesis)
     if isinstance(synthesis, dict):
         try:
             from execution_plan_observer import record_observation as _record_plan_observation

@@ -1,4 +1,4 @@
-"""Stage 0A/4A: GINN 中央安全ゲート + walk-forward validation。
+"""Stage 0A/4A: GINN 中央安全ゲート + chronological holdout validation。
 
 インシデント: 2026-07-26 18:30 に学習したモデルが n_test=0 (訓練外評価なし)
 のまま 2026-07-27 06:24 の分析へ配線され、ボラティリティを GARCH 比
@@ -18,6 +18,8 @@ train_ginn() 側で修正し、昇格基準を「訓練外評価が最低1件」
 from __future__ import annotations
 
 import json
+import os
+import subprocess
 import sys
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -38,10 +40,41 @@ def _synthetic_returns(n=200, seed=0) -> pd.Series:
     return pd.Series(np.random.normal(0, 0.01, n), index=pd.date_range("2024-01-01", periods=n))
 
 
+def test_subprocess_honors_model_and_state_directories(tmp_path):
+    model_dir = tmp_path / "models"
+    state_dir = tmp_path / "state"
+    env = {
+        **os.environ,
+        "ALMANAC_MODEL_DIR": str(model_dir),
+        "ALMANAC_STATE_DIR": str(state_dir),
+    }
+    proc = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import json, ginn_model as g;"
+                "print(json.dumps({'model':str(g.MODEL_PATH),"
+                "'safety':str(g.SAFETY_LOG_PATH)}))"
+            ),
+        ],
+        cwd=_REPO_ROOT,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+    paths = json.loads(proc.stdout.strip())
+    assert paths["model"].startswith(str(model_dir))
+    assert paths["safety"].startswith(str(state_dir))
+
+
 @pytest.fixture(autouse=True)
 def _isolate_paths(tmp_path, monkeypatch):
     monkeypatch.setattr(gm, "MODEL_PATH", tmp_path / "ginn_model.pt")
     monkeypatch.setattr(gm, "META_PATH", tmp_path / "ginn_meta.json")
+    monkeypatch.setattr(gm, "BUNDLE_ROOT", tmp_path / "ginn")
+    monkeypatch.setattr(gm, "CURRENT_POINTER_PATH", tmp_path / "ginn" / "current.json")
     monkeypatch.setattr(gm, "SAFETY_LOG_PATH", tmp_path / "ginn_safety_gate.jsonl")
     monkeypatch.delenv("ALMANAC_DISABLE_GINN", raising=False)
     return tmp_path
@@ -57,6 +90,7 @@ def _passing_meta(**overrides) -> dict:
         "n_validation_tickers": 5,
         "validation_metrics": {"mse": 0.01, "garch_baseline_mse": 0.01},
         "feature_coverage": 0.98,
+        "inference_contract_complete": True,
     }
     base.update(overrides)
     return base
@@ -94,6 +128,62 @@ def test_corrupt_manifest_is_treated_as_missing(tmp_path):
     r = gm.forecast_ginn_result(_synthetic_returns(), garch_sigma=0.5)
     assert r["used_model"] == "gjr_garch"
     assert r["fallback_reason"] == "manifest_missing"
+
+
+def test_incomplete_active_bundle_never_falls_back_to_legacy(tmp_path):
+    gm.MODEL_PATH.write_bytes(b"legacy")
+    gm.META_PATH.write_text(json.dumps(_passing_meta()), encoding="utf-8")
+    gm.CURRENT_POINTER_PATH.parent.mkdir(parents=True)
+    gm.CURRENT_POINTER_PATH.write_text(
+        json.dumps({"version": "candidate-missing", "model_sha256": "abc"}),
+        encoding="utf-8",
+    )
+    r = gm.forecast_ginn_result(_synthetic_returns(), garch_sigma=0.5)
+    assert r["used_model"] == "gjr_garch"
+    assert r["fallback_reason"] == "active_bundle_incomplete"
+
+
+def test_active_bundle_checksum_mismatch_is_rejected(tmp_path):
+    bundle = gm.BUNDLE_ROOT / "v1"
+    bundle.mkdir(parents=True)
+    (bundle / "model.pt").write_bytes(b"tampered")
+    (bundle / "manifest.json").write_text(json.dumps(_passing_meta()), encoding="utf-8")
+    gm.CURRENT_POINTER_PATH.write_text(
+        json.dumps({"version": "v1", "model_sha256": "0" * 64}),
+        encoding="utf-8",
+    )
+    r = gm.forecast_ginn_result(_synthetic_returns(), garch_sigma=0.5)
+    assert r["used_model"] == "gjr_garch"
+    assert r["fallback_reason"] == "active_bundle_checksum_mismatch"
+
+
+def test_active_bundle_manifest_checksum_mismatch_is_rejected(tmp_path):
+    bundle = gm.BUNDLE_ROOT / "v1"
+    bundle.mkdir(parents=True)
+    model_path = bundle / "model.pt"
+    manifest_path = bundle / "manifest.json"
+    model_path.write_bytes(b"model")
+    manifest_path.write_text(json.dumps(_passing_meta()), encoding="utf-8")
+    gm.CURRENT_POINTER_PATH.write_text(
+        json.dumps({
+            "version": "v1",
+            "model_sha256": gm._sha256_file(model_path),
+            "manifest_sha256": "0" * 64,
+        }),
+        encoding="utf-8",
+    )
+
+    result = gm.forecast_ginn_result(_synthetic_returns(), garch_sigma=0.5)
+    assert result["used_model"] == "gjr_garch"
+    assert result["fallback_reason"] == "active_manifest_checksum_mismatch"
+
+
+def test_inference_contract_must_be_complete_for_promotion():
+    ok, reason = gm._meets_promotion_criteria(
+        _passing_meta(inference_contract_complete=False)
+    )
+    assert ok is False
+    assert reason == "inference_contract_incomplete"
 
 
 # ---------------------------------------------------------------------------
@@ -338,9 +428,9 @@ def test_build_sequences_min_target_pos_never_targets_before_boundary():
 def test_train_ginn_produces_nonzero_validation_with_short_lookback(tmp_path, monkeypatch):
     """本件の直接再現: lookback が短く validation 区間単独では
     seq_len+2日に満たないケースで、旧コードなら n_test=0 になっていたが
-    新コードでは n_validation > 0 になり、5基準を満たせば実際に昇格できる。"""
+    新コードでは n_validation > 0 の候補 bundle が作られる。短い学習で
+    基準未達なら current pointer は進めず、既存 active を破壊しない。"""
     pytest.importorskip("torch")
-    import torch as _torch
     from ginn_model import GINNModel
 
     if not GINNModel(input_size=4, hidden_size=64, num_layers=2).is_available():
@@ -363,7 +453,9 @@ def test_train_ginn_produces_nonzero_validation_with_short_lookback(tmp_path, mo
     result = gm.train_ginn(tickers=tickers, lookback_days=n_days, seq_len=60, epochs=2)
 
     assert result["success"] is True
-    meta = json.loads(gm.META_PATH.read_text(encoding="utf-8"))
+    candidate_dir = Path(result["candidate_dir"])
+    meta = json.loads((candidate_dir / "manifest.json").read_text(encoding="utf-8"))
+    assert (candidate_dir / "model.pt").is_file()
     assert meta["n_validation"] > 0  # 旧コードなら 0 になっていたはず
     assert meta["n_validation_tickers"] == 5
     assert meta["data_end"] == idx[-1].strftime("%Y-%m-%d")
@@ -371,4 +463,10 @@ def test_train_ginn_produces_nonzero_validation_with_short_lookback(tmp_path, mo
     assert meta["validation_metrics"]["garch_baseline_mse"] is not None
     assert meta["feature_coverage"] == 1.0  # 合成データに欠損なし
     assert meta["forward_observations"] == 0
-    assert meta["promotion_policy_version"] == "4A_v1"
+    assert meta["inference_contract_complete"] is False
+    assert meta["validation_scheme"] == "chronological_80_20_single_holdout"
+    assert meta["promotion_policy_version"] == "4A_chronological_holdout_v1"
+    assert meta["model_sha256"] == gm._sha256_file(candidate_dir / "model.pt")
+    assert result["promoted"] is False
+    assert result["promotion_reason"] == "inference_contract_incomplete"
+    assert not gm.CURRENT_POINTER_PATH.exists()

@@ -140,11 +140,7 @@ def test_opus_prompt_omits_black_litterman_framing_when_no_independent_source(tm
     assert saved["independent_count"] == 0
 
     text = analyst._load_bl_views_for_opus()
-    assert "Black-Litterman" not in text
-    assert "定量モデル" not in text
-    assert "独立検証なし" in text
-    assert "2/3ティア一致" not in text  # sanity: AVGOは3ティア一致のはず
-    assert "3/3ティア一致" in text
+    assert text == ""
 
 
 def test_opus_prompt_keeps_quant_framing_when_independent_source_present(tmp_path, monkeypatch):

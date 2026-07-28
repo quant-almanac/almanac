@@ -35,6 +35,7 @@ from dataclasses import dataclass
 from typing import Optional
 
 from kelly_sizing import suggest_size_pct
+from position_identity import position_identity_for_action
 
 BUY_SIDE_TYPES = frozenset({'buy', 'add', 'dca'})
 
@@ -98,11 +99,31 @@ def _action_notional_jpy(action: dict) -> Optional[float]:
     return None
 
 
+def _replace_action_notional_jpy(action: dict, amount: float) -> None:
+    """Make the counterfactual action itself reflect the capped notional.
+
+    Keeping the old action fields and writing only ``kelly_shadow`` metadata
+    produced a false counterfactual: the downstream policy still evaluated the
+    original amount.  Preserve the original field for audit, then update the
+    structured field that supplied the notional and always expose the canonical
+    ``estimated_notional_jpy`` value.
+    """
+    for key in ('notional_jpy', 'estimated_notional_jpy', 'amount_jpy'):
+        value = action.get(key)
+        if isinstance(value, (int, float)) and value > 0:
+            action[f'kelly_original_{key}'] = value
+            action[key] = amount
+            break
+    action['estimated_notional_jpy'] = amount
+
+
 def apply_kelly_cap_to_action(
     action: dict,
     *,
     portfolio_total_jpy: float,
     current_holdings_by_ticker: dict,
+    current_holdings_by_position: Optional[dict] = None,
+    require_position_identity: bool = False,
     kelly_stats: Optional[dict] = None,
     lot_unit_jpy: float = 1.0,
 ) -> dict:
@@ -119,7 +140,28 @@ def apply_kelly_cap_to_action(
         return new_action
 
     itype = str(action.get('tier') or action.get('investment_type') or 'medium').lower()
-    current_holding = float(current_holdings_by_ticker.get(ticker, 0.0) or 0.0)
+    holding_basis = "ticker_legacy"
+    if current_holdings_by_position is not None:
+        identity = position_identity_for_action(action)
+        if identity is None or identity.key not in current_holdings_by_position:
+            if require_position_identity:
+                new_action['kelly_shadow'] = {
+                    'capped': False,
+                    'cap_skipped_reason': (
+                        'position_identity_unresolved'
+                        if identity is None
+                        else 'position_holding_unknown'
+                    ),
+                    'current_holding_basis': 'unknown',
+                }
+                return new_action
+        if identity is not None and identity.key in current_holdings_by_position:
+            current_holding = float(current_holdings_by_position[identity.key] or 0.0)
+            holding_basis = "position_identity"
+        else:
+            current_holding = float(current_holdings_by_ticker.get(ticker, 0.0) or 0.0)
+    else:
+        current_holding = float(current_holdings_by_ticker.get(ticker, 0.0) or 0.0)
     cap = compute_kelly_cap(
         ticker=ticker, investment_type=itype,
         portfolio_total_jpy=portfolio_total_jpy, current_holding_jpy=current_holding,
@@ -128,6 +170,7 @@ def apply_kelly_cap_to_action(
     new_action['kelly_shadow'] = {
         'kelly_target_jpy': cap.kelly_target_jpy,
         'current_holding_jpy': cap.current_holding_jpy,
+        'current_holding_basis': holding_basis,
         'addable_jpy': cap.addable_jpy,
         'reason': cap.reason,
     }
@@ -149,6 +192,7 @@ def apply_kelly_cap_to_action(
     new_action['kelly_shadow']['capped'] = True
     new_action['kelly_shadow']['original_notional_jpy'] = original_notional
     new_action['kelly_shadow']['capped_notional_jpy'] = capped_notional
+    _replace_action_notional_jpy(new_action, capped_notional)
 
     if capped_notional < lot_unit_jpy:
         # 想定内の業務状態 (assert しない) — action を除外して理由を記録する
@@ -162,6 +206,7 @@ def apply_kelly_cap_to_action(
 
 @dataclass(frozen=True)
 class KellyShadowDecision:
+    evaluated: tuple
     accepted: tuple
     rejected: tuple
     modified: tuple
@@ -175,6 +220,8 @@ def run_kelly_shadow(
     *,
     portfolio_total_jpy: float,
     current_holdings_by_ticker: dict,
+    current_holdings_by_position: Optional[dict] = None,
+    require_position_identity: bool = False,
     kelly_stats: Optional[dict] = None,
     lot_unit_jpy: float = 1.0,
 ) -> KellyShadowDecision:
@@ -192,6 +239,7 @@ def run_kelly_shadow(
     from policy_engine import apply_policy_gate
 
     capped_actions = []
+    evaluated_actions = []
     capped_count = 0
     non_actionable_count = 0
     for action in actions:
@@ -201,11 +249,14 @@ def run_kelly_shadow(
             action,
             portfolio_total_jpy=portfolio_total_jpy,
             current_holdings_by_ticker=current_holdings_by_ticker,
+            current_holdings_by_position=current_holdings_by_position,
+            require_position_identity=require_position_identity,
             kelly_stats=kelly_stats,
             lot_unit_jpy=lot_unit_jpy,
         )
         if new_action.get('kelly_shadow', {}).get('capped'):
             capped_count += 1
+        evaluated_actions.append(new_action)
         if new_action.get('actionable') is False:
             non_actionable_count += 1
             continue  # policy_gate に渡さない (既に non_actionable)
@@ -217,6 +268,7 @@ def run_kelly_shadow(
     decision = apply_policy_gate(capped_actions, policy_ctx)
 
     return KellyShadowDecision(
+        evaluated=tuple(evaluated_actions),
         accepted=tuple(decision.accepted),
         rejected=tuple(decision.rejected),
         modified=tuple(decision.modified),

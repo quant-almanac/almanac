@@ -127,6 +127,23 @@ def test_base_snapshot_hash_changes_when_file_content_changes(tmp_path):
     assert h1 != h2
 
 
+def test_in_memory_payload_hash_changes_even_when_artifact_is_unchanged(tmp_path):
+    now = datetime(2026, 7, 27, 12, 0, 0)
+    _write(tmp_path, "account.json", {"last_updated": now.isoformat()})
+    first = snap.build_base_snapshot_from_data(
+        {"positions": [{"ticker": "AVGO", "shares": 5}], "cash_info": {}},
+        base_dir=tmp_path,
+        now=now,
+    )
+    second = snap.build_base_snapshot_from_data(
+        {"positions": [{"ticker": "AVGO", "shares": 27}], "cash_info": {}},
+        base_dir=tmp_path,
+        now=now,
+    )
+    assert first.holdings.artifact_hash == second.holdings.artifact_hash
+    assert first.holdings.payload_hash != second.holdings.payload_hash
+
+
 # ---------------------------------------------------------------------------
 # build_enriched_snapshot
 # ---------------------------------------------------------------------------
@@ -142,12 +159,19 @@ def test_enriched_snapshot_with_no_options_is_just_the_base(tmp_path):
 def test_enriched_snapshot_captures_options_payload_per_ticker():
     base = snap.build_base_snapshot(base_dir=Path("/nonexistent"), now=datetime(2026, 7, 27))
     payload = {
-        "AVGO": {"put_call_ratio": 0.8, "iv_rank": 45},
-        "SPY": {"put_call_ratio": 1.1, "iv_rank": 30},
+        "AVGO": {
+            "put_call_ratio": 0.8, "iv_rank": 45,
+            "as_of": "2026-07-27T00:00:00",
+        },
+        "SPY": {
+            "put_call_ratio": 1.1, "iv_rank": 30,
+            "as_of": "2026-07-27T00:00:00",
+        },
     }
     enriched = snap.build_enriched_snapshot(base, options_by_ticker_raw=payload, now=datetime(2026, 7, 27))
     assert set(enriched.options_by_ticker.keys()) == {"AVGO", "SPY"}
     assert enriched.options_by_ticker["AVGO"].source == "options_fetcher:AVGO"
+    assert enriched.options_by_ticker["AVGO"].freshness_status == "fresh"
     assert enriched.options_by_ticker["AVGO"].artifact_hash != snap._MISSING_HASH
 
 
@@ -156,6 +180,37 @@ def test_enriched_snapshot_options_hash_reflects_payload_content():
     e1 = snap.build_enriched_snapshot(base, options_by_ticker_raw={"AVGO": {"iv_rank": 45}})
     e2 = snap.build_enriched_snapshot(base, options_by_ticker_raw={"AVGO": {"iv_rank": 99}})
     assert e1.options_by_ticker["AVGO"].artifact_hash != e2.options_by_ticker["AVGO"].artifact_hash
+
+
+def test_decision_freshness_issues_include_unknown_option_inputs(tmp_path):
+    base = snap.build_base_snapshot(base_dir=tmp_path, now=datetime(2026, 7, 27))
+    enriched = snap.build_enriched_snapshot(
+        base,
+        options_by_ticker_raw={"AVGO": {"iv_rank": 45}},
+        now=datetime(2026, 7, 27),
+    )
+    issues = snap.decision_freshness_issues(enriched)
+    categories = {row["category"] for row in issues}
+    assert "holdings" in categories
+    assert any(
+        row.get("category") == "options"
+        and row.get("ticker") == "AVGO"
+        and row.get("status") == "unknown"
+        for row in issues
+    )
+
+
+def test_old_options_timestamp_is_stale_not_fresh():
+    now = datetime(2026, 7, 27, 12, 0, 0)
+    base = snap.build_base_snapshot(base_dir=Path("/nonexistent"), now=now)
+    enriched = snap.build_enriched_snapshot(
+        base,
+        options_by_ticker_raw={
+            "AVGO": {"iv_rank": 45, "as_of": "2026-07-25T00:00:00"},
+        },
+        now=now,
+    )
+    assert enriched.options_by_ticker["AVGO"].freshness_status == "stale"
 
 
 # ---------------------------------------------------------------------------
@@ -247,10 +302,22 @@ def test_resolve_missing_file_returns_none(tmp_path):
 
 
 def test_execution_quote_snapshot_is_tagged_distinctly():
-    q = snap.build_execution_quote_snapshot("AVGO", price=410.5, spread=0.2, market_status="open")
+    q = snap.build_execution_quote_snapshot(
+        "AVGO",
+        price=410.5,
+        spread=0.2,
+        market_status="open",
+        source_as_of="2026-07-28T09:00:00+09:00",
+        decision_snapshot_id="decision-1",
+        decision_snapshot_hash="abc123",
+    )
     assert q["snapshot_kind"] == "execution_quote"
     assert q["ticker"] == "AVGO"
     assert q["price"] == 410.5
+    assert q["source_as_of"] == "2026-07-28T09:00:00+09:00"
+    assert q["decision_snapshot_id"] == "decision-1"
+    assert q["decision_snapshot_hash"] == "abc123"
+    assert len(q["quote_hash"]) == 64
 
 
 def test_execution_quote_snapshot_never_touches_decision_snapshot_state(tmp_path, monkeypatch):

@@ -820,6 +820,7 @@ def _record_notional_jpy(record: dict, *, fx_rate: float) -> float | None:
 
 def evaluate_nisa_capacity(action: dict, *, base_dir: Path, now: datetime) -> dict:
     account = action_account(action)
+    account_identity = canonical_account(account)
     direction = economic_direction(action.get("type") or action.get("action_type"))
     if direction != "buy" or not is_nisa_account(account):
         return {"readiness": "ready", "reasons": []}
@@ -833,6 +834,14 @@ def evaluate_nisa_capacity(action: dict, *, base_dir: Path, now: datetime) -> di
             "reasons": [{
                 "code": "nisa_route_missing",
                 "message": "NISA買付の名義・証券会社を特定できない",
+            }],
+        }
+    if account_identity not in {"nisa_growth", "nisa_tsumitate"}:
+        return {
+            "readiness": "blocked",
+            "reasons": [{
+                "code": "nisa_type_missing",
+                "message": "NISA買付が成長投資枠かつみたて投資枠かを特定できない",
             }],
         }
 
@@ -849,7 +858,31 @@ def evaluate_nisa_capacity(action: dict, *, base_dir: Path, now: datetime) -> di
             }],
         }
 
-    baseline_dt, baseline_day = _baseline_cutoff(raw.get("last_updated"))
+    from position_identity import NisaCapacityIdentity
+
+    nisa_type = "tsumitate" if account_identity == "nisa_tsumitate" else "growth"
+    tax_year = now.astimezone(JST).year
+    capacity_identity = NisaCapacityIdentity(
+        owner=owner,
+        broker=broker,
+        account=account_identity,
+        nisa_type=nisa_type,
+        tax_year=tax_year,
+    )
+    baseline_source = ""
+    baseline_raw = None
+    for source_name, value in (
+        ("profile.limit_screen_as_of", profile.get("limit_screen_as_of")),
+        ("profile.screen_as_of", profile.get("screen_as_of")),
+        ("profile.source_as_of", profile.get("source_as_of")),
+        ("profile.last_updated", profile.get("last_updated")),
+        ("file.last_updated", raw.get("last_updated")),
+    ):
+        baseline_dt, baseline_day = _baseline_cutoff(value)
+        if baseline_dt is not None or baseline_day is not None:
+            baseline_raw = value
+            baseline_source = source_name
+            break
     if baseline_dt is None and baseline_day is None:
         return {
             "readiness": "blocked",
@@ -931,6 +964,15 @@ def evaluate_nisa_capacity(action: dict, *, base_dir: Path, now: datetime) -> di
             continue
         if row_owner != owner or row_broker != broker:
             continue
+        row_account_identity = canonical_account(row_account)
+        if row_account_identity == "nisa":
+            unattributed.append(str(row.get("id") or "unknown"))
+            continue
+        if row_account_identity != account_identity:
+            continue
+        when_local = when if when.tzinfo is not None else when.replace(tzinfo=JST)
+        if when_local.astimezone(JST).year != tax_year:
+            continue
         notional = _record_notional_jpy(row, fx_rate=fx_rate)
         if notional is None:
             unattributed.append(str(row.get("id") or "unknown"))
@@ -969,7 +1011,7 @@ def evaluate_nisa_capacity(action: dict, *, base_dir: Path, now: datetime) -> di
         stale_reason = {
             "code": "nisa_capacity_stale",
             "message": f"NISA残枠の基準日が{age_days}日前",
-            "baseline": str(raw.get("last_updated")),
+            "baseline": str(baseline_raw),
             "age_days": age_days,
         }
 
@@ -986,6 +1028,8 @@ def evaluate_nisa_capacity(action: dict, *, base_dir: Path, now: datetime) -> di
         "reasons": reasons,
         "execution_owner": owner,
         "execution_broker": broker,
+        "nisa_capacity_identity": capacity_identity.key,
+        "nisa_capacity_baseline_source": baseline_source,
         "nisa_capacity_remaining_jpy": round(remaining),
-        "nisa_capacity_baseline": raw.get("last_updated"),
+        "nisa_capacity_baseline": baseline_raw,
     }

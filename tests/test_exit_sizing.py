@@ -94,6 +94,23 @@ def test_pending_same_intent_is_netted_out_before_max_step():
     assert with_pending.final_qty != no_pending.final_qty
     assert with_pending.is_revision_of_pending is True
     assert no_pending.is_revision_of_pending is False
+    assert abs(with_pending.final_qty) < abs(no_pending.final_qty)
+    assert next(
+        step for step in with_pending.steps if step["name"] == "net_of_pending"
+    )["value"] == pytest.approx(-30.0)
+
+
+def test_sell_pending_quantity_contract_is_signed():
+    """注文台帳の正の20株を呼び出し側で-20へ正規化する契約を固定する。
+
+    raw=-50 に既売却注文=-20 があれば残りは -30。+20 を渡すと -70 に
+    増えるため、符号を誤った呼び出しを見つけやすい数値で検証する。
+    """
+    result = es.compute_exit_size(**_base_kwargs(pending_qty_same_intent=-20.0))
+    net = next(step for step in result.steps if step["name"] == "net_of_pending")
+    assert result.raw_delta_qty == pytest.approx(-50.0)
+    assert net["value"] == pytest.approx(-30.0)
+    assert result.final_qty == pytest.approx(-30.0)
 
 
 # ---------------------------------------------------------------------------

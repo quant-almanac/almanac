@@ -139,6 +139,9 @@ class ExecutionRequest(BaseModel):
     limit_price:               Optional[float] = None  # 実際に出した指値（ユーザーが上書き可能）
     decision_price:            Optional[float] = None  # AI 提示時 mid（後で shortfall 計算用）
     decision_ts:               Optional[str]   = None  # ISO（AI 提示時刻）
+    decision_snapshot_id:      Optional[str]   = None  # 判断根拠の凍結 snapshot
+    decision_snapshot_hash:    Optional[str]   = None
+    quote_as_of:               Optional[str]   = None  # 執行価格ソースの観測時刻
     ai_recommended_order_type: Optional[str]   = None  # AI 推奨 order_type（人間が変えても保持）
     ai_recommended_limit:      Optional[float] = None  # AI 推奨 limit_price
     # AI 推奨から実行した場合、元の分析runとjoinするために保持する（手入力はNone）。
@@ -148,6 +151,17 @@ class ExecutionRequest(BaseModel):
     execution_owner:           Optional[str]   = None  # husband | wife
     execution_broker:          Optional[str]   = None  # rakuten | sbi
     execution_position_keys:   Optional[list[str]] = None
+    # Optional broker-reconciliation evidence.  A normal historical fill stays
+    # recordable without these fields, but it must not advance PositionIdentity
+    # freshness unless the complete contract is supplied.
+    broker_confirmed_filled:    bool            = False
+    external_execution_id:     Optional[str]   = None
+    broker_source:              Optional[str]   = None
+    broker_reported_at:         Optional[str]   = None
+    filled_quantity:            Optional[float] = None
+    filled_price:               Optional[float] = None
+    reconciled_at:              Optional[str]   = None
+    reconciliation_snapshot_hash: Optional[str] = None
     # Explicit funding provenance for a new discretionary purchase.  Historical
     # fills remain recordable without it; only future plan accounting consumes
     # an approved contribution.
@@ -198,6 +212,8 @@ class ExecutionRequest(BaseModel):
     @field_validator(
         "analysis_id", "action_state_id", "policy_override_reason",
         "execution_owner", "execution_broker", "contribution_id",
+        "external_execution_id", "broker_source", "broker_reported_at",
+        "reconciled_at", "reconciliation_snapshot_hash",
     )
     @classmethod
     def normalize_optional_text(cls, v: Optional[str]) -> Optional[str]:
@@ -461,6 +477,75 @@ def _load_execution_log() -> dict:
     elif not isinstance(records, list):
         raise HTTPException(status_code=500, detail="action_executions.json の executions が list ではありません")
     return data
+
+
+def _validate_broker_confirmation(req: ExecutionRequest) -> None:
+    evidence_fields = {
+        "external_execution_id": req.external_execution_id,
+        "broker_source": req.broker_source,
+        "broker_reported_at": req.broker_reported_at,
+        "filled_quantity": req.filled_quantity,
+        "filled_price": req.filled_price,
+        "reconciled_at": req.reconciled_at,
+        "reconciliation_snapshot_hash": req.reconciliation_snapshot_hash,
+    }
+    supplied = any(value not in (None, "") for value in evidence_fields.values())
+    if supplied and not req.broker_confirmed_filled:
+        raise HTTPException(
+            status_code=422,
+            detail="broker約定根拠を保存する場合は broker_confirmed_filled=true が必要です",
+        )
+    if not req.broker_confirmed_filled:
+        return
+    missing = [key for key, value in evidence_fields.items() if value in (None, "")]
+    if missing:
+        raise HTTPException(
+            status_code=422,
+            detail=f"broker-confirmed fill の根拠が不足: {', '.join(missing)}",
+        )
+    if req.status not in {Status.executed, Status.partial}:
+        raise HTTPException(
+            status_code=422,
+            detail="broker_confirmed_filled は executed/partial にのみ指定できます",
+        )
+    if not req.execution_owner or not req.execution_broker or not req.account:
+        raise HTTPException(
+            status_code=422,
+            detail="broker-confirmed fill には owner・broker・account が必要です",
+        )
+    if req.filled_quantity is None or req.filled_quantity <= 0:
+        raise HTTPException(status_code=422, detail="filled_quantity は正数が必要です")
+    if req.filled_price is None or req.filled_price <= 0:
+        raise HTTPException(status_code=422, detail="filled_price は正数が必要です")
+    if req.quantity is not None and abs(req.filled_quantity - req.quantity) > 1e-9:
+        raise HTTPException(status_code=422, detail="filled_quantity と quantity が一致しません")
+    if req.price is not None and abs(req.filled_price - req.price) > 1e-9:
+        raise HTTPException(status_code=422, detail="filled_price と price が一致しません")
+    for label, value in (
+        ("broker_reported_at", req.broker_reported_at),
+        ("reconciled_at", req.reconciled_at),
+    ):
+        try:
+            datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=f"{label} は ISO-8601 形式が必要です") from exc
+
+
+def _reject_duplicate_external_execution(req: ExecutionRequest) -> None:
+    if not req.broker_confirmed_filled:
+        return
+    data = _load_execution_log()
+    for row in data.get("executions", []):
+        if not isinstance(row, dict):
+            continue
+        if (
+            str(row.get("external_execution_id") or "") == req.external_execution_id
+            and str(row.get("broker_source") or "") == req.broker_source
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="同じbroker external_execution_idは既に記録済みです",
+            )
 
 
 def _is_portfolio_applied(rec: dict) -> bool:
@@ -2044,6 +2129,7 @@ async def save_execution(req: ExecutionRequest):
     _enforce_discretionary_order_funding(req)
     _enforce_ordered_exit_inventory(req)
     _validate_contribution_link(req)
+    _validate_broker_confirmation(req)
     plan_metadata = _snapshot_execution_plan_metadata(req)
     _validate_fill_trade_inputs(
         ticker=req.ticker,
@@ -2096,6 +2182,7 @@ async def save_execution(req: ExecutionRequest):
                     application_status=response["portfolio_application_status"],
                 )
                 return response
+            _reject_duplicate_external_execution(req)
             # ① ポートフォリオ反映
             pending_reason = None
             try:
@@ -2125,6 +2212,20 @@ async def save_execution(req: ExecutionRequest):
                 )
             except Exception:
                 _shortfall_bps = None
+            from analysis_snapshot import build_execution_quote_snapshot
+            _execution_quote_snapshot = build_execution_quote_snapshot(
+                req.ticker,
+                price=req.price,
+                spread=(
+                    abs(float(req.ask_at_order) - float(req.bid_at_order))
+                    if req.ask_at_order is not None and req.bid_at_order is not None
+                    else None
+                ),
+                market_status=req.status.value,
+                source_as_of=req.quote_as_of,
+                decision_snapshot_id=req.decision_snapshot_id,
+                decision_snapshot_hash=req.decision_snapshot_hash,
+            )
 
             record = {
                 "id":              exec_id,
@@ -2143,6 +2244,14 @@ async def save_execution(req: ExecutionRequest):
                 "execution_owner": req.execution_owner,
                 "execution_broker": req.execution_broker,
                 "execution_position_keys": req.execution_position_keys,
+                "broker_confirmed_filled": req.broker_confirmed_filled,
+                "external_execution_id": req.external_execution_id,
+                "broker_source": req.broker_source,
+                "broker_reported_at": req.broker_reported_at,
+                "filled_quantity": req.filled_quantity,
+                "filled_price": req.filled_price,
+                "reconciled_at": req.reconciled_at,
+                "reconciliation_snapshot_hash": req.reconciliation_snapshot_hash,
                 "contribution_id":     req.contribution_id,
                 "sell_all":        req.sell_all,
                 "name":            req.name,
@@ -2156,9 +2265,13 @@ async def save_execution(req: ExecutionRequest):
                 "limit_price":               req.limit_price,
                 "decision_price":            req.decision_price,
                 "decision_ts":               req.decision_ts,
+                "decision_snapshot_id":       req.decision_snapshot_id,
+                "decision_snapshot_hash":     req.decision_snapshot_hash,
+                "quote_as_of":                req.quote_as_of,
                 "ai_recommended_order_type": req.ai_recommended_order_type,
                 "ai_recommended_limit":      req.ai_recommended_limit,
                 "shortfall_bps":             round(_shortfall_bps, 2) if _shortfall_bps is not None else None,
+                "execution_quote_snapshot":  _execution_quote_snapshot,
                 # P0-8: ledger 反映済みフラグ（idempotency 保証）
                 "portfolio_applied":    bool(portfolio_result["updated"]),
                 "portfolio_applied_at": datetime.now().isoformat() if portfolio_result["updated"] else None,

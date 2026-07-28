@@ -8,6 +8,7 @@
 """
 from __future__ import annotations
 
+import json
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -187,3 +188,63 @@ def test_claims_from_bl_views_independent_source_is_market_provider():
 def test_claims_from_bl_views_empty_root_returns_empty_list():
     assert cp.claims_from_bl_views({}) == []
     assert cp.claims_from_bl_views({"views": {}}) == []
+
+
+def test_snapshot_claims_and_action_claim_preserve_parent_quality(tmp_path):
+    import analysis_snapshot as snapshot
+
+    now = datetime(2026, 7, 28, 9, 0)
+    for name, payload in {
+        "account.json": {"last_updated": now.isoformat()},
+        "technical_state.json": {"cached_at": now.isoformat()},
+        "macro_event_state.json": {"refreshed_at": now.isoformat()},
+        "news_signal_candidates.json": {"generated_at": now.isoformat()},
+        "short_candidates.json": {"generated_at": now.isoformat()},
+        "margin_long_candidates.json": {"generated_at": now.isoformat()},
+        "long_term_screen_results.json": {"as_of": now.isoformat()},
+        "holdings.json": {},
+    }.items():
+        (tmp_path / name).write_text(json.dumps(payload), encoding="utf-8")
+    base = snapshot.build_base_snapshot_from_data(
+        {"positions": [], "cash_info": {"fx_rate_usdjpy": 150}},
+        base_dir=tmp_path,
+        now=now,
+    )
+    enriched = snapshot.build_enriched_snapshot(
+        base,
+        options_by_ticker_raw={"AVGO": {"iv_rank": 45, "as_of": now.isoformat()}},
+        now=now,
+    )
+    claims = cp.claims_from_decision_snapshot(
+        enriched, decision_snapshot_id="snap-1", ticker="AVGO", now=now,
+    )
+    action_claim = cp.build_action_claim(
+        claim_id="snap-1:action:1:AVGO",
+        input_claims=[
+            c for c in claims
+            if c.claim_id.endswith((":holdings", ":cash", ":prices", ":fx", ":options:AVGO"))
+        ],
+        calculation_version="test-v1",
+        evidence_lineage_id="analysis:snap-1",
+        now=now,
+    )
+    assert action_claim.verified is True
+    assert cp.claim_to_dict(action_claim)["derived_from_claim_ids"]
+
+
+def test_action_claim_does_not_launder_unknown_parent():
+    unknown = cp.build_claim_provenance(
+        "snapshot:prices",
+        source_type="local_artifact",
+        source_ref="technical_state.json",
+        artifact_hash="missing",
+        freshness_status="unknown",
+    )
+    action_claim = cp.build_action_claim(
+        claim_id="action:1",
+        input_claims=[unknown],
+        calculation_version="test-v1",
+        evidence_lineage_id="analysis:test",
+    )
+    assert action_claim.verified is False
+    assert "unverified_or_stale_parents" in action_claim.unverified_reason

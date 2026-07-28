@@ -271,6 +271,10 @@ def test_nisa_capacity_counts_only_activity_strictly_after_date_baseline(tmp_pat
 
     assert result["readiness"] == "ready"
     assert result["nisa_capacity_remaining_jpy"] == 1_200_000
+    assert (
+        result["nisa_capacity_identity"]
+        == "wife|sbi|nisa_growth|growth|2026"
+    )
 
 
 def test_nisa_capacity_datetime_baseline_is_strictly_after_not_at(tmp_path) -> None:
@@ -393,3 +397,47 @@ def test_cancelled_order_is_not_reserved_in_nisa_capacity(tmp_path) -> None:
 
     assert result["readiness"] == "ready"
     assert result["nisa_capacity_remaining_jpy"] == 1_300_000
+
+
+def test_nisa_capacity_does_not_mix_growth_and_tsumitate_activity(tmp_path) -> None:
+    _write_nisa_base(tmp_path)
+    (tmp_path / "action_executions.json").write_text(json.dumps({"executions": [{
+        "id": "tsumitate-fill",
+        "ticker": "SLIM_ORCAN",
+        "direction": "buy",
+        "status": "executed",
+        "account": "NISAつみたて投資枠",
+        "execution_owner": "wife",
+        "execution_broker": "sbi",
+        "notional_jpy": 200_000,
+        "saved_at": "2026-06-11T10:00:00",
+    }]}), encoding="utf-8")
+
+    result = evaluate_nisa_capacity(
+        _nisa_action(),
+        base_dir=tmp_path,
+        now=datetime(2026, 6, 20, 6, 0, tzinfo=JST),
+    )
+
+    assert result["readiness"] == "ready"
+    assert result["nisa_capacity_remaining_jpy"] == 1_300_000
+
+
+def test_nisa_capacity_prefers_owner_profile_baseline(tmp_path) -> None:
+    _write_nisa_base(tmp_path, last_updated="2026-06-19")
+    raw = json.loads((tmp_path / "nisa_portfolio.json").read_text(encoding="utf-8"))
+    raw["wife"]["limit_screen_as_of"] = "2026-05-01"
+    (tmp_path / "nisa_portfolio.json").write_text(
+        json.dumps(raw, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+    result = evaluate_nisa_capacity(
+        _nisa_action(),
+        base_dir=tmp_path,
+        now=datetime(2026, 6, 20, 6, 0, tzinfo=JST),
+    )
+
+    assert result["readiness"] == "review"
+    assert result["nisa_capacity_baseline"] == "2026-05-01"
+    assert result["nisa_capacity_baseline_source"] == "profile.limit_screen_as_of"

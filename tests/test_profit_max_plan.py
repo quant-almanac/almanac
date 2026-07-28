@@ -6,6 +6,7 @@ import json
 from datetime import datetime, timezone
 
 import pandas as pd
+import pytest
 
 from brief_disclosures import format_brief_section, yesterday_disclosure_signals
 from disclosure_push import push_new_disclosure_features, qualifies_for_push
@@ -386,14 +387,17 @@ def test_tax_harvest_scanner_excludes_nisa_and_warns_same_day(tmp_path, monkeypa
         recommended.append(kwargs)
         return {"plan": [{"quantity": 10}]}
 
-    report = scan_tax_harvest(
-        lots_snapshot=lots,
-        price_provider=lambda ticker, currency: (10_000, None),
-        recommend_func=recommend,
-    )
+    with pytest.warns(DeprecationWarning, match="recommend_func is deprecated"):
+        report = scan_tax_harvest(
+            lots_snapshot=lots,
+            price_provider=lambda ticker, currency: (10_000, None),
+            recommend_func=recommend,
+        )
     assert report["candidate_count"] == 1
     assert report["candidates"][0]["account"] == "特定"
-    assert recommended[0]["mode"] == "loss_harvest"
+    assert report["candidates"][0]["actionable_for_gate"] is False
+    assert report["candidates"][0]["recommendation_id"] is None
+    assert recommended == []
     assert "翌営業日以降" in REPURCHASE_WARNING
 
 

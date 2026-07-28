@@ -29,8 +29,9 @@ revision として扱う (呼び出し側が cancel/replace するか人間確�
 税務入力が unknown なら数量を 0 にせず review — fail-closed だが、
 「見えなくする」のではなく「人に見せて止める」。
 
-このモジュールは配線しない (standalone)。rebalance_engine.py など既存の
-target/band 計算エンジンへの統合は別段階。
+Medium-tier の構造化 target/band と同じ PositionIdentity を解決できる exit
+だけが analyst の影響経路へ配線される。owner/broker を含む取得原価を確定
+できない間は status="review" のままで、AI が生成した数量を executable にしない。
 """
 from __future__ import annotations
 
@@ -98,6 +99,9 @@ def compute_exit_size(
     """決定論的 exit sizing。8ステップの計算順を固定する。
 
     Args:
+        pending_qty_same_intent: 既存注文の signed quantity。buy は正、
+            sell は負で raw_delta_qty と同じ符号にそろえる。正の注文株数を
+            sell にそのまま渡すと二重発注分を控除する代わりに増額してしまう。
         cost_basis_resolver: (position, qty) -> CostBasisEstimate | None。
             None を返す = 取得原価不明。この場合 status="review" になり、
             final_qty は 0 にせず「丸め済みの意図数量」をそのまま保持する

@@ -55,14 +55,17 @@ def _save(state: dict) -> None:
 
 
 def _make_id(ticker: str, action_type: str, recommended_at: str,
-              account_bucket: str = "default") -> str:
-    """再現可能な一意ID（ticker + type + 日付 + 口座）
+              account_bucket: str = "default",
+              analysis_id: str = "") -> str:
+    """一意ID（ticker + type + 推奨時刻 + 口座 + analysis）
 
     account_bucket を含めることで「同日同 ticker・同タイプでも口座が違えば別 ID」
     となり、夫NISA / 妻NISA の同日提案が ID 衝突で潰れない。
+    時刻と analysis_id も含めるのは、同日中に invalidated / placed となった
+    旧 action と新分析の successor が同じIDへ衝突するのを防ぐため。live pending
+    の同一 intent は ID 生成前の _find_existing_pending() で引き続き更新される。
     """
-    day = recommended_at[:10]
-    raw = f"{ticker}|{action_type}|{day}|{account_bucket}"
+    raw = f"{ticker}|{action_type}|{recommended_at}|{account_bucket}|{analysis_id}"
     return hashlib.md5(raw.encode()).hexdigest()[:12]
 
 
@@ -141,8 +144,8 @@ def _account_bucket(act_or_entry: dict) -> str:
     if "夫NISA" in text or "husband_nisa" in text.lower():
         return "husband_nisa"
     if "NISA成長" in text or "NISAつみたて" in text or "NISA枠" in text:
-        # 「妻NISA」が明示されていない NISA は自分(夫) のものとして扱う
-        return "husband_nisa"
+        # 名義の記述がない NISA を夫名義と推測しない。
+        return "unknown_nisa"
     if "信用" in text or "margin" in text.lower():
         return "margin"
     if "一般口座" in text or "一般" in text:
@@ -266,6 +269,22 @@ ORDER_TRACKING_FIELDS = (
     "execution_account",
     "execution_investment_type",
     "execution_position_keys",
+    "position_identity_key",
+    "decision_snapshot_id",
+    "decision_snapshot_hash",
+    "decision_snapshot_freshness_issues",
+    "claim_ids",
+    "confidence_evidence_verified",
+    "unverified_numeric_claims",
+    "quote_as_of",
+    "chart_data_as_of",
+    "chart_price_source",
+    "exit_sizing_status",
+    "exit_sizing_reason",
+    "exit_sizing_intent_key",
+    "exit_sizing_evaluation_key",
+    "exit_sizing_steps",
+    "exit_sizing_is_revision",
     "holding_shares_before",
     "requested_sell_quantity",
     "holding_shares_after",
@@ -406,7 +425,10 @@ def record_recommendations(actions: list[dict], source: str = "opus") -> int:
             continue
 
         # Step 2: 新規エントリを作成
-        action_id = _make_id(ticker, action_type, now, bucket)
+        action_id = _make_id(
+            ticker, action_type, now, bucket,
+            analysis_id=str(act.get("analysis_id") or ""),
+        )
         if action_id in state["actions"]:
             # 同日同種同IDの衝突（極めて稀） — pending でなければ別注文として扱うが
             # 安全のためここではスキップ

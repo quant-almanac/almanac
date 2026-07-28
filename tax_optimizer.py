@@ -4,6 +4,7 @@ ALMANAC v4.0 - 税務最適化エンジン
 """
 
 import json
+import os
 from datetime import datetime, date, timedelta
 from pathlib import Path
 from typing import Optional
@@ -905,6 +906,48 @@ def calculate_sell_tax(
 # 総合分析レポート
 # ============================================================
 
+def _active_total_average_loss_harvest_report() -> dict:
+    """Return the side-effect-free, identity-scoped Stage 5C report.
+
+    ``analyze_loss_harvest`` and ``suggest_loss_harvest_pairs`` remain callable
+    for compatibility and historical comparison, but they are not allowed to
+    feed the live analyst context: both originate from holdings-level
+    unrealized P/L and the latter embeds a US-style 30-day operating rule.
+    """
+    from tax_harvest_scanner import compute_tax_harvest
+
+    raw = compute_tax_harvest()
+    candidates = []
+    for row in raw.get("candidates", []):
+        actionable = row.get("actionable_for_gate") is True
+        candidates.append({
+            **row,
+            "unrealized_jpy": row.get("estimated_loss_jpy", 0),
+            "tax_saving_jpy": row.get("estimated_tax_saving_jpy", 0),
+            "cost_basis_crosscheck": {
+                "available": actionable,
+                "method": row.get("cost_basis_method"),
+                "data_quality_issues": (
+                    [] if actionable else ["identity-scoped total-average basis unavailable"]
+                ),
+            },
+        })
+    return {
+        "schema_version": 2,
+        "basis_method": "total_average_like",
+        "source": "tax_harvest_scanner.compute_tax_harvest",
+        "candidate_count": len(candidates),
+        "candidates": candidates,
+        "total_loss_jpy": raw.get("total_estimated_loss_jpy", 0),
+        "total_tax_saving": raw.get("total_estimated_tax_saving_jpy", 0),
+        "deadline": None,
+        "days_to_deadline": -1,
+        "warning": raw.get("warning"),
+        "data_quality_issues": raw.get("data_quality_issues") or [],
+        "execution": "display_and_notify_only",
+    }
+
+
 def get_full_tax_report(snapshot: Optional[dict] = None) -> dict:
     """
     NISA・損出し・外国税額控除の総合レポートを生成する。
@@ -918,9 +961,18 @@ def get_full_tax_report(snapshot: Optional[dict] = None) -> dict:
         }
     """
     nisa   = analyze_nisa_usage()
-    losses = analyze_loss_harvest(snapshot)
+    losses = _active_total_average_loss_harvest_report()
     nisa_leak = detect_nisa_foreign_tax_leak()   # A-1
-    harvest_pairs = suggest_loss_harvest_pairs(snapshot)  # A-2
+    harvest_pairs = {
+        "status": "retired_from_live_report",
+        "pairs": [],
+        "total_net_benefit_jpy": 0,
+        "wash_sale_window_days": None,
+        "notes": [
+            "旧30日代替銘柄ルールは米国制度の運用を日本口座へ流用するため、"
+            "ライブ分析から外しました。"
+        ],
+    }
 
     # 概算配当収入（holdings.jsonのUS株から推計）
     holdings     = _load_holdings()
@@ -934,15 +986,6 @@ def get_full_tax_report(snapshot: Optional[dict] = None) -> dict:
 
     today = date.today()
     urgent_actions = []
-
-    # 12月26日まで1ヶ月以内なら損出しを急ぐ
-    deadline = date(today.year, SONDASHI_DEADLINE_MONTH, SONDASHI_DEADLINE_DAY)
-    if 0 <= losses['days_to_deadline'] <= 30 and losses['candidates']:
-        urgent_actions.append({
-            'priority': 1,
-            'message':  f'⚠️ 損出し期限まで{losses["days_to_deadline"]}日！'
-                        f'節税効果¥{losses["total_tax_saving"]/10000:.0f}万の損出しを急いでください。',
-        })
 
     # NISA枠の推奨
     for rec in nisa['recommendations']:
@@ -1048,6 +1091,7 @@ if __name__ == '__main__':
         print(json.dumps(result, ensure_ascii=False, indent=2))
 
     elif cmd == 'loss':
+        print("⚠️ LEGACY比較専用: holdings/FIFO由来であり執行判断には使えません")
         result = analyze_loss_harvest()
         if result['candidates']:
             print(f'損出し候補 {len(result["candidates"])}件: 節税効果¥{result["total_tax_saving"]/10000:.1f}万')
@@ -1058,6 +1102,12 @@ if __name__ == '__main__':
 
     elif cmd == 'harvest':
         register = '--register' in sys.argv
+        if register and os.environ.get("ALMANAC_ENABLE_LEGACY_TAX_ACTIONS") != "1":
+            raise SystemExit(
+                "legacy harvest action registration is disabled; "
+                "use tax_harvest_scanner.py after broker reconciliation"
+            )
+        print("⚠️ LEGACY比較専用: 米国型30日ルールを含むため通常運用には使えません")
         result = suggest_loss_harvest_pairs()
         pairs = result['pairs']
         if not pairs:

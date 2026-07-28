@@ -188,19 +188,15 @@ def test_resolve_corrupt_state_is_static(paths):
     assert meta["source"] == "static_fallback"
 
 
-def test_resolve_valid_state_returns_ai_targets(paths):
+def test_resolve_valid_state_stays_shadow_until_exposure_contract_is_wired(paths):
     cp.ingest(_valid_rec(usd_target_pct=70, jpy_target_pct=30),
               current_targets=STATIC, now=TODAY, **paths)
     targets, meta = cp.resolve_effective_targets(
         static=STATIC, state_path=paths["state_path"], now=TODAY)
-    assert meta["source"] == "ai_policy"
-    assert targets["USD"]["ideal"] == pytest.approx(0.70)
-    assert targets["JPY"]["ideal"] == pytest.approx(0.30)
-    # band は static と同じ ±0.05
-    assert targets["USD"]["min"] == pytest.approx(0.65)
-    assert targets["USD"]["max"] == pytest.approx(0.75)
-    # rebalance が直接消費できる形 (同じキー集合)
-    assert set(targets["USD"]) == set(STATIC["USD"])
+    assert targets == STATIC
+    assert meta["source"] == "shadow_ai_policy"
+    assert meta["candidate_usd_target_pct"] == 70
+    assert meta["candidate_jpy_target_pct"] == 30
 
 
 def test_resolve_expired_state_is_static(paths):

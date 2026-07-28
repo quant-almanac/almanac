@@ -9,12 +9,33 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+import pytest
+
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 import action_state_tracker as ast  # noqa: E402
 import tax_harvest_scanner as ths  # noqa: E402
+from tax_lot import CostBasisEstimate  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def _authoritative_scoped_basis(monkeypatch):
+    """Most tests in this file exercise scanner orchestration, not ledger scope."""
+    monkeypatch.setattr(
+        ths,
+        "compute_total_average_cost_basis",
+        lambda *args, **kwargs: {
+            "特定": CostBasisEstimate(
+                amount_jpy=20_000,
+                source="broker_report",
+                method="broker_reported",
+                as_of="2026-07-28",
+                reconciled=True,
+            ),
+        },
+    )
 
 
 def _lots_snapshot():
@@ -23,6 +44,8 @@ def _lots_snapshot():
             "9432.T": [
                 {
                     "account": "特定",
+                    "owner": "husband",
+                    "broker": "rakuten",
                     "currency": "JPY",
                     "cost_per_share_jpy": 200.0,
                     "remaining_qty": 100,
@@ -155,6 +178,23 @@ def test_register_actions_is_the_only_side_effecting_step(tmp_path, monkeypatch)
 
     # register_actions は引数の report を書き換えない (deepcopy を返す)
     assert "recommendation_id" not in report["candidates"][0]
+
+
+def test_unverified_owner_broker_basis_is_display_only_and_not_registered(tmp_path, monkeypatch):
+    state_path = tmp_path / "action_state.json"
+    monkeypatch.setattr(ast, "STATE_FILE", state_path)
+    monkeypatch.setattr(ths, "compute_total_average_cost_basis", lambda *a, **k: {})
+
+    report = ths.scan_tax_harvest(
+        min_loss_jpy=1_000,
+        lots_snapshot=_lots_snapshot(),
+        price_provider=_price_provider,
+        recommend_func=_recommend_func,
+    )
+    candidate = report["candidates"][0]
+    assert candidate["actionable_for_gate"] is False
+    assert candidate["recommendation_id"] is None
+    assert not state_path.exists()
 
 
 def test_scan_tax_harvest_reproduces_old_combined_behavior(tmp_path, monkeypatch):

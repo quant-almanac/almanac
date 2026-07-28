@@ -163,10 +163,10 @@ async def get_tax_lots(ticker: Optional[str] = None):
 
 @router.get("/api/realized-pnl")
 async def get_realized_pnl(year: int = Query(..., ge=2000, le=2100)):
-    """年内の確定損益サマリ。"""
+    """年内の確定損益サマリ。schema は basis mode に依存せず常に v2。"""
     try:
-        from tax_lot import realized_pnl_in_year
-        return realized_pnl_in_year(year)
+        from tax_lot import realized_pnl_in_year_v2
+        return realized_pnl_in_year_v2(year)
     except Exception as e:
         return {"error": str(e), "year": year}
 

@@ -40,6 +40,13 @@ def _isolate_llm_call_log(tmp_path, monkeypatch):
 PROTECTED_STATE = (
     "account.json", "holdings.json", "nisa_portfolio.json", "tickers.json",
     "trade_history.csv", "action_state.json", "tunable_params.json",
+    "action_executions.json", "decision_snapshot_state.json",
+    "execution_invalidation_state.json", "macro_event_state.json",
+    "currency_policy_state.json", "hedge_target.json", "hedge_target_shadow.json",
+    "fx_actual_hedge_state.json",
+    "factor_attribution.json",
+    "models/ginn_model.pt", "models/ginn_meta.json", "models/ginn/current.json",
+    "data/tax_harvest_reports.jsonl",
     "data/short_universe.json", "beliefs/agent_beliefs.json",
 )
 
@@ -76,13 +83,18 @@ def _restore_changed_state(snapshot: dict[Path, bytes | None]) -> list[str]:
 
 @pytest.fixture(autouse=True)
 def _fail_test_that_mutates_production_state():
-    """Restore and fail the exact test that touched repository state."""
+    """Detect the exact test that touched repository state, including subprocesses.
+
+    A session-only restore allowed later tests to observe contaminated state and
+    only emitted one warning at the end. Per-test comparison both restores before
+    the next test and turns the unsafe write into an actionable failure.
+    """
     snapshot = _state_snapshot()
     yield
     restored = _restore_changed_state(snapshot)
     if restored:
         pytest.fail(
-            "test mutated repository state (restored): "
+            "テストが本番状態ファイルを書き換えました（復元済み）: "
             + ", ".join(sorted(restored))
         )
 

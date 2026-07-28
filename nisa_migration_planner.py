@@ -139,8 +139,9 @@ def _taxable_candidates(
             if canonical_owner(lot.get("owner")) == position.owner
             and canonical_broker(lot.get("broker")) == position.broker
         ]
-        cost_basis_source = "identity_scoped_tax_lot"
-        cost_basis_verified = bool(lots)
+        audit_lot_ids = [
+            str(lot.get("lot_id")) for lot in lots if lot.get("lot_id")
+        ]
         ambiguous_account_lots = [
             lot for lot in account_lots
             if not canonical_owner(lot.get("owner"))
@@ -148,56 +149,74 @@ def _taxable_candidates(
         ]
         if ambiguous_account_lots:
             issues.append(f"tax_lot_identity_unverified:{position.key}")
-        if not lots:
+        holding_quantity = float(holding.get("shares") or 0)
+        if holding_quantity <= 0:
+            issues.append(f"holding_quantity_missing:{position.key}")
+            continue
+        lot_quantity = sum(float(lot.get("remaining_qty") or 0) for lot in lots)
+        if lots and abs(lot_quantity - holding_quantity) > 1e-6:
+            issues.append(f"inventory_quantity_mismatch:{position.key}")
+
+        # A tax estimate is position-level.  Individual FIFO lots are retained
+        # only as audit lineage and must never select a "low-gain lot" for a
+        # Japanese partial sale.  Prefer an explicitly broker-reported average;
+        # otherwise use an identity-scoped weighted inventory fallback.  That
+        # fallback is display-only until reconciled to the broker average.
+        broker_avg = holding.get("broker_average_cost_per_share_jpy")
+        broker_as_of = holding.get("broker_cost_basis_as_of")
+        broker_verified = bool(
+            holding.get("broker_cost_basis_verified")
+            and broker_avg not in (None, "")
+            and broker_as_of
+        )
+        if broker_verified:
+            avg_cost_jpy = float(broker_avg)
+            cost_basis_source = "broker_reported_average"
+            cost_basis_verified = True
+        elif lots and lot_quantity > 0:
+            avg_cost_jpy = sum(
+                float(lot.get("remaining_qty") or 0)
+                * float(lot.get("cost_per_share_jpy") or 0)
+                for lot in lots
+            ) / lot_quantity
+            cost_basis_source = "inventory_weighted_average_unreconciled"
+            cost_basis_verified = False
+            issues.append(f"cost_basis_unreconciled:{position.key}")
+        else:
             issues.append(f"tax_lot_missing_for_position:{position.key}")
             cost_basis_source = "holding_entry_price_fallback"
-            lots = [{
-                "lot_id": f"holding:{key}",
-                "purchase_date": holding.get("entry_date") or "",
-                "remaining_qty": float(holding.get("shares") or 0),
-                "cost_per_share_jpy": _cost_per_quantity_jpy(
-                    float(holding.get("entry_price") or 0),
-                    holding=holding,
-                    currency=currency,
-                    fx=fx,
-                    current_price_jpy=current_price_jpy,
-                    raw_is_native_price=True,
-                ),
-                "account": account,
-                "owner": position.owner,
-                "broker": position.broker,
-            }]
-        for lot in lots:
-            quantity = float(lot.get("remaining_qty") or 0)
-            if quantity <= 0:
-                continue
-            cost = _cost_per_quantity_jpy(
-                float(lot.get("cost_per_share_jpy") or 0),
+            cost_basis_verified = False
+            avg_cost_jpy = _cost_per_quantity_jpy(
+                float(holding.get("entry_price") or 0),
                 holding=holding,
                 currency=currency,
-                fx=1.0,
+                fx=fx,
                 current_price_jpy=current_price_jpy,
-                raw_is_native_price=False,
+                raw_is_native_price=True,
             )
-            gain_per_share = current_price_jpy - cost
-            candidates.append({
-                "ticker": ticker,
-                "name": holding.get("name") or ticker,
-                "owner": position.owner,
-                "source_broker": position.broker,
-                "source_account": account,
-                "source_account_id": position.account,
-                "canonical_instrument_id": position.canonical_instrument_id,
-                "position_identity": position.key,
-                "lot_id": lot.get("lot_id"),
-                "purchase_date": lot.get("purchase_date"),
-                "remaining_qty": quantity,
-                "current_price_jpy": current_price_jpy,
-                "gain_per_share_jpy": gain_per_share,
-                "nisa_score": float(scored["score"]),
-                "cost_basis_source": cost_basis_source,
-                "cost_basis_verified": cost_basis_verified,
-            })
+        if avg_cost_jpy <= 0:
+            issues.append(f"cost_basis_invalid:{position.key}")
+        gain_per_share = current_price_jpy - avg_cost_jpy
+        candidates.append({
+            "ticker": ticker,
+            "name": holding.get("name") or ticker,
+            "owner": position.owner,
+            "source_broker": position.broker,
+            "source_account": account,
+            "source_account_id": position.account,
+            "canonical_instrument_id": position.canonical_instrument_id,
+            "position_identity": position.key,
+            "lot_id": None,
+            "audit_lot_ids": audit_lot_ids,
+            "purchase_date": None,
+            "remaining_qty": holding_quantity,
+            "current_price_jpy": current_price_jpy,
+            "average_cost_per_share_jpy": avg_cost_jpy,
+            "gain_per_share_jpy": gain_per_share,
+            "nisa_score": float(scored["score"]),
+            "cost_basis_source": cost_basis_source,
+            "cost_basis_verified": cost_basis_verified,
+        })
     candidates.sort(
         key=lambda row: (
             -row["nisa_score"],
@@ -290,6 +309,7 @@ def build_migration_plan(
                     "destination_account_id": capacity_identity.account,
                     "nisa_capacity_identity": capacity_identity.key,
                     "lot_id": row["lot_id"],
+                    "audit_lot_ids": list(row.get("audit_lot_ids") or []),
                     "purchase_date": row["purchase_date"],
                     "quantity": round(qty, 6),
                     "market_value_jpy": round(market_value, 0),

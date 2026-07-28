@@ -17,7 +17,7 @@ def test_kelly_zero_on_negative_ev():
 
 def test_size_cap_long():
     r = k.suggest_size_pct('NVDA', 'long', overrides={
-        'win_rate': 0.7, 'avg_win_pct': 0.1, 'avg_loss_pct': 0.03, 'n': 10,
+        'win_rate': 0.7, 'avg_win_pct': 0.1, 'avg_loss_pct': 0.03, 'n': 20,
     })
     assert r['entry_allowed']
     assert r['size_pct'] == k.CAPS_BY_ITYPE['long']  # 5% cap
@@ -26,14 +26,14 @@ def test_size_cap_long():
 
 def test_size_cap_swing():
     r = k.suggest_size_pct('CRWV', 'swing', overrides={
-        'win_rate': 0.6, 'avg_win_pct': 0.08, 'avg_loss_pct': 0.03, 'n': 10,
+        'win_rate': 0.6, 'avg_win_pct': 0.08, 'avg_loss_pct': 0.03, 'n': 20,
     })
     assert r['size_pct'] == k.CAPS_BY_ITYPE['swing']  # 2% cap
 
 
 def test_negative_kelly_rejected():
     r = k.suggest_size_pct('X', 'long', overrides={
-        'win_rate': 0.4, 'avg_win_pct': 0.02, 'avg_loss_pct': 0.05, 'n': 10,
+        'win_rate': 0.4, 'avg_win_pct': 0.02, 'avg_loss_pct': 0.05, 'n': 20,
     })
     assert not r['entry_allowed']
     assert r['method'] == 'rejected'
@@ -59,10 +59,12 @@ def test_fallback_insufficient_history():
 # ---------------------------------------------------------------------------
 
 
-def _rec(ticker, type_, outcome_pct, *, analysis_id=None, verified=True):
+def _rec(ticker, type_, outcome_pct, *, analysis_id=None, verified=True, **extra):
+    extra.setdefault('tier', 'swing')
     return {
         'ticker': ticker, 'type': type_, 'outcome_pct': outcome_pct,
         'verified': verified, 'analysis_id': analysis_id,
+        **extra,
     }
 
 
@@ -129,3 +131,63 @@ def test_unverified_entries_are_still_excluded():
     recs = [_rec('AVGO', 'buy', 5.0, analysis_id='a1', verified=False)]
     stats = k.aggregate_ticker_stats(recs, min_trades=1)
     assert 'AVGO' not in stats
+
+
+def test_signal_population_uses_signal_evaluable_not_execution_eligible():
+    recs = [
+        _rec(
+            'AVGO', 'buy', 5.0, analysis_id='cash-blocked',
+            signal_evaluable=True, execution_eligible=False,
+        ),
+        _rec(
+            'AVGO', 'buy', -20.0, analysis_id='stale-input',
+            signal_evaluable=False, execution_eligible=True,
+        ),
+    ]
+    stats = k.aggregate_ticker_stats(recs, min_trades=1)
+    assert stats['AVGO']['n'] == 1
+    assert stats['AVGO']['win_rate'] == 1.0
+
+
+def test_medium_uses_20d_outcome_instead_of_legacy_5d_value():
+    recs = [
+        _rec(
+            'AVGO', 'buy', -99.0, analysis_id='medium-1', tier='medium',
+            horizons={'5d': {'outcome_pct': -10.0}, '20d': {'outcome_pct': 6.0}},
+        ),
+    ]
+    stats = k.aggregate_ticker_stats(recs, min_trades=1)
+    assert stats['AVGO']['by_horizon']['20d']['win_rate'] == 1.0
+    assert '5d' not in stats['AVGO']['by_horizon']
+
+
+def test_long_without_60d_outcome_is_excluded():
+    recs = [
+        _rec(
+            'AVGO', 'buy', 5.0, analysis_id='long-1', tier='long',
+            horizons={'5d': {'outcome_pct': 5.0}, '20d': {'outcome_pct': 4.0}},
+        ),
+    ]
+    assert 'AVGO' not in k.aggregate_ticker_stats(recs, min_trades=1)
+
+
+def test_suggest_size_selects_matching_investment_horizon():
+    stats = {
+        'AVGO': {
+            'by_horizon': {
+                '5d': {
+                    'win_rate': 0.2, 'avg_win_pct': 0.01,
+                    'avg_loss_pct': 0.1, 'n': 20, 'sufficient': True,
+                    'horizon': '5d',
+                },
+                '20d': {
+                    'win_rate': 0.7, 'avg_win_pct': 0.08,
+                    'avg_loss_pct': 0.03, 'n': 20, 'sufficient': True,
+                    'horizon': '20d',
+                },
+            },
+        },
+    }
+    result = k.suggest_size_pct('AVGO', 'medium', stats=stats)
+    assert result['entry_allowed'] is True
+    assert result['inputs']['horizon'] == '20d'

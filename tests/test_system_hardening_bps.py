@@ -7,7 +7,7 @@ from employee_plan_exit import build_exit_proposal
 from nisa_migration_planner import build_migration_plan, build_plan_from_files
 
 
-def test_nisa_migration_uses_low_gain_lot_and_never_executes() -> None:
+def test_nisa_migration_uses_position_average_not_specific_low_gain_lot() -> None:
     plan = build_migration_plan(
         nisa_data={
             "husband": {"growth_limit_annual": 2_400_000, "broker": "楽天証券"},
@@ -55,7 +55,13 @@ def test_nisa_migration_uses_low_gain_lot_and_never_executes() -> None:
 
     assert plan["human_execution_only"] is True
     assert plan["display_only"] is True
-    assert plan["moves"][0]["lot_id"] == "low-gain"
+    assert plan["actionable"] is False
+    assert plan["moves"][0]["lot_id"] is None
+    assert plan["moves"][0]["audit_lot_ids"] == ["high-gain", "low-gain"]
+    assert plan["moves"][0]["quantity"] == 20
+    assert plan["moves"][0]["estimated_realized_gain_jpy"] == 850_000
+    assert plan["moves"][0]["estimated_tax_jpy"] == 172_678
+    assert plan["moves"][0]["cost_basis_source"] == "inventory_weighted_average_unreconciled"
     assert all(move["human_execution_only"] for move in plan["moves"])
 
 
@@ -402,8 +408,9 @@ def test_nisa_migration_does_not_mix_same_ticker_account_across_brokers() -> Non
         years=1,
     )
 
-    assert [move["lot_id"] for move in plan["moves"]] == ["sbi-wife"]
+    assert [move["lot_id"] for move in plan["moves"]] == [None]
     move = plan["moves"][0]
+    assert move["audit_lot_ids"] == ["sbi-wife"]
     assert move["source_owner"] == "wife"
     assert move["source_broker"] == "sbi"
     assert move["destination_owner"] == "wife"
@@ -479,6 +486,35 @@ def test_nisa_migration_legacy_lot_without_owner_broker_is_non_actionable() -> N
     assert "tax_lot_identity_unverified:husband|rakuten|specific|AAA" in plan["data_quality_issues"]
     assert plan["moves"][0]["cost_basis_verified"] is False
     assert plan["moves"][0]["cost_basis_source"] == "holding_entry_price_fallback"
+
+
+def test_nisa_migration_can_use_explicit_broker_average_without_lot_selection() -> None:
+    plan = build_migration_plan(
+        nisa_data={
+            "husband": {"growth_limit_annual": 2_400_000, "broker": "楽天証券"},
+            "wife": {"growth_limit_annual": 2_400_000, "broker": "SBI証券"},
+        },
+        holdings={
+            "AAA": {
+                "ticker": "AAA", "account": "特定", "owner": "husband",
+                "broker": "楽天証券", "currency": "JPY", "shares": 10,
+                "current_price": 100_000, "expected_return_pct": 0.15,
+                "dividend_yield": 0.0, "investment_type": "long",
+                "broker_average_cost_per_share_jpy": 80_000,
+                "broker_cost_basis_as_of": "2026-07-28",
+                "broker_cost_basis_verified": True,
+            },
+        },
+        lots_by_ticker={},
+        start_year=2027,
+        years=1,
+    )
+
+    assert plan["actionable"] is True
+    assert plan["moves"][0]["cost_basis_source"] == "broker_reported_average"
+    assert plan["moves"][0]["cost_basis_verified"] is True
+    assert plan["moves"][0]["lot_id"] is None
+    assert plan["moves"][0]["estimated_realized_gain_jpy"] == 200_000
 
 
 def test_nisa_migration_respects_explicit_owner_field_over_account_name_heuristic() -> None:

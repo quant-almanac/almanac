@@ -265,14 +265,30 @@ def optimize_skfolio(
 # 最適化: Black-Litterman + LLM Views (ICLR 2025)
 # ============================================================
 
+def _load_independent_bl_views(path: Path) -> dict:
+    """Read only views backed by an independent alpha lineage."""
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    raw_views = raw.get("views", raw) if isinstance(raw, dict) else {}
+    if not isinstance(raw_views, dict):
+        return {}
+    return {
+        ticker: view
+        for ticker, view in raw_views.items()
+        if isinstance(view, dict) and view.get("is_independent") is True
+    }
+
+
 def bl_optimize(
     returns: pd.DataFrame,
     bl_views_path: Optional[Path] = None,
 ) -> dict:
     """
-    Black-Litterman最適化: Sonnet Bull/Bear/Macroの3視点分散をΩ（信頼度行列）として使用。
+    Black-Litterman最適化: 独立 alpha source の view だけを使用。
 
-    LLMビューの分散 = モデル不確実性 → Ω（view confidence matrix）
+    view の分散 = モデル不確実性 → Ω（view confidence matrix）
     μ_BL = [(τΣ)⁻¹ + PᵀΩ⁻¹P]⁻¹ [(τΣ)⁻¹Π + PᵀΩ⁻¹q]
 
     Returns:
@@ -295,12 +311,9 @@ def bl_optimize(
     # BLビューを読み込み
     views_dict: dict = {}
     if bl_views_path.exists():
-        try:
-            with open(bl_views_path, encoding='utf-8') as f:
-                raw = json.load(f)
-            views_dict = raw.get('views', raw) if isinstance(raw, dict) else {}
-        except Exception:
-            pass
+        # Stage 0C: tier LLM の出力を期待リターンへ写像した view は、
+        # 次回の最適化へ戻すと自己参照になる。
+        views_dict = _load_independent_bl_views(bl_views_path)
 
     prices = (1 + returns).cumprod()
     cov_df = returns.cov() * 252
@@ -314,13 +327,6 @@ def bl_optimize(
 
     # BLビューとΩ構築
     # P2-11: investment_type 別のクランプ幅（long=0.20 / medium=0.15 / swing=0.25）
-    # P1-16: LLM 由来 view を Ω scale で意図的に deweight する。
-    #   BL では Ω が小さい = view の信頼度が高い = posterior 影響が強い。
-    #   現状の bl_views.json は Sonnet の (action,urgency) を期待リターンに写像した
-    #   "confidence laundering" であり、独立な alpha 源ではない。
-    #   独立 alpha source (factor / analyst consensus) が入るまでは大きめの scale で posterior 影響を抑制する。
-    BL_LLM_OMEGA_SCALE = float(os.environ.get("BL_LLM_OMEGA_SCALE", "25.0"))
-
     holdings = _load_holdings()
     absolute_views: dict = {}
     view_variances: dict = {}
@@ -339,9 +345,10 @@ def bl_optimize(
         itype = _lookup_investment_type(ticker, holdings)
         max_abs = get_max_abs_view(itype)
         absolute_views[ticker] = max(-max_abs, min(max_abs, mean_view))
-        # _extract_bl_views が計算済みの variance を優先使用 + LLM deweight scale
+        # _extract_bl_views / independent source が計算済みの variance。
+        # LLM consensus は上の読込時点で除外済み。
         raw_variance = max(0.001, v.get("variance", 0.01))
-        view_variances[ticker] = raw_variance * BL_LLM_OMEGA_SCALE
+        view_variances[ticker] = raw_variance
 
     views_used = len(absolute_views)
 

@@ -219,7 +219,12 @@ def _requested_buy_notional(action: dict, *, currency: str) -> float | None:
     return None
 
 
-def evaluate_cash_buying_power(action: dict, *, base_dir: Path) -> dict:
+def evaluate_cash_buying_power(
+    action: dict,
+    *,
+    base_dir: Path,
+    now: datetime | None = None,
+) -> dict:
     """Check an explicitly routed cash buy against that wallet only.
 
     The wife's SBI row is an estimated reconciliation ledger by design.  It is
@@ -229,18 +234,40 @@ def evaluate_cash_buying_power(action: dict, *, base_dir: Path) -> dict:
     action_type = str(action.get("type") or action.get("action_type") or "").lower()
     if action_type not in {"buy", "add", "dca"}:
         return {"required": False, "readiness": "ready", "reasons": []}
+    if action.get("scheduled_contribution"):
+        return {
+            "required": False,
+            "readiness": "ready",
+            "reasons": [],
+            "cash_route": "scheduled_contribution_managed_externally",
+        }
 
-    from execution_safety import canonical_broker, canonical_owner
+    from execution_safety import canonical_account, canonical_broker, canonical_owner
+    from position_identity import AccountResourceIdentity
 
     owner = canonical_owner(action.get("execution_owner") or action.get("owner"))
     broker = canonical_broker(action.get("execution_broker") or action.get("broker"))
-    # Legacy actions without a structured route are handled by the existing
-    # route/scope gates.  Do not infer a wallet from prose here.
-    if not owner or not broker:
-        return {"required": False, "readiness": "ready", "reasons": []}
+    account_scope = canonical_account(
+        action.get("execution_account") or action.get("account")
+    )
+    if not owner or not broker or not account_scope:
+        return {
+            "required": True,
+            "readiness": "blocked",
+            "reasons": [{
+                "code": "cash_resource_identity_missing",
+                "message": "買付資金の owner・broker・account を一意に確定できません",
+            }],
+        }
 
     ticker = str(action.get("ticker") or "").upper()
     currency = str(action.get("currency") or ("JPY" if ticker.endswith(".T") else "USD")).upper()
+    resource_identity = AccountResourceIdentity(
+        owner=owner,
+        broker=broker,
+        account=account_scope,
+        currency=currency,
+    )
     required = _requested_buy_notional(action, currency=currency)
     route = ""
     balance = None
@@ -291,6 +318,7 @@ def evaluate_cash_buying_power(action: dict, *, base_dir: Path) -> dict:
         }
 
     details = {
+        "account_resource_identity": resource_identity.key,
         "cash_route": route,
         "execution_owner": owner,
         "execution_broker": broker,
@@ -338,6 +366,66 @@ def evaluate_cash_buying_power(action: dict, *, base_dir: Path) -> dict:
                 "code": "cash_balance_insufficient",
                 "message": f"{route} の残高{balance:,.2f}{currency}では{required:,.2f}{currency}を買付できません",
                 "shortfall": round(required - balance, 2),
+                **details,
+            }],
+        }
+
+    now = now or datetime.now(ZoneInfo("Asia/Tokyo"))
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=ZoneInfo("Asia/Tokyo"))
+    resource_as_of = None
+    if route == "account.json":
+        raw = _load_json_object(base_dir / "account.json") or {}
+        for key in ("broker_reconciled_at", "source_as_of", "last_updated", "as_of"):
+            resource_as_of = _parse_local_timestamp(
+                raw.get(key), local_tz=ZoneInfo("Asia/Tokyo")
+            )
+            if resource_as_of is not None:
+                break
+    else:
+        row = _cash_holding_row(base_dir, route) or {}
+        for key in (
+            "broker_reconciled_at", "reconciled_at", "source_as_of",
+            "reported_as_of", "last_updated", "as_of",
+        ):
+            resource_as_of = _parse_local_timestamp(
+                row.get(key), local_tz=ZoneInfo("Asia/Tokyo")
+            )
+            if resource_as_of is not None:
+                break
+    if resource_as_of is None:
+        return {
+            "required": True,
+            "readiness": "blocked",
+            "reasons": [{
+                "code": "cash_resource_freshness_unknown",
+                "message": f"{route} の残高基準時刻を確認できません",
+                **details,
+            }],
+        }
+    resource_as_of = resource_as_of.astimezone(now.tzinfo)
+    age_hours = max(0.0, (now - resource_as_of).total_seconds() / 3600)
+    details.update({
+        "cash_resource_as_of": resource_as_of.isoformat(),
+        "cash_resource_age_hours": round(age_hours, 1),
+    })
+    if age_hours > 72:
+        return {
+            "required": True,
+            "readiness": "blocked",
+            "reasons": [{
+                "code": "cash_resource_stale",
+                "message": f"{route} の残高が72時間超更新されていません",
+                **details,
+            }],
+        }
+    if age_hours > 24:
+        return {
+            "required": True,
+            "readiness": "review",
+            "reasons": [{
+                "code": "cash_resource_degraded",
+                "message": f"{route} の残高が24時間超前です",
                 **details,
             }],
         }
@@ -399,10 +487,42 @@ def classify_execution_readiness(
         add("review", "cross_scope_opposite_action", "異なる口座・運用ティアに反対方向の提案が併存")
     if action.get("cross_owner_opposite_action"):
         add("review", "cross_owner_opposite_action", "別名義に反対方向の注文・約定が存在")
+    if action.get("exit_sizing_status") == "review":
+        add(
+            "review",
+            "exit_sizing_review",
+            str(action.get("exit_sizing_reason") or "決定論的な売却数量を確定できません"),
+            intent_key=action.get("exit_sizing_intent_key"),
+            evaluation_key=action.get("exit_sizing_evaluation_key"),
+        )
+    elif action.get("exit_sizing_status") == "non_actionable":
+        add(
+            "blocked",
+            "exit_sizing_non_actionable",
+            str(action.get("exit_sizing_reason") or "売買単位を満たす売却数量がありません"),
+        )
     if action.get("holding_scope_unresolved"):
         add("blocked", "holding_scope_unresolved", "指定された口座・運用ティアに一致する保有を確認できない")
     elif action.get("holding_scope_ambiguous"):
         add("blocked", "holding_scope_ambiguous", "同一銘柄を複数口座で保有しており発注口座を特定できない")
+
+    snapshot_issues = action.get("decision_snapshot_freshness_issues")
+    if isinstance(snapshot_issues, list) and snapshot_issues:
+        add(
+            "review",
+            "decision_snapshot_input_stale",
+            "分析に使用した凍結入力に stale/unknown データがあります",
+            issues=[dict(row) for row in snapshot_issues if isinstance(row, dict)],
+            decision_snapshot_id=action.get("decision_snapshot_id"),
+        )
+    if action.get("confidence_evidence_verified") is False:
+        add(
+            "review",
+            "claim_provenance_unverified",
+            "確率・確信度を支える claim provenance を検証できません",
+            claim_ids=action.get("claim_ids") or [],
+            unverified_numeric_claims=action.get("unverified_numeric_claims") or [],
+        )
 
     action_type = str(action.get("type") or "").lower()
     ticker = str(action.get("ticker") or "")
@@ -421,11 +541,19 @@ def classify_execution_readiness(
     # あり (実測 35/39 ポジションが72h超)、これを blocked にすると発注機能が
     # 事実上停止する。stale/degraded/unknown はいずれも review 止まりとし、
     # 人間の確認を促すに留める — 自動で止めない。
-    if action_type in EXIT_ACTION_TYPES or risk_increasing:
+    if (action_type in EXIT_ACTION_TYPES or risk_increasing) and not action.get(
+        "scheduled_contribution"
+    ):
         from position_identity import position_identity_for_action, position_freshness
 
         position = position_identity_for_action(action)
-        if position is not None:
+        if position is None:
+            add(
+                "review",
+                "position_identity_unknown",
+                "owner・broker・account・instrument を一意に確定できません",
+            )
+        elif position is not None:
             freshness = position_freshness(position, base_dir=base_dir, now=now)
             if freshness["status"] == "stale":
                 add(
@@ -500,7 +628,7 @@ def classify_execution_readiness(
         )
 
     try:
-        cash_result = evaluate_cash_buying_power(action, base_dir=base_dir)
+        cash_result = evaluate_cash_buying_power(action, base_dir=base_dir, now=now)
     except Exception as exc:
         cash_result = {
             "readiness": "blocked",

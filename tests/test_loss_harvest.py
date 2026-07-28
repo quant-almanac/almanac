@@ -159,3 +159,30 @@ def test_analyze_loss_harvest_crosscheck_matches_by_account():
         cc = tx._cost_basis_crosscheck_for_candidate(ticker='AVGO', account='特定')
     assert cc['available'] is True
     assert cc['fifo_cost_basis_jpy'] == 700_000
+
+
+def test_live_tax_report_uses_pure_total_average_scanner(monkeypatch):
+    monkeypatch.setattr(
+        "tax_harvest_scanner.compute_tax_harvest",
+        lambda: {
+            "candidates": [{
+                "ticker": "AVGO",
+                "estimated_loss_jpy": -80_000,
+                "estimated_tax_saving_jpy": 16_252,
+                "actionable_for_gate": True,
+                "cost_basis_method": "total_average_like",
+            }],
+            "total_estimated_loss_jpy": -80_000,
+            "total_estimated_tax_saving_jpy": 16_252,
+            "warning": "翌営業日以降",
+            "data_quality_issues": [],
+        },
+    )
+
+    report = tx._active_total_average_loss_harvest_report()
+
+    assert report["schema_version"] == 2
+    assert report["basis_method"] == "total_average_like"
+    assert report["candidates"][0]["unrealized_jpy"] == -80_000
+    assert report["candidates"][0]["cost_basis_crosscheck"]["available"] is True
+    assert report["deadline"] is None

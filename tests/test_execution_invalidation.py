@@ -23,6 +23,9 @@ execution_invalidation_state.json が両経路・dedup・通知の4箇所すべ�
 """
 from __future__ import annotations
 
+import json
+import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -117,6 +120,35 @@ def test_state_persists_across_reload(tmp_path):
     # 新しいプロセスを模して state を read し直す (グローバルはキャッシュしない設計)
     fresh = ei._load_state()
     assert any(e.get("analysis_id") == ANALYSIS_ID for e in fresh["entries"])
+
+
+def test_subprocess_honors_state_dir(tmp_path):
+    """CLI/subprocess callers must not fall back to the production overlay."""
+    state_dir = tmp_path / "isolated-state"
+    env = os.environ.copy()
+    env["ALMANAC_STATE_DIR"] = str(state_dir)
+    code = f"""
+import json
+import execution_invalidation as ei
+ei.invalidate_analysis(
+    analysis_id={ANALYSIS_ID!r},
+    action_state_ids={[AVGO_ID]!r},
+    reason_codes=[ei.REASON_UNVALIDATED_GINN_INPUT],
+    approved_by="user:test",
+    source_incident="subprocess-test",
+)
+print(json.dumps(ei.resolve_execution_invalidation(analysis_id={ANALYSIS_ID!r})))
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        cwd=_REPO_ROOT,
+        env=env,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert json.loads(result.stdout)["analysis_id"] == ANALYSIS_ID
+    assert (state_dir / "execution_invalidation_state.json").exists()
 
 
 def test_reinvalidate_replaces_not_duplicates():
@@ -262,6 +294,35 @@ def test_dedup_skips_invalidated_pending(tmp_path, monkeypatch):
     )
     state = ast._load()
     assert ast._find_existing_pending(state, dedup_key) is None
+
+
+def test_new_analysis_after_invalidation_gets_a_new_action_state_id(tmp_path, monkeypatch):
+    """同日・同intentでも旧IDへ衝突せず successor を作る。"""
+    state_path = tmp_path / "action_state.json"
+    _seed_action_state(state_path)
+    monkeypatch.setattr(ast, "STATE_FILE", state_path)
+    ei.invalidate_analysis(
+        analysis_id=ANALYSIS_ID, action_state_ids=[AVGO_ID],
+        reason_codes=[ei.REASON_UNVALIDATED_GINN_INPUT], approved_by="user:test",
+        source_incident="test",
+    )
+
+    added = ast.record_recommendations([{
+        "analysis_id": "new-analysis-id",
+        "ticker": "AVGO", "type": "trim", "urgency": "medium",
+        "action": "再照合後の新しい候補",
+        "execution_owner": "husband", "execution_broker": "rakuten",
+        "execution_account": "一般",
+    }])
+    rows = ast._load()["actions"]
+    successors = [
+        row for key, row in rows.items()
+        if key != AVGO_ID and row.get("ticker") == "AVGO"
+    ]
+    assert added == 1
+    assert len(successors) == 1
+    assert successors[0]["id"] != AVGO_ID
+    assert successors[0]["analysis_id"] == "new-analysis-id"
 
 
 # ---------------------------------------------------------------------------

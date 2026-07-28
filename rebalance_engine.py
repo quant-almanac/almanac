@@ -678,6 +678,14 @@ def calculate_medium_drift(snapshot: dict) -> dict:
         key    = p.get("key", ticker)
         name   = p.get("name", ticker)
         account = p.get("account")
+        owner = p.get("owner")
+        broker = p.get("broker")
+        try:
+            from position_identity import position_identity_for_holding
+
+            position_identity = position_identity_for_holding(p, key=str(key))
+        except Exception:
+            position_identity = None
         value  = p.get("value_jpy", 0)
 
         actual_pct = value / total_medium
@@ -696,15 +704,19 @@ def calculate_medium_drift(snapshot: dict) -> dict:
             atype = "reduce" if drift > 0 else "buy"
 
             # Codex round6 #3 (C): NISA 口座の reduce は hard suppress する。
-            #   NISA は売却すると非課税枠が戻らないため、rebalance レイヤーで
-            #   実行不可にする (特定/一般の税効率順序・損益通算は tax_lot/execution に委ねる)。
+            #   年間投資枠は年度内に戻らず、生涯非課税保有限度額の簿価分が
+            #   復活するのも翌年以降。即時の買い戻し原資には使えないため、
+            #   rebalance レイヤーでは実行不可にする (税効率は別レイヤー)。
             nisa_protected = (atype == "reduce" and _is_nisa_account(account))
 
             _suppressed = bool(degraded_target_model) or nisa_protected
             if degraded_target_model:
                 _reason = "degraded_target_model: cap 再配分先不足のため観測のみ"
             elif nisa_protected:
-                _reason = f"NISA売却保護: {account} は非課税枠が戻らないため reduce 実行不可 (観測のみ)"
+                _reason = (
+                    f"NISA売却保護: {account} は年度内の年間投資枠が戻らず、"
+                    "生涯枠の簿価復活も翌年以降のため reduce 実行不可 (観測のみ)"
+                )
             else:
                 _reason = None
 
@@ -716,6 +728,11 @@ def calculate_medium_drift(snapshot: dict) -> dict:
                 # Codex round4 #2: 同一 ticker 複数口座を区別できるよう key/account を保持。
                 "key":      key,
                 "account":  account,
+                "owner":    owner,
+                "broker":   broker,
+                "position_identity_key": (
+                    position_identity.key if position_identity is not None else None
+                ),
                 "message":  (
                     f"Medium/{ticker}"
                     + (f"[{account}]" if account else "")
@@ -744,6 +761,11 @@ def calculate_medium_drift(snapshot: dict) -> dict:
             "name":       name,
             "key":        key,
             "account":    account,
+            "owner":      owner,
+            "broker":     broker,
+            "position_identity_key": (
+                position_identity.key if position_identity is not None else None
+            ),
             "actual_pct": round(actual_pct * 100, 1),
             "target_pct": round(target_pct * 100, 1),
             "drift_pct":  round(drift * 100, 1),
@@ -923,31 +945,35 @@ def check_nisa_sell_protection(snapshot: dict, action_plan: list) -> list:
 
 
 def find_loss_harvest_candidates(snapshot: dict, min_loss_jpy: float = 50_000) -> list:
-    """
-    損出し候補銘柄を検出する。
+    """Display identity-scoped total-average candidates without side effects.
 
-    Args:
-        snapshot:      portfolio_manager スナップショット
-        min_loss_jpy:  最低含み損額（円）
-
-    Returns:
-        [{ticker, name, unrealized_jpy, unrealized_pct, investment_type, account}, ...]
+    ``snapshot`` remains in the signature for compatibility, but it is not a
+    tax-basis authority.  The previous implementation independently scanned
+    holdings-level unrealized P/L (and even failed to exclude NISA), creating a
+    second live definition that could disagree with the analyst gate.
     """
-    candidates = []
-    for p in snapshot.get('positions', []):
-        if p['unrealized_jpy'] < -min_loss_jpy:
-            candidates.append({
-                'key':             p['key'],
-                'ticker':          p['ticker'],
-                'name':            p['name'],
-                'unrealized_jpy':  p['unrealized_jpy'],
-                'unrealized_pct':  p['unrealized_pct'],
-                'investment_type': p['investment_type'],
-                'account':         p['account'],
-                'sector':          p['sector'],
-            })
-    candidates.sort(key=lambda x: x['unrealized_jpy'])   # 損失が大きい順
-    return candidates
+    del snapshot
+    try:
+        from tax_harvest_scanner import compute_tax_harvest
+
+        report = compute_tax_harvest(min_loss_jpy=min_loss_jpy)
+    except Exception:
+        return []
+    return [{
+        "ticker": row.get("ticker"),
+        "name": row.get("ticker"),
+        "unrealized_jpy": row.get("estimated_loss_jpy"),
+        "unrealized_pct": None,
+        "investment_type": None,
+        "account": row.get("account"),
+        "owner": row.get("owner"),
+        "broker": row.get("broker"),
+        "quantity": row.get("quantity"),
+        "cost_basis_method": row.get("cost_basis_method"),
+        "actionable_for_gate": row.get("actionable_for_gate") is True,
+        "human_execution_only": True,
+        "sector": None,
+    } for row in report.get("candidates", [])]
 
 
 # ============================================================

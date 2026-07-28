@@ -118,7 +118,7 @@ def test_stale_position_matches_the_actual_incident_math():
 
     result = pi.position_freshness(position, base_dir=Path("."), now=now, holdings_entry=entry)
     assert result["status"] == "stale"
-    assert result["synced_at"] == "2026-07-14"
+    assert result["synced_at"] == "2026-07-14T00:00:00+09:00"
     assert result["age_hours"] == pytest.approx(330.0, abs=1.0)  # 13.75日
 
 
@@ -167,6 +167,73 @@ def test_no_matching_holding_is_unknown():
     result = pi.position_freshness(position, base_dir=Path("/nonexistent"), now=now)
     assert result["status"] == "unknown"
     assert result["source"] == "unknown"
+
+
+def test_internal_portfolio_applied_does_not_advance_position_freshness(tmp_path):
+    position = pi.PositionIdentity("husband", "rakuten", "general", "AVGO")
+    (tmp_path / "action_executions.json").write_text(json.dumps({
+        "executions": [{
+            "ticker": "AVGO",
+            "status": "executed",
+            "portfolio_applied": True,
+            "saved_at": "2026-07-27T17:00:00+09:00",
+            "execution_owner": "husband",
+            "execution_broker": "rakuten",
+            "execution_account": "一般",
+        }],
+    }), encoding="utf-8")
+
+    result = pi.position_freshness(
+        position,
+        base_dir=tmp_path,
+        now=datetime(2026, 7, 27, 18, 0, tzinfo=JST),
+        holdings_entry={"note": "楽天CSV保有同期 2026-07-14"},
+    )
+
+    assert result["status"] == "stale"
+    assert result["source"] == "holdings_note_legacy"
+
+
+def test_only_fully_evidenced_broker_fill_advances_position_freshness(tmp_path):
+    position = pi.PositionIdentity("husband", "rakuten", "general", "AVGO")
+    base = {
+        "ticker": "AVGO",
+        "status": "broker_confirmed_filled",
+        "execution_owner": "husband",
+        "execution_broker": "rakuten",
+        "execution_account": "一般",
+        "external_execution_id": "broker-123",
+        "broker_source": "broker_csv",
+        "broker_reported_at": "2026-07-27T16:55:00+09:00",
+        "filled_quantity": 5,
+        "filled_price": 410.0,
+        "reconciled_at": "2026-07-27T17:00:00+09:00",
+    }
+    (tmp_path / "action_executions.json").write_text(json.dumps({
+        "executions": [{**base}],
+    }), encoding="utf-8")
+    incomplete = pi.position_freshness(
+        position,
+        base_dir=tmp_path,
+        now=datetime(2026, 7, 27, 18, 0, tzinfo=JST),
+        holdings_entry={"note": "楽天CSV保有同期 2026-07-14"},
+    )
+    assert incomplete["status"] == "stale"
+
+    (tmp_path / "action_executions.json").write_text(json.dumps({
+        "executions": [{
+            **base,
+            "reconciliation_snapshot_hash": "sha256:abc",
+        }],
+    }), encoding="utf-8")
+    confirmed = pi.position_freshness(
+        position,
+        base_dir=tmp_path,
+        now=datetime(2026, 7, 27, 18, 0, tzinfo=JST),
+        holdings_entry={"note": "楽天CSV保有同期 2026-07-14"},
+    )
+    assert confirmed["status"] == "fresh"
+    assert confirmed["source"] == "broker_confirmed_fill:broker-123"
 
 
 # ---------------------------------------------------------------------------

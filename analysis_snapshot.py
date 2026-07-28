@@ -32,7 +32,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -56,6 +56,9 @@ class SourceProvenance:
     freshness_status: str  # "fresh" | "degraded" | "stale" | "unknown"
     max_age_policy_hours: float
     artifact_hash: str
+    # Hash of the exact in-memory payload handed to the analysis pipeline.
+    # artifact_hash alone only proves what was on disk at freeze time.
+    payload_hash: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -104,6 +107,21 @@ def _file_hash(path: Path) -> str:
         return _MISSING_HASH
 
 
+def _payload_hash(payload: object) -> str:
+    """Return a stable hash for the exact value consumed by the pipeline."""
+    try:
+        encoded = json.dumps(
+            payload,
+            sort_keys=True,
+            default=str,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    except Exception:
+        return _MISSING_HASH
+    return hashlib.sha256(encoded).hexdigest()
+
+
 def _combined_hash(paths: list[Path]) -> str:
     """複数ファイルにまたがる1カテゴリ (例: screening) を1つのハッシュにまとめる。
     ファイル名込みでハッシュするため、内容が同じでもファイル構成が変われば
@@ -150,17 +168,27 @@ def _extract_json_timestamp(path: Path, ts_keys: tuple[str, ...]) -> Optional[da
         v = raw.get(k)
         if not v:
             continue
-        s = str(v).replace("Z", "+00:00")
-        for parser in (
-            lambda x: datetime.fromisoformat(x),
-            lambda x: datetime.strptime(x[:19], "%Y-%m-%d %H:%M:%S"),
-            lambda x: datetime.strptime(x[:16], "%Y-%m-%d %H:%M"),
-        ):
-            try:
-                dt = parser(s)
-                return dt.replace(tzinfo=None) if dt.tzinfo is not None else dt
-            except (ValueError, TypeError):
-                continue
+        parsed = _parse_timestamp_value(v)
+        if parsed is not None:
+            return parsed
+    return None
+
+
+def _parse_timestamp_value(value: object) -> Optional[datetime]:
+    """Parse one source timestamp into the naive local form used by this module."""
+    if value in (None, ""):
+        return None
+    s = str(value).replace("Z", "+00:00")
+    for parser in (
+        lambda x: datetime.fromisoformat(x),
+        lambda x: datetime.strptime(x[:19], "%Y-%m-%d %H:%M:%S"),
+        lambda x: datetime.strptime(x[:16], "%Y-%m-%d %H:%M"),
+    ):
+        try:
+            dt = parser(s)
+            return dt.astimezone().replace(tzinfo=None) if dt.tzinfo is not None else dt
+        except (ValueError, TypeError):
+            continue
     return None
 
 
@@ -260,6 +288,79 @@ def build_base_snapshot(*, base_dir: Path = BASE_DIR, now: Optional[datetime] = 
     )
 
 
+def build_base_snapshot_from_data(
+    data: dict,
+    *,
+    base_dir: Path = BASE_DIR,
+    now: Optional[datetime] = None,
+) -> BaseSnapshot:
+    """Freeze provenance for the exact in-memory payload used by the LLMs.
+
+    ``build_base_snapshot`` records the authoritative source artifact and its
+    freshness.  This wrapper additionally records hashes of the already loaded
+    values that are actually passed downstream.  Callers must build this once
+    after ``gather_data()`` and reuse the returned object for every later stage;
+    rebuilding it from disk would create a second, non-authoritative view.
+    """
+    base = build_base_snapshot(base_dir=base_dir, now=now)
+    payloads = {
+        "holdings": data.get("positions"),
+        "cash": data.get("cash_info"),
+        "prices": data.get("technical_state"),
+        "fx": (data.get("cash_info") or {}).get("fx_rate_usdjpy"),
+        "macro": {
+            "market_meta": data.get("market_meta"),
+            "regime": data.get("regime"),
+            "scenario": data.get("scenario"),
+        },
+        "news": {
+            "feed": data.get("news"),
+            "web_search": data.get("web_search_news"),
+        },
+        "screening": {
+            "screening": data.get("screening"),
+            "screen_candidates": data.get("screen_candidates"),
+            "beliefs_context": data.get("beliefs_context"),
+            "catalyst_context": data.get("catalyst_context"),
+        },
+    }
+    return BaseSnapshot(**{
+        key: replace(getattr(base, key), payload_hash=_payload_hash(payload))
+        for key, payload in payloads.items()
+    })
+
+
+def decision_freshness_issues(enriched: EnrichedSnapshot) -> list[dict]:
+    """Return non-fresh inputs that must be visible to readiness consumers."""
+    issues: list[dict] = []
+    for category in ("holdings", "cash", "prices", "fx", "macro", "news", "screening"):
+        provenance = getattr(enriched.base, category)
+        if provenance.freshness_status in {"stale", "unknown"}:
+            issues.append({
+                "category": category,
+                "status": provenance.freshness_status,
+                "source": provenance.source,
+                "source_as_of": provenance.source_as_of,
+                "max_age_policy_hours": provenance.max_age_policy_hours,
+            })
+    for ticker, provenance in enriched.options_by_ticker.items():
+        if provenance.freshness_status in {"stale", "unknown"}:
+            issues.append({
+                "category": "options",
+                "ticker": ticker,
+                "status": provenance.freshness_status,
+                "source": provenance.source,
+                "source_as_of": provenance.source_as_of,
+                "max_age_policy_hours": provenance.max_age_policy_hours,
+            })
+    return issues
+
+
+def decision_snapshot_content_hash(enriched: EnrichedSnapshot) -> str:
+    """Hash the complete frozen decision payload for deterministic keys."""
+    return _payload_hash(asdict(enriched))
+
+
 def build_enriched_snapshot(
     base: BaseSnapshot,
     *,
@@ -281,11 +382,14 @@ def build_enriched_snapshot(
             continue
         serialized = json.dumps(payload, sort_keys=True, default=str, ensure_ascii=False).encode("utf-8")
         as_of_raw = payload.get("as_of") or payload.get("fetched_at") or payload.get("timestamp")
+        as_of = _parse_timestamp_value(as_of_raw)
         options_by_ticker[ticker] = SourceProvenance(
             source=f"options_fetcher:{ticker}",
-            source_as_of=str(as_of_raw) if as_of_raw else None,
+            source_as_of=as_of.isoformat() if as_of else None,
             retrieved_at=now.isoformat(),
-            freshness_status="fresh" if payload else "unknown",
+            freshness_status=_freshness_status(
+                as_of, now=now, max_age_hours=24.0,
+            ),
             max_age_policy_hours=24.0,
             artifact_hash=hashlib.sha256(serialized).hexdigest(),
         )
@@ -302,6 +406,7 @@ def _source_provenance_from_dict(d: dict) -> SourceProvenance:
         source=d["source"], source_as_of=d.get("source_as_of"),
         retrieved_at=d["retrieved_at"], freshness_status=d["freshness_status"],
         max_age_policy_hours=d["max_age_policy_hours"], artifact_hash=d["artifact_hash"],
+        payload_hash=d.get("payload_hash"),
     )
 
 
@@ -423,6 +528,9 @@ def build_execution_quote_snapshot(
     price: Optional[float] = None,
     spread: Optional[float] = None,
     market_status: Optional[str] = None,
+    source_as_of: Optional[str] = None,
+    decision_snapshot_id: Optional[str] = None,
+    decision_snapshot_hash: Optional[str] = None,
     now: Optional[datetime] = None,
 ) -> dict:
     """execution_quote_snapshot: 注文直前に自由に再取得してよいレーン。
@@ -439,11 +547,15 @@ def build_execution_quote_snapshot(
     取得経路は増やさない。
     """
     now = now or datetime.now()
-    return {
+    payload = {
         "snapshot_kind": "execution_quote",
         "ticker": ticker,
         "price": price,
         "spread": spread,
         "market_status": market_status,
+        "source_as_of": source_as_of,
         "retrieved_at": now.isoformat(),
+        "decision_snapshot_id": decision_snapshot_id,
+        "decision_snapshot_hash": decision_snapshot_hash,
     }
+    return {**payload, "quote_hash": _payload_hash(payload)}

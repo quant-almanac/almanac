@@ -14,7 +14,7 @@ ai_recommendation_log.json の verified outcomes から銘柄別
     swing  2%
 
 負の Kelly（EV ≤ 0）は entry reject。
-履歴 < MIN_TRADES なら固定 3% fallback（aggressive スタンスに合わせた中位）。
+履歴 < MIN_TRADES なら entry を許可せず、観察用 0.5% だけを表示する。
 
 Stage 6A (2026-07): この統計は「AI推奨シグナルの的中率」であって
 「実際に執行した売買の勝率」ではない — 呼び出し側・表示側は
@@ -26,20 +26,18 @@ recommendation_kelly_stats() の名前が示す通り、これを実売買の
     扱っていた — 新規エントリーのサイジングに使う統計として不適切)
   - (analysis_id, ticker, direction) で重複除去 (同一分析からの
     重複ログ行が母集団を水増ししない)
-  - 統計キーを (ticker, direction, horizon) に拡張 (horizon は
-    現状 "5d" のみだが、tier別ホライズンを将来追加する際の構造を
-    先に用意する — recommendation_verifier.py 側の複数ホライズン
-    計測が実装されるまでは "5d" 固定)
+  - 統計キーを (ticker, direction, horizon) に拡張。検証器が保存する
+    5/20/60営業日を swing/medium/long に対応させ、必要ホライズンが
+    未観測の推薦は母集団へ入れない
 
-未着手 (このモジュール単体では解決できない、別途要対応):
-  - _log_recommendations() (analyst/__init__.py) が事後のログ時点で
-    改めて yfinance から価格を取得しており、tier LLM が実際に見た
-    凍結済み decision_price と異なりうる (Stage 1B の
-    decision_snapshot と統合する形で解消すべき)
-  - signal_evaluable / execution_eligible の2軸分離 (blocked を
-    一律除外すると「実行しやすかった推薦だけ残る」選択バイアスになる
-    という論点) は ai_recommendation_log.json 側にその判別に必要な
-    情報が十分あるか未検証
+解消済み (2026-07-28):
+  - _log_recommendations() は凍結済み decision_price（無ければ
+    limit_price）だけを使い、両方無ければ外部価格を再取得せず
+    signal_evaluable=false とする。price_at_rec_source は
+    'decision_price' | 'limit_price' | None。
+  - signal_evaluable / execution_eligible を別々に記録する。現金不足等で
+    execution_eligible=false でも signal_evaluable=true なら予測母集団へ残す。
+    stale/unknown入力・provenance不明・価格不明は signal_evaluable=false。
 """
 from __future__ import annotations
 
@@ -57,7 +55,7 @@ CAPS_BY_ITYPE = {
     'swing':  0.02,
 }
 
-MIN_TRADES_FOR_KELLY = 5   # これ未満は fallback
+MIN_TRADES_FOR_KELLY = 20  # 低標本の勝率を絶対上限に使わない
 # P1-20: 旧 fallback 3% / entry_allowed=True は「履歴不足でも 3% で入る」default-allow で、
 # 行動量最大化バイアスの原因の 1 つだった。fail-safe で entry_allowed=False を default にし、
 # Policy Engine / 人間判断で例外的に許可する流れに変更。観察用の最小サイズだけ別途定義。
@@ -111,9 +109,11 @@ def kelly_fraction(
 # 決定であり、将来の新規 buy が成功するかどうかの情報を持たない。
 BUY_SIDE_TYPES = frozenset({'buy', 'add', 'dca'})
 
-# 現状 recommendation_verifier.py は 5 営業日ホライズンのみを計測する。
-# tier別 (long/medium/swing) ホライズンが実装されるまでの固定値。
-_SINGLE_HORIZON = '5d'
+HORIZON_BY_ITYPE = {
+    'swing': '5d',
+    'medium': '20d',
+    'long': '60d',
+}
 
 
 def aggregate_ticker_stats(
@@ -142,10 +142,12 @@ def aggregate_ticker_stats(
         except Exception:
             recs = []
 
-    by_ticker: dict = {}
+    by_group: dict = {}
     seen_dedup_keys: set = set()
     for r in recs:
         if not r.get('verified'):
+            continue
+        if r.get('signal_evaluable') is False:
             continue
         outcome = r.get('outcome_pct')
         if outcome is None:
@@ -157,41 +159,69 @@ def aggregate_ticker_stats(
         ticker = (r.get('ticker') or '').upper()
         if not ticker:
             continue
+        itype = str(r.get('tier') or r.get('investment_type') or '').lower()
+        horizon = HORIZON_BY_ITYPE.get(itype)
+        if horizon is None:
+            continue
+        horizon_row = (r.get('horizons') or {}).get(horizon)
+        if isinstance(horizon_row, dict):
+            outcome = horizon_row.get('outcome_pct')
+        elif horizon == '5d':
+            outcome = r.get('outcome_pct')
+        else:
+            outcome = None
+        if outcome is None:
+            continue
 
         # (analysis_id, ticker, direction) で重複除去。analysis_id が
         # 無い古いログ行は dedup キーを構成できないため常に採用する
         # (fail-open — 過去ログを一律で捨てない)。
         analysis_id = r.get('analysis_id')
         if analysis_id:
-            dedup_key = (analysis_id, ticker, 'buy')
+            dedup_key = (analysis_id, ticker, 'buy', horizon)
             if dedup_key in seen_dedup_keys:
                 continue
             seen_dedup_keys.add(dedup_key)
 
         outcome = float(outcome)
-        slot = by_ticker.setdefault(ticker, {'wins': [], 'losses': []})
+        slot = by_group.setdefault((ticker, horizon), {'wins': [], 'losses': []})
         if outcome > 0:
             slot['wins'].append(outcome / 100.0)    # % → 小数
         elif outcome < 0:
             slot['losses'].append(abs(outcome) / 100.0)
 
     result = {}
-    for ticker, s in by_ticker.items():
+    for (ticker, horizon), s in by_group.items():
         n = len(s['wins']) + len(s['losses'])
         if n == 0:
             continue
         win_rate = len(s['wins']) / n
         avg_win  = (sum(s['wins']) / len(s['wins'])) if s['wins']  else 0.0
         avg_loss = (sum(s['losses'])/len(s['losses'])) if s['losses'] else 0.0
-        result[ticker] = {
+        metrics = {
             'win_rate':     round(win_rate, 4),
             'avg_win_pct':  round(avg_win, 4),
             'avg_loss_pct': round(avg_loss, 4),
             'n':            n,
             'sufficient':   n >= min_trades,
             'direction':    'buy',
-            'horizon':      _SINGLE_HORIZON,
+            'horizon':      horizon,
         }
+        ticker_slot = result.setdefault(ticker, {'by_horizon': {}})
+        ticker_slot['by_horizon'][horizon] = metrics
+    for ticker_slot in result.values():
+        # Backward-compatible top-level metrics for display callers.  The
+        # sizing decision below always selects the investment-type horizon.
+        preferred = next(
+            (
+                ticker_slot['by_horizon'][h]
+                for h in ('20d', '5d', '60d')
+                if h in ticker_slot['by_horizon']
+            ),
+            None,
+        )
+        if preferred:
+            ticker_slot.update(preferred)
     return result
 
 
@@ -245,11 +275,15 @@ def suggest_size_pct(
         if stats is None:
             stats = aggregate_ticker_stats()
         entry = stats.get(ticker_upper, {})
+        horizon = HORIZON_BY_ITYPE.get(itype, '20d')
+        if isinstance(entry.get('by_horizon'), dict):
+            entry = entry['by_horizon'].get(horizon, {})
         inputs = {
             'win_rate':     entry.get('win_rate', 0),
             'avg_win_pct':  entry.get('avg_win_pct', 0),
             'avg_loss_pct': entry.get('avg_loss_pct', 0),
             'n':            entry.get('n', 0),
+            'horizon':      entry.get('horizon', horizon),
         }
         sufficient = entry.get('sufficient', False)
 

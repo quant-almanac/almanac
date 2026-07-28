@@ -282,13 +282,25 @@ def _stub_synthesize_deps(monkeypatch, rows):
 
     monkeypatch.setattr(analyst, "_append_llm_call_log", lambda row: rows.append(row), raising=False)
     for name, ret in [
-        ("fetch_web_search_news", ""), ("load_history_context", ""),
-        ("_load_bl_views_for_opus", ""), ("_load_beliefs", []),
+        ("load_history_context", ""),
+        ("_load_bl_views_for_opus", ""),
         ("_load_execution_quality_summary", None), ("_fmt_tunable_limits_context", ""),
     ]:
         monkeypatch.setattr(analyst, name, lambda *a, _r=ret, **k: _r)
+    for name in (
+        "fetch_web_search_news",
+        "_load_catalyst_context_for_opus",
+        "_load_beliefs",
+    ):
+        monkeypatch.setattr(
+            analyst,
+            name,
+            lambda *a, _name=name, **k: (_ for _ in ()).throw(
+                AssertionError(f"{_name} must not be called after decision snapshot freeze")
+            ),
+        )
     for name in [
-        "fmt_news_section", "fmt_earnings_section", "_load_catalyst_context_for_opus",
+        "fmt_news_section", "fmt_earnings_section",
         "_format_beliefs_context", "_format_execution_quality_for_prompt",
         "_format_agent_reliability_for_prompt", "_format_recent_own_recs_for_prompt",
         "_format_earnings_blackout_for_prompt", "_format_done_list_for_prompt",

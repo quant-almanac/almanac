@@ -19,6 +19,7 @@ AI (Opus synthesis) が出力する currency_target_recommendation を:
 from __future__ import annotations
 
 import json
+import os
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Optional
@@ -376,6 +377,28 @@ def resolve_effective_targets(*, static: dict, now=None,
         today = _today(now)
         if today > vu:
             return _static(f"AI方針 expired (valid_until={vu}, today={today})")
+
+        # Stage 7A safety boundary: the saved recommendation is still useful
+        # as an advisory/shadow observation, but listing-currency allocation is
+        # not an economic FX exposure model.  Until the look-through resolver
+        # and broker-reconciled hedge notional are wired end-to-end, never feed
+        # the AI target into rebalance.
+        mode = str(os.environ.get("ALMANAC_CURRENCY_POLICY_MODE", "shadow")).strip().lower()
+        if mode not in {"off", "shadow", "advisory"}:
+            mode = "shadow"
+        if mode != "off":
+            return static, {
+                "source": f"{mode}_ai_policy",
+                "reason": "economic exposure resolver is not authoritative; static target enforced",
+                "mode": mode,
+                "candidate_usd_target_pct": int(round(usd)),
+                "candidate_jpy_target_pct": int(round(jpy)),
+                "as_of": state.get("as_of"),
+                "valid_until": state.get("valid_until"),
+                "confidence_pct": state.get("confidence_pct"),
+            }
+        if mode == "off":
+            return _static("AI currency policy mode is off")
 
         targets = _targets_from_pct(usd, jpy)
         meta = {

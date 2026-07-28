@@ -440,6 +440,116 @@ def test_total_average_separates_accounts(tmp_db):
     assert result["持株会"].amount_jpy == pytest.approx(1500)
 
 
+def test_total_average_actionable_scope_requires_owner_and_broker(tmp_db):
+    _add_buy(tmp_db, ticker="AAPL", qty=10, price=100, date="2026-01-10")
+    assert tl.compute_total_average_cost_basis(
+        "AAPL", db_path=tmp_db, require_position_identity=True,
+    ) == {}
+
+
+def test_total_average_actionable_scope_accepts_execution_identity(tmp_db):
+    el.append_event(
+        event_type="trade", direction="buy", ticker="AAPL",
+        quantity=10, price=100, currency="JPY", account="一般",
+        occurred_at="2026-01-10T10:00:00", event_id="identity-buy",
+        raw_payload={
+            "execution_owner": "husband",
+            "execution_broker": "rakuten",
+        },
+        db_path=tmp_db,
+    )
+    result = tl.compute_total_average_cost_basis(
+        "AAPL", db_path=tmp_db, require_position_identity=True,
+    )
+    assert result["一般"].amount_jpy == pytest.approx(1_000)
+
+
+def test_total_average_rounds_unit_cost_up_and_includes_trade_fees(tmp_db):
+    el.append_event(
+        event_type="trade", direction="buy", ticker="FEE",
+        quantity=3, price=100.1, currency="JPY", account="特定",
+        occurred_at="2026-01-10T10:00:00", event_id="fee-buy",
+        raw_payload={
+            "execution_owner": "husband",
+            "execution_broker": "rakuten",
+            "fee_jpy": 2,
+        },
+        db_path=tmp_db,
+    )
+    el.append_event(
+        event_type="trade", direction="sell", ticker="FEE",
+        quantity=1, price=120, currency="JPY", account="特定",
+        occurred_at="2026-02-10T10:00:00", event_id="fee-sell",
+        raw_payload={
+            "execution_owner": "husband",
+            "execution_broker": "rakuten",
+            "fee_jpy": 1,
+        },
+        db_path=tmp_db,
+    )
+    report = tl.realized_pnl_in_year_total_average(
+        2026, tickers=["FEE"], db_path=tmp_db,
+    )
+    # (3*100.1 + 2) / 3 = 100.766.. -> 1 unit is rounded up to 101.
+    # Sale proceeds 120 - 1 fee, acquisition cost 101 => gain 18.
+    assert report["complete"] is True
+    assert report["taxable_realized_pnl_jpy"] == pytest.approx(18)
+    assert report["by_account"]["husband|rakuten|特定"] == pytest.approx(18)
+
+
+def test_total_average_v2_can_be_authoritative_with_raw_payload_identity(tmp_db):
+    for event_id, direction, price in (
+        ("nisa-buy", "buy", 100),
+        ("nisa-sell", "sell", 90),
+    ):
+        el.append_event(
+            event_type="trade", direction=direction, ticker="NISAID",
+            quantity=1, price=price, currency="JPY", account="NISA成長投資枠",
+            occurred_at=(
+                "2026-01-10T10:00:00"
+                if direction == "buy" else "2026-02-10T10:00:00"
+            ),
+            event_id=event_id,
+            raw_payload={
+                "execution_owner": "wife",
+                "execution_broker": "sbi",
+            },
+            db_path=tmp_db,
+        )
+    report = tl.realized_pnl_in_year_v2(
+        2026, tickers=["NISAID"], db_path=tmp_db, mode="total_average",
+    )
+    assert report["authoritative_basis"] == "total_average_like"
+    assert report["economic_realized_pnl_jpy"] == pytest.approx(-10)
+    assert report["taxable_realized_pnl_jpy"] == 0
+    assert report["nisa_realized_pnl_jpy"] == pytest.approx(-10)
+
+
+def test_fifo_audit_never_consumes_same_account_lot_from_other_broker(tmp_db):
+    for event_id, owner, broker in (
+        ("buy-rakuten", "husband", "rakuten"),
+        ("buy-sbi", "husband", "sbi"),
+    ):
+        el.append_event(
+            event_type="trade", direction="buy", ticker="AAPL",
+            quantity=10, price=100, currency="JPY", account="一般",
+            occurred_at="2026-01-10T10:00:00", event_id=event_id,
+            raw_payload={"execution_owner": owner, "execution_broker": broker},
+            db_path=tmp_db,
+        )
+    el.append_event(
+        event_type="trade", direction="sell", ticker="AAPL",
+        quantity=10, price=120, currency="JPY", account="一般",
+        occurred_at="2026-02-10T10:00:00", event_id="sell-sbi",
+        raw_payload={"execution_owner": "husband", "execution_broker": "sbi"},
+        db_path=tmp_db,
+    )
+    state = tl.build_lots("AAPL", db_path=tmp_db)
+    remaining = {(lot.broker, lot.remaining_qty) for lot in state.open_lots}
+    assert ("rakuten", 10) in remaining
+    assert ("sbi", 0) in remaining
+
+
 def test_compare_old_new_matches_when_no_sells(tmp_db):
     """売却が無ければ FIFO と総平均法は (単一lotなので) 一致する。"""
     _add_buy(tmp_db, ticker="AAPL", qty=10, price=150, date="2026-01-10")

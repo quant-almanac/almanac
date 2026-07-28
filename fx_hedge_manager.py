@@ -6,14 +6,14 @@ regime × VIX × IV で目標ヘッジ比率を計算し、受動的（JPY ヘ�
 
 whipsaw 防止のため日次変更幅 ±10% にクランプ。
 
-Stage 3 是正 (2026-07): 以下は配線しない (このモジュールは現状どこからも
-import されていない、スタンドアロン CLI 専用)。
+Stage 3 是正 (2026-07): 以下の比率計算は Stage 7 の shadow policy から
+観測用途にだけ配線する（注文は生成せず、本番 hedge state も更新しない）。
   - 「簡易（JPY 積み増し）」を提案手段から削除した。通貨配分の変更であって
     ヘッジ overlay ではなく、実装もされていなかったため。
   - usdjpy_mom_1m は検証済み係数もバックテストも無いため比率計算に使わない
     (受け取って何もしない no-op 分岐だったものを削除。パラメータ自体は
-    後方互換のため残すが、inputs への記録のみで比率には影響しない —
-    delegate 前提の破壊的 API 変更を避けるため)。
+    後方互換のため一期間だけ残すが、非ゼロ値には DeprecationWarning を出し、
+    inputs への記録のみで比率には影響しない)。
   - 商品リストを JPX・発行体資料 (2026-07 時点) で再確認して是正:
     1655.T は「円建て」であって「円ヘッジ」ではない (無ヘッジ) ため除外。
     2631.T も無ヘッジ (ヘッジ版は 2632.T) のため除外し 2632.T に差し替え。
@@ -24,6 +24,8 @@ import されていない、スタンドアロン CLI 専用)。
 from __future__ import annotations
 
 import json
+import os
+import warnings
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -32,10 +34,20 @@ from typing import Optional
 BASE_DIR        = Path(__file__).parent
 HEDGE_STATE     = BASE_DIR / 'hedge_target.json'
 
+
+def _state_path(*, shadow: bool = False) -> Path:
+    """Resolve state at call time so subprocess tests can isolate writes."""
+    state_root = os.environ.get("ALMANAC_STATE_DIR")
+    if state_root:
+        return Path(state_root) / (
+            "hedge_target_shadow.json" if shadow else "hedge_target.json"
+        )
+    return SHADOW_HEDGE_STATE if shadow else HEDGE_STATE
+
 # ── 境界 ──────────────────────────────────────────────
 MIN_HEDGE  = 0.00
 MAX_HEDGE  = 0.70
-MAX_DAILY_DELTA = 0.10   # 日次変更幅
+MAX_DAILY_DELTA = 0.10   # 評価日あたりの変更幅（10パーセントポイント）
 
 # ── 追加トリガーの閾値 ─────────────────────────────────
 JPY_WEAKNESS_VS_90SMA = 0.08   # 90 日 SMA +8% 超 → +10%
@@ -67,18 +79,21 @@ ACTIVE_HEDGE_INSTRUMENTS = [
 # ============================================================
 
 def _load_state() -> dict:
-    if HEDGE_STATE.exists():
+    path = _state_path()
+    if path.exists():
         try:
-            return json.loads(HEDGE_STATE.read_text(encoding='utf-8'))
+            return json.loads(path.read_text(encoding='utf-8'))
         except Exception:
             pass
     return {'last_target': 0.0, 'history': []}
 
 
 def _save_state(state: dict) -> None:
-    tmp = HEDGE_STATE.with_suffix('.tmp')
+    path = _state_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix('.tmp')
     tmp.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding='utf-8')
-    tmp.replace(HEDGE_STATE)
+    tmp.replace(path)
 
 
 def _resolve_previous_business_date_target(state: dict, *, today_str: str) -> float:
@@ -152,8 +167,8 @@ def compute_target_hedge_ratio(
         usdjpy_mom_1m:   [非推奨・比率計算には使用しない] USDJPY 月次モメンタム
                          （小数、-0.05 = -5%）。検証済み係数もバックテストも
                          無いため比率へは反映しない。inputs への記録のみ。
-                         後方互換のため signature には残すが、将来的に
-                         有効なモデルへ差し替わるまで無効のまま。
+                         後方互換のため signature には一期間だけ残し、
+                         非ゼロ値には DeprecationWarning を出す。
         usdjpy_sma_90d:  USDJPY 90 日 SMA
         usdjpy_avg_5y:   USDJPY 5 年平均
         current_hedge_ratio: 前回の目標比率（whipsaw 防止用）
@@ -170,6 +185,13 @@ def compute_target_hedge_ratio(
           'delta_vs_prev':        前回からの変化,
         }
     """
+    if abs(float(usdjpy_mom_1m or 0.0)) > 1e-12:
+        warnings.warn(
+            "usdjpy_mom_1m is deprecated and is not used in hedge-ratio "
+            "calculation; remove it from callers before the next major version",
+            DeprecationWarning,
+            stacklevel=2,
+        )
     base = _base_target_from_regime(regime, vix, usdjpy_iv_1m)
 
     addons: dict = {}
@@ -267,7 +289,7 @@ def _recommend_method(target: float, regime: str, iv: float) -> dict:
     if target <= 0.50:
         return {
             'primary':      'passive_or_active',
-            'description':  'ヘッジ付き ETF 拡大 or USDJPY 先物売（CFD/くりっく365）',
+            'description':  'ヘッジ付き ETF 拡大 or 6J買い / USDJPY売（CFD・くりっく365）',
             'instruments':  PASSIVE_HEDGE_ETFS['sp500'] + ACTIVE_HEDGE_INSTRUMENTS[:2],
             'rationale':    '比率が 30% 超では能動手段の方が機動的、ただしロールコストに注意',
         }
@@ -275,7 +297,7 @@ def _recommend_method(target: float, regime: str, iv: float) -> dict:
     # 高比率（crisis 相当）
     return {
         'primary':      'active',
-        'description':  'USDJPY 先物売 / CFD で比率 50%+ を機動的に構築',
+        'description':  '6J買い / USDJPY売（CFD等）で比率 50%+ を機動的に構築',
         'instruments':  ACTIVE_HEDGE_INSTRUMENTS,
         'rationale':    f'Crisis / IV={iv*100:.0f}%: 受動 ETF では追随遅延、能動ヘッジで即時に比率を上げる',
     }
@@ -308,6 +330,7 @@ def persist_target(result: dict, *, state: Optional[dict] = None, save: bool = T
         'as_of':  result['as_of'],
         'target': result['target_hedge_ratio'],
         'inputs': result['inputs'],
+        'input_snapshot_hash': result.get('input_snapshot_hash'),
     }
     history = state.setdefault('history', [])
     if is_new_business_date or not history:
@@ -339,23 +362,27 @@ SHADOW_HEDGE_STATE = BASE_DIR / 'hedge_target_shadow.json'  # 本番 state と�
 
 
 def _load_shadow_state() -> dict:
-    if SHADOW_HEDGE_STATE.exists():
+    path = _state_path(shadow=True)
+    if path.exists():
         try:
-            return json.loads(SHADOW_HEDGE_STATE.read_text(encoding='utf-8'))
+            return json.loads(path.read_text(encoding='utf-8'))
         except Exception:
             pass
     return {'last_target': 0.0, 'history': []}
 
 
 def _save_shadow_state(state: dict) -> None:
-    tmp = SHADOW_HEDGE_STATE.with_suffix('.tmp')
+    path = _state_path(shadow=True)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix('.tmp')
     tmp.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding='utf-8')
-    tmp.replace(SHADOW_HEDGE_STATE)
+    tmp.replace(path)
 
 
 def run_hedge_shadow(
     regime: str, vix: float, usdjpy: float,
-    *, mode: str = HEDGE_MODE_SHADOW, now: Optional[datetime] = None, **kwargs,
+    *, mode: str = HEDGE_MODE_SHADOW, now: Optional[datetime] = None,
+    snapshot_hash: Optional[str] = None, **kwargs,
 ) -> dict:
     """影実行本体。mode='off' なら何もしない。'shadow'/'advisory' は
     本番 persist_target()/hedge_target.json を一切呼ばず、専用の
@@ -376,6 +403,7 @@ def run_hedge_shadow(
         regime, vix, usdjpy, current_hedge_ratio=current, now=now, **kwargs,
     )
     result['mode'] = mode
+    result['input_snapshot_hash'] = snapshot_hash
 
     # persist_target() (本番用) は使わない — shadow_state への書き込みに限定する。
     persist_target(result, state=shadow_state, save=False)

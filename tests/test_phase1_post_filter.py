@@ -1196,7 +1196,11 @@ def test_replay_2026_07_16_has_no_ready_actions(monkeypatch, tmp_path):
         reason["code"] == "holding_quantity_unresolved"
         for reason in by_ticker["ROBO"]["execution_block_reasons"]
     )
-    assert by_ticker["1306.T"]["execution_readiness"] == "review"
+    assert by_ticker["1306.T"]["execution_readiness"] == "blocked"
+    assert any(
+        reason["code"] == "cash_resource_identity_missing"
+        for reason in by_ticker["1306.T"]["execution_block_reasons"]
+    )
     assert result["decision_summary"]["executable_count"] == 0
 
 
@@ -1915,8 +1919,9 @@ def test_enforce_active_zero_funding_plan_blocks_new_buy_without_items(monkeypat
     assert result["_filtered_actions"][0]["filtered_reason"].startswith("plan_unmatched_no_override")
 
 
-def test_execution_plan_opportunistic_override_uses_bounded_gate(monkeypatch):
+def test_execution_plan_opportunistic_override_uses_bounded_gate(monkeypatch, tmp_path):
     _silence_external_filters(monkeypatch)
+    monkeypatch.setattr(analyst, "BASE_DIR", tmp_path)
     monkeypatch.setattr(tunable_params, "get", _tp_get_enforce_plan)
     plan = {
         "items": [{

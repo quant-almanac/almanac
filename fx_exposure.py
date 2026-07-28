@@ -6,7 +6,8 @@ currency) の単純合計で USD/JPY 比率を出している
 以下のケースで経済的な為替エクスポージャーと一致しない:
   - 2634.T は JPY 建てだが円ヘッジ済み S&P500 → 経済的には米国株
     (ネットではヘッジ比率分だけ USD 感応が減る)
-  - IEV は USD 建てだが欧州株 ETF → 経済通貨は EUR であって USD ではない
+  - IEV は USD 建てだが欧州株 ETF → 経済通貨は欧州の複数通貨であって
+    USD 単一でも EUR 単一でもない
   - レバレッジ/インバース商品は look-through すると gross が100%を超えうる
 
 3分類 (取得資本配分/ヘッジ後純エクスポージャー/オーバーレイ) では
@@ -87,14 +88,15 @@ INSTRUMENT_MASTER: dict[str, InstrumentClassification] = {
                                 "(2倍レバレッジ商品 — ヘッジ目的の素朴な資産クラスではない)",
         source="verified_2026_07_jpx_issuer", confirmed_as_of="2026-07-27",
     ),
-    # IEV: well-known iShares Europe ETF。USD建てだが中身は欧州株であり
-    # 経済通貨は EUR (USD でも JPY でもない) — 「取引通貨だけ見た集計は不可」
-    # の典型例としてプランが名指ししているケースに直接該当する。
+    # IEV: 公式資料では S&P Europe 350 連動。構成国には英国・スイス等も
+    # 含むため「EUR」と単一通貨化するのも誤り。欧州通貨バスケットとして
+    # USD/JPY の2区分から分離する。
     "IEV": InstrumentClassification(
-        ticker="IEV", listing_currency="USD", economic_currency="EUR",
+        ticker="IEV", listing_currency="USD", economic_currency="MULTI_EUROPE",
         hedge_ratio=0.0, is_leveraged_or_inverse=False,
         underlying_description="iShares Europe ETF (S&P Europe 350 連動、無ヘッジ)",
-        source="well_known_fund_prospectus", confirmed_as_of="2026-07-27",
+        source="https://www.ishares.com/us/products/239736/",
+        confirmed_as_of="2026-07-28",
     ),
 }
 
@@ -115,7 +117,7 @@ def resolve_economic_exposure(
     position: PositionIdentity,
     market_value_jpy: float,
     listing_currency: str,
-    is_fund: bool = False,
+    is_fund: Optional[bool] = None,
     now: Optional[datetime] = None,
 ) -> EconomicCurrencyExposure:
     """1ポジション分の経済的為替エクスポージャーを解決する。
@@ -152,7 +154,7 @@ def resolve_economic_exposure(
             exposure_source="instrument_master", as_of=as_of,
         )
 
-    if not is_fund:
+    if is_fund is False:
         # 単一株: 上場通貨=経済通貨 (look-through の余地が無い)
         is_usd = listing_currency.upper() == "USD"
         gross = market_value_jpy if is_usd else 0.0
@@ -164,7 +166,8 @@ def resolve_economic_exposure(
             exposure_source="single_stock", as_of=as_of,
         )
 
-    # fund かつ instrument_master 未登録 → 憶測せず unknown (fail-closed)
+    # fund または商品種別未確認で instrument_master 未登録 → unknown。
+    # default を単一株扱いにすると、未分類の投信/ETFを上場通貨へ誤帰属する。
     return EconomicCurrencyExposure(
         position_identity=position, market_value_jpy=market_value_jpy,
         gross_usd_exposure_jpy=None, embedded_hedge_notional_jpy=None, net_usd_exposure_jpy=None,
@@ -189,7 +192,7 @@ class FxExposureSummary:
     total_market_value_jpy: float
     unknown_value_jpy: float                # exposure_source="unknown" だった分の時価総額
     unknown_tickers: tuple[str, ...]
-    other_currency_value_jpy: float         # USD でも JPY でもない経済通貨 (例: EUR) の時価総額
+    other_currency_value_jpy: float         # USD/JPY 以外または複数通貨バスケット
     other_currency_tickers: tuple[str, ...]
 
 

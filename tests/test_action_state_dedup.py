@@ -88,9 +88,9 @@ def test_account_bucket_husband_nisa_from_detail() -> None:
     assert ast._account_bucket({"action_detail": "夫NISAつみたて枠"}) == "husband_nisa"
 
 
-def test_account_bucket_nisa_growth_defaults_husband() -> None:
-    """『NISA成長』だけで妻が付いていない → 夫NISA扱い。"""
-    assert ast._account_bucket({"action_detail": "NISA成長投資枠でAVGO 1株"}) == "husband_nisa"
+def test_account_bucket_nisa_growth_without_owner_is_unknown() -> None:
+    """『NISA成長』だけでは名義を推測せず fail-closed のbucketへ隔離する。"""
+    assert ast._account_bucket({"action_detail": "NISA成長投資枠でAVGO 1株"}) == "unknown_nisa"
 
 
 def test_account_bucket_general() -> None:
@@ -338,6 +338,35 @@ def test_record_recommendation_persists_inventory_evidence(tmp_path, monkeypatch
     assert entry["requested_sell_quantity"] == 3
     assert entry["holding_shares_after"] == 2
     assert entry["holding_quantity_exceeds_account"] is False
+
+
+def test_record_recommendation_persists_snapshot_provenance_and_exit_sizing(
+    tmp_path, monkeypatch,
+) -> None:
+    state_path = tmp_path / "action_state.json"
+    _write_state(state_path, {})
+    monkeypatch.setattr(ast, "STATE_FILE", state_path)
+
+    ast.record_recommendations([{
+        "ticker": "AVGO", "type": "trim", "urgency": "low",
+        "execution_owner": "husband", "execution_broker": "rakuten",
+        "execution_account": "一般",
+        "position_identity_key": "husband|rakuten|general|AVGO",
+        "decision_snapshot_id": "snap-1", "decision_snapshot_hash": "hash-1",
+        "claim_ids": ["claim-1"], "confidence_evidence_verified": True,
+        "quote_as_of": "2026-07-28T09:00:00+09:00",
+        "exit_sizing_status": "review", "exit_sizing_intent_key": "intent-1",
+        "exit_sizing_evaluation_key": "eval-1",
+    }])
+
+    entry = next(iter(_read_state(state_path)["actions"].values()))
+    assert entry["position_identity_key"] == "husband|rakuten|general|AVGO"
+    assert entry["decision_snapshot_id"] == "snap-1"
+    assert entry["decision_snapshot_hash"] == "hash-1"
+    assert entry["claim_ids"] == ["claim-1"]
+    assert entry["quote_as_of"] == "2026-07-28T09:00:00+09:00"
+    assert entry["exit_sizing_intent_key"] == "intent-1"
+    assert entry["exit_sizing_evaluation_key"] == "eval-1"
 
 
 def test_record_placed_entry_not_merged(tmp_path, monkeypatch) -> None:

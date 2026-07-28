@@ -1,33 +1,20 @@
-"""
-tax_lot.py — P2: Tax Lot tracker & solver
+"""Tax inventory audit and total-average-like cost-basis estimates.
 
-event_ledger の trade event 系列から、銘柄ごとの lot (取得単位) timeline を再構築する。
-既存 tax_optimizer.py は holdings.json の加重平均単価しか見ていないため、
-特定の lot を狙って売って実損確定 / NISA 枠を踏まないという制御ができなかった。
+``build_lots`` keeps FIFO lots only for inventory reconciliation: quantities,
+missing trades, corporate actions and broker-cost cross-checks. Japan does not
+allow choosing a favorable individual lot for the tax cost of a partial sale,
+so legacy specific-lot recommendation helpers are compatibility/audit code and
+must not feed live tax actions.
 
-本モジュールはそのギャップを埋める:
-  - build_lots(ticker)              : event_ledger から FIFO で lot を組み立てる
-  - recommend_sell_lots(...)        : 売却量に対し、戦略別 (FIFO/LIFO/loss_harvest/gain_minimize) で lot を選ぶ
-  - realized_pnl_in_year(year)      : 確定申告用、年内の実現損益サマリ
-  - portfolio_lot_snapshot()        : 保有銘柄全件の現存 lot リスト (account 別に集計可能)
-
-設計:
-  - source of truth は event_ledger.ledger_events (event_type='trade' のみ)
-  - SELL は FIFO で消費 (account/currency が一致する lot から)
-  - cost basis は event 時点の price × quantity × (USD なら fx_rate_usdjpy)、JPY 換算で保存
-  - "specific identification" は recommend_sell_lots で sell lot を chosen list として返し、
-    呼出側が UI で確認した後に SELL event として post する想定
-
-注意:
-  - 配当・分割・併合の event_type も将来は cost basis 調整に組み込むが、
-    現状は trade event のみ。split は parquet 側で adjusted close が更新されるため、
-    realized 計算では「lot の cost_jpy が時系列で歪まないか」を別途確認する必要がある。
-  - 全 lot を毎回 event_ledger から再構築する rebuild モデル (キャッシュなし)。
-    1000 trade 程度なら数 ms。large scale ではキャッシュテーブルを追加する想定。
+Tax-facing consumers use the additive v2/total-average-like functions below.
+Broker annual reports remain authoritative; ledger estimates fail closed when
+owner/broker identity, opening inventory or FX is incomplete.
 """
 from __future__ import annotations
 
 import json
+import math
+import os
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -50,6 +37,8 @@ class Lot:
     currency:        str            # JPY / USD
     cost_per_share_jpy: float       # 取得時 fx で JPY 換算した単価
     account:         Optional[str]  # 特定 / NISA成長投資枠 / 持株会 / etc.
+    owner:           Optional[str] = None
+    broker:          Optional[str] = None
 
     @property
     def remaining_cost_jpy(self) -> float:
@@ -74,6 +63,8 @@ class RealizedTrade:
     cost_basis_jpy:  float
     realized_jpy:    float
     account:         Optional[str]
+    owner:           Optional[str] = None
+    broker:          Optional[str] = None
 
 
 @dataclass
@@ -123,6 +114,49 @@ def _split_ratio(ev: dict) -> Optional[float]:
     except (TypeError, ValueError):
         return None
     return r if r > 0 else None
+
+
+def _event_owner_broker(ev: dict) -> tuple[Optional[str], Optional[str]]:
+    payload = ev.get("raw_payload")
+    if isinstance(payload, str) and payload:
+        try:
+            payload = json.loads(payload)
+        except Exception:
+            payload = {}
+    if not isinstance(payload, dict):
+        payload = {}
+    owner = ev.get("owner") or payload.get("owner") or payload.get("execution_owner")
+    broker = ev.get("broker") or payload.get("broker") or payload.get("execution_broker")
+    return (
+        str(owner) if owner else None,
+        str(broker) if broker else None,
+    )
+
+
+def _event_fee_jpy(ev: dict) -> float:
+    """Return an explicitly recorded trade commission in JPY.
+
+    Purchase commissions form part of acquisition cost; sale commissions
+    reduce proceeds. Missing fields remain zero rather than being invented.
+    Broker reconciliation is still required before an estimate is authoritative.
+    """
+    payload = ev.get("raw_payload")
+    if isinstance(payload, str) and payload:
+        try:
+            payload = json.loads(payload)
+        except Exception:
+            payload = {}
+    if not isinstance(payload, dict):
+        payload = {}
+    for key in ("fee_jpy", "commission_jpy", "trade_fee_jpy"):
+        value = payload.get(key)
+        if value in (None, ""):
+            continue
+        try:
+            return max(0.0, float(value))
+        except (TypeError, ValueError):
+            return 0.0
+    return 0.0
 
 
 def build_lots(
@@ -181,11 +215,14 @@ def build_lots(
             continue
 
         purchase_date = (ev.get("occurred_at") or "")[:10]
+        event_owner, event_broker = _event_owner_broker(ev)
 
         if direction == "buy":
             if currency == "USD" and (fx is None or float(fx) <= 0):
                 raise ValueError(f"{ticker} の USD BUY event に fx_rate_usdjpy がありません")
-            cps_jpy = price * float(fx) if currency == "USD" and fx else price
+            fee_jpy = _event_fee_jpy(ev)
+            base_cps_jpy = price * float(fx) if currency == "USD" and fx else price
+            cps_jpy = base_cps_jpy + fee_jpy / qty
             lot = Lot(
                 lot_id            = ev.get("event_id") or f"lot_{len(state.open_lots)}",
                 ticker            = ticker,
@@ -196,6 +233,8 @@ def build_lots(
                 currency          = currency,
                 cost_per_share_jpy = cps_jpy,
                 account           = ev.get("account"),
+                owner             = event_owner,
+                broker            = event_broker,
             )
             state.open_lots.append(lot)
 
@@ -206,6 +245,16 @@ def build_lots(
             # 食う等の誤りを防ぐ)。同一 account の lot のみを FIFO (購入日昇順) で消費する。
             sell_account = ev.get("account")
             same_account = [l for l in state.open_lots if l.is_open and l.account == sell_account]
+            if event_owner and event_broker:
+                same_account = [
+                    lot for lot in same_account
+                    if lot.owner == event_owner and lot.broker == event_broker
+                ]
+            elif any(lot.owner or lot.broker for lot in same_account):
+                raise ValueError(
+                    f"{ticker} の SELL ({qty}株 @ {purchase_date}, account={sell_account!r}) に "
+                    "owner/broker が無く、identity付き lot と安全に照合できません"
+                )
 
             for lot in same_account:
                 if remaining_to_sell <= 1e-9:
@@ -227,6 +276,8 @@ def build_lots(
                     cost_basis_jpy     = round(cost_jpy, 2),
                     realized_jpy       = round(proc_jpy - cost_jpy, 2),
                     account            = lot.account,
+                    owner              = lot.owner,
+                    broker             = lot.broker,
                 ))
                 lot.remaining_qty -= consume
                 remaining_to_sell -= consume
@@ -411,6 +462,7 @@ def realized_pnl_in_year_v2(
     *,
     tickers: Optional[List[str]] = None,
     db_path: Optional[Path] = None,
+    mode: Optional[str] = None,
 ) -> dict:
     """Stage 5B: realized_pnl_in_year() の加算的 v2 schema。
 
@@ -424,7 +476,13 @@ def realized_pnl_in_year_v2(
     account 名に "NISA" を含むかどうかで taxable/nisa を分ける
     (tax_harvest_scanner.py の NISA 除外判定と同じ規約)。
     """
+    mode = str(mode or os.environ.get("ALMANAC_TAX_BASIS_MODE", "compare")).lower()
+    if mode not in {"legacy", "compare", "total_average"}:
+        mode = "compare"
     legacy = realized_pnl_in_year(year, tickers=tickers, db_path=db_path)
+    total_average = realized_pnl_in_year_total_average(
+        year, tickers=tickers, db_path=db_path
+    )
 
     taxable_total = 0.0
     nisa_total = 0.0
@@ -434,20 +492,179 @@ def realized_pnl_in_year_v2(
         else:
             taxable_total += amount
 
-    return {
-        "schema_version": 2,
-        "year": year,
-        # 旧フィールドは互換のため残すが、課税対象額と誤解されないよう
-        # semantics を明示する。新規コードは economic/taxable/nisa の
-        # 3フィールドを権威として使うこと。
-        "realized_jpy": legacy["realized_jpy"],
-        "realized_jpy_semantics": "legacy_mixed_accounts_deprecated",
+    use_total_average = mode == "total_average" and total_average["complete"]
+    authoritative = total_average if use_total_average else {
         "economic_realized_pnl_jpy": legacy["realized_jpy"],
         "taxable_realized_pnl_jpy": round(taxable_total, 2),
         "nisa_realized_pnl_jpy": round(nisa_total, 2),
         "by_account": legacy["by_account"],
         "by_ticker": legacy["by_ticker"],
         "trade_count": legacy["trade_count"],
+    }
+    return {
+        "schema_version": 2,
+        "year": year,
+        "basis_mode": mode,
+        "authoritative_basis": (
+            "total_average_like" if use_total_average else "legacy_fifo"
+        ),
+        "total_average_complete": total_average["complete"],
+        "data_quality_issues": total_average["data_quality_issues"],
+        # 旧フィールドは互換のため残すが、課税対象額と誤解されないよう
+        # semantics を明示する。新規コードは economic/taxable/nisa の
+        # 3フィールドを権威として使うこと。
+        "realized_jpy": legacy["realized_jpy"],
+        "realized_jpy_semantics": "legacy_mixed_accounts_deprecated",
+        "economic_realized_pnl_jpy": authoritative["economic_realized_pnl_jpy"],
+        "taxable_realized_pnl_jpy": authoritative["taxable_realized_pnl_jpy"],
+        "nisa_realized_pnl_jpy": authoritative["nisa_realized_pnl_jpy"],
+        "by_account": authoritative["by_account"],
+        "by_ticker": authoritative["by_ticker"],
+        "trade_count": authoritative["trade_count"],
+        "comparison": {
+            "legacy_fifo": {
+                "economic_realized_pnl_jpy": legacy["realized_jpy"],
+                "taxable_realized_pnl_jpy": round(taxable_total, 2),
+                "nisa_realized_pnl_jpy": round(nisa_total, 2),
+            },
+            "total_average_like": {
+                key: total_average[key]
+                for key in (
+                    "economic_realized_pnl_jpy",
+                    "taxable_realized_pnl_jpy",
+                    "nisa_realized_pnl_jpy",
+                )
+            },
+        },
+    }
+
+
+def realized_pnl_in_year_total_average(
+    year: int,
+    *,
+    tickers: Optional[List[str]] = None,
+    db_path: Optional[Path] = None,
+) -> dict:
+    """Estimate realized P&L with a moving total-average cost basis.
+
+    Missing opening balances, owner/broker identity, FX or oversold inventory
+    are reported as data-quality issues.  Incomplete output is never promoted
+    to the authoritative tax view.
+    """
+    from event_ledger import query_events
+
+    all_events = query_events(
+        types=["trade", "split", "merge"],
+        date_to=f"{year}-12-31T23:59:59",
+        db_path=db_path,
+    )
+    if tickers is not None:
+        wanted = set(tickers)
+        all_events = [row for row in all_events if row.get("ticker") in wanted]
+
+    state: dict[tuple, dict] = {}
+    realized_rows: list[dict] = []
+    issues: list[str] = []
+    for event in all_events:
+        ticker = str(event.get("ticker") or "")
+        account = event.get("account")
+        owner, broker = _event_owner_broker(event)
+        event_id = event.get("event_id")
+        if not ticker or not account:
+            issues.append(f"{event_id}: ticker/account missing")
+            continue
+        if not owner or not broker:
+            issues.append(
+                f"{event_id}: owner/broker missing for {ticker}/{account}"
+            )
+        key = (owner or "(unknown)", broker or "(unknown)", account, ticker)
+        row = state.setdefault(key, {"qty": 0.0, "avg_jpy": 0.0})
+        event_type = str(event.get("event_type") or "").lower()
+        if event_type in {"split", "merge"}:
+            ratio = _split_ratio(event)
+            if ratio is None:
+                issues.append(f"{event_id}: split ratio missing")
+                continue
+            row["qty"] *= ratio
+            if row["avg_jpy"]:
+                row["avg_jpy"] /= ratio
+            continue
+        qty = float(event.get("quantity") or 0)
+        price = float(event.get("price") or 0)
+        currency = str(event.get("currency") or "JPY").upper()
+        fx = event.get("fx_rate_usdjpy")
+        if qty <= 0 or price <= 0:
+            continue
+        if currency == "USD" and (fx is None or float(fx) <= 0):
+            issues.append(f"{event_id}: USD FX missing")
+            continue
+        unit_jpy = price * float(fx) if currency == "USD" else price
+        fee_jpy = _event_fee_jpy(event)
+        direction = str(event.get("direction") or "").lower()
+        if direction == "buy":
+            new_qty = row["qty"] + qty
+            row["avg_jpy"] = (
+                (
+                    row["qty"] * row["avg_jpy"]
+                    + qty * unit_jpy
+                    + fee_jpy
+                ) / new_qty
+                if new_qty > 0 else 0.0
+            )
+            row["qty"] = new_qty
+        elif direction == "sell":
+            if row["qty"] < qty - 1e-9:
+                issues.append(
+                    f"{event_id}: opening balance/inventory missing "
+                    f"({ticker}/{account}, need={qty}, have={row['qty']})"
+                )
+                continue
+            # NTA examples require the per-unit total-average-like acquisition
+            # amount to be rounded up to the next whole yen.
+            acquisition_unit_jpy = math.ceil(row["avg_jpy"])
+            proceeds = qty * unit_jpy - fee_jpy
+            realized = proceeds - qty * acquisition_unit_jpy
+            row["qty"] -= qty
+            if row["qty"] > 1e-9:
+                row["avg_jpy"] = float(acquisition_unit_jpy)
+            sell_date = str(event.get("occurred_at") or "")[:10]
+            if f"{year}-01-01" <= sell_date <= f"{year}-12-31":
+                realized_rows.append({
+                    "ticker": ticker,
+                    "account": account,
+                    "owner": owner,
+                    "broker": broker,
+                    "realized_jpy": realized,
+                })
+
+    by_account: dict[str, float] = {}
+    by_ticker: dict[str, float] = {}
+    taxable = 0.0
+    nisa = 0.0
+    for row in realized_rows:
+        amount = float(row["realized_jpy"])
+        account = str(row["account"])
+        identity_key = "|".join((
+            str(row.get("owner") or "(unknown)"),
+            str(row.get("broker") or "(unknown)"),
+            account,
+        ))
+        by_account[identity_key] = by_account.get(identity_key, 0.0) + amount
+        by_ticker[row["ticker"]] = by_ticker.get(row["ticker"], 0.0) + amount
+        if "NISA" in account:
+            nisa += amount
+        else:
+            taxable += amount
+    economic = taxable + nisa
+    return {
+        "complete": not issues,
+        "economic_realized_pnl_jpy": round(economic, 2),
+        "taxable_realized_pnl_jpy": round(taxable, 2),
+        "nisa_realized_pnl_jpy": round(nisa, 2),
+        "by_account": {key: round(value, 2) for key, value in by_account.items()},
+        "by_ticker": {key: round(value, 2) for key, value in by_ticker.items()},
+        "trade_count": len(realized_rows),
+        "data_quality_issues": sorted(set(issues)),
     }
 
 
@@ -480,6 +697,8 @@ def portfolio_lot_snapshot(
                 "cost_per_share_jpy": round(l.cost_per_share_jpy, 4),
                 "currency":           l.currency,
                 "account":            l.account,
+                "owner":              l.owner,
+                "broker":             l.broker,
                 "remaining_cost_jpy": round(l.remaining_cost_jpy, 2),
             }
             for l in opens
@@ -525,6 +744,7 @@ def compute_total_average_cost_basis(
     *,
     db_path: Optional[Path] = None,
     until: Optional[str] = None,
+    require_position_identity: bool = False,
 ) -> Dict[str, CostBasisEstimate]:
     """総平均法に準ずる方法での取得原価を account 別に見積る。
 
@@ -547,6 +767,40 @@ def compute_total_average_cost_basis(
         date_to=(until + "T23:59:59" if until and "T" not in until else until),
         db_path=db_path,
     )
+    if require_position_identity:
+        # The legacy ledger table has no owner/broker columns.  Newer writers
+        # may carry them in raw_payload, but unless every event in the
+        # reconstruction has both values, account labels such as "一般" cannot
+        # distinguish two brokers or two owners.  Never promote that mixed
+        # basis to an actionable tax estimate.
+        identities_by_account: dict[str, set[tuple[str, str]]] = {}
+        for ev in events:
+            payload = ev.get("raw_payload")
+            if isinstance(payload, str) and payload:
+                try:
+                    payload = json.loads(payload)
+                except Exception:
+                    payload = {}
+            if not isinstance(payload, dict):
+                payload = {}
+            owner = (
+                ev.get("owner")
+                or payload.get("owner")
+                or payload.get("execution_owner")
+            )
+            broker = (
+                ev.get("broker")
+                or payload.get("broker")
+                or payload.get("execution_broker")
+            )
+            if not owner or not broker:
+                return {}
+            account = str(ev.get("account") or "")
+            identities_by_account.setdefault(account, set()).add(
+                (str(owner), str(broker))
+            )
+        if any(len(identities) != 1 for identities in identities_by_account.values()):
+            return {}
 
     state: Dict[str, dict] = {}
     excluded_accounts: set = set()
@@ -587,13 +841,15 @@ def compute_total_average_cost_basis(
                 )
                 continue
             cps_jpy = price * float(fx) if currency == "USD" and fx else price
+            fee_jpy = _event_fee_jpy(ev)
             acct_state = state.setdefault(
                 account, {"avg_cost_jpy": 0.0, "qty": 0.0, "last_event_at": occurred_at},
             )
             old_qty, old_avg = acct_state["qty"], acct_state["avg_cost_jpy"]
             new_qty = old_qty + qty
             acct_state["avg_cost_jpy"] = (
-                (old_qty * old_avg + qty * cps_jpy) / new_qty if new_qty > 1e-12 else cps_jpy
+                (old_qty * old_avg + qty * cps_jpy + fee_jpy) / new_qty
+                if new_qty > 1e-12 else cps_jpy
             )
             acct_state["qty"] = new_qty
             acct_state["last_event_at"] = occurred_at
@@ -608,6 +864,10 @@ def compute_total_average_cost_basis(
                 )
                 continue
             acct_state["qty"] -= qty  # 総平均法の定義: 売却は平均単価を変えない
+            if acct_state["qty"] > 1e-9:
+                acct_state["avg_cost_jpy"] = float(
+                    math.ceil(acct_state["avg_cost_jpy"])
+                )
             acct_state["last_event_at"] = occurred_at
 
     result: Dict[str, CostBasisEstimate] = {}
@@ -615,7 +875,9 @@ def compute_total_average_cost_basis(
         if account in excluded_accounts or acct_state["qty"] <= 1e-9:
             continue
         result[account] = CostBasisEstimate(
-            amount_jpy=round(acct_state["qty"] * acct_state["avg_cost_jpy"], 2),
+            amount_jpy=round(
+                acct_state["qty"] * math.ceil(acct_state["avg_cost_jpy"]), 2
+            ),
             source="event_ledger",
             method="total_average_like",
             as_of=acct_state["last_event_at"] or datetime.now().isoformat(),

@@ -106,6 +106,52 @@ def test_buy_over_kelly_cap_is_capped_and_lot_rounded():
     assert result['kelly_shadow']['capped'] is True
     assert result['kelly_shadow']['capped_notional_jpy'] < action['notional_jpy']
     assert result['kelly_shadow']['capped_notional_jpy'] % 1000.0 == 0
+    assert result['notional_jpy'] == result['kelly_shadow']['capped_notional_jpy']
+    assert result['estimated_notional_jpy'] == result['notional_jpy']
+    assert result['kelly_original_notional_jpy'] == action['notional_jpy']
+
+
+def test_position_identity_holding_does_not_mix_same_ticker_across_accounts():
+    stats = {
+        'AVGO': {
+            'win_rate': 0.6, 'avg_win_pct': 0.05, 'avg_loss_pct': 0.03,
+            'n': 10, 'sufficient': True,
+        },
+    }
+    husband = {
+        'ticker': 'AVGO', 'type': 'add', 'tier': 'long',
+        'notional_jpy': 400_000,
+        'execution_owner': 'husband', 'execution_broker': 'rakuten',
+        'execution_account': 'general',
+    }
+    result = ks.apply_kelly_cap_to_action(
+        husband,
+        portfolio_total_jpy=10_000_000,
+        current_holdings_by_ticker={'AVGO': 9_000_000},
+        current_holdings_by_position={
+            'husband|rakuten|general|AVGO': 100_000,
+            'wife|rakuten|general|AVGO': 8_900_000,
+        },
+        require_position_identity=True,
+        kelly_stats=stats,
+    )
+    assert result['kelly_shadow']['current_holding_jpy'] == 100_000
+    assert result['kelly_shadow']['current_holding_basis'] == 'position_identity'
+    assert result['kelly_shadow']['capped'] is False
+
+
+def test_required_position_identity_never_assumes_missing_holding_is_zero():
+    action = {'ticker': 'AVGO', 'type': 'add', 'notional_jpy': 400_000}
+    result = ks.apply_kelly_cap_to_action(
+        action,
+        portfolio_total_jpy=10_000_000,
+        current_holdings_by_ticker={'AVGO': 0},
+        current_holdings_by_position={},
+        require_position_identity=True,
+    )
+    assert result['kelly_shadow']['capped'] is False
+    assert result['kelly_shadow']['cap_skipped_reason'] == 'position_identity_unresolved'
+    assert result['kelly_shadow']['current_holding_basis'] == 'unknown'
 
 
 def test_capped_below_one_lot_marks_non_actionable_without_raising():
@@ -195,3 +241,5 @@ def test_run_kelly_shadow_returns_capped_and_non_actionable_counts():
         current_holdings_by_ticker={'AVGO': 0, 'NVDA': 0}, kelly_stats=stats,
     )
     assert decision.capped_count == 1
+    avgo = next(a for a in decision.evaluated if a.get('ticker') == 'AVGO')
+    assert avgo['notional_jpy'] < 5_000_000

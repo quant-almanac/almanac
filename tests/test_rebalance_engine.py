@@ -165,6 +165,23 @@ def test_nisa_sell_protection_sees_medium_tier_nisa_positions():
     assert "nisa_warning" in reduce_with_nisa
 
 
+def test_medium_drift_propagates_position_identity_to_reports_and_actions(monkeypatch):
+    monkeypatch.setattr(re, "MEDIUM_TARGET_WEIGHTS", {"AVGO": 0.2, "XLF": 0.8})
+    avgo = _position("AVGO", "USD", "Technology", "medium", 800_000)
+    xlf = _position("XLF", "USD", "Financial Services", "medium", 200_000)
+    for row in (avgo, xlf):
+        row.update(owner="husband", broker="rakuten", account="一般")
+
+    result = re.calculate_medium_drift(_snapshot([avgo, xlf]))
+    avgo_report = next(p for p in result["positions"] if p["ticker"] == "AVGO")
+    avgo_action = next(a for a in result["actions"] if a["ticker"] == "AVGO")
+
+    assert avgo_report["position_identity_key"] == "husband|rakuten|general|AVGO"
+    assert avgo_action["position_identity_key"] == avgo_report["position_identity_key"]
+    assert avgo_action["owner"] == "husband"
+    assert avgo_action["broker"] == "rakuten"
+
+
 # ── api/routes/rebalance.py 経路との一致 ──────────────────────────────────
 
 def test_api_rebalance_route_matches_engine_core_filter(monkeypatch):
@@ -188,3 +205,27 @@ def test_api_rebalance_route_matches_engine_core_filter(monkeypatch):
     assert api_result["sector"]["data"] == engine_result["sector_result"]["sectors"]
     assert api_result["core_total_jpy"] == engine_result["summary"]["core_total_jpy"]
     assert api_result["core_position_count"] == engine_result["summary"]["core_position_count"]
+
+
+def test_rebalance_loss_harvest_uses_shared_total_average_scanner(monkeypatch):
+    monkeypatch.setattr(
+        "tax_harvest_scanner.compute_tax_harvest",
+        lambda **kwargs: {"candidates": [{
+            "ticker": "AVGO",
+            "account": "特定",
+            "owner": "husband",
+            "broker": "rakuten",
+            "quantity": 5,
+            "estimated_loss_jpy": -80_000,
+            "cost_basis_method": "total_average_like",
+            "actionable_for_gate": True,
+        }]},
+    )
+
+    result = re.find_loss_harvest_candidates(
+        {"positions": [{"ticker": "NISA_ONLY", "unrealized_jpy": -999_999}]},
+    )
+
+    assert [row["ticker"] for row in result] == ["AVGO"]
+    assert result[0]["actionable_for_gate"] is True
+    assert result[0]["human_execution_only"] is True

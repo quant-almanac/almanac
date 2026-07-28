@@ -3,7 +3,7 @@
 背景: currency_breakdown (portfolio_manager.py) は取引通貨の単純合計
 (`p['currency']=='USD'`) で USD/JPY 比率を出しており、2634.T (JPY建て
 だが円ヘッジ済みS&P500=経済的にはUSD) や IEV (USD建てだが欧州株=
-経済通貨はEUR) のような look-through 不一致を扱えない。本テストは
+経済通貨は複数の欧州通貨) のような look-through 不一致を扱えない。本テストは
 instrument_master 経由の解決・単一株のtrivialケース・未登録fundの
 fail-closed (unknown) 動作を検証する。
 """
@@ -53,14 +53,15 @@ def test_unhedged_jpy_fund_keeps_full_net_usd_exposure():
     assert e.net_usd_exposure_jpy == pytest.approx(1_000_000)
 
 
-def test_ietf_with_non_usd_economic_currency_is_not_counted_as_usd():
-    """本題: IEV は USD建てだが経済通貨はEUR。gross_usd_exposure に
+def test_ietf_with_multi_currency_europe_exposure_is_not_counted_as_usd():
+    """本題: IEV は USD建てだが中身は複数の欧州通貨。gross_usd_exposure に
     算入してはならない (取引通貨だけ見た集計の誤りを再現しない)。"""
     e = fx.resolve_economic_exposure(
         position=_pos('IEV'), market_value_jpy=500_000, listing_currency='USD',
     )
     assert e.exposure_source == 'instrument_master'
-    assert e.gross_usd_exposure_jpy == 0.0  # EUR エクスポージャーであり USD ではない
+    assert e.gross_usd_exposure_jpy == 0.0
+    assert fx.INSTRUMENT_MASTER["IEV"].economic_currency == "MULTI_EUROPE"
 
 
 def test_leveraged_etn_still_resolves_but_is_flagged_leveraged():
@@ -124,6 +125,14 @@ def test_is_fund_flag_is_caller_responsibility_not_guessed_from_ticker():
     assert as_fund.exposure_source == 'unknown'
 
 
+def test_missing_instrument_kind_fails_closed_instead_of_assuming_single_stock():
+    unresolved = fx.resolve_economic_exposure(
+        position=_pos('UNKNOWN'), market_value_jpy=100_000, listing_currency='USD',
+    )
+    assert unresolved.exposure_source == 'unknown'
+    assert unresolved.net_usd_exposure_jpy is None
+
+
 # ---------------------------------------------------------------------------
 # summarize_fx_exposure — ポートフォリオ集計
 # ---------------------------------------------------------------------------
@@ -131,8 +140,8 @@ def test_is_fund_flag_is_caller_responsibility_not_guessed_from_ticker():
 
 def test_summary_separates_unknown_from_known_totals():
     exposures = [
-        fx.resolve_economic_exposure(position=_pos('AAPL'), market_value_jpy=1_000_000, listing_currency='USD'),
-        fx.resolve_economic_exposure(position=_pos('9432.T'), market_value_jpy=1_000_000, listing_currency='JPY'),
+        fx.resolve_economic_exposure(position=_pos('AAPL'), market_value_jpy=1_000_000, listing_currency='USD', is_fund=False),
+        fx.resolve_economic_exposure(position=_pos('9432.T'), market_value_jpy=1_000_000, listing_currency='JPY', is_fund=False),
         fx.resolve_economic_exposure(position=_pos('SLIM_ORCAN'), market_value_jpy=500_000, listing_currency='JPY', is_fund=True),
     ]
     summary = fx.summarize_fx_exposure(exposures)
@@ -146,7 +155,7 @@ def test_summary_separates_unknown_from_known_totals():
 def test_summary_separates_other_currency_from_jpy():
     """本題: IEV (EUR) を JPY 側へ黙って合算しない。"""
     exposures = [
-        fx.resolve_economic_exposure(position=_pos('AAPL'), market_value_jpy=1_000_000, listing_currency='USD'),
+        fx.resolve_economic_exposure(position=_pos('AAPL'), market_value_jpy=1_000_000, listing_currency='USD', is_fund=False),
         fx.resolve_economic_exposure(position=_pos('IEV'), market_value_jpy=500_000, listing_currency='USD'),
     ]
     summary = fx.summarize_fx_exposure(exposures)
@@ -171,8 +180,8 @@ def test_summary_gross_vs_net_diverge_when_hedged_positions_present():
 
 def test_summary_capital_allocation_sums_to_full_portfolio_when_all_known():
     exposures = [
-        fx.resolve_economic_exposure(position=_pos('AAPL'), market_value_jpy=600_000, listing_currency='USD'),
-        fx.resolve_economic_exposure(position=_pos('9432.T'), market_value_jpy=400_000, listing_currency='JPY'),
+        fx.resolve_economic_exposure(position=_pos('AAPL'), market_value_jpy=600_000, listing_currency='USD', is_fund=False),
+        fx.resolve_economic_exposure(position=_pos('9432.T'), market_value_jpy=400_000, listing_currency='JPY', is_fund=False),
     ]
     summary = fx.summarize_fx_exposure(exposures)
     assert summary.capital_allocation_usd_pct + summary.capital_allocation_jpy_pct == pytest.approx(1.0)

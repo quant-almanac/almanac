@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -46,11 +47,20 @@ def _record_hash(record: dict) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
 
 
+def _state_path() -> Path:
+    """Resolve at call time so subprocess tests can isolate persistent state."""
+    state_root = os.environ.get("ALMANAC_STATE_DIR")
+    if state_root:
+        return Path(state_root) / "execution_invalidation_state.json"
+    return STATE_PATH
+
+
 def _load_state() -> dict:
-    if not STATE_PATH.exists():
+    path = _state_path()
+    if not path.exists():
         return {"schema_version": SCHEMA_VERSION, "entries": []}
     try:
-        data = json.loads(STATE_PATH.read_text(encoding="utf-8"))
+        data = json.loads(path.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError):
         return {"schema_version": SCHEMA_VERSION, "entries": []}
     if not isinstance(data, dict) or not isinstance(data.get("entries"), list):
@@ -111,7 +121,9 @@ def invalidate_analysis(
         state["entries"].append(entry)
         state["schema_version"] = SCHEMA_VERSION
         state["last_updated"] = _now_iso()
-        atomic_write_json(STATE_PATH, state)
+        state_path = _state_path()
+        state_path.parent.mkdir(parents=True, exist_ok=True)
+        atomic_write_json(state_path, state)
 
     return entry
 

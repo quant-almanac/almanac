@@ -4,13 +4,15 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import warnings
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Optional
 
 import action_state_tracker as ast
 from almanac.observability.append_only_log import append_jsonl_safe
-from tax_lot import portfolio_lot_snapshot, recommend_sell_lots
+from tax_lot import compute_total_average_cost_basis, portfolio_lot_snapshot
 from tax_optimizer import (
     TAX_IPPAN,
     TAX_TOKUTEI,
@@ -21,7 +23,8 @@ from tax_optimizer import (
 TAX_HARVEST_ACTION_TYPE = "loss_harvest_sell"
 
 BASE_DIR = Path(__file__).parent
-DEFAULT_REPORT_PATH = BASE_DIR / "data" / "tax_harvest_reports.jsonl"
+REPORT_DIR = Path(os.environ.get("ALMANAC_REPORT_DIR", BASE_DIR / "data"))
+DEFAULT_REPORT_PATH = REPORT_DIR / "tax_harvest_reports.jsonl"
 REPURCHASE_WARNING = (
     "同日中に同一銘柄を買い戻すと、特定口座では一日の取引終了後に総平均法に準ずる方法で"
     "取得価額が再計算され、想定した損失確定額が小さくなる場合があります。"
@@ -48,7 +51,7 @@ def compute_tax_harvest(
     price_provider: Optional[
         Callable[[str, str], tuple[Optional[float], Optional[float]]]
     ] = None,
-    recommend_func: Callable[..., dict] = recommend_sell_lots,
+    recommend_func: Optional[Callable[..., dict]] = None,
     db_path: Optional[Path] = None,
 ) -> dict:
     """純粋: 損出し候補を計算するだけ。action_state への登録・通知・
@@ -58,10 +61,19 @@ def compute_tax_harvest(
     action_state_tracker への登録と同時に付与する。
     """
 
+    if recommend_func is not None:
+        warnings.warn(
+            "recommend_func is deprecated and is not called: specific-lot sell "
+            "selection was removed during the total-average cost-basis migration",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+
     snapshot = lots_snapshot if lots_snapshot is not None else portfolio_lot_snapshot(db_path=db_path)
     provider = price_provider or _default_price_provider
     substitutes = _load_substitutes()
     candidates: list[dict] = []
+    data_quality_issues: list[str] = []
 
     for ticker, lots in (snapshot.get("lots") or {}).items():
         if not lots:
@@ -71,33 +83,47 @@ def compute_tax_harvest(
         if current_price is None or current_price <= 0:
             continue
         current_jpy = current_price * (fx or 1.0) if currency.upper() == "USD" else current_price
+        averages = compute_total_average_cost_basis(
+            ticker, db_path=db_path, require_position_identity=True,
+        )
         accounts = sorted({lot.get("account") for lot in lots}, key=str)
         for account in accounts:
             if not account or "NISA" in str(account):
                 continue
             account_lots = [lot for lot in lots if lot.get("account") == account]
-            losing = [
-                lot for lot in account_lots
-                if current_jpy < float(lot.get("cost_per_share_jpy") or 0)
-            ]
-            quantity = sum(float(lot.get("remaining_qty") or 0) for lot in losing)
-            estimated_loss = sum(
-                float(lot.get("remaining_qty") or 0)
-                * (current_jpy - float(lot.get("cost_per_share_jpy") or 0))
-                for lot in losing
+            quantity = sum(float(lot.get("remaining_qty") or 0) for lot in account_lots)
+            estimate = averages.get(account)
+            identity_pairs = {
+                (str(lot.get("owner") or ""), str(lot.get("broker") or ""))
+                for lot in account_lots
+                if lot.get("owner") and lot.get("broker")
+            }
+            authoritative_basis = bool(
+                estimate is not None and not estimate.data_quality_issues
+                and len(identity_pairs) == 1
             )
+            if authoritative_basis:
+                avg_cost_jpy = float(estimate.amount_jpy) / quantity if quantity > 0 else 0.0
+                cost_basis_method = estimate.method
+            else:
+                data_quality_issues.append(
+                    f"{ticker}/{account}: total-average cost basis unavailable"
+                )
+                # Inventory snapshot fallback is display-only.  It averages all
+                # remaining units in the account; it never selects only losing
+                # lots and therefore does not reintroduce specific-lot logic.
+                total_cost = sum(
+                    float(lot.get("remaining_qty") or 0)
+                    * float(lot.get("cost_per_share_jpy") or 0)
+                    for lot in account_lots
+                )
+                avg_cost_jpy = total_cost / quantity if quantity > 0 else 0.0
+                cost_basis_method = "inventory_weighted_average_unreconciled"
+            if quantity <= 0:
+                continue
+            estimated_loss = quantity * (current_jpy - avg_cost_jpy)
             if quantity <= 0 or estimated_loss > -abs(min_loss_jpy):
                 continue
-            plan = recommend_func(
-                ticker,
-                quantity,
-                current_price=current_price,
-                current_fx=fx,
-                currency=currency,
-                mode="loss_harvest",
-                account_filter=account,
-                db_path=db_path,
-            )
             tax_rate = TAX_TOKUTEI if "特定" in str(account) else TAX_IPPAN
             is_japan = ticker.endswith(".T")
             estimated_tax_saving_jpy = round(abs(estimated_loss) * tax_rate)
@@ -105,6 +131,12 @@ def compute_tax_harvest(
             candidates.append({
                 "ticker": ticker,
                 "account": account,
+                "owner": (
+                    next(iter(identity_pairs))[0] if len(identity_pairs) == 1 else None
+                ),
+                "broker": (
+                    next(iter(identity_pairs))[1] if len(identity_pairs) == 1 else None
+                ),
                 "quantity": round(quantity, 6),
                 "current_price": current_price,
                 "currency": currency,
@@ -112,7 +144,10 @@ def compute_tax_harvest(
                 "estimated_tax_saving_jpy": estimated_tax_saving_jpy,
                 "urgency": "medium" if abs(estimated_loss) >= min_loss_jpy * 3 else "low",
                 "substitutes": _lookup_substitutes(ticker, is_japan, substitutes)[:3],
-                "lot_plan": plan.get("plan", []),
+                "cost_basis_method": cost_basis_method,
+                "average_cost_per_share_jpy": round(avg_cost_jpy, 4),
+                "specific_lot_selection": False,
+                "actionable_for_gate": authoritative_basis,
                 "human_execution_only": True,
             })
 
@@ -127,6 +162,7 @@ def compute_tax_harvest(
         ),
         "warning": REPURCHASE_WARNING,
         "execution": "display_and_notify_only",
+        "data_quality_issues": sorted(set(data_quality_issues)),
     }
 
 
@@ -142,6 +178,12 @@ def register_actions(report: dict) -> dict:
 
     report = copy.deepcopy(report)
     for row in report.get("candidates", []):
+        if not row.get("actionable_for_gate"):
+            row["recommendation_id"] = None
+            row["registration_skipped_reason"] = (
+                "owner/broker scoped total-average basis is not authoritative"
+            )
+            continue
         act_for_tracking = {
             "ticker": row["ticker"],
             "type": TAX_HARVEST_ACTION_TYPE,
@@ -152,11 +194,15 @@ def register_actions(report: dict) -> dict:
                 f"推定節税¥{row['estimated_tax_saving_jpy']:,.0f}"
             ),
             "account": row["account"],
+            "execution_owner": row.get("owner"),
+            "execution_broker": row.get("broker"),
+            "execution_account": row["account"],
         }
         ast.record_recommendations([act_for_tracking], source="tax_harvest_scanner")
         bucket = ast.account_bucket_for_action(act_for_tracking)
-        row["recommendation_id"] = ast._make_id(
-            row["ticker"], TAX_HARVEST_ACTION_TYPE, datetime.now().isoformat(), bucket,
+        row["recommendation_id"] = ast._find_existing_pending(
+            ast._load(),
+            ast.dedup_key(row["ticker"], TAX_HARVEST_ACTION_TYPE, bucket),
         )
     return report
 

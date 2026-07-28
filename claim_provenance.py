@@ -24,7 +24,7 @@ Stage 0C (evidence anti-circularity) が防いだのと同じ種類の問題
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime
 from typing import Optional
 
@@ -135,6 +135,106 @@ def can_raise_confidence(claim: ClaimProvenance) -> bool:
     直接見て個別に判断すると、将来 verified の意味が拡張されたときに
     整合性が崩れる。"""
     return claim.verified
+
+
+def claim_to_dict(claim: ClaimProvenance) -> dict:
+    """JSON output helper with tuples normalized to lists."""
+    value = asdict(claim)
+    value["derived_from_claim_ids"] = list(claim.derived_from_claim_ids)
+    return value
+
+
+def claims_from_decision_snapshot(
+    enriched,
+    *,
+    decision_snapshot_id: str,
+    ticker: str | None = None,
+    now: Optional[datetime] = None,
+) -> list[ClaimProvenance]:
+    """Build provenance claims from the exact frozen analysis inputs.
+
+    The function intentionally uses duck typing so ``claim_provenance`` does
+    not import ``analysis_snapshot`` and create a dependency cycle.
+    """
+    now = now or datetime.now()
+    claims: list[ClaimProvenance] = []
+    base = getattr(enriched, "base", None)
+    if base is not None:
+        for category in ("holdings", "cash", "prices", "fx", "macro", "news", "screening"):
+            row = getattr(base, category, None)
+            if row is None:
+                continue
+            claims.append(build_claim_provenance(
+                f"{decision_snapshot_id}:{category}",
+                source_type="local_artifact",
+                source_ref=getattr(row, "source", None),
+                observation_date=getattr(row, "source_as_of", None),
+                freshness_status=getattr(row, "freshness_status", "unknown"),
+                artifact_hash=(
+                    getattr(row, "payload_hash", None)
+                    or getattr(row, "artifact_hash", None)
+                ),
+                evidence_lineage_id=f"snapshot:{decision_snapshot_id}:{category}",
+                now=now,
+            ))
+    option_rows = getattr(enriched, "options_by_ticker", {}) or {}
+    if ticker and ticker in option_rows:
+        row = option_rows[ticker]
+        claims.append(build_claim_provenance(
+            f"{decision_snapshot_id}:options:{ticker}",
+            source_type="market_provider",
+            source_ref=f"options_fetcher:{ticker}",
+            observation_date=getattr(row, "source_as_of", None),
+            freshness_status=getattr(row, "freshness_status", "unknown"),
+            artifact_hash=getattr(row, "artifact_hash", None),
+            evidence_lineage_id=f"snapshot:{decision_snapshot_id}:options:{ticker}",
+            now=now,
+        ))
+    return claims
+
+
+def build_action_claim(
+    *,
+    claim_id: str,
+    input_claims: list[ClaimProvenance],
+    calculation_version: str,
+    evidence_lineage_id: str,
+    now: Optional[datetime] = None,
+) -> ClaimProvenance:
+    """Create a derived action claim and recursively validate its parents.
+
+    ``build_claim_provenance(..., source_type="derived")`` can only check that
+    parent IDs exist.  This helper additionally prevents a stale/unverified
+    parent from being laundered into a verified derived claim.
+    """
+    usable = [
+        claim for claim in input_claims
+        if claim.freshness_status in {"fresh", "degraded"}
+    ]
+    derived = build_claim_provenance(
+        claim_id,
+        source_type="derived",
+        derived_from_claim_ids=[claim.claim_id for claim in usable],
+        calculation_version=calculation_version,
+        evidence_lineage_id=evidence_lineage_id,
+        freshness_status=(
+            "fresh"
+            if usable and all(c.freshness_status == "fresh" for c in usable)
+            else ("degraded" if usable else "unknown")
+        ),
+        now=now,
+    )
+    bad_parents = [
+        claim.claim_id for claim in input_claims
+        if not claim.verified or claim.freshness_status in {"stale", "unknown"}
+    ]
+    if bad_parents:
+        return replace(
+            derived,
+            verified=False,
+            unverified_reason="unverified_or_stale_parents:" + ",".join(bad_parents),
+        )
+    return derived
 
 
 # ---------------------------------------------------------------------------

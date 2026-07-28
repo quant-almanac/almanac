@@ -29,6 +29,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
+from zoneinfo import ZoneInfo
 
 # 鮮度の閾値は execution_readiness.portfolio_snapshot_health() の
 # file-wide 版 (72h=stale / 24h=degraded) とそろえる。ポジション単位に
@@ -220,6 +221,111 @@ def _find_holding_entry(position: PositionIdentity, *, base_dir: Path) -> dict |
     return None
 
 
+def _parse_sync_timestamp(entry: dict) -> tuple[datetime | None, str]:
+    """Resolve an identity-scoped broker snapshot timestamp.
+
+    Structured reconciliation fields are authoritative.  The historical note
+    parser remains as an explicitly labelled compatibility source so old
+    holdings become stale/review instead of being silently treated as current.
+    """
+    for key in (
+        "broker_reconciled_at",
+        "reconciled_at",
+        "source_as_of",
+        "reported_as_of",
+        "last_updated",
+    ):
+        value = entry.get(key)
+        if value in (None, ""):
+            continue
+        try:
+            parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+            return parsed, f"holding.{key}"
+        except ValueError:
+            continue
+    return parse_note_sync_date(entry.get("note")), (
+        "holdings_note_legacy" if parse_note_sync_date(entry.get("note")) else "unknown"
+    )
+
+
+def _broker_confirmed_fill_timestamp(
+    position: PositionIdentity,
+    *,
+    base_dir: Path,
+) -> tuple[datetime | None, str]:
+    """Return the latest externally evidenced fill for this exact position.
+
+    Internal ``portfolio_applied`` and ordinary ``executed`` rows deliberately
+    do not qualify.  A fill advances freshness only when the broker execution,
+    quantity/price, report time and reconciliation snapshot can all be audited.
+    """
+    raw = _load_json_object(base_dir / "action_executions.json") or {}
+    rows = raw.get("executions") if isinstance(raw, dict) else None
+    if not isinstance(rows, list):
+        return None, "unknown"
+    state_raw = _load_json_object(base_dir / "action_state.json") or {}
+    state_actions = state_raw.get("actions") if isinstance(state_raw, dict) else {}
+    if not isinstance(state_actions, dict):
+        state_actions = {}
+
+    required = (
+        "external_execution_id",
+        "broker_source",
+        "broker_reported_at",
+        "filled_quantity",
+        "filled_price",
+        "reconciled_at",
+        "reconciliation_snapshot_hash",
+    )
+    latest: datetime | None = None
+    latest_id = ""
+    seen_external_ids: set[str] = set()
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        state_id = str(row.get("action_state_id") or "")
+        linked = state_actions.get(state_id) if state_id else None
+        merged = {**(linked if isinstance(linked, dict) else {}), **row}
+        status = str(
+            merged.get("event_type")
+            or merged.get("status")
+            or merged.get("reconciliation_status")
+            or ""
+        ).lower()
+        confirmed = bool(merged.get("broker_confirmed_filled")) or status in {
+            "broker_confirmed_filled",
+            "broker_confirmed",
+        }
+        if not confirmed or any(merged.get(key) in (None, "") for key in required):
+            continue
+        candidate = position_identity_for_action(merged)
+        if candidate != position:
+            continue
+        external_id = str(merged["external_execution_id"])
+        if external_id in seen_external_ids:
+            continue
+        seen_external_ids.add(external_id)
+        try:
+            reconciled_at = datetime.fromisoformat(
+                str(merged["reconciled_at"]).replace("Z", "+00:00")
+            )
+        except ValueError:
+            continue
+        if latest is None or _as_jst(reconciled_at) > _as_jst(latest):
+            latest = reconciled_at
+            latest_id = external_id
+    return (
+        (latest, f"broker_confirmed_fill:{latest_id}")
+        if latest is not None
+        else (None, "unknown")
+    )
+
+
+def _as_jst(value: datetime) -> datetime:
+    jst = ZoneInfo("Asia/Tokyo")
+    return value.replace(tzinfo=jst) if value.tzinfo is None else value.astimezone(jst)
+
+
 def position_freshness(
     position: PositionIdentity,
     *,
@@ -231,13 +337,14 @@ def position_freshness(
 
     他銘柄の更新や無関係な約定 (action_executions.json 側のイベント) には
     一切影響されない。「鮮度を進めてよいのは broker_confirmed_filled または
-    再照合済みイベントのみ」という Stage 0B の契約どおり、ここで見ているのは
-    holdings.json への実際の証券会社同期記録 (note フィールド) のみ。
+    再照合済みイベントのみ」という Stage 0B の契約どおり、構造化された
+    holdings の照合時刻と、完全な外部根拠を持つ約定だけを見る。自由記述 note
+    の日付は旧データ互換のため明示的に legacy source として扱う。
 
     Returns:
         {
           "status": "fresh" | "degraded" | "stale" | "unknown",
-          "synced_at": "YYYY-MM-DD" | None,
+          "synced_at": ISO-8601 timestamp | None,
           "age_hours": float | None,
           "source": "holdings_note" | "unknown",
         }
@@ -247,12 +354,26 @@ def position_freshness(
     if entry is None:
         return {"status": "unknown", "synced_at": None, "age_hours": None, "source": "unknown"}
 
-    synced_at = parse_note_sync_date(entry.get("note"))
-    if synced_at is None:
+    holding_sync, holding_source = _parse_sync_timestamp(entry)
+    fill_sync, fill_source = _broker_confirmed_fill_timestamp(
+        position,
+        base_dir=base_dir,
+    )
+    candidates = [
+        (timestamp, source)
+        for timestamp, source in (
+            (holding_sync, holding_source),
+            (fill_sync, fill_source),
+        )
+        if timestamp is not None
+    ]
+    if not candidates:
         return {"status": "unknown", "synced_at": None, "age_hours": None, "source": "unknown"}
+    synced_at, source = max(candidates, key=lambda item: _as_jst(item[0]))
 
-    now_naive = now.replace(tzinfo=None) if now.tzinfo is not None else now
-    age_hours = max(0.0, (now_naive - synced_at).total_seconds() / 3600)
+    synced_jst = _as_jst(synced_at)
+    now_jst = _as_jst(now)
+    age_hours = max(0.0, (now_jst - synced_jst).total_seconds() / 3600)
 
     if age_hours > STALE_AFTER_HOURS:
         status = "stale"
@@ -263,7 +384,7 @@ def position_freshness(
 
     return {
         "status": status,
-        "synced_at": synced_at.date().isoformat(),
+        "synced_at": synced_jst.isoformat(),
         "age_hours": round(age_hours, 1),
-        "source": "holdings_note",
+        "source": source,
     }

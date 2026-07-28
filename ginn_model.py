@@ -15,8 +15,10 @@ Cornish-Fisher VaR/CVaRの入力ボラティリティ精度を改善する。
 """
 
 import argparse
+import hashlib
 import json
 import os
+import subprocess
 import sys
 import warnings
 from pathlib import Path
@@ -28,13 +30,17 @@ import pandas as pd
 warnings.filterwarnings('ignore')
 
 BASE_DIR = Path(__file__).parent
-MODEL_PATH = BASE_DIR / 'models' / 'ginn_model.pt'
-META_PATH = BASE_DIR / 'models' / 'ginn_meta.json'
-SAFETY_LOG_PATH = BASE_DIR / 'logs' / 'ginn_safety_gate.jsonl'
+MODEL_DIR = Path(os.environ.get("ALMANAC_MODEL_DIR", BASE_DIR / "models"))
+STATE_DIR = Path(os.environ.get("ALMANAC_STATE_DIR", BASE_DIR))
+MODEL_PATH = MODEL_DIR / 'ginn_model.pt'
+META_PATH = MODEL_DIR / 'ginn_meta.json'
+BUNDLE_ROOT = MODEL_DIR / 'ginn'
+CURRENT_POINTER_PATH = BUNDLE_ROOT / 'current.json'
+SAFETY_LOG_PATH = STATE_DIR / 'logs' / 'ginn_safety_gate.jsonl'
 sys.path.insert(0, str(BASE_DIR))
 
 # モデルパスディレクトリ作成
-MODEL_PATH.parent.mkdir(exist_ok=True)
+MODEL_PATH.parent.mkdir(parents=True, exist_ok=True)
 
 # Stage 0A/4A: 中央安全ゲート (2026-07-27 インシデント対応)。
 #
@@ -57,6 +63,77 @@ MAX_DATA_AGE_DAYS = 10             # 週次 cron を1回逃しても許容する
 MIN_FEATURE_COVERAGE = 0.90        # 学習対象銘柄群の平均データ充足率
 
 
+def _sha256_file(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _atomic_write_json(path: Path, payload: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
+    os.replace(tmp, path)
+
+
+def _git_revision() -> str | None:
+    try:
+        return subprocess.check_output(
+            ["git", "rev-parse", "HEAD"],
+            cwd=BASE_DIR,
+            text=True,
+            stderr=subprocess.DEVNULL,
+            timeout=5,
+        ).strip() or None
+    except Exception:
+        return None
+
+
+def _data_snapshot_hash(returns_df: pd.DataFrame) -> str:
+    """Hash the actual chronological training frame, including index/NaNs."""
+    try:
+        values = pd.util.hash_pandas_object(returns_df, index=True).values.tobytes()
+        columns = json.dumps(list(map(str, returns_df.columns))).encode("utf-8")
+        return hashlib.sha256(columns + b"\x00" + values).hexdigest()
+    except Exception:
+        return "unavailable"
+
+
+def _resolve_active_bundle() -> tuple[Path, Path, str | None, str | None]:
+    """Return active model/manifest paths and pointer diagnostics.
+
+    ``current.json`` is authoritative once present.  Legacy flat files remain
+    readable only for backwards compatibility and are still subject to the
+    same manifest promotion checks.
+    """
+    if not CURRENT_POINTER_PATH.exists():
+        return MODEL_PATH, META_PATH, None, None
+    try:
+        pointer = json.loads(CURRENT_POINTER_PATH.read_text(encoding="utf-8"))
+        version = str(pointer["version"])
+        bundle_dir = BUNDLE_ROOT / version
+        model_path = bundle_dir / "model.pt"
+        manifest_path = bundle_dir / "manifest.json"
+        expected_model_hash = pointer.get("model_sha256")
+        expected_manifest_hash = pointer.get("manifest_sha256")
+        if not model_path.is_file() or not manifest_path.is_file():
+            return model_path, manifest_path, version, "active_bundle_incomplete"
+        if expected_model_hash and _sha256_file(model_path) != expected_model_hash:
+            return model_path, manifest_path, version, "active_bundle_checksum_mismatch"
+        if not expected_manifest_hash:
+            return model_path, manifest_path, version, "active_manifest_checksum_missing"
+        if _sha256_file(manifest_path) != expected_manifest_hash:
+            return model_path, manifest_path, version, "active_manifest_checksum_mismatch"
+        return model_path, manifest_path, version, None
+    except Exception:
+        return MODEL_PATH, META_PATH, None, "current_pointer_invalid"
+
+
 def _log_safety_gate_event(event: dict) -> None:
     """rejected legacy model のロード試行などを追記のみで記録する。"""
     try:
@@ -68,26 +145,35 @@ def _log_safety_gate_event(event: dict) -> None:
         pass  # 監査ログの失敗でフォールバック経路自体は止めない
 
 
-def _load_ginn_meta() -> dict | None:
-    if not META_PATH.exists():
+def _load_ginn_meta(path: Path | None = None) -> dict | None:
+    path = path or META_PATH
+    if not path.exists():
         return None
     try:
-        data = json.loads(META_PATH.read_text(encoding="utf-8"))
+        data = json.loads(path.read_text(encoding="utf-8"))
         return data if isinstance(data, dict) else None
     except (json.JSONDecodeError, OSError):
         return None
 
 
 def _meets_promotion_criteria(meta: dict) -> tuple[bool, str | None]:
-    """Stage 4A: walk-forward validation の正式な昇格基準。
+    """Stage 4A: chronological holdout validation の暫定昇格基準。
 
     5つの数値基準をすべて満たさない限り昇格を拒否する (fail-closed)。
     「訓練外 test で最終性能を確認した」とは書かない — validation は
     昇格判定に使った時点で真の意味での test ではない (held-out ではあるが、
     このモデル選択プロセス自体に影響するため)。真に未観測のデータに対する
-    forward 評価は別途 forward_observations/forward_metrics で追跡する
-    (Stage 4A時点では計測パイプライン未実装のため常に空)。
+    真の rolling-origin walk-forward と、昇格後の未観測データに対する
+    forward 評価は未実装。forward_observations/forward_metrics は予約済み
+    だが Stage 4A 時点では常に空であり、最終性能の証明には使えない。
     """
+    # 現行の train_ginn() は train 時の銘柄別 scaler 実値を bundle に保存せず、
+    # forecast_ginn_result() は直近 inference window で統計を再 fit している。
+    # version 文字列だけでは「学習と推論が同じ変換」を証明できないため、
+    # scaler artifact と ticker routing が実装されるまで候補は昇格不能にする。
+    if meta.get("inference_contract_complete") is not True:
+        return False, "inference_contract_incomplete"
+
     n_validation = meta.get("n_validation")
     if not isinstance(n_validation, int) or n_validation < MIN_VALIDATION_SAMPLES:
         return False, f"insufficient_validation_samples:{n_validation!r}<{MIN_VALIDATION_SAMPLES}"
@@ -269,6 +355,10 @@ def train_ginn(
     from portfolio_optimizer import _load_holdings_tickers, load_returns
     from risk_engine import estimate_gjr_garch
 
+    random_seed = 42
+    np.random.seed(random_seed)
+    torch.manual_seed(random_seed)
+
     if tickers is None:
         tickers = _load_holdings_tickers()
 
@@ -400,11 +490,20 @@ def train_ginn(
 
     feature_coverage = round(sum(coverages) / len(coverages), 4) if coverages else 0.0
 
-    # 保存
-    torch.save(model.state_dict(), MODEL_PATH)
+    trained_at = datetime.now(timezone.utc)
+    version = trained_at.strftime("%Y%m%dT%H%M%S%fZ")
+    candidate_dir = BUNDLE_ROOT / version
+    candidate_dir.mkdir(parents=True, exist_ok=False)
+    candidate_model_path = candidate_dir / "model.pt"
+    candidate_manifest_path = candidate_dir / "manifest.json"
+    torch.save(model.state_dict(), candidate_model_path)
+    model_sha256 = _sha256_file(candidate_model_path)
     meta = {
-        'trained_at':              datetime.now().isoformat(),
+        'schema_version':           2,
+        'model_version':            version,
+        'trained_at':               trained_at.isoformat(),
         'data_end':                data_end.strftime('%Y-%m-%d') if data_end is not None else None,
+        'n_train':                  n_train,
         'n_samples':                n_train,
         'n_validation':             n_validation,
         'n_validation_tickers':     n_validation_tickers,
@@ -418,18 +517,61 @@ def train_ginn(
         # 未実装のため常に空。将来 recommendation_verifier.py 相当の仕組みで埋める。
         'forward_observations':     0,
         'forward_metrics':          None,
-        'promotion_policy_version': '4A_v1',
+        # Stage 4B: train 時の scaler artifact と inference ticker routing が
+        # bundle 契約へ入るまで False。False の候補は中央ゲートが昇格を拒否する。
+        'inference_contract_complete': False,
+        'promotion_policy_version': '4A_chronological_holdout_v1',
+        'validation_scheme':         'chronological_80_20_single_holdout',
+        'feature_schema_version':    'ginn_v1_constant_aux',
+        'feature_transformation_version': 'ginn_normalization_v1',
+        'scaler_version':            'per_ticker_train_stats_v1',
+        'model_sha256':              model_sha256,
+        'random_seed':               random_seed,
+        'code_revision':             _git_revision(),
+        'data_snapshot_hash':        _data_snapshot_hash(returns_df),
+        'ticker_universe':           list(map(str, tickers)),
+        'dependency_versions': {
+            'numpy': np.__version__,
+            'pandas': pd.__version__,
+            'torch': getattr(torch, '__version__', None),
+        },
         'tickers':      tickers[:10],
         'epochs':       epochs,
         'seq_len':      seq_len,
         'garch_lambda': garch_lambda,
         'split':        'chronological_80_20_shuffle_False_with_train_tail_context',
     }
-    with open(MODEL_PATH.parent / 'ginn_meta.json', 'w') as f:
-        json.dump(meta, f, indent=2)
+    promoted, promotion_reason = _meets_promotion_criteria(meta)
+    meta['promotion'] = {
+        'eligible': promoted,
+        'reason': promotion_reason,
+        'evaluated_at': datetime.now(timezone.utc).isoformat(),
+    }
+    _atomic_write_json(candidate_manifest_path, meta)
 
-    print(f"  GINN学習完了: loss={final_loss:.6f} -> {MODEL_PATH}")
-    return {'success': True, 'loss': final_loss, 'n_samples': n_train, 'validation_mse': validation_mse}
+    if promoted:
+        _atomic_write_json(CURRENT_POINTER_PATH, {
+            'schema_version': 1,
+            'version': version,
+            'model_sha256': model_sha256,
+            'manifest_sha256': _sha256_file(candidate_manifest_path),
+            'promoted_at': datetime.now(timezone.utc).isoformat(),
+            'promotion_policy_version': meta['promotion_policy_version'],
+        })
+        print(f"  GINN候補を昇格: loss={final_loss:.6f} -> {candidate_dir}")
+    else:
+        print(f"  GINN候補は未昇格: {promotion_reason} -> {candidate_dir}")
+    return {
+        'success': True,
+        'promoted': promoted,
+        'promotion_reason': promotion_reason,
+        'model_version': version,
+        'candidate_dir': str(candidate_dir),
+        'loss': final_loss,
+        'n_samples': n_train,
+        'n_validation': n_validation,
+        'validation_mse': validation_mse,
+    }
 
 
 def forecast_ginn_result(
@@ -469,17 +611,27 @@ def forecast_ginn_result(
     if os.environ.get("ALMANAC_DISABLE_GINN", "").strip().lower() in ("1", "true", "yes"):
         return _fallback("disabled_by_env")
 
-    if not MODEL_PATH.exists():
+    active_model_path, active_manifest_path, active_version, pointer_error = _resolve_active_bundle()
+    if pointer_error:
+        _log_safety_gate_event({
+            "event": "rejected_active_bundle",
+            "reason": pointer_error,
+            "current_pointer_path": str(CURRENT_POINTER_PATH),
+            "model_path": str(active_model_path),
+        })
+        return _fallback(pointer_error)
+
+    if not active_model_path.exists():
         return _fallback("model_file_missing")
 
-    meta = _load_ginn_meta()
+    meta = _load_ginn_meta(active_manifest_path)
     if meta is None:
         # manifest 無しの legacy model は default-deny。ファイルは削除しない
         # (隔離であって破棄ではない) が、ロードせず監査ログへ記録する。
         _log_safety_gate_event({
             "event": "rejected_legacy_model_load",
             "reason": "manifest_missing",
-            "model_path": str(MODEL_PATH),
+            "model_path": str(active_model_path),
         })
         return _fallback("manifest_missing")
 
@@ -488,7 +640,7 @@ def forecast_ginn_result(
         _log_safety_gate_event({
             "event": "rejected_legacy_model_load",
             "reason": reason,
-            "model_path": str(MODEL_PATH),
+            "model_path": str(active_model_path),
             "meta": meta,
         })
         return _fallback(reason)
@@ -504,7 +656,10 @@ def forecast_ginn_result(
 
         model = ginn_obj.model
         device = ginn_obj._device
-        model.load_state_dict(torch.load(MODEL_PATH, map_location=device, weights_only=True))
+        expected_hash = meta.get("model_sha256")
+        if expected_hash and _sha256_file(active_model_path) != expected_hash:
+            return _fallback("manifest_model_checksum_mismatch")
+        model.load_state_dict(torch.load(active_model_path, map_location=device, weights_only=True))
         model.eval()
 
         r = returns.dropna().tail(seq_len + 10)
@@ -534,7 +689,7 @@ def forecast_ginn_result(
             "forecast_vol": round(pred_annual, 4),
             "used_model": "ginn",
             "fallback_reason": None,
-            "model_version": meta.get("trained_at"),
+            "model_version": active_version or meta.get("model_version") or meta.get("trained_at"),
         }
 
     except Exception as e:

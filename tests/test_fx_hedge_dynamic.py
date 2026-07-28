@@ -31,11 +31,12 @@ def test_bear_high_iv_triggers_40():
 
 
 def test_crisis_60():
-    r = fx.compute_target_hedge_ratio(
-        regime='crisis', vix=35, usdjpy=140,
-        usdjpy_iv_1m=0.15, usdjpy_mom_1m=-0.06,
-        current_hedge_ratio=0.55,
-    )
+    with pytest.warns(DeprecationWarning, match="usdjpy_mom_1m"):
+        r = fx.compute_target_hedge_ratio(
+            regime='crisis', vix=35, usdjpy=140,
+            usdjpy_iv_1m=0.15, usdjpy_mom_1m=-0.06,
+            current_hedge_ratio=0.55,
+        )
     assert r['base_target'] == 0.60
 
 
@@ -77,7 +78,8 @@ def test_momentum_is_accepted_but_never_changes_the_ratio():
     変わらないこと (受け取って記録するだけで比率計算には使わない)。"""
     kwargs = dict(regime='crisis', vix=35, usdjpy=140, usdjpy_iv_1m=0.15, current_hedge_ratio=0.55)
     r_no_mom = fx.compute_target_hedge_ratio(usdjpy_mom_1m=0.0, **kwargs)
-    r_big_mom = fx.compute_target_hedge_ratio(usdjpy_mom_1m=-0.30, **kwargs)
+    with pytest.warns(DeprecationWarning, match="usdjpy_mom_1m"):
+        r_big_mom = fx.compute_target_hedge_ratio(usdjpy_mom_1m=-0.30, **kwargs)
     assert r_no_mom['base_target'] == r_big_mom['base_target']
     assert r_no_mom['raw_target'] == r_big_mom['raw_target']
     assert r_no_mom['target_hedge_ratio'] == r_big_mom['target_hedge_ratio']
@@ -212,6 +214,26 @@ def test_shadow_advisory_mode_also_isolated():
     result = fx.run_hedge_shadow('crisis', 40, 155, mode=fx.HEDGE_MODE_ADVISORY, now=now)
     assert result['mode'] == fx.HEDGE_MODE_ADVISORY
     assert not fx.HEDGE_STATE.exists()
+
+
+def test_state_dir_env_routes_actual_and_shadow_files(tmp_path, monkeypatch):
+    """ALMANAC_STATE_DIR is resolved at call time, as it is in a subprocess."""
+    isolated = tmp_path / "isolated-state"
+    monkeypatch.setenv("ALMANAC_STATE_DIR", str(isolated))
+
+    actual = fx.compute_target_hedge_ratio(
+        "neutral", 22, 150, current_hedge_ratio=0.0,
+        now=datetime(2026, 7, 27, 9, 0, 0),
+    )
+    fx.persist_target(actual)
+    fx.run_hedge_shadow(
+        "neutral", 22, 150,
+        now=datetime(2026, 7, 27, 9, 0, 0),
+        snapshot_hash="snapshot-1",
+    )
+
+    assert (isolated / "hedge_target.json").exists()
+    assert (isolated / "hedge_target_shadow.json").exists()
 
 
 # ---------------------------------------------------------------------------

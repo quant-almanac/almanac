@@ -340,6 +340,9 @@ def test_save_execution_records_to_execution_log(isolated) -> None:
         currency="USD",
         account="特定",
         status="executed",
+        decision_snapshot_id="decision-1",
+        decision_snapshot_hash="snapshot-hash-1",
+        quote_as_of="2026-07-28T09:00:00+09:00",
     )
     result = asyncio.run(actions.save_execution(req))
 
@@ -352,6 +355,69 @@ def test_save_execution_records_to_execution_log(isolated) -> None:
     assert rec["quantity"] == 2
     assert rec["portfolio_applied"] is True
     assert rec["id"] == result["id"]
+    assert rec["execution_quote_snapshot"]["snapshot_kind"] == "execution_quote"
+    assert rec["execution_quote_snapshot"]["ticker"] == "NVDA"
+    assert rec["execution_quote_snapshot"]["price"] == 500.0
+    assert rec["execution_quote_snapshot"]["decision_snapshot_id"] == "decision-1"
+    assert rec["execution_quote_snapshot"]["decision_snapshot_hash"] == "snapshot-hash-1"
+    assert rec["execution_quote_snapshot"]["source_as_of"] == "2026-07-28T09:00:00+09:00"
+    assert rec["decision_snapshot_id"] == "decision-1"
+    assert rec["quote_as_of"] == "2026-07-28T09:00:00+09:00"
+
+
+def test_broker_confirmed_fill_requires_complete_evidence(isolated) -> None:
+    req = ExecutionRequest(
+        ticker="7203.T",
+        direction="buy",
+        quantity=1,
+        price=1_000.0,
+        currency="JPY",
+        account="特定",
+        status="executed",
+        broker_confirmed_filled=True,
+        external_execution_id="broker-fill-incomplete",
+    )
+
+    with pytest.raises(HTTPException) as exc:
+        asyncio.run(actions.save_execution(req))
+
+    assert exc.value.status_code == 422
+    assert "根拠が不足" in str(exc.value.detail)
+
+
+def test_duplicate_broker_execution_id_is_rejected_before_second_apply(isolated) -> None:
+    files = isolated
+    common = {
+        "ticker": "7203.T",
+        "direction": "buy",
+        "quantity": 1,
+        "price": 1_000.0,
+        "currency": "JPY",
+        "account": "特定",
+        "status": "executed",
+        "broker_confirmed_filled": True,
+        "external_execution_id": "broker-fill-123",
+        "broker_source": "broker_csv",
+        "broker_reported_at": "2026-07-28T08:55:00+09:00",
+        "filled_quantity": 1,
+        "filled_price": 1_000.0,
+        "reconciled_at": "2026-07-28T09:00:00+09:00",
+        "reconciliation_snapshot_hash": "sha256:fixture",
+    }
+    first = ExecutionRequest(**common)
+    asyncio.run(actions.save_execution(first))
+    shares_after_first = _read(files["holdings"])["7203.T"]["shares"]
+
+    duplicate = ExecutionRequest(**common)
+    with pytest.raises(HTTPException) as exc:
+        asyncio.run(actions.save_execution(duplicate))
+
+    assert exc.value.status_code == 409
+    assert "external_execution_id" in str(exc.value.detail)
+    assert _read(files["holdings"])["7203.T"]["shares"] == shares_after_first
+    record = _read(files["executions"])["executions"][0]
+    assert record["broker_confirmed_filled"] is True
+    assert record["reconciliation_snapshot_hash"] == "sha256:fixture"
 
 
 def test_save_execution_preserves_analysis_id_in_execution_record_and_stage_log(isolated) -> None:
