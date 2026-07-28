@@ -22,6 +22,17 @@ import fx_exposure as fx  # noqa: E402
 from position_identity import PositionIdentity  # noqa: E402
 
 
+@pytest.fixture(autouse=True)
+def _isolate_runtime_instrument_master(tmp_path, monkeypatch):
+    """Unit tests must not depend on a user's ignored runtime master."""
+    master = tmp_path / "fx_instrument_master.json"
+    master.write_text(
+        '{"schema_version":1,"instrument_kinds":{},"instruments":{}}',
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("ALMANAC_FX_INSTRUMENT_MASTER", str(master))
+
+
 def _pos(ticker):
     return PositionIdentity("husband", "rakuten", "general", ticker)
 
