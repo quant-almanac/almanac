@@ -57,7 +57,9 @@ def test_build_reconciled_holdings_updates_and_adds(tmp_path):
 
     assert next_holdings["6762.T"]["shares"] == 100
     assert next_holdings["SLIM_ORCAN"]["shares"] == 479679
+    assert next_holdings["SLIM_ORCAN"]["asset_type"] == "investment_trust"
     assert next_holdings["GS_MMF_USD"]["shares"] == 4018.77
+    assert next_holdings["GS_MMF_USD"]["asset_type"] == "money_market_fund"
     assert "GLD_NISA" in next_holdings
     assert next_holdings["GLD_NISA"]["account"] == "NISA成長投資枠"
     assert next_holdings["GLD_NISA"]["owner"] == "husband"
@@ -67,6 +69,24 @@ def test_build_reconciled_holdings_updates_and_adds(tmp_path):
     assert next_holdings["1489_WIFE"]["shares"] == 150
     assert len(diff["adds"]) == 2
     assert any(u["key"] == "6762.T" for u in diff["updates"])
+
+
+def test_structured_reconciliation_evidence_is_written_to_each_position(tmp_path):
+    holdings = tmp_path / "holdings.json"
+    holdings.write_text("{}", encoding="utf-8")
+    positions = bpi.parse_rakuten_positions(_sample_csv(tmp_path))
+    next_holdings, _ = bpi.build_reconciled_holdings(
+        positions=positions,
+        holdings_path=holdings,
+        as_of="2026-07-28",
+        reconciled_at="2026-07-28T09:00:00+09:00",
+        reconciliation_snapshot_hash="sha256:fixture",
+    )
+    row = next_holdings["6762"]
+    assert row["source_as_of"] == "2026-07-28"
+    assert row["broker_reconciled_at"] == "2026-07-28T09:00:00+09:00"
+    assert row["reconciliation_snapshot_hash"] == "sha256:fixture"
+    assert row["broker_source"] == "rakuten_assetbalance_csv"
 
 
 # Codex P1 #8 — 完全スナップショットなら CSV に無い楽天保有 (売却済み) を 0 化する

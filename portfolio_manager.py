@@ -242,11 +242,31 @@ def build_portfolio_snapshot(
             if len(owner_matches) == 1:
                 owner = owner_matches[0]
 
+        # 商品種別は holdings/importer/runtime instrument master の明示値だけを
+        # 使う。ticker 形状から ETF と単一株を推測しない。
+        explicit_asset_type = str(info.get('asset_type') or info.get('instrument_type') or '').lower()
+        if not explicit_asset_type:
+            try:
+                from fx_exposure import instrument_kind_for
+                explicit_asset_type = str(instrument_kind_for(ticker) or '').lower()
+            except Exception:
+                explicit_asset_type = ''
+        if is_cash:
+            explicit_asset_type = 'cash'
+        elif not explicit_asset_type and info.get('unit'):
+            explicit_asset_type = 'investment_trust'
+        is_fund = explicit_asset_type in {
+            'fund', 'etf', 'mutual_fund', 'investment_trust', 'etn',
+            'money_market_fund',
+        }
+        uses_nav_per_10000 = bool(info.get('unit')) or explicit_asset_type in {
+            'mutual_fund', 'investment_trust',
+        }
+
         # 現在値取得（投資信託はNAV固定、株式はyfinance）
-        is_fund = bool(info.get('unit'))
         if is_cash:
             current_price = current_nav or entry_price or 1.0
-        elif is_fund:
+        elif uses_nav_per_10000:
             current_price = current_nav or entry_price
         else:
             current_price = get_current_price(ticker, currency, current_nav) or entry_price
@@ -256,7 +276,7 @@ def build_portfolio_snapshot(
             value_jpy = shares * current_price * fx_rate
         else:
             # 投資信託は口数 × NAV / 10000
-            if is_fund:
+            if uses_nav_per_10000:
                 value_jpy = shares * current_price / 10000
             else:
                 value_jpy = shares * current_price
@@ -264,7 +284,7 @@ def build_portfolio_snapshot(
         # 含み損益（通貨チェックを先に行い、USD建てファンドが /10000 される誤りを防ぐ）
         if currency == 'USD':
             cost_jpy = shares * entry_price * fx_rate
-        elif is_fund:
+        elif uses_nav_per_10000:
             cost_jpy = shares * entry_price / 10000
         else:
             cost_jpy = shares * entry_price
@@ -314,6 +334,8 @@ def build_portfolio_snapshot(
             'account':         info.get('account', ''),
             'broker':          broker,
             'owner':           owner,
+            'asset_type':      explicit_asset_type or None,
+            'is_fund':         is_fund if explicit_asset_type else None,
             'entry_date':      entry_date_str,
             'entry_price':     entry_price,
             'holding_days':    holding_days,
@@ -340,6 +362,10 @@ def build_portfolio_snapshot(
                 'sector':          'Industrials',
                 'investment_type': 'long',
                 'account':         '持株会',
+                'broker':          espp.get('broker', ''),
+                'owner':           espp.get('owner', ''),
+                'asset_type':      'stock',
+                'is_fund':         False,
             })
 
     # 現金

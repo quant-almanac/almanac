@@ -41,6 +41,10 @@ def canonical_broker(value: object) -> str:
         return "sbi"
     if "rakuten" in text or "楽天" in str(value or ""):
         return "rakuten"
+    if "monex" in text or "マネックス" in str(value or ""):
+        return "monex"
+    if text in {"employee_plan", "employee_stock_plan"} or "持株会" in str(value or ""):
+        return "employee_plan"
     return ""
 
 

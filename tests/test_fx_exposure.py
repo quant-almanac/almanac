@@ -104,12 +104,56 @@ def test_unregistered_fund_fails_closed_to_unknown():
     """本題: instrument_master に無い fund/ETF を「上場通貨=経済通貨」と
     憶測しない。0ではなく unknown として明示する。"""
     e = fx.resolve_economic_exposure(
-        position=_pos('SLIM_SP500'), market_value_jpy=1_500_000, listing_currency='JPY', is_fund=True,
+        position=_pos('UNREGISTERED_FUND'), market_value_jpy=1_500_000, listing_currency='JPY', is_fund=True,
     )
     assert e.exposure_source == 'unknown'
     assert e.gross_usd_exposure_jpy is None
     assert e.embedded_hedge_notional_jpy is None
     assert e.net_usd_exposure_jpy is None
+
+
+def test_runtime_master_supports_expiring_multi_currency_usd_weight(tmp_path, monkeypatch):
+    master = tmp_path / "fx_instrument_master.json"
+    master.write_text(
+        """{"instruments":{"GLOBAL":{"listing_currency":"JPY",
+        "economic_currency":"MULTI_GLOBAL","hedge_ratio":0,
+        "is_leveraged_or_inverse":false,"underlying_description":"global equities",
+        "source":"issuer monthly report","confirmed_as_of":"2026-07-01",
+        "valid_until":"2026-08-31","usd_exposure_ratio":0.63,
+        "instrument_kind":"investment_trust"}}}""",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("ALMANAC_FX_INSTRUMENT_MASTER", str(master))
+    e = fx.resolve_economic_exposure(
+        position=_pos("GLOBAL"),
+        market_value_jpy=1_000_000,
+        listing_currency="JPY",
+        is_fund=True,
+        now=__import__("datetime").datetime(2026, 7, 28),
+    )
+    assert e.gross_usd_exposure_jpy == 630_000
+    assert e.economic_currency == "MULTI_GLOBAL"
+
+
+def test_expired_runtime_currency_weight_fails_closed(tmp_path, monkeypatch):
+    master = tmp_path / "fx_instrument_master.json"
+    master.write_text(
+        """{"instruments":{"GLOBAL":{"listing_currency":"JPY",
+        "economic_currency":"MULTI_GLOBAL","hedge_ratio":0,
+        "is_leveraged_or_inverse":false,"underlying_description":"global equities",
+        "source":"issuer monthly report","confirmed_as_of":"2026-01-01",
+        "valid_until":"2026-02-01","usd_exposure_ratio":0.63}}}""",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("ALMANAC_FX_INSTRUMENT_MASTER", str(master))
+    e = fx.resolve_economic_exposure(
+        position=_pos("GLOBAL"),
+        market_value_jpy=1_000_000,
+        listing_currency="JPY",
+        is_fund=True,
+        now=__import__("datetime").datetime(2026, 7, 28),
+    )
+    assert e.exposure_source == "unknown"
 
 
 def test_is_fund_flag_is_caller_responsibility_not_guessed_from_ticker():

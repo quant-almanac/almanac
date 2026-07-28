@@ -13,7 +13,9 @@ holdings.json の楽天口座分（broker 未指定/楽天証券）を同期す�
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import os
 from copy import deepcopy
 from dataclasses import asdict, dataclass
 from datetime import datetime
@@ -29,6 +31,11 @@ RECONCILE_LOG = BASE_DIR / "broker_position_reconcile_log.jsonl"
 
 SECURITY_TYPES = {"国内株式", "米国株式", "投資信託", "外貨建MMF"}
 RAKUTEN_BROKER = "楽天証券"
+
+
+def _position_snapshot_path() -> Path:
+    root = Path(os.environ.get("ALMANAC_STATE_DIR") or BASE_DIR)
+    return root / "broker_position_snapshot_rakuten.json"
 
 FUND_NAME_MAP = {
     "eMAXIS Slim 米国株式(S&P500)": "SLIM_SP500",
@@ -192,7 +199,14 @@ def _new_key(pos: BrokerPosition, holdings: dict) -> str:
     return f"{base}_{idx}"
 
 
-def _apply_position_to_record(pos: BrokerPosition, existing: Optional[dict], *, as_of: Optional[str]) -> dict:
+def _apply_position_to_record(
+    pos: BrokerPosition,
+    existing: Optional[dict],
+    *,
+    as_of: Optional[str],
+    reconciled_at: Optional[str] = None,
+    reconciliation_snapshot_hash: Optional[str] = None,
+) -> dict:
     rec = deepcopy(existing) if isinstance(existing, dict) else {}
     rec["ticker"] = pos.ticker
     rec["name"] = rec.get("name") or pos.name
@@ -211,11 +225,32 @@ def _apply_position_to_record(pos: BrokerPosition, existing: Optional[dict], *, 
         rec["current_nav"] = 1.0
     if "broker" not in rec:
         rec["broker"] = RAKUTEN_BROKER
+    if pos.security_type == "投資信託":
+        rec["asset_type"] = "investment_trust"
+    elif pos.security_type == "外貨建MMF":
+        rec["asset_type"] = "money_market_fund"
+    elif not rec.get("asset_type"):
+        # 国内株式/米国株式には ETF も含まれるため stock と推測しない。
+        # 発行体確認済み master にある商品だけ kind を採用する。
+        try:
+            from fx_exposure import instrument_kind_for
+            known_kind = instrument_kind_for(pos.ticker)
+        except Exception:
+            known_kind = None
+        if known_kind:
+            rec["asset_type"] = known_kind
     # This importer is scoped to the primary Rakuten account. Record owner at
     # the source boundary instead of asking downstream code to infer it.
     if "owner" not in rec:
         rec["owner"] = "husband"
     rec["note"] = f"楽天CSV保有同期 {as_of or ''}".strip()
+    if as_of:
+        rec["source_as_of"] = as_of
+    if reconciled_at:
+        rec["broker_reconciled_at"] = reconciled_at
+    if reconciliation_snapshot_hash:
+        rec["reconciliation_snapshot_hash"] = reconciliation_snapshot_hash
+    rec["broker_source"] = "rakuten_assetbalance_csv"
     return rec
 
 
@@ -225,6 +260,8 @@ def build_reconciled_holdings(
     holdings_path: Path = HOLDINGS_FILE,
     as_of: Optional[str] = None,
     full_snapshot: bool = True,
+    reconciled_at: Optional[str] = None,
+    reconciliation_snapshot_hash: Optional[str] = None,
 ) -> tuple[dict, dict]:
     holdings = load_json_strict(holdings_path)
     if not isinstance(holdings, dict):
@@ -243,11 +280,18 @@ def build_reconciled_holdings(
         if key is None:
             key = _new_key(pos, next_holdings)
             before = None
-            next_holdings[key] = _apply_position_to_record(pos, None, as_of=as_of)
+            next_holdings[key] = _apply_position_to_record(
+                pos, None, as_of=as_of, reconciled_at=reconciled_at,
+                reconciliation_snapshot_hash=reconciliation_snapshot_hash,
+            )
             adds.append({"key": key, "after": next_holdings[key], "broker": asdict(pos)})
         else:
             before = deepcopy(next_holdings[key])
-            next_holdings[key] = _apply_position_to_record(pos, next_holdings[key], as_of=as_of)
+            next_holdings[key] = _apply_position_to_record(
+                pos, next_holdings[key], as_of=as_of,
+                reconciled_at=reconciled_at,
+                reconciliation_snapshot_hash=reconciliation_snapshot_hash,
+            )
             if before != next_holdings[key]:
                 updates.append({"key": key, "before": before, "after": next_holdings[key], "broker": asdict(pos)})
         used.add(key)
@@ -295,20 +339,43 @@ def build_reconciled_holdings(
 def apply_reconcile(*, rakuten_csv: Path, apply: bool = False, full_snapshot: bool = True) -> dict:
     positions = parse_rakuten_positions(rakuten_csv)
     as_of = _date_from_filename(rakuten_csv)
+    reconciled_at = datetime.now().astimezone().isoformat(timespec="seconds")
+    snapshot_hash = "sha256:" + hashlib.sha256(rakuten_csv.read_bytes()).hexdigest()
     with process_lock("portfolio_ledger"):
         next_holdings, diff = build_reconciled_holdings(
             positions=positions,
             holdings_path=HOLDINGS_FILE,
             as_of=as_of,
             full_snapshot=full_snapshot,
+            reconciled_at=reconciled_at,
+            reconciliation_snapshot_hash=snapshot_hash,
         )
         if apply:
             atomic_write_json(HOLDINGS_FILE, next_holdings)
+            atomic_write_json(_position_snapshot_path(), {
+                "schema_version": 1,
+                "broker": RAKUTEN_BROKER,
+                "complete": bool(full_snapshot),
+                "source_as_of": as_of,
+                "reconciled_at": reconciled_at,
+                "reconciliation_snapshot_hash": snapshot_hash,
+                "positions": [
+                    {
+                        "ticker": position.ticker,
+                        "account": position.account,
+                        "quantity": position.quantity,
+                        "security_type": position.security_type,
+                        "vehicle_type": "cash_security",
+                    }
+                    for position in positions
+                ],
+            })
             log_entry = {
-                "timestamp": datetime.now().isoformat(timespec="seconds"),
+                "timestamp": reconciled_at,
                 "kind": "broker_position_reconcile",
                 "source": str(rakuten_csv),
                 "as_of": as_of,
+                "reconciliation_snapshot_hash": snapshot_hash,
                 "diff": diff,
             }
             with RECONCILE_LOG.open("a", encoding="utf-8") as f:

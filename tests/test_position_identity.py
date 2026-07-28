@@ -22,6 +22,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import pytest
+from execution_safety import canonical_broker
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:
@@ -369,3 +370,10 @@ def test_severity_never_escalates_to_blocked_from_this_check_alone(tmp_path, not
     codes = {row["code"] for row in result["execution_block_reasons"]}
     assert expected_code in codes
     assert result["execution_readiness"] != "blocked"
+
+
+def test_canonical_broker_supports_all_position_identity_sources():
+    assert canonical_broker("楽天証券") == "rakuten"
+    assert canonical_broker("SBI証券") == "sbi"
+    assert canonical_broker("マネックス証券") == "monex"
+    assert canonical_broker("employee_plan") == "employee_plan"
