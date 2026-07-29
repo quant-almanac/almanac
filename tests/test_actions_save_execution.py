@@ -143,6 +143,40 @@ def isolated(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     }
 
 
+def test_read_api_applies_route_overlay_without_rewriting_raw(isolated) -> None:
+    from execution_reconciliation import record_route_correction
+
+    raw = {
+        "id": "route-corrected",
+        "ticker": "XLF",
+        "direction": "sell",
+        "status": "executed",
+        "account": "特定",
+        "quantity": 20,
+        "price": 56.7331,
+        "saved_at": "2026-07-16T01:10:43",
+    }
+    _write_json(actions.EXEC_FILE, {"executions": [raw]})
+    record_route_correction(
+        execution_record=raw,
+        corrected_route={
+            "execution_owner": "husband",
+            "execution_broker": "rakuten",
+            "execution_account": "NISA成長投資枠",
+        },
+        evidence={"row_hash": "fixture"},
+        reason="broker evidence",
+        approved_by="test",
+        state_path=Path(actions.BASE_DIR) / "execution_reconciliation_state.json",
+    )
+
+    response = asyncio.run(actions.get_executions())
+
+    assert response["executions"][0]["execution_account"] == "nisa_growth"
+    assert response["executions"][0]["execution_reconciliation_status"] == "corrected"
+    assert _read(actions.EXEC_FILE)["executions"][0] == raw
+
+
 # ---------------------------------------------------------------------------
 # _auto_detect_currency
 # ---------------------------------------------------------------------------

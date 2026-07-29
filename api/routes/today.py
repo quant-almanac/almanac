@@ -34,6 +34,17 @@ def _load(name: str) -> dict:
         return {}
 
 
+def _load_effective_execution_log() -> dict:
+    """Return the read-only execution view used by Today."""
+    try:
+        from execution_reconciliation import load_effective_execution_records
+        return {
+            "executions": load_effective_execution_records(base_dir=BASE_DIR),
+        }
+    except Exception:
+        return {"executions": []}
+
+
 def _parse_dt(s: str | None) -> datetime | None:
     if not s:
         return None
@@ -529,7 +540,7 @@ def _build_almanac(board: list[dict], analysis: dict, currency: dict, nisa: dict
     past_cutoff = now - timedelta(days=45)
     past: list[dict] = []
     seen_trades = set()
-    executions = _load("action_executions.json").get("executions") or []
+    executions = _load_effective_execution_log().get("executions") or []
     for e in executions:
         if e.get("status") not in ("executed", "filled", "partial"):
             continue
@@ -991,7 +1002,7 @@ def _build_today() -> dict:
     currency = _load("currency_policy_state.json")
     guard = _load("guard_state.json")
     nisa = _load("nisa_portfolio.json")
-    execution_log = _load("action_executions.json")
+    execution_log = _load_effective_execution_log()
     execution_plan_state = _load("execution_plan_state.json")
     scenario_state = _load("scenario_state.json")
 

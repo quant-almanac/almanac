@@ -378,7 +378,12 @@ def test_inject_skips_recently_executed_buy(monkeypatch):
         {"ticker": "1306.T", "direction": "buy", "status": "executed",
          "saved_at": datetime.now().isoformat()},
     ]
-    monkeypatch.setattr(analyst, "load_json", _fake_load_json_factory(executions=executions))
+    import execution_reconciliation
+    monkeypatch.setattr(
+        execution_reconciliation,
+        "load_effective_execution_records",
+        lambda **_kwargs: executions,
+    )
     synthesis = {"priority_actions": []}
     result = analyst._inject_playbook_actions(synthesis, _base_data())
     assert [a["ticker"] for a in result["injected"]] == ["1489.T"]

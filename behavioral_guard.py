@@ -120,16 +120,15 @@ def _business_days_since(d: date) -> int:
 
 def _last_rebalance_execution_date():
     """action_executions.json から直近の trim/sell/rebalance 約定日を返す。なければ None。"""
-    p = BASE_DIR / "action_executions.json"
-    if not p.exists():
-        return None
     try:
-        data = json.load(open(p, encoding="utf-8"))
+        from execution_reconciliation import load_effective_execution_records
+        items = load_effective_execution_records(base_dir=BASE_DIR)
     except Exception:
         return None
-    items = data.get("executions", []) if isinstance(data, dict) else (data if isinstance(data, list) else [])
     latest = None
     for e in items:
+        if e.get("execution_reconciliation_status") == "review":
+            continue
         status = (e.get("status") or "").lower()
         direction = (e.get("direction") or "").lower()
         if status not in {"executed", "filled"} or direction not in _REBAL_DIRECTIONS:

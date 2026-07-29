@@ -93,6 +93,14 @@ def resolve_recent_order_intents(
     effective: list[dict] = []
     conflicts: list[dict] = []
     for row in rows:
+        if row.get("execution_reconciliation_status") == "review":
+            conflict = dict(row)
+            conflict.update({
+                "order_state_conflict": True,
+                "resolution_required": "resolve_execution_reconciliation",
+            })
+            conflicts.append(conflict)
+            continue
         status = str(row.get("status") or "").lower()
         if status not in ACTIVE_EXECUTION_STATUSES | FILL_STATUSES:
             continue

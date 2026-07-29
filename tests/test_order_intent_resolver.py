@@ -69,3 +69,21 @@ def test_later_fill_supersedes_ordered_row(tmp_path):
 
     assert [row["id"] for row in effective] == ["fill"]
     assert conflicts == []
+
+
+def test_reconciliation_review_never_enters_effective_order_intents(tmp_path):
+    effective, conflicts = resolve_recent_order_intents(
+        [{
+            "id": "ambiguous",
+            "ticker": "XLF",
+            "status": "ordered",
+            "saved_at": "2026-07-28T10:00:00",
+            "execution_reconciliation_status": "review",
+        }],
+        action_state_path=tmp_path / "action_state.json",
+        days=7,
+        now=datetime(2026, 7, 29, 10, 0, 0),
+    )
+
+    assert effective == []
+    assert conflicts[0]["resolution_required"] == "resolve_execution_reconciliation"

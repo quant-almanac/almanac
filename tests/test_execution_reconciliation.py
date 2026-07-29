@@ -160,6 +160,25 @@ def test_effective_loader_applies_overlay_without_mutating_ledger(tmp_path):
     assert json.loads(ledger.read_text())["executions"][0] == raw
 
 
+def test_effective_loader_fails_closed_on_corrupt_overlay_state(tmp_path):
+    raw = _execution()
+    (tmp_path / "action_executions.json").write_text(
+        json.dumps({"executions": [raw]}),
+        encoding="utf-8",
+    )
+    (tmp_path / "execution_reconciliation_state.json").write_text(
+        "{broken",
+        encoding="utf-8",
+    )
+
+    rows = load_effective_execution_records(base_dir=tmp_path)
+
+    assert rows[0]["execution_reconciliation_status"] == "review"
+    assert rows[0]["execution_reconciliation_reasons"] == [
+        "reconciliation_state_invalid"
+    ]
+
+
 @pytest.mark.parametrize(
     ("trade_date", "expected", "review"),
     [

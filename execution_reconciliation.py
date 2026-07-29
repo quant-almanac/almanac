@@ -254,6 +254,16 @@ def load_effective_execution_records(
     )
     if not source.exists():
         return []
+    overlay_invalid = False
+    if overlay.exists():
+        try:
+            overlay_payload = json.loads(overlay.read_text(encoding="utf-8"))
+            overlay_invalid = not (
+                isinstance(overlay_payload, dict)
+                and isinstance(overlay_payload.get("corrections"), list)
+            )
+        except (OSError, json.JSONDecodeError):
+            overlay_invalid = True
     try:
         payload = json.loads(source.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
@@ -269,6 +279,14 @@ def load_effective_execution_records(
             legacy = dict(row)
             legacy["execution_reconciliation_status"] = "clean_legacy_no_execution_id"
             effective.append(legacy)
+            continue
+        if overlay_invalid:
+            unresolved = dict(row)
+            unresolved["execution_reconciliation_status"] = "review"
+            unresolved["execution_reconciliation_reasons"] = [
+                "reconciliation_state_invalid"
+            ]
+            effective.append(unresolved)
             continue
         effective.append(resolve_effective_execution_record(row, state_path=overlay))
     return effective

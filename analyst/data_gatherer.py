@@ -1366,12 +1366,17 @@ def gather_data() -> dict:
     except Exception:
         rebalance = {}
 
-    exec_raw = load_json(BASE_DIR / "action_executions.json", {"executions": []})
+    try:
+        from execution_reconciliation import load_effective_execution_records
+        _pending_execution_rows = load_effective_execution_records(base_dir=BASE_DIR)
+    except Exception:
+        _pending_execution_rows = []
     pending_orders = [
         {"ticker": e.get("ticker"), "direction": e.get("direction"),
          "action": e.get("action", ""), "saved_at": e.get("saved_at", "")}
-        for e in exec_raw.get("executions", [])
+        for e in _pending_execution_rows
         if e.get("status") == "ordered"
+        and e.get("execution_reconciliation_status") != "review"
     ]
 
     risk: dict = {}

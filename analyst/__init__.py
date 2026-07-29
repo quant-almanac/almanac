@@ -4393,17 +4393,12 @@ def _recommendation_entry_is_cancelled(entry: dict, cancelled_keys: set[tuple[st
 
 def _load_recommendation_execution_rows() -> tuple[list[dict], bool]:
     """Load the fill/order source of truth for RECENT_OWN_RECS labels."""
-    path = BASE_DIR / "action_executions.json"
-    if not path.exists():
-        return [], False
     try:
-        raw = json.loads(path.read_text(encoding="utf-8"))
+        from execution_reconciliation import load_effective_execution_records
+        rows = load_effective_execution_records(base_dir=BASE_DIR)
     except Exception:
         return [], False
-    rows = raw.get("executions") if isinstance(raw, dict) else raw
-    if not isinstance(rows, list):
-        return [], False
-    return [row for row in rows if isinstance(row, dict)], True
+    return rows, True
 
 
 def _load_recommendation_action_states() -> list[dict]:
@@ -5024,14 +5019,11 @@ def _load_recent_execution_snapshot(
     now: datetime | None = None,
 ) -> tuple[list[dict], list[dict]]:
     """Return effective DONE_LIST rows and cross-ledger order conflicts."""
-    p = BASE_DIR / "action_executions.json"
-    if not p.exists():
-        return [], []
     try:
-        data = json.loads(p.read_text(encoding="utf-8"))
+        from execution_reconciliation import load_effective_execution_records
+        entries = load_effective_execution_records(base_dir=BASE_DIR)
     except Exception:
         return [], []
-    entries = data.get("executions") if isinstance(data, dict) else (data if isinstance(data, list) else [])
     try:
         from order_intent_resolver import resolve_recent_order_intents
         return resolve_recent_order_intents(
@@ -9206,9 +9198,11 @@ def _inject_playbook_actions(synthesis: dict, data: dict) -> dict:
     recent_buy_tickers: set = set()
     try:
         _cutoff = (datetime.now() - timedelta(days=_PLAYBOOK_REPROPOSE_DAYS)).isoformat()
-        _exec_raw = load_json(BASE_DIR / "action_executions.json", {}) or {}
-        for e in _exec_raw.get("executions", []) or []:
+        from execution_reconciliation import load_effective_execution_records
+        for e in load_effective_execution_records(base_dir=BASE_DIR):
             if not isinstance(e, dict):
+                continue
+            if e.get("execution_reconciliation_status") == "review":
                 continue
             if str(e.get("direction") or "").lower() == "buy" \
                and str(e.get("status") or "").lower() in ("executed", "ordered") \

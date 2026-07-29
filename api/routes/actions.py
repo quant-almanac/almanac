@@ -479,6 +479,27 @@ def _load_execution_log() -> dict:
     return data
 
 
+def _load_effective_execution_log() -> dict:
+    """Read-only execution view with broker route overlays applied.
+
+    Mutating endpoints must continue to use ``_load_execution_log()`` so
+    corrected route fields never leak back into the immutable raw ledger.
+    """
+    data = _load_execution_log()
+    try:
+        from execution_reconciliation import load_effective_execution_records
+        effective = load_effective_execution_records(
+            base_dir=BASE_DIR,
+            execution_path=EXEC_FILE,
+        )
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"execution reconciliation の読み込みに失敗: {exc}",
+        ) from exc
+    return {**data, "executions": effective}
+
+
 def _validate_broker_confirmation(req: ExecutionRequest) -> None:
     evidence_fields = {
         "external_execution_id": req.external_execution_id,
@@ -2528,7 +2549,7 @@ async def resolve_execution_portfolio(exec_id: str, req: PortfolioResolutionRequ
 
 @router.get("/api/actions/executions")
 async def get_executions():
-    data = _load_execution_log()
+    data = _load_effective_execution_log()
     data["executions"] = [_normalize_execution_record(r) for r in data.get("executions", [])]
     return data
 
