@@ -391,7 +391,7 @@ def _apply_cash_change(req: CashRequest, tx_type: TxType) -> dict:
     try:
         with process_lock("portfolio_ledger"):
             original_account, original_holdings, original_tx_log, next_state, fx_for_event = _prepare_cash_change(req, tx_type)
-            return _commit_cash_change(
+            result = _commit_cash_change(
                 req=req,
                 tx_type=tx_type,
                 original_account=original_account,
@@ -400,6 +400,15 @@ def _apply_cash_change(req: CashRequest, tx_type: TxType) -> dict:
                 next_state=next_state,
                 fx_for_event=fx_for_event,
             )
+        try:
+            from execution_plan_engine import generate_execution_plan
+
+            generate_execution_plan(base_dir=ACCOUNT_FILE.parent, write=True)
+            result["execution_plan_refreshed"] = True
+        except Exception as exc:
+            result["execution_plan_refreshed"] = False
+            result["execution_plan_refresh_warning"] = str(exc)[:200]
+        return result
     except LockBusy as e:
         raise HTTPException(status_code=409, detail="portfolio ledger is busy") from e
 

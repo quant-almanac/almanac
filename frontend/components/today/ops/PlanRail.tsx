@@ -183,7 +183,14 @@ function PlanTab({ plan, onOpenModal }: { plan?: ExecutionPlan; onOpenModal: () 
             確認済み現金 {fmtJpy(b.confirmed_cash_jpy)}
             {' '}− 戦術現金 {b.cash_target_pct != null ? `${b.cash_target_pct}% (${fmtJpy(b.required_cash_reserve_jpy)})` : '未確定'}
             {' '}＝ 余剰 {fmtJpy(b.surplus_cash_above_targets_jpy)}
-            <span style={{ color: OPS.sub }}> · 月次上限 {fmtJpy(b.surplus_cash_monthly_capacity_jpy)}</span>
+            <span style={{ color: OPS.sub }}>
+              {' '}· 配備基準 {fmtJpy(b.deployment_basis_surplus_jpy)}
+              {' '}÷ {b.deployment_months != null ? `${b.deployment_months}か月` : '通常配備なし'}
+              {' '}＝ 今月枠 {fmtJpy(b.surplus_cash_monthly_capacity_jpy)}
+            </span>
+            {b.deployment_regime_label && (
+              <span style={{ color: OPS.dim }}>（{b.deployment_regime_label}）</span>
+            )}
           </p>
         )}
 

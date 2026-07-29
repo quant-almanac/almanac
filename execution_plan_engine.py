@@ -134,7 +134,9 @@ def load_plan_params() -> dict[str, Any]:
         ),
         "default_monthly_budget_jpy": _jpy(_tp_get("execution_plan_default_monthly_budget_jpy", 300_000)),
         "cash_deploy_pct": _ratio(_tp_get("execution_plan_cash_deploy_pct", 0.05), 0.05),
-        "max_monthly_budget_jpy": _jpy(_tp_get("execution_plan_max_monthly_budget_jpy", 700_000)),
+        # Retained only for backwards-compatible tunable snapshots.  The
+        # dynamic surplus policy no longer applies a fixed monthly ceiling.
+        "max_monthly_budget_jpy": _jpy(_tp_get("execution_plan_max_monthly_budget_jpy", 0)),
         "weekly_normal_budget_pct": _ratio(_tp_get("execution_plan_weekly_normal_budget_pct", 0.70), 0.70),
         "opportunity_reserve_pct": _ratio(_tp_get("execution_plan_opportunity_reserve_pct", 0.25), 0.25),
         "max_single_normal_jpy": _jpy(_tp_get("execution_plan_max_single_normal_jpy", 250_000)),
@@ -323,12 +325,18 @@ def resolve_cash_target_policy(
             "policy_version": policy.get("policy_version") or candidate.get("policy_version"),
             "portfolio_label": policy.get("portfolio_label")
             or (candidate.get("portfolio") or {}).get("committed_label"),
+            "portfolio_level": policy.get("portfolio_level")
+            if policy.get("portfolio_level") is not None
+            else (candidate.get("portfolio") or {}).get("committed_level"),
+            "shock_active": bool((candidate.get("shock") or {}).get("active")),
         }
     return {
         "cash_target_pct": None,
         "source": "unresolved",
         "policy_version": None,
         "portfolio_label": None,
+        "portfolio_level": None,
+        "shock_active": False,
     }
 
 
@@ -381,6 +389,7 @@ def derive_budgets(
     horizon: dict[str, Any],
     contribution_summary: dict[str, Any] | None = None,
     cash_target_policy: dict[str, Any] | None = None,
+    monthly_consumption: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], list[str]]:
     """Derive a paced budget from confirmed cash above the tactical target.
 
@@ -391,21 +400,40 @@ def derive_budgets(
     warnings: list[str] = []
     contribution_summary = contribution_summary if isinstance(contribution_summary, dict) else {}
     explicit_monthly = _jpy(params.get("monthly_discretionary_budget_jpy"))
-    max_monthly = _jpy(params.get("max_monthly_budget_jpy"))
-    if max_monthly > 0 and explicit_monthly > 0:
-        explicit_monthly = min(explicit_monthly, max_monthly)
+    monthly_consumption = (
+        monthly_consumption if isinstance(monthly_consumption, dict) else {}
+    )
 
     try:
-        from investment_policy import cash_deployment_policy
+        from investment_policy import cash_deployment_horizon, cash_deployment_policy
 
         deployment_policy = cash_deployment_policy()
+        deployment_horizon = cash_deployment_horizon(
+            portfolio_level=cash_target_policy.get("portfolio_level")
+            if isinstance(cash_target_policy, dict) else None,
+            portfolio_label=cash_target_policy.get("portfolio_label")
+            if isinstance(cash_target_policy, dict) else None,
+            shock_active=bool((cash_target_policy or {}).get("shock_active")),
+        )
     except Exception:
         deployment_policy = {
             "all_system_cash_is_surplus": False,
             "protected_cash_reserve_jpy": 0,
         }
+        deployment_horizon = {
+            "resolved": False,
+            "deployment_months": None,
+            "ordinary_deployment_allowed": False,
+            "policy_version": None,
+            "reason": "deployment_policy_unavailable",
+        }
     all_cash_is_surplus = bool(deployment_policy.get("all_system_cash_is_surplus"))
     protected_reserve = _jpy(deployment_policy.get("protected_cash_reserve_jpy"))
+    if (
+        deployment_horizon.get("resolved")
+        and not deployment_horizon.get("ordinary_deployment_allowed")
+    ):
+        explicit_monthly = 0
     cash_target_policy = cash_target_policy if isinstance(cash_target_policy, dict) else {}
     cash_target_pct_raw = cash_target_policy.get("cash_target_pct")
     try:
@@ -429,15 +457,38 @@ def derive_budgets(
     )
     surplus_cash = 0
     surplus_monthly_capacity = 0
+    contribution_filled_this_month = (
+        _jpy(contribution_summary.get("filled_this_month_normal_jpy"))
+        + _jpy(contribution_summary.get("filled_this_month_opportunity_jpy"))
+    )
+    base_filled_buys = max(
+        0,
+        _jpy(monthly_consumption.get("monthly_filled_consumed_jpy"))
+        + _jpy(monthly_consumption.get("unattributed_monthly_buy_filled_notional_jpy"))
+        - contribution_filled_this_month,
+    )
+    filled_sells = _jpy(
+        monthly_consumption.get("unattributed_monthly_sell_filled_notional_jpy")
+    )
+    deployment_basis_cash = max(0, confirmed_cash + base_filled_buys - filled_sells)
+    deployment_basis_surplus = 0
+    deployment_months = deployment_horizon.get("deployment_months")
     if all_cash_is_surplus and cash_info.get("valid_for_budget"):
         if tactical_reserve is None:
             warnings.append("cash_target_unresolved: confirmed cash not converted into deployment budget")
+        elif not deployment_horizon.get("resolved"):
+            warnings.append("deployment_horizon_unresolved: ordinary deployment budget disabled")
         else:
             surplus_cash = max(0, confirmed_cash - required_reserve)
-            surplus_monthly_capacity = min(
-                surplus_cash,
-                max_monthly if max_monthly > 0 else surplus_cash,
-            )
+            deployment_basis_surplus = max(0, deployment_basis_cash - required_reserve)
+            if deployment_months is not None and int(deployment_months) > 0:
+                surplus_monthly_capacity = _jpy(
+                    deployment_basis_surplus / int(deployment_months)
+                )
+            else:
+                warnings.append(
+                    "ordinary_deployment_disabled_for_regime: use active DCA/playbook only"
+                )
     elif all_cash_is_surplus:
         warnings.append("cash_authority_unresolved: confirmed cash not converted into deployment budget")
 
@@ -510,6 +561,20 @@ def derive_budgets(
         "protected_cash_reserve_jpy": protected_reserve,
         "required_cash_reserve_jpy": required_reserve,
         "surplus_cash_above_targets_jpy": surplus_cash,
+        "deployment_basis_cash_jpy": deployment_basis_cash,
+        "deployment_basis_surplus_jpy": deployment_basis_surplus,
+        "deployment_basis_filled_buys_added_back_jpy": base_filled_buys,
+        "deployment_basis_sell_proceeds_removed_jpy": filled_sells,
+        "deployment_basis_method": (
+            "confirmed_cash_plus_base_filled_buys_minus_filled_sell_proceeds"
+        ),
+        "deployment_months": deployment_months,
+        "deployment_regime_level": deployment_horizon.get("portfolio_level"),
+        "deployment_regime_label": deployment_horizon.get("portfolio_label"),
+        "deployment_policy_version": deployment_horizon.get("policy_version"),
+        "ordinary_deployment_allowed": deployment_horizon.get(
+            "ordinary_deployment_allowed", False
+        ),
         "surplus_cash_monthly_capacity_jpy": _jpy(
             surplus_monthly_capacity * deployment_multiplier
         ),
@@ -1986,15 +2051,6 @@ def build_execution_plan(
             "released_this_month_jpy": 0,
             "summary_error": str(exc)[:160],
         }
-    budgets, budget_warnings = derive_budgets(
-        cash_info=cash_info,
-        guard=guard,
-        params=params,
-        scheduled_contributions_jpy=scheduled_jpy,
-        horizon=horizon,
-        contribution_summary=contribution_summary,
-        cash_target_policy=cash_target_policy,
-    )
     month_start = date(today.year, today.month, 1)
     month_end = date.fromisoformat(str(horizon["month_end"]))
     monthly_consumption = compute_monthly_consumption(
@@ -2003,6 +2059,16 @@ def build_execution_plan(
         action_state=action_state,
         executions=executions,
         fx_rate=float(cash_info.get("fx_rate_usdjpy") or 150.0),
+    )
+    budgets, budget_warnings = derive_budgets(
+        cash_info=cash_info,
+        guard=guard,
+        params=params,
+        scheduled_contributions_jpy=scheduled_jpy,
+        horizon=horizon,
+        contribution_summary=contribution_summary,
+        cash_target_policy=cash_target_policy,
+        monthly_consumption=monthly_consumption,
     )
     # Existing unlinked buys are shown and consume a recurring policy amount,
     # but can never be guessed against a newly approved salary/bonus source.

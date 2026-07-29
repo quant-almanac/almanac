@@ -170,6 +170,8 @@ def test_jpy_rakuten_deposit_increases_balance(isolated) -> None:
     result = _apply_cash_change(req, TxType.deposit)
 
     assert result["ok"] is True
+    assert result["execution_plan_refreshed"] is True
+    assert (isolated["account"].parent / "execution_plan_state.json").is_file()
     account = _read(isolated["account"])
     assert account["balance"] == pytest.approx(600_000.0)
 

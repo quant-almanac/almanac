@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 from datetime import date, datetime, timedelta, timezone
 
+import pytest
+
 import execution_plan_engine as epe
 from action_state_tracker import dedup_key, dedup_key_for_action
 
@@ -1026,8 +1028,9 @@ def test_confirmed_surplus_cash_creates_paced_monthly_budget() -> None:
     assert budgets["confirmed_cash_jpy"] == 3_911_286
     assert budgets["tactical_cash_reserve_jpy"] == 2_100_000
     assert budgets["surplus_cash_above_targets_jpy"] == 1_811_286
-    assert budgets["monthly_discretionary_budget_jpy"] == 700_000
-    assert budgets["normal_pool_available_jpy"] == 700_000
+    assert budgets["deployment_months"] == 3
+    assert budgets["monthly_discretionary_budget_jpy"] == 603_762
+    assert budgets["normal_pool_available_jpy"] == 603_762
     assert budgets["budget_source"] == "confirmed_surplus_cash"
     assert plan["items"]
 
@@ -1057,7 +1060,11 @@ def test_monthly_surplus_budget_is_paced_by_existing_buys() -> None:
             "market_regime_v2": {
                 "status": "ok",
                 "mode": "advisory",
-                "policy": {"cash_target_pct": 7.0},
+                "policy": {
+                    "cash_target_pct": 7.0,
+                    "portfolio_level": 1,
+                    "portfolio_label": "mild_bull",
+                },
             },
         },
         params={
@@ -1080,6 +1087,145 @@ def test_monthly_surplus_budget_is_paced_by_existing_buys() -> None:
     assert plan["no_action_rationale"][0]["reason_code"] == (
         "monthly_surplus_deployment_budget_consumed"
     )
+
+
+def test_dynamic_budget_adds_fills_back_once_and_removes_sell_proceeds() -> None:
+    cash_info = {"total_cash_jpy": 9_000_000, "valid_for_budget": True}
+    budgets, warnings = epe.derive_budgets(
+        cash_info=cash_info,
+        guard={
+            "portfolio_value": 30_000_000,
+            "new_entry_allowed": True,
+            "trading_allowed": True,
+        },
+        params={
+            "monthly_discretionary_budget_jpy": 0,
+            "max_single_normal_jpy": 250_000,
+            "max_single_opportunity_jpy": 300_000,
+            "max_single_action_pct_of_portfolio": 0.05,
+        },
+        scheduled_contributions_jpy=0,
+        horizon=epe.horizon_for(date(2026, 7, 30)),
+        cash_target_policy={
+            "cash_target_pct": 7.0,
+            "portfolio_level": 1,
+            "portfolio_label": "mild_bull",
+        },
+        monthly_consumption={
+            "monthly_filled_consumed_jpy": 500_000,
+            "unattributed_monthly_buy_filled_notional_jpy": 250_000,
+            "unattributed_monthly_sell_filled_notional_jpy": 300_000,
+        },
+    )
+
+    assert warnings == []
+    assert budgets["deployment_basis_cash_jpy"] == 9_450_000
+    assert budgets["deployment_basis_surplus_jpy"] == 7_350_000
+    assert budgets["monthly_discretionary_budget_jpy"] == 2_450_000
+    assert budgets["deployment_basis_method"] == (
+        "confirmed_cash_plus_base_filled_buys_minus_filled_sell_proceeds"
+    )
+
+
+@pytest.mark.parametrize(
+    ("level", "label", "months", "expected"),
+    [
+        (2, "strong_bull", 2, 3_950_000),
+        (1, "mild_bull", 3, 2_633_333),
+        (0, "neutral", 6, 1_316_667),
+        (-1, "mild_bear", 12, 658_333),
+        (-2, "strong_bear", None, 0),
+    ],
+)
+def test_dynamic_budget_uses_regime_deployment_horizon(
+    level: int,
+    label: str,
+    months: int | None,
+    expected: int,
+) -> None:
+    budgets, _ = epe.derive_budgets(
+        cash_info={"total_cash_jpy": 10_000_000, "valid_for_budget": True},
+        guard={
+            "portfolio_value": 30_000_000,
+            "new_entry_allowed": True,
+            "trading_allowed": True,
+        },
+        params={
+            "monthly_discretionary_budget_jpy": 0,
+            "max_single_normal_jpy": 250_000,
+            "max_single_opportunity_jpy": 300_000,
+            "max_single_action_pct_of_portfolio": 0.05,
+        },
+        scheduled_contributions_jpy=0,
+        horizon=epe.horizon_for(date(2026, 7, 30)),
+        cash_target_policy={
+            "cash_target_pct": 7.0,
+            "portfolio_level": level,
+            "portfolio_label": label,
+        },
+    )
+
+    assert budgets["deployment_months"] == months
+    assert budgets["monthly_discretionary_budget_jpy"] == expected
+
+
+def test_confirmed_new_cash_recalculates_dynamic_budget() -> None:
+    common = {
+        "guard": {
+            "portfolio_value": 30_000_000,
+            "new_entry_allowed": True,
+            "trading_allowed": True,
+        },
+        "params": {
+            "monthly_discretionary_budget_jpy": 0,
+            "max_single_normal_jpy": 250_000,
+            "max_single_opportunity_jpy": 300_000,
+            "max_single_action_pct_of_portfolio": 0.05,
+        },
+        "scheduled_contributions_jpy": 0,
+        "horizon": epe.horizon_for(date(2026, 7, 30)),
+        "cash_target_policy": {
+            "cash_target_pct": 7.0,
+            "portfolio_level": 1,
+            "portfolio_label": "mild_bull",
+        },
+    }
+    before, _ = epe.derive_budgets(
+        cash_info={"total_cash_jpy": 9_000_000, "valid_for_budget": True},
+        **common,
+    )
+    after, _ = epe.derive_budgets(
+        cash_info={"total_cash_jpy": 10_000_000, "valid_for_budget": True},
+        **common,
+    )
+
+    assert (
+        after["monthly_discretionary_budget_jpy"]
+        - before["monthly_discretionary_budget_jpy"]
+    ) == 333_333
+
+
+def test_strong_bear_disables_legacy_explicit_ordinary_budget() -> None:
+    budgets, _ = epe.derive_budgets(
+        cash_info={"total_cash_jpy": 10_000_000, "valid_for_budget": True},
+        guard={"portfolio_value": 30_000_000, "trading_allowed": True},
+        params={
+            "monthly_discretionary_budget_jpy": 700_000,
+            "max_single_normal_jpy": 250_000,
+            "max_single_opportunity_jpy": 300_000,
+            "max_single_action_pct_of_portfolio": 0.05,
+        },
+        scheduled_contributions_jpy=0,
+        horizon=epe.horizon_for(date(2026, 7, 30)),
+        cash_target_policy={
+            "cash_target_pct": 30.0,
+            "portfolio_level": -2,
+            "portfolio_label": "strong_bear",
+        },
+    )
+
+    assert budgets["ordinary_deployment_allowed"] is False
+    assert budgets["monthly_discretionary_budget_jpy"] == 0
 
 
 def test_approved_contribution_creates_one_common_pool_without_priority_wallet_splitting() -> None:

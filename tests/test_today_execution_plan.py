@@ -533,6 +533,14 @@ def test_execution_plan_view_surfaces_surplus_cash_pacing_reason() -> None:
             "protected_cash_reserve_jpy": 0,
             "required_cash_reserve_jpy": 2_084_027,
             "surplus_cash_above_targets_jpy": 7_202_743,
+            "deployment_basis_cash_jpy": 9_825_842,
+            "deployment_basis_surplus_jpy": 7_741_815,
+            "deployment_basis_method": "confirmed_cash_plus_base_filled_buys_minus_filled_sell_proceeds",
+            "deployment_months": 3,
+            "deployment_regime_level": 1,
+            "deployment_regime_label": "mild_bull",
+            "deployment_policy_version": "regime_horizon_v1",
+            "ordinary_deployment_allowed": True,
             "surplus_cash_monthly_capacity_jpy": 700_000,
         },
         "consumption_summary": {
@@ -559,6 +567,9 @@ def test_execution_plan_view_surfaces_surplus_cash_pacing_reason() -> None:
     assert view["budgets"]["confirmed_cash_jpy"] == 9_286_770
     assert view["budgets"]["cash_target_pct"] == 7.0
     assert view["budgets"]["surplus_cash_above_targets_jpy"] == 7_202_743
+    assert view["budgets"]["deployment_basis_surplus_jpy"] == 7_741_815
+    assert view["budgets"]["deployment_months"] == 3
+    assert view["budgets"]["deployment_regime_label"] == "mild_bull"
     assert view["budgets"]["surplus_cash_monthly_capacity_jpy"] == 700_000
 
 

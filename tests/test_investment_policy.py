@@ -111,4 +111,13 @@ def test_all_confirmed_system_cash_is_surplus_but_operational_reservations_remai
         "protected_cash_reserve_jpy": 0,
         "tactical_cash_retention_allowed": True,
         "operational_reservations_still_required": True,
+        "monthly_budget_method": "deployable_surplus_divided_by_regime_horizon",
+        "deployment_policy_version": "regime_horizon_v1",
+        "deployment_months_by_level": {
+            2: 2,
+            1: 3,
+            0: 6,
+            -1: 12,
+            -2: None,
+        },
     }

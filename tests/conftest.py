@@ -49,6 +49,7 @@ PROTECTED_STATE = (
     "account.json", "holdings.json", "nisa_portfolio.json", "tickers.json",
     "trade_history.csv", "action_state.json", "tunable_params.json",
     "action_executions.json", "decision_snapshot_state.json",
+    "execution_plan_state.json",
     "execution_invalidation_state.json", "execution_reconciliation_state.json",
     "feature_control_state.json",
     "macro_event_state.json",

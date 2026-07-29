@@ -113,8 +113,8 @@
     "auto_apply": false
   },
   "execution_plan_max_monthly_budget_jpy": {
-    "value": 700000,
-    "default": 700000,
+    "value": 0,
+    "default": 0,
     "min": 0,
     "max": 3000000,
     "step": 50000,
@@ -122,13 +122,13 @@
     "type": "number",
     "integer": true,
     "category": "execution_plan",
-    "label": "実行計画 月次予算上限",
-    "desc": "cash-derived 月次投資予算の絶対上限。通常計画が現金量だけで膨らみすぎるのを防ぐ。",
+    "label": "実行計画 固定月次上限（廃止）",
+    "desc": "互換表示用。現在は適用せず、確認済み余剰現金を相場レジーム別の配備月数で割って月次枠を算出する。",
     "ai_recommended": null,
     "ai_rationale": null,
-    "last_changed": "2026-07-10T00:00:00+09:00",
+    "last_changed": "2026-07-30T00:00:00+09:00",
     "last_changed_by": "codex",
-    "last_rationale": "execution_plan_engine Phase 1: conservative monthly cap",
+    "last_rationale": "fixed 700k cap replaced by regime-based deployment horizon",
     "ai_recommended_at": null,
     "auto_apply": false
   },

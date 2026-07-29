@@ -20,6 +20,14 @@ POSITION_CAPS_BY_TIER = {
 }
 EMPLOYER_POSITION_CAP = 0.10
 PROTECTED_CASH_RESERVE_JPY = 0
+CASH_DEPLOYMENT_POLICY_VERSION = "regime_horizon_v1"
+CASH_DEPLOYMENT_MONTHS_BY_LEVEL = {
+    2: 2,   # strong bull
+    1: 3,   # mild bull
+    0: 6,   # neutral
+    -1: 12, # mild bear
+    -2: None,  # strong bear: ordinary deployment is disabled
+}
 
 
 def cash_deployment_policy() -> dict:
@@ -35,6 +43,53 @@ def cash_deployment_policy() -> dict:
         "protected_cash_reserve_jpy": PROTECTED_CASH_RESERVE_JPY,
         "tactical_cash_retention_allowed": True,
         "operational_reservations_still_required": True,
+        "monthly_budget_method": "deployable_surplus_divided_by_regime_horizon",
+        "deployment_policy_version": CASH_DEPLOYMENT_POLICY_VERSION,
+        "deployment_months_by_level": dict(CASH_DEPLOYMENT_MONTHS_BY_LEVEL),
+    }
+
+
+def cash_deployment_horizon(
+    *,
+    portfolio_level: int | None,
+    portfolio_label: str | None = None,
+    shock_active: bool = False,
+) -> dict:
+    """Return the fixed deployment horizon for the committed market regime.
+
+    A shock or strong-bear regime creates no ordinary monthly buying budget.
+    Active drawdown/DCA playbooks remain separate from this cash-deployment
+    allowance.
+    """
+    labels = {
+        "strong_bull": 2,
+        "mild_bull": 1,
+        "neutral": 0,
+        "mild_bear": -1,
+        "strong_bear": -2,
+    }
+    level = portfolio_level
+    if level not in CASH_DEPLOYMENT_MONTHS_BY_LEVEL:
+        level = labels.get(str(portfolio_label or "").strip().lower())
+    if level not in CASH_DEPLOYMENT_MONTHS_BY_LEVEL:
+        return {
+            "resolved": False,
+            "portfolio_level": None,
+            "portfolio_label": portfolio_label,
+            "deployment_months": None,
+            "ordinary_deployment_allowed": False,
+            "policy_version": CASH_DEPLOYMENT_POLICY_VERSION,
+            "reason": "market_regime_unresolved",
+        }
+    deployment_months = None if shock_active else CASH_DEPLOYMENT_MONTHS_BY_LEVEL[level]
+    return {
+        "resolved": True,
+        "portfolio_level": level,
+        "portfolio_label": portfolio_label,
+        "deployment_months": deployment_months,
+        "ordinary_deployment_allowed": deployment_months is not None,
+        "policy_version": CASH_DEPLOYMENT_POLICY_VERSION,
+        "reason": "shock_active" if shock_active else None,
     }
 
 

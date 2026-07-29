@@ -328,6 +328,16 @@ export interface ExecutionPlan {
     protected_cash_reserve_jpy?: number
     required_cash_reserve_jpy?: number
     surplus_cash_above_targets_jpy?: number
+    deployment_basis_cash_jpy?: number
+    deployment_basis_surplus_jpy?: number
+    deployment_basis_filled_buys_added_back_jpy?: number
+    deployment_basis_sell_proceeds_removed_jpy?: number
+    deployment_basis_method?: string
+    deployment_months?: number | null
+    deployment_regime_level?: number | null
+    deployment_regime_label?: string | null
+    deployment_policy_version?: string | null
+    ordinary_deployment_allowed?: boolean
     surplus_cash_monthly_capacity_jpy?: number
     scheduled_contributions_remaining_jpy?: number
   }
