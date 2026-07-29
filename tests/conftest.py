@@ -42,6 +42,7 @@ PROTECTED_STATE = (
     "trade_history.csv", "action_state.json", "tunable_params.json",
     "action_executions.json", "decision_snapshot_state.json",
     "execution_invalidation_state.json", "execution_reconciliation_state.json",
+    "feature_control_state.json",
     "macro_event_state.json",
     "market_regime_v2_state.json",
     "currency_policy_state.json", "hedge_target.json", "hedge_target_shadow.json",

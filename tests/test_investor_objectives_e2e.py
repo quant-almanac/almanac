@@ -22,6 +22,7 @@ import rebalance_engine
 import scenario_engine
 import scenario_strategy
 import short_screener
+import short_universe
 import tax_harvest_scanner
 from analyst.data_gatherer import fmt_earnings_section
 from almanac.observability.catalyst_layer import (
@@ -310,7 +311,6 @@ def test_objective_12_dilution_feature_should_reach_short_hypothesis_observe_onl
             "reasons": ["loanable_not_confirmed"],
         },
     )
-
     hypotheses = synthesize_from_disclosure_features(
         [
             {
@@ -458,6 +458,23 @@ def test_objective_09_overheat_bull_regime_surfaces_observe_only_contrarian_shor
             "reverse_daily_fee": False,
             "untradeable": False,
             "reasons": [],
+        },
+    )
+    monkeypatch.setattr(
+        short_universe,
+        "build_short_universe",
+        lambda tickers, **_kwargs: {
+            "tickers": {
+                ticker: {
+                    "shortable": True,
+                    "squeeze_guard_status": "ok",
+                    "reasons": [],
+                    "borrow_cost_annual_pct": 0.011,
+                    "cost_model": {"borrow_cost_annual_pct": 0.011},
+                    "lane_eligibility": ["overheat"],
+                }
+                for ticker in tickers
+            },
         },
     )
 

@@ -4,6 +4,7 @@
   "horizons": [5, 20, 60],
   "notional_jpy": 100000,
   "us_short_enabled": false,
+  "jp_short_enabled": true,
   "thresholds": {
     "directional_score": 0.6,
     "directional_confidence": 0.7,

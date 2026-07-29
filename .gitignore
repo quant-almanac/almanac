@@ -78,6 +78,7 @@ trade_history.csv
 action_*.json
 execution_invalidation_state.json
 execution_reconciliation_state.json
+feature_control_state.json
 decision_snapshot_state.json
 agent_briefing.json
 agent_reliability.json

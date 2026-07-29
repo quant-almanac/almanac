@@ -998,6 +998,7 @@ def _short_execution_metadata(
         "requires_squeeze_guard": True,
         "excluded_from_certify_if_untradeable": True,
     }
+    cfg: dict[str, Any] = {}
 
     try:
         from disclosure_shadow_book import estimate_round_trip_cost_pct, load_config
@@ -1008,7 +1009,13 @@ def _short_execution_metadata(
             "available": True,
             "notional_jpy": round(notional_jpy),
         })
-        if market == "JP":
+        enabled_key = "jp_short_enabled" if market == "JP" else "us_short_enabled"
+        if not bool(cfg.get(enabled_key, market == "JP")):
+            tradeability.update({
+                "untradeable": True,
+                "reasons": [f"{market.lower()}_short_disabled_by_user"],
+            })
+        elif market == "JP":
             standard = estimate_round_trip_cost_pct(
                 market="JP",
                 notional_jpy=notional_jpy,
@@ -1057,10 +1064,9 @@ def _short_execution_metadata(
             tradeability.update(checked)
             tradeability["market"] = market
         else:
-            # US short availability/cost is not broker-certified in this system.
             tradeability.update({
                 "untradeable": True,
-                "reasons": ["us_short_not_enabled"],
+                "reasons": ["short_universe_verification_required"],
             })
     except Exception as exc:  # noqa: BLE001
         tradeability.update({

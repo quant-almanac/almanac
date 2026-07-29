@@ -5,6 +5,7 @@ import { fetcher, type DashboardDataHealth } from '@/lib/api'
 import { OPS } from '@/components/today/ops/tokens'
 import { OpsPage, Panel, PanelTitle, Chip, Grid, Loading } from '@/components/today/ops/PageKit'
 import FreshnessDots from '@/components/today/ops/FreshnessDots'
+import FeatureControls from '@/components/system/FeatureControls'
 
 interface SystemStatus {
   generated_at: string
@@ -34,6 +35,8 @@ export default function DesignPage() {
     {isLoading && <Loading />}
     {error && <Panel><span role="alert" style={{ color: OPS.redSoft }}>/api/system/status を取得できません。</span></Panel>}
     {data && <>
+      <FeatureControls />
+
       <Grid cols={2} gap={16}>
         <Panel pad="18px 20px">
           <PanelTitle>運用状態</PanelTitle>

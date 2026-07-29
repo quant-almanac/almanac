@@ -21,7 +21,19 @@ RAKUTEN_FX_SPREAD_JPY = 0.25
 
 
 def load_config(path: Path | str = DEFAULT_CONFIG_PATH) -> dict:
-    return json.loads(Path(path).read_text(encoding="utf-8"))
+    config_path = Path(path)
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    from feature_controls import overlay_disclosure_config
+    state_base = (
+        config_path.parent
+        if config_path.resolve() != DEFAULT_CONFIG_PATH.resolve()
+        else None
+    )
+    return overlay_disclosure_config(
+        config,
+        config_path=config_path,
+        base_dir=state_base,
+    )
 
 
 def signal_from_feature(row: dict, thresholds: dict) -> Optional[dict]:
@@ -172,20 +184,19 @@ def simulate_shadow_book(
             "reasons": [],
         }
         if signal["direction"] < 0:
-            if market.upper() == "JP":
-                from jp_loanability import evaluate_short_tradeability
-                tradeability = evaluate_short_tradeability(ticker)
-            elif not bool(cfg.get("us_short_enabled", False)):
-                # Rakuten US short availability/cost is unverified, so a US short
-                # simulated at long-side costs would flatter the shadow book.
-                # Same conservative default as JP "loanable_not_confirmed".
+            market_key = market.upper()
+            enabled_key = "jp_short_enabled" if market_key == "JP" else "us_short_enabled"
+            if not bool(cfg.get(enabled_key, market_key == "JP")):
                 tradeability = {
                     "loanable": None,
                     "loan_ratio": None,
                     "reverse_daily_fee": False,
                     "untradeable": True,
-                    "reasons": ["us_short_not_enabled"],
+                    "reasons": [f"{market_key.lower()}_short_disabled_by_user"],
                 }
+            elif market_key == "JP":
+                from jp_loanability import evaluate_short_tradeability
+                tradeability = evaluate_short_tradeability(ticker)
         for horizon in cfg["horizons"]:
             exit_position = entry_position + int(horizon)
             if exit_position >= len(prices):

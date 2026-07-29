@@ -414,6 +414,14 @@ def apply_shortability_gate(candidate: dict, universe: Optional[dict] = None, *,
         "cost_model": entry.get("cost_model"),
         "lane_eligibility": list(entry.get("lane_eligibility") or []),
     }
+    tradeability = dict(out.get("tradeability") or {})
+    tradeability.update({
+        "loanable": True if entry.get("shortable") else None,
+        "untradeable": not bool(entry.get("shortable")),
+        "reasons": list(entry.get("reasons") or []),
+        "excluded_from_certify": not bool(entry.get("shortable")),
+    })
+    out["tradeability"] = tradeability
     # observe_only-first 不変: 自動発注はしない
     out["observe_only"] = True
     out["human_execution_only"] = True

@@ -64,6 +64,7 @@ TARGETS = [
     'action_executions.json',
     'execution_invalidation_state.json',
     'execution_reconciliation_state.json',
+    'feature_control_state.json',
     'decision_snapshot_state.json',
     'trade_history.csv',
     'beliefs/agent_beliefs.json',

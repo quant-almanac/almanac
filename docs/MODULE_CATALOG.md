@@ -41,6 +41,7 @@ The large orchestration implementation lives in the `analyst/` package; see §15
 |---|---|---|
 | live | `action_stage_log.py`, `action_state_tracker.py`, `execution_invalidation.py` | Stage audit, action lifecycle and invalidation overlay |
 | live | `execution_readiness.py`, `execution_safety.py`, `policy_engine.py` | Deterministic admission, freshness and safety gates |
+| live | `feature_controls.py` | Runtime feature switches, effective-state reasons and fail-closed UI contract |
 | live | `order_intent_resolver.py`, `exit_sizing.py`, `execution_explanation.py` | Idempotent intent, deterministic quantity and display text |
 | observe | `execution_plan_engine.py`, `execution_plan_observer.py`, `execution_quality.py` | Plan budgets, enforce-readiness evidence and implementation shortfall |
 | live | `behavioral_guard.py`, `margin_manager.py` | Drawdown behavior guard and margin-position controls |

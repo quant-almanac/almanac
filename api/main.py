@@ -20,7 +20,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from almanac.runtime_config import load_api_key
-from api.routes import dashboard, portfolio, risk, signals, ws, chart, rebalance, margin, nisa, admin, decision, screening, strategy, ai_analysis, actions, contributions, chat, macro, batch, agent, market, scenario, comparison, dca, tuning, performance, disclosure, today, system_status
+from api.routes import dashboard, portfolio, risk, signals, ws, chart, rebalance, margin, nisa, admin, decision, screening, strategy, ai_analysis, actions, contributions, chat, macro, batch, agent, market, scenario, comparison, dca, tuning, performance, disclosure, today, system_status, features
 
 app = FastAPI(title="ALMANAC API", version="5.0.0")
 
@@ -112,6 +112,7 @@ app.include_router(performance.router)  # 整理 #6: TWR / tax-lots / policy-dec
 app.include_router(disclosure.router)  # Phase 0: observe_only public-disclosure features (参考のみ)
 app.include_router(today.router)  # /today オブシディアン・コンソール v5 合成エンドポイント
 app.include_router(system_status.router)
+app.include_router(features.router)
 
 
 @app.get("/")

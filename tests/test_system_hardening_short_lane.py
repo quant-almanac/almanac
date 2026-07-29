@@ -185,7 +185,7 @@ def test_us_short_is_untradeable_until_explicitly_enabled() -> None:
     assert result["tradeable_trade_count"] == 0
     trade = result["trades"][0]
     assert trade["untradeable"] is True
-    assert "us_short_not_enabled" in trade["untradeable_reasons"]
+    assert "us_short_disabled_by_user" in trade["untradeable_reasons"]
     assert trade["excluded_from_certify"] is True
     # Opt-in flips it back to a simulated trade.
     enabled = simulate_shadow_book(

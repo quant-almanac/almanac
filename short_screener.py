@@ -319,6 +319,7 @@ def _short_execution_metadata(ticker: str, *, horizon_days: int = 10) -> tuple[d
         'reasons': ['short_tradeability_not_checked'],
         'excluded_from_certify': True,
     }
+    cfg: dict = {}
     try:
         from disclosure_shadow_book import estimate_round_trip_cost_pct, load_config
         cfg = load_config()
@@ -348,14 +349,20 @@ def _short_execution_metadata(ticker: str, *, horizon_days: int = 10) -> tuple[d
         cost_model['error'] = str(exc)[:160]
 
     try:
-        if market == 'JP':
+        enabled_key = 'jp_short_enabled' if market == 'JP' else 'us_short_enabled'
+        if not bool(cfg.get(enabled_key, market == 'JP')):
+            tradeability.update({
+                'untradeable': True,
+                'reasons': [f'{market.lower()}_short_disabled_by_user'],
+            })
+        elif market == 'JP':
             from jp_loanability import evaluate_short_tradeability
             tradeability.update(evaluate_short_tradeability(ticker))
             tradeability['market'] = market
         else:
             tradeability.update({
                 'untradeable': True,
-                'reasons': ['us_short_not_enabled'],
+                'reasons': ['short_universe_verification_required'],
             })
     except Exception as exc:
         tradeability.update({
@@ -888,6 +895,20 @@ def screen_candidates(
             output_path=short_universe_output_path,
         )
         candidates = [apply_shortability_gate(c, universe) for c in candidates]
+        from disclosure_shadow_book import load_config
+        short_cfg = load_config()
+        for candidate in candidates:
+            market = 'JP' if str(candidate.get('ticker') or '').endswith('.T') else 'US'
+            enabled_key = 'jp_short_enabled' if market == 'JP' else 'us_short_enabled'
+            if bool(short_cfg.get(enabled_key, market == 'JP')):
+                continue
+            reason = f'{market.lower()}_short_disabled_by_user'
+            candidate['shortable'] = False
+            candidate.setdefault('shortability', {})['shortable'] = False
+            candidate['shortability']['reasons'] = [reason]
+            candidate.setdefault('tradeability', {})['untradeable'] = True
+            candidate['tradeability']['reasons'] = [reason]
+            candidate['tradeability']['excluded_from_certify'] = True
     except Exception as exc:
         # gate 失敗時は fail-closed: 全候補 shortable=false に倒す
         for c in candidates:

@@ -18,6 +18,7 @@ async def get_system_status():
     from auto_tune import get_status as get_auto_tune_status
     from model_router import get_model, resolve_adapter
     from tunable_params import get as tunable
+    from feature_controls import list_feature_statuses
 
     roles = (
         "tier_analysis_long",
@@ -57,6 +58,7 @@ async def get_system_status():
             "auto_tune": auto_tune.get("mode"),
             "disclosure_features": "observe_only",
         },
+        "feature_controls": list_feature_statuses(),
         "heartbeats": heartbeats,
         "schedules": {"auto_tune": auto_tune.get("schedule") or {}},
     }

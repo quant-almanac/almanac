@@ -41,6 +41,7 @@
 |---|---|---|
 | live | `action_stage_log.py`, `action_state_tracker.py`, `execution_invalidation.py` | stage監査、action lifecycle、invalidation |
 | live | `execution_readiness.py`, `execution_safety.py`, `policy_engine.py` | 決定論的採用、freshness、安全gate |
+| live | `feature_controls.py` | runtime機能switch、実効状態の理由、fail-closed UI contract |
 | live | `order_intent_resolver.py`, `exit_sizing.py`, `execution_explanation.py` | 冪等intent、数量、表示文 |
 | observe | `execution_plan_engine.py`, `execution_plan_observer.py`, `execution_quality.py` | plan budget、enforce readiness、shortfall |
 | live | `behavioral_guard.py`, `margin_manager.py` | drawdown行動guardと信用管理 |
