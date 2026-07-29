@@ -16,7 +16,11 @@ from typing import Any, Iterable
 from zoneinfo import ZoneInfo
 
 
-JST = ZoneInfo("Asia/Tokyo")
+SYSTEM_LOCAL_TZ_NAME = "Asia/Tokyo"
+SYSTEM_LOCAL_TZ = ZoneInfo(SYSTEM_LOCAL_TZ_NAME)
+# Backwards-compatible alias.  All naive internal/broker timestamps are
+# interpreted using this single policy before comparisons.
+JST = SYSTEM_LOCAL_TZ
 EXCHANGE_CONFIG = {
     "JPX": ZoneInfo("Asia/Tokyo"),
     "NYSE": ZoneInfo("America/New_York"),
@@ -111,9 +115,9 @@ def canonical_account(value: object) -> str:
     if not text:
         return ""
     if "nisa" in text:
-        if "つみたて" in text or "積立" in text:
+        if text in {"nisa_tsumitate", "nisa-tsumitate"} or "つみたて" in text or "積立" in text:
             return "nisa_tsumitate"
-        if "成長" in text:
+        if text in {"nisa_growth", "nisa-growth"} or "成長" in text:
             return "nisa_growth"
         return "nisa"
     if "特定" in text or text in {"tokutei", "specific"}:

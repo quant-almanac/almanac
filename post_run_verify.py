@@ -266,6 +266,46 @@ def check_action_stage_executed_alignment(base_dir: Path = BASE_DIR) -> list[dic
     )]
 
 
+def check_execution_reconciliation_integrity(base_dir: Path = BASE_DIR) -> list[dict]:
+    """Fail loud when a route overlay is ambiguous, stale, or orphaned."""
+    from execution_reconciliation import resolve_effective_execution_record
+
+    raw = _load_json(base_dir / "action_executions.json", {"executions": []})
+    records = raw.get("executions", []) if isinstance(raw, dict) else []
+    records = [row for row in records if isinstance(row, dict)]
+    state_path = base_dir / "execution_reconciliation_state.json"
+    issues: list[dict] = []
+    ids = {str(row.get("id") or "") for row in records}
+    for record in records:
+        effective = resolve_effective_execution_record(record, state_path=state_path)
+        if effective.get("execution_reconciliation_status") == "review":
+            issues.append(_issue(
+                "execution_reconciliation_requires_review",
+                "execution route overlay cannot be applied safely",
+                "error",
+                execution_id=record.get("id"),
+                reasons=effective.get("execution_reconciliation_reasons"),
+            ))
+
+    state = _load_json(state_path, {"corrections": []})
+    corrections = state.get("corrections", []) if isinstance(state, dict) else []
+    orphan_ids = sorted({
+        str(row.get("execution_id") or "")
+        for row in corrections
+        if isinstance(row, dict)
+        and row.get("execution_id")
+        and str(row.get("execution_id")) not in ids
+    })
+    if orphan_ids:
+        issues.append(_issue(
+            "execution_reconciliation_orphan_corrections",
+            "route corrections reference missing action execution records",
+            "error",
+            execution_ids=orphan_ids[:20],
+        ))
+    return issues
+
+
 def check_observability_logs(base_dir: Path = BASE_DIR) -> list[dict]:
     issues: list[dict] = []
     required = [
@@ -508,6 +548,7 @@ def verify_post_run(base_dir: Path = BASE_DIR, *, repair: bool = False) -> dict:
     issues.extend(check_scenario_null_signals(base_dir))
     issues.extend(check_action_state_alignment(base_dir))
     issues.extend(check_action_stage_executed_alignment(base_dir))
+    issues.extend(check_execution_reconciliation_integrity(base_dir))
     issues.extend(check_observability_logs(base_dir))
     issues.extend(check_agent_reliability_join(base_dir))
     issues.extend(check_portfolio_integrity(base_dir, repair=repair))

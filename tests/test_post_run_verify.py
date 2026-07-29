@@ -275,6 +275,52 @@ def test_check_action_stage_executed_alignment_flags_orphan_stage_rows(tmp_path)
     assert issues[0]["context"]["examples"][0]["ticker"] == "7203.T"
 
 
+def test_execution_reconciliation_integrity_flags_stale_and_orphan_overlay(tmp_path):
+    execution = {
+        "id": "ABC_sell_demo",
+        "saved_at": "2026-07-16T01:00:00",
+        "ticker": "ABC",
+        "direction": "sell",
+        "quantity": 5,
+        "price": 42,
+        "account": "特定",
+        "status": "executed",
+    }
+    _write(tmp_path / "action_executions.json", {"executions": [execution]})
+    from execution_reconciliation import record_route_correction
+
+    record_route_correction(
+        execution_record=execution,
+        corrected_route={
+            "execution_owner": "husband",
+            "execution_broker": "rakuten",
+            "execution_account": "NISA成長投資枠",
+        },
+        evidence={"row_hash": "proof"},
+        reason="test",
+        approved_by="test",
+        state_path=tmp_path / "execution_reconciliation_state.json",
+    )
+    changed = {**execution, "quantity": 6}
+    _write(tmp_path / "action_executions.json", {"executions": [changed]})
+    issues = prv.check_execution_reconciliation_integrity(tmp_path)
+    assert issues[0]["code"] == "execution_reconciliation_requires_review"
+
+    state_path = tmp_path / "execution_reconciliation_state.json"
+    state = json.loads(state_path.read_text())
+    state["corrections"].append({
+        "correction_type": "route",
+        "correction_id": "orphan",
+        "execution_id": "missing",
+    })
+    _write(state_path, state)
+    codes = {
+        issue["code"]
+        for issue in prv.check_execution_reconciliation_integrity(tmp_path)
+    }
+    assert "execution_reconciliation_orphan_corrections" in codes
+
+
 def test_check_action_stage_executed_alignment_ignores_pre_execution_window_rows(tmp_path):
     _write(tmp_path / "action_executions.json", {
         "executions": [{

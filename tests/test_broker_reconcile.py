@@ -64,6 +64,80 @@ def test_parse_csv_unknown_broker():
         br.parse_csv("/dev/null", "unknown_broker")
 
 
+def test_parse_actual_rakuten_us_shape_cp932_without_pii(tmp_path):
+    path = tmp_path / "tradehistory_us.csv"
+    text = (
+        "約定日,受渡日,ティッカー,銘柄名,口座,取引区分,売買区分,決済通貨,"
+        "数量［株］,単価［USドル］,約定代金［USドル］,為替レート,"
+        "手数料［USドル］,税金［USドル］,受渡金額［USドル］,受渡金額［円］\n"
+        "2026/7/16,2026/7/21,DEMO,Sample ETF,NISA成長投資枠,現物,売付,"
+        "米ドル,7,12.3456,86.4192,150.00,0.03,,86.3892,12958\n"
+    )
+    path.write_bytes(text.encode("cp932"))
+
+    trades, report = br.parse_csv_with_report(path, "rakuten", owner="husband")
+
+    assert report.parsed == 1
+    assert report.skipped == 0
+    trade = trades[0]
+    assert trade.trade_date == "2026-07-16"
+    assert trade.ticker == "DEMO"
+    assert trade.direction == "sell"
+    assert trade.account == "NISA成長投資枠"
+    assert trade.owner == "husband"
+    assert trade.broker == "rakuten"
+    assert trade.external_id.startswith("rakuten:")
+    assert len(trade.source_sha256) == 64
+    assert len(trade.row_hash) == 64
+    assert trade.source_kind == "rakuten_us_equity"
+
+
+def test_compare_action_executions_uses_route_overlay(tmp_path, monkeypatch):
+    monkeypatch.setenv("ALMANAC_STATE_DIR", str(tmp_path))
+    raw = {
+        "id": "DEMO_sell_20260716010000",
+        "saved_at": "2026-07-16T01:00:00",
+        "ticker": "DEMO",
+        "direction": "sell",
+        "quantity": 7,
+        "price": 12.3456,
+        "account": "特定",
+        "status": "executed",
+    }
+    from execution_reconciliation import record_route_correction
+
+    record_route_correction(
+        execution_record=raw,
+        corrected_route={
+            "execution_owner": "husband",
+            "execution_broker": "rakuten",
+            "execution_account": "NISA成長投資枠",
+        },
+        evidence={"row_hash": "proof"},
+        reason="broker history",
+        approved_by="test",
+    )
+    broker_trade = br.BrokerTrade(
+        trade_date="2026-07-16",
+        ticker="DEMO",
+        direction="sell",
+        quantity=7,
+        price=12.3456,
+        currency="USD",
+        account="NISA成長投資枠",
+        broker="rakuten",
+        owner="husband",
+    )
+    report = br.compare_to_action_executions(
+        [broker_trade],
+        date_from="2026-07-16",
+        date_to="2026-07-16",
+        executions=[raw],
+    )
+    assert report.matched_count == 1
+    assert not report.has_discrepancy
+
+
 # ────────────────────────────────────────────────────────
 # Reconcile — 完全一致
 # ────────────────────────────────────────────────────────

@@ -36,12 +36,23 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import json
+import re
 import sys
+import unicodedata
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Iterable, List, Optional
+
+from execution_safety import (
+    canonical_account,
+    canonical_broker,
+    canonical_owner,
+    effective_execution_timestamp,
+    is_fill_record,
+)
 
 BASE_DIR = Path(__file__).parent
 
@@ -61,6 +72,15 @@ class BrokerTrade:
     account:     Optional[str] = None
     broker:      Optional[str] = None
     external_id: Optional[str] = None
+    owner:       Optional[str] = None
+    settlement_date: Optional[str] = None
+    fee:         Optional[float] = None
+    tax:         Optional[float] = None
+    settlement_amount: Optional[float] = None
+    source_sha256: Optional[str] = None
+    row_hash:    Optional[str] = None
+    source_row:  Optional[int] = None
+    source_kind: Optional[str] = None
 
 
 @dataclass
@@ -191,38 +211,160 @@ def compare_tax_cost_basis(
 # Parser registry
 # ============================================================
 
-def parse_csv(path: Path, broker: str) -> List[BrokerTrade]:
+def parse_csv(path: Path, broker: str, *, owner: Optional[str] = None) -> List[BrokerTrade]:
     """ブローカー名で適切な parser に振り分け、trade のみ返す (後方互換)。"""
-    trades, _ = parse_csv_with_report(path, broker)
+    trades, _ = parse_csv_with_report(path, broker, owner=owner)
     return trades
 
 
-def parse_csv_with_report(path: Path, broker: str) -> "tuple[List[BrokerTrade], ParseReport]":
+def parse_csv_with_report(
+    path: Path,
+    broker: str,
+    *,
+    owner: Optional[str] = None,
+) -> "tuple[List[BrokerTrade], ParseReport]":
     """parse_csv に加え、パース件数 / skip 理由 (ParseReport) も返す (Codex P2 #12)。"""
     broker = broker.lower()
     if broker == "rakuten":
-        return _parse_rakuten(path)
+        return _parse_rakuten(path, owner=owner)
     if broker == "sbi":
-        return _parse_sbi(path)
+        return _parse_sbi(path, owner=owner)
     raise ValueError(f"unknown broker: {broker} (rakuten | sbi のみ対応)")
 
 
-def _parse_rakuten(path: Path) -> "tuple[List[BrokerTrade], ParseReport]":
+def _parse_rakuten(
+    path: Path,
+    *,
+    owner: Optional[str] = None,
+) -> "tuple[List[BrokerTrade], ParseReport]":
     """
     楽天証券 国内株式・米国株式 約定履歴 CSV のパース。
 
-    仕様 (推定):
-      Shift_JIS、ヘッダ行あり、カラム: 約定日, 銘柄コード, 銘柄名, 売買, 数量, 単価, 通貨, 口座区分, ...
-      実機 CSV を見て確定したら本関数のヘッダ/カラム名を実値に合わせる。
-
-    現状: stub として汎用 UTF-8 CSV を受け、ヘッダのキーワード一致で列を抜き出す。
+    実機エクスポートで確認した国内株式・米国株式・投資信託の
+    CP932 CSV をヘッダで判別する。owner はブローカー名から推測せず、
+    呼び出し元が明示した値だけを保持する。
     """
-    return _parse_generic(path, broker="rakuten")
+    text, source_sha = _read_csv_text(path)
+    reader = csv.DictReader(text.splitlines())
+    headers = [str(item or "").strip() for item in (reader.fieldnames or [])]
+    if "ティッカー" in headers and "単価［USドル］" in headers:
+        source_kind = "rakuten_us_equity"
+        mapping = {
+            "trade_date": "約定日", "settlement_date": "受渡日",
+            "ticker": "ティッカー", "account": "口座", "direction": "売買区分",
+            "currency": "決済通貨", "quantity": "数量［株］",
+            "price": "単価［USドル］", "fee": "手数料［USドル］",
+            "tax": "税金［USドル］", "settlement_amount": "受渡金額［USドル］",
+        }
+    elif "銘柄コード" in headers and "単価［円］" in headers:
+        source_kind = "rakuten_jp_equity"
+        mapping = {
+            "trade_date": "約定日", "settlement_date": "受渡日",
+            "ticker": "銘柄コード", "account": "口座区分", "direction": "売買区分",
+            "quantity": "数量［株］", "price": "単価［円］",
+            "fee": "手数料［円］", "tax": "税金等［円］",
+            "settlement_amount": "受渡金額［円］",
+        }
+    elif "ファンド名" in headers and "数量［口］" in headers:
+        source_kind = "rakuten_investment_trust"
+        mapping = {
+            "trade_date": "約定日", "settlement_date": "受渡日",
+            "ticker": "ファンド名", "account": "口座", "direction": "取引",
+            "currency": "決済通貨", "quantity": "数量［口］", "price": "単価",
+            "fee": "経費", "settlement_amount": "受渡金額/(ポイント利用)[円]",
+        }
+    else:
+        return _parse_generic(path, broker="rakuten", owner=owner)
+
+    required = ("trade_date", "ticker", "direction", "quantity", "price")
+    missing = [mapping[key] for key in required if mapping[key] not in headers]
+    if missing:
+        raise RuntimeError(f"楽天CSVの必須カラム不足: {missing}; headers={headers}")
+
+    trades: List[BrokerTrade] = []
+    rep = ParseReport(broker="rakuten")
+    duplicate_ordinals: dict[str, int] = {}
+    for index, row in enumerate(reader, start=2):
+        rep.rows_total += 1
+        try:
+            direction = _normalize_direction(row.get(mapping["direction"], ""))
+            if direction is None:
+                raise ValueError(
+                    f"売買区分を解釈不能: {row.get(mapping['direction'])!r}"
+                )
+            currency = _normalize_currency(
+                row.get(mapping.get("currency", ""), "") or "JPY"
+            )
+            raw_ticker = str(row.get(mapping["ticker"], "") or "").strip()
+            ticker = _rakuten_ticker(raw_ticker, source_kind, currency)
+            if not ticker:
+                raise ValueError("ticker is empty")
+            canonical_row = {
+                str(key): str(value or "").strip()
+                for key, value in row.items()
+                if key is not None
+            }
+            row_payload = json.dumps(
+                canonical_row, ensure_ascii=False, sort_keys=True,
+            ).encode("utf-8")
+            row_hash = hashlib.sha256(row_payload).hexdigest()
+            identity = "|".join([
+                "rakuten", str(owner or ""), source_kind,
+                _normalize_date(row.get(mapping["trade_date"], "")),
+                _normalize_date(row.get(mapping.get("settlement_date", ""), "")),
+                ticker, canonical_account(row.get(mapping["account"], "")),
+                direction,
+                _stable_number(row.get(mapping["quantity"], "")),
+                _stable_number(row.get(mapping["price"], "")),
+                _stable_number(row.get(mapping.get("settlement_amount", ""), "")),
+                row_hash,
+            ])
+            ordinal = duplicate_ordinals.get(identity, 0)
+            duplicate_ordinals[identity] = ordinal + 1
+            external_id = "rakuten:" + hashlib.sha256(
+                f"{identity}|{ordinal}".encode("utf-8")
+            ).hexdigest()[:24]
+            trades.append(BrokerTrade(
+                trade_date=_normalize_date(row.get(mapping["trade_date"], "")),
+                settlement_date=_normalize_date(
+                    row.get(mapping.get("settlement_date", ""), "")
+                ) or None,
+                ticker=ticker,
+                direction=direction,
+                quantity=_number(row.get(mapping["quantity"], "")),
+                price=_number(row.get(mapping["price"], "")),
+                currency=currency,
+                account=str(row.get(mapping["account"], "") or "").strip() or None,
+                broker="rakuten",
+                external_id=external_id,
+                owner=canonical_owner(owner),
+                fee=_optional_number(row.get(mapping.get("fee", ""), "")),
+                tax=_optional_number(row.get(mapping.get("tax", ""), "")),
+                settlement_amount=_optional_number(
+                    row.get(mapping.get("settlement_amount", ""), "")
+                ),
+                source_sha256=source_sha,
+                row_hash=row_hash,
+                source_row=index,
+                source_kind=source_kind,
+            ))
+            rep.parsed += 1
+        except (KeyError, ValueError, TypeError) as exc:
+            rep.skipped += 1
+            rep.skip_reasons.append({
+                "row": index,
+                "reason": f"{type(exc).__name__}: {exc}",
+            })
+    return trades, rep
 
 
-def _parse_sbi(path: Path) -> "tuple[List[BrokerTrade], ParseReport]":
+def _parse_sbi(
+    path: Path,
+    *,
+    owner: Optional[str] = None,
+) -> "tuple[List[BrokerTrade], ParseReport]":
     """SBI 証券 約定履歴 CSV のパース (stub — 楽天と同じ汎用 parser に委譲)。"""
-    return _parse_generic(path, broker="sbi")
+    return _parse_generic(path, broker="sbi", owner=owner)
 
 
 # ── 汎用 parser ─────────────────────────────────────────
@@ -250,12 +392,82 @@ def _match_header(headers: List[str], field_name: str) -> Optional[str]:
 
 
 def _normalize_direction(s: str) -> Optional[str]:
-    s = (s or "").strip().lower()
-    if s in ("買", "買付", "buy", "b"):
+    s = unicodedata.normalize("NFKC", s or "").strip().lower()
+    if s in ("買", "買付", "買い", "再投資", "buy", "b"):
         return "buy"
-    if s in ("売", "売却", "sell", "s"):
+    if s in ("売", "売付", "売却", "売り", "sell", "s"):
         return "sell"
     return None
+
+
+def _read_csv_text(path: Path) -> tuple[str, str]:
+    raw = Path(path).read_bytes()
+    source_sha = hashlib.sha256(raw).hexdigest()
+    for encoding in ("utf-8-sig", "utf-8", "cp932", "shift_jis"):
+        try:
+            return raw.decode(encoding), source_sha
+        except UnicodeDecodeError:
+            continue
+    raise RuntimeError(f"CSV のエンコーディングが判定不能: {path}")
+
+
+def _normalize_date(value: object) -> str:
+    text = unicodedata.normalize("NFKC", str(value or "")).strip()
+    if not text:
+        return ""
+    match = re.fullmatch(r"(\d{4})[/-](\d{1,2})[/-](\d{1,2})", text)
+    if match:
+        year, month, day = (int(part) for part in match.groups())
+        return datetime(year, month, day).date().isoformat()
+    text = text.replace("/", "-")
+    try:
+        return datetime.fromisoformat(text[:10]).date().isoformat()
+    except ValueError as exc:
+        raise ValueError(f"日付を解釈不能: {value!r}") from exc
+
+
+def _normalize_currency(value: object) -> str:
+    text = unicodedata.normalize("NFKC", str(value or "")).strip().upper()
+    aliases = {
+        "円": "JPY",
+        "日本円": "JPY",
+        "JPY": "JPY",
+        "米ドル": "USD",
+        "USドル": "USD",
+        "USD": "USD",
+    }
+    return aliases.get(text, text or "JPY")
+
+
+def _number(value: object) -> float:
+    text = unicodedata.normalize("NFKC", str(value or "")).strip()
+    text = re.sub(r"\([^)]*\)\s*$", "", text).replace(",", "")
+    if not text or text == "-":
+        raise ValueError(f"数値を解釈不能: {value!r}")
+    return float(text)
+
+
+def _optional_number(value: object) -> Optional[float]:
+    text = unicodedata.normalize("NFKC", str(value or "")).strip()
+    if not text or text == "-":
+        return None
+    return _number(text)
+
+
+def _stable_number(value: object) -> str:
+    parsed = _optional_number(value)
+    return "" if parsed is None else format(parsed, ".12g")
+
+
+def _rakuten_ticker(raw: str, source_kind: str, currency: str) -> str:
+    if source_kind == "rakuten_investment_trust":
+        try:
+            from broker_position_import import FUND_NAME_MAP
+
+            return str(FUND_NAME_MAP.get(raw) or raw).strip()
+        except Exception:
+            return raw.strip()
+    return _normalize_ticker(raw, currency)
 
 
 def _normalize_ticker(raw: str, currency: Optional[str]) -> str:
@@ -268,20 +480,17 @@ def _normalize_ticker(raw: str, currency: Optional[str]) -> str:
     return raw
 
 
-def _parse_generic(path: Path, *, broker: str) -> "tuple[List[BrokerTrade], ParseReport]":
+def _parse_generic(
+    path: Path,
+    *,
+    broker: str,
+    owner: Optional[str] = None,
+) -> "tuple[List[BrokerTrade], ParseReport]":
     """汎用 CSV parser (UTF-8 / Shift_JIS 両対応)。実 CSV 確定後に専用 parser へ置換可能。
 
     Codex P2 #12: 不正行を黙って捨てず ParseReport に件数 + 理由を記録する。
     """
-    text = None
-    for enc in ("utf-8-sig", "utf-8", "cp932", "shift_jis"):
-        try:
-            text = path.read_text(encoding=enc)
-            break
-        except UnicodeDecodeError:
-            continue
-    if text is None:
-        raise RuntimeError(f"CSV のエンコーディングが判定不能: {path}")
+    text, source_sha = _read_csv_text(Path(path))
 
     reader = csv.DictReader(text.splitlines())
     headers = reader.fieldnames or []
@@ -318,6 +527,10 @@ def _parse_generic(path: Path, *, broker: str) -> "tuple[List[BrokerTrade], Pars
                 account     = row[col["account"]] if col["account"] else None,
                 broker      = broker,
                 external_id = row[col["external_id"]] if col["external_id"] else None,
+                owner       = canonical_owner(owner),
+                source_sha256 = source_sha,
+                source_row  = line_no,
+                source_kind = f"{broker}_generic",
             ))
             rep.parsed += 1
         except (KeyError, ValueError, TypeError) as e:
@@ -492,14 +705,153 @@ def compare_to_ledger(
     return report
 
 
+def _execution_to_dict(row: dict) -> dict:
+    from execution_reconciliation import resolve_effective_execution_record
+
+    effective = resolve_effective_execution_record(row)
+    timestamp, timestamp_source = effective_execution_timestamp(effective)
+    return {
+        "trade_date": timestamp.date().isoformat() if timestamp else "",
+        "ticker": str(effective.get("ticker") or "").upper(),
+        "direction": str(effective.get("direction") or "").lower(),
+        "quantity": effective.get("quantity"),
+        "price": effective.get("price"),
+        "currency": effective.get("currency"),
+        "account": (
+            effective.get("execution_account")
+            or effective.get("account")
+            or effective.get("account_type")
+        ),
+        "owner": effective.get("execution_owner") or effective.get("owner"),
+        "broker": effective.get("execution_broker") or effective.get("broker"),
+        "execution_id": effective.get("id"),
+        "status": effective.get("status"),
+        "saved_at": effective.get("saved_at"),
+        "timestamp_source": timestamp_source,
+        "execution_reconciliation_status": effective.get(
+            "execution_reconciliation_status"
+        ),
+    }
+
+
+def load_action_executions(path: Optional[Path] = None) -> list[dict]:
+    resolved = Path(path or (BASE_DIR / "action_executions.json"))
+    try:
+        data = json.loads(resolved.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return []
+    rows = data.get("executions") if isinstance(data, dict) else data
+    return [row for row in (rows or []) if isinstance(row, dict)]
+
+
+def compare_to_action_executions(
+    broker_trades: Iterable[BrokerTrade],
+    *,
+    date_from: str,
+    date_to: str,
+    executions: Optional[Iterable[dict]] = None,
+    executions_path: Optional[Path] = None,
+    qty_tolerance: float = 1e-6,
+    price_tolerance_pct: float = 0.005,
+) -> ReconcileReport:
+    """Compare broker fills with immutable ``action_executions.json`` facts.
+
+    Route corrections are resolved through the overlay before comparison.
+    Unknown owner/broker values are not inferred from account labels.
+    """
+    source_rows = list(executions) if executions is not None else load_action_executions(
+        executions_path
+    )
+    internal = [
+        _execution_to_dict(row)
+        for row in source_rows
+        if is_fill_record(row)
+    ]
+    internal = [
+        row for row in internal
+        if date_from <= str(row.get("trade_date") or "") <= date_to
+    ]
+    broker_rows = [
+        asdict(row)
+        for row in broker_trades
+        if date_from <= str(row.trade_date or "") <= date_to
+    ]
+    report = ReconcileReport(scope={
+        "source": "action_executions",
+        "date_from": date_from,
+        "date_to": date_to,
+        "internal_in_scope": len(internal),
+        "broker_in_scope": len(broker_rows),
+    })
+    internal_by_key: dict[tuple, list[dict]] = {}
+    for row in internal:
+        internal_by_key.setdefault(_key(row), []).append(row)
+    used: set[int] = set()
+    for broker_row in broker_rows:
+        candidates = [
+            row for row in internal_by_key.get(_key(broker_row), [])
+            if id(row) not in used
+        ]
+        if not candidates:
+            report.only_in_broker.append(broker_row)
+            continue
+        candidates.sort(key=lambda row: _match_distance(broker_row, row))
+        exact = next(
+            (
+                row for row in candidates
+                if not _diff_trade(
+                    broker_row, row, qty_tolerance, price_tolerance_pct
+                )
+            ),
+            None,
+        )
+        partner = exact or candidates[0]
+        used.add(id(partner))
+        differences = _diff_trade(
+            broker_row, partner, qty_tolerance, price_tolerance_pct
+        )
+        if differences:
+            report.mismatched.append(TradeMismatch(
+                broker_trade=broker_row,
+                ledger_trade=partner,
+                differences=differences,
+            ))
+        else:
+            report.matched_count += 1
+    report.only_in_ledger.extend(row for row in internal if id(row) not in used)
+    return report
+
+
+def _match_distance(broker_row: dict, internal_row: dict) -> float:
+    try:
+        quantity_distance = abs(
+            float(broker_row.get("quantity")) - float(internal_row.get("quantity"))
+        )
+    except (TypeError, ValueError):
+        quantity_distance = 1e12
+    try:
+        price_distance = abs(
+            float(broker_row.get("price")) - float(internal_row.get("price"))
+        )
+    except (TypeError, ValueError):
+        price_distance = 1e12
+    return quantity_distance * 1e6 + price_distance
+
+
 def _diff_trade(b: dict, l: dict, qty_tol: float, price_tol_pct: float) -> List[str]:
     diffs: List[str] = []
     bc, lc = (b.get("currency") or "").upper(), (l.get("currency") or "").upper()
     if bc and lc and bc != lc:
         diffs.append(f"currency {bc} vs {lc}")
-    ba, la = b.get("account"), l.get("account")
-    if ba and la and str(ba).strip() != str(la).strip():
+    ba, la = canonical_account(b.get("account")), canonical_account(l.get("account"))
+    if ba and la and ba != la:
         diffs.append(f"account {ba} vs {la}")
+    bo, lo = canonical_owner(b.get("owner")), canonical_owner(l.get("owner"))
+    if bo and lo and bo != lo:
+        diffs.append(f"owner {bo} vs {lo}")
+    bb, lb = canonical_broker(b.get("broker")), canonical_broker(l.get("broker"))
+    if bb and lb and bb != lb:
+        diffs.append(f"broker {bb} vs {lb}")
     bq, lq = b.get("quantity"), l.get("quantity")
     if bq is None or lq is None or abs(float(bq) - float(lq)) > qty_tol:
         diffs.append(f"quantity {bq} vs {lq}")
@@ -521,6 +873,11 @@ def _main() -> None:
     parser = argparse.ArgumentParser(description="ALMANAC broker reconcile")
     parser.add_argument("--csv",    required=True, help="ブローカー CSV ファイルパス")
     parser.add_argument("--broker", required=True, choices=["rakuten", "sbi"])
+    parser.add_argument(
+        "--owner",
+        choices=["husband", "wife"],
+        help="口座所有者。broker からは推測しないため、実運用では明示する",
+    )
     parser.add_argument("--from", dest="date_from", required=True, help="YYYY-MM-DD")
     parser.add_argument("--to",   dest="date_to",   required=True, help="YYYY-MM-DD")
     args = parser.parse_args()
@@ -530,7 +887,9 @@ def _main() -> None:
         print(f"CSV が見つかりません: {csv_path}", file=sys.stderr)
         sys.exit(1)
 
-    trades, parse_report = parse_csv_with_report(csv_path, args.broker)
+    trades, parse_report = parse_csv_with_report(
+        csv_path, args.broker, owner=args.owner
+    )
     print(f"[broker] parsed {parse_report.parsed}/{parse_report.rows_total} rows "
           f"(skipped {parse_report.skipped}) from {csv_path}", file=sys.stderr)
     for sr in parse_report.skip_reasons[:20]:
@@ -542,10 +901,25 @@ def _main() -> None:
         date_to=args.date_to,
         broker=args.broker,
     )
-    out = {"parse": parse_report.as_dict(), **report.as_dict()}
+    execution_report = compare_to_action_executions(
+        trades,
+        date_from=args.date_from,
+        date_to=args.date_to,
+    )
+    out = {
+        "parse": parse_report.as_dict(),
+        **report.as_dict(),
+        "action_executions": execution_report.as_dict(),
+        "owner_explicit": bool(args.owner),
+    }
     print(json.dumps(out, ensure_ascii=False, indent=2))
     # Codex P2 #12: パース skip / 差分があれば本番反映前に loud に失敗 (exit 2)。
-    if parse_report.skipped > 0 or report.has_discrepancy:
+    if (
+        parse_report.skipped > 0
+        or report.has_discrepancy
+        or execution_report.has_discrepancy
+        or not args.owner
+    ):
         sys.exit(2)
 
 
