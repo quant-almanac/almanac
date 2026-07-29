@@ -1461,6 +1461,7 @@ def test_ambiguous_nisa_fill_waits_then_applies_only_selected_wife_position(isol
         "CASH_JPY_SBI": {"ticker": "CASH_JPY_SBI", "shares": 100_000, "currency": "JPY"},
         "CASH_JPY_SBI_WIFE": {
             "ticker": "CASH_JPY_SBI_WIFE", "shares": 50_000, "currency": "JPY",
+            "available_to_trade_jpy": 45_000,
             "reported_balance_jpy": 50_000, "reported_as_of": "2026-05-12",
             "ledger_delta_since_report_jpy": 0, "balance_status": "confirmed",
             "reconciliation_required": False,
@@ -1493,6 +1494,8 @@ def test_ambiguous_nisa_fill_waits_then_applies_only_selected_wife_position(isol
     assert holdings["XLF_WIFE"]["shares"] == 4
     assert holdings["XLF_NISA"]["shares"] == 2
     assert holdings["CASH_JPY_SBI_WIFE"]["shares"] == 49_000
+    assert holdings["CASH_JPY_SBI_WIFE"]["available_to_trade_jpy"] == 44_000
+    assert holdings["CASH_JPY_SBI_WIFE"]["unavailable_cash_jpy"] == 5_000
     assert holdings["CASH_JPY_SBI"]["shares"] == 100_000
     assert _read(files["account"]) == original_account
     assert len(event_ledger.query_events(db_path=files["ledger_db"])) == 1

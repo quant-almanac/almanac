@@ -39,6 +39,7 @@ from utils import (  # noqa: E402
     load_json_strict as _load_json_strict,
     process_lock,
 )
+from execution_safety import SYSTEM_LOCAL_TZ  # noqa: E402
 
 
 def _load_required_dict(path: Path, label: str) -> dict:
@@ -95,6 +96,11 @@ class CashReconcileRequest(BaseModel):
     broker: CashBroker
     currency: CashCurrency
     reported_balance: float = Field(..., ge=0)
+    available_to_trade: Optional[float] = Field(
+        None,
+        ge=0,
+        description="証券会社画面の買付余力。省略時はreported_balanceと同額。",
+    )
     reported_as_of: str
     source: str
 
@@ -215,6 +221,24 @@ def _prepare_cash_change(req: CashRequest, tx_type: TxType) -> tuple[dict, dict,
     if key == "CASH_JPY_SBI_WIFE":
         h.setdefault("reported_balance_jpy", float(h.get("shares", 0) or 0) - amount_signed)
         h.setdefault("reported_as_of", "2026-05-12")
+        previous_available = float(
+            h.get("available_to_trade_jpy", h.get("shares", 0) - amount_signed) or 0
+        )
+        h.setdefault("reported_available_to_trade_jpy", previous_available)
+        next_available = previous_available + amount_signed
+        if next_available < 0:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"{key} の買付余力不足"
+                    f"（現在: {previous_available}, 要求: {amount_signed}）"
+                ),
+            )
+        h["available_to_trade_jpy"] = round(next_available, 2)
+        h["unavailable_cash_jpy"] = round(
+            max(float(h["shares"]) - next_available, 0.0),
+            2,
+        )
         h["ledger_delta_since_report_jpy"] = round(
             float(h.get("ledger_delta_since_report_jpy", 0) or 0) + amount_signed,
             2,
@@ -358,6 +382,16 @@ async def reconcile_cash(req: CashReconcileRequest):
     key = _holdings_key(req.currency, req.broker, req.owner)
     if key != "CASH_JPY_SBI_WIFE":
         raise HTTPException(status_code=409, detail="現在は妻SBI JPYの推定台帳だけが照合対象です")
+    available = (
+        req.reported_balance
+        if req.available_to_trade is None
+        else req.available_to_trade
+    )
+    if available > req.reported_balance:
+        raise HTTPException(
+            status_code=422,
+            detail="available_to_trade は reported_balance 以下である必要があります",
+        )
     try:
         with process_lock("portfolio_ledger"):
             holdings = _load_required_dict(HOLDINGS_FILE, "holdings.json")
@@ -365,16 +399,31 @@ async def reconcile_cash(req: CashReconcileRequest):
             if not isinstance(row, dict):
                 raise HTTPException(status_code=500, detail=f"{key} が見つかりません")
             row["reported_balance_jpy"] = round(req.reported_balance, 2)
+            row["reported_available_to_trade_jpy"] = round(available, 2)
+            row["available_to_trade_jpy"] = round(available, 2)
+            row["unavailable_cash_jpy"] = round(
+                req.reported_balance - available,
+                2,
+            )
             row["reported_as_of"] = req.reported_as_of
             row["ledger_delta_since_report_jpy"] = 0
             row["shares"] = round(req.reported_balance, 2)
             row["balance_status"] = "confirmed"
             row["reconciliation_required"] = False
             row["reconciliation_source"] = req.source
-            row["reconciled_at"] = datetime.now().isoformat(timespec="seconds")
+            row["source_as_of"] = req.reported_as_of
+            reconciled_at = datetime.now(SYSTEM_LOCAL_TZ).isoformat(timespec="seconds")
+            row["broker_reconciled_at"] = reconciled_at
+            row["reconciled_at"] = reconciled_at
             _save_json(HOLDINGS_FILE, holdings)
             _invalidate_portfolio_cache()
-            return {"ok": True, "cash_route": key, "balance": row["shares"], "status": "confirmed"}
+            return {
+                "ok": True,
+                "cash_route": key,
+                "balance": row["shares"],
+                "available_to_trade": row["available_to_trade_jpy"],
+                "status": "confirmed",
+            }
     except LockBusy as exc:
         raise HTTPException(status_code=409, detail="portfolio ledger is busy") from exc
 
@@ -397,6 +446,7 @@ async def get_balances():
 
     sbi_jpy = 0
     wife_sbi_jpy = 0
+    wife_sbi_available = 0
     wife_status = None
     if isinstance(holdings, dict):
         h = holdings.get("CASH_JPY_SBI")
@@ -405,6 +455,9 @@ async def get_balances():
         wife = holdings.get("CASH_JPY_SBI_WIFE")
         if isinstance(wife, dict):
             wife_sbi_jpy = float(wife.get("shares", 0) or 0)
+            wife_sbi_available = float(
+                wife.get("available_to_trade_jpy", wife_sbi_jpy) or 0
+            )
             # The legacy ¥492,606 row is a 2026-05-12 snapshot.  Until an
             # explicit reconciliation is recorded it is an estimate, not
             # deployable buying power.
@@ -416,7 +469,7 @@ async def get_balances():
         "balance_jpy_sbi_wife": wife_sbi_jpy,
         "balance_jpy_sbi_wife_status": wife_status,
         "balance_jpy_sbi_wife_available_for_new_buy": (
-            wife_sbi_jpy if wife_status == "confirmed" else 0
+            wife_sbi_available if wife_status == "confirmed" else 0
         ),
         "balance_usd":         account.get("usd_balance", 0),
         "fx_rate_usdjpy":      account.get("fx_rate_usdjpy"),

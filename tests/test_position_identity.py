@@ -154,6 +154,18 @@ def test_degraded_between_24_and_72_hours():
     assert result["status"] == "degraded"
 
 
+def test_old_source_snapshot_is_not_refreshed_by_late_reconciliation_time(tmp_path):
+    position = pi.PositionIdentity("wife", "sbi", "nisa_growth", "1489.T")
+    now = datetime(2026, 7, 29, 18, 0, tzinfo=JST)
+    entry = {
+        "source_as_of": "2026-07-20T09:00:00+09:00",
+        "broker_reconciled_at": "2026-07-29T17:00:00+09:00",
+    }
+    result = pi.position_freshness(position, base_dir=tmp_path, now=now, holdings_entry=entry)
+    assert result["status"] == "stale"
+    assert result["source"] == "holding.source_as_of"
+
+
 def test_unparseable_note_is_unknown_not_silently_fresh():
     position = pi.PositionIdentity("husband", "rakuten", "general", "NVDA")
     now = datetime(2026, 7, 27, 18, 0)

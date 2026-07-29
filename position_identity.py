@@ -229,10 +229,10 @@ def _parse_sync_timestamp(entry: dict) -> tuple[datetime | None, str]:
     holdings become stale/review instead of being silently treated as current.
     """
     for key in (
-        "broker_reconciled_at",
-        "reconciled_at",
         "source_as_of",
         "reported_as_of",
+        "broker_reconciled_at",
+        "reconciled_at",
         "last_updated",
     ):
         value = entry.get(key)

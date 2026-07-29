@@ -1460,7 +1460,7 @@ def _build_today() -> dict:
                 "balance_status": row.get("balance_status", default_status),
                 "reconciliation_required": bool(row.get("reconciliation_required", is_wife)),
                 "available_for_new_buy": (
-                    row.get("shares")
+                    row.get("available_to_trade_jpy", row.get("shares"))
                     if row.get("balance_status", default_status) == "confirmed" else 0
                 ),
             })

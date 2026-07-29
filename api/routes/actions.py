@@ -1937,11 +1937,28 @@ def _compute_routed_cash_change(
             cash["reported_balance_jpy"] = current
         if not cash.get("reported_as_of"):
             cash["reported_as_of"] = "2026-05-12"
+        current_available = float(
+            cash.get("available_to_trade_jpy", current) or 0
+        )
+        cash.setdefault(
+            "reported_available_to_trade_jpy",
+            current_available,
+        )
+        effective_available = round(current_available + delta, 2)
+        cash["available_to_trade_jpy"] = effective_available
+        cash["unavailable_cash_jpy"] = round(
+            max(effective - effective_available, 0.0),
+            2,
+        )
         cash["ledger_delta_since_report_jpy"] = round(
             float(cash.get("ledger_delta_since_report_jpy", 0) or 0) + delta,
             2,
         )
-        cash["balance_status"] = "estimated_negative" if effective < 0 else "estimated"
+        cash["balance_status"] = (
+            "estimated_negative"
+            if effective < 0 or effective_available < 0
+            else "estimated"
+        )
         cash["reconciliation_required"] = True
     elif effective < 0:
         raise PortfolioApplicationPending(

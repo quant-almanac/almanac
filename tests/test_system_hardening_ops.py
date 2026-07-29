@@ -45,6 +45,10 @@ def test_backup_is_restorable_and_bundle_cloneable(tmp_path, monkeypatch):
         json.dumps({"schema_version": 1, "corrections": [{"correction_id": "route-1"}]}),
         encoding="utf-8",
     )
+    (root / "broker_position_snapshot_sbi.json").write_text(
+        json.dumps({"schema_version": 1, "broker": "sbi", "complete": True}),
+        encoding="utf-8",
+    )
     _git(root, "add", "README.md")
     _git(root, "commit", "-m", "test")
 
@@ -72,6 +76,9 @@ def test_backup_is_restorable_and_bundle_cloneable(tmp_path, monkeypatch):
     assert json.loads(
         (restored / "execution_reconciliation_state.json").read_text(encoding="utf-8")
     )["corrections"][0]["correction_id"] == "route-1"
+    assert json.loads(
+        (restored / "broker_position_snapshot_sbi.json").read_text(encoding="utf-8")
+    )["complete"] is True
     restored_db = sqlite3.connect(restored / "nexustrader.db")
     try:
         assert restored_db.execute("SELECT COUNT(*) FROM ledger_events").fetchone()[0] == 1

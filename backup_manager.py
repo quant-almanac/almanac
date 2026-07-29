@@ -60,8 +60,11 @@ TARGETS = [
     'signal_history.json',
     'nisa_portfolio.json',
     'nisa_sale_history.json',
+    'action_state.json',
     'action_executions.json',
+    'execution_invalidation_state.json',
     'execution_reconciliation_state.json',
+    'decision_snapshot_state.json',
     'trade_history.csv',
     'beliefs/agent_beliefs.json',
     'heartbeats.json',
@@ -87,6 +90,15 @@ TARGETS = [
     # 2026-07: AI 動的外貨比率方針の state / 監査 log。
     'currency_policy_state.json',
     'currency_policy_log.jsonl',
+    # Broker reconciliation and FX shadow evidence are not reconstructable
+    # from Git.  Missing optional snapshots are reported, not fabricated.
+    'broker_position_snapshot_monex.json',
+    'broker_position_snapshot_rakuten.json',
+    'broker_position_snapshot_sbi.json',
+    'fx_actual_hedge_state.json',
+    'fx_instrument_master.json',
+    'hedge_target.json',
+    'hedge_target_shadow.json',
     # 2026-07: 楽天かぶミニ対象銘柄のローカル確認台帳。
     'data/kabu_mini_eligible.json',
     'data/kabu_mini_verification_needed.json',

@@ -147,7 +147,8 @@ def test_confirmed_wife_sbi_cash_must_cover_requested_notional(tmp_path):
     (tmp_path / "holdings.json").write_text(json.dumps({
         "CASH_JPY_SBI_WIFE": {
             "ticker": "CASH_JPY_SBI_WIFE",
-            "shares": 50_000,
+            "shares": 100_000,
+            "available_to_trade_jpy": 50_000,
             "currency": "JPY",
             "balance_status": "confirmed",
             "reconciliation_required": False,
@@ -167,6 +168,7 @@ def test_confirmed_wife_sbi_cash_must_cover_requested_notional(tmp_path):
     assert result["readiness"] == "blocked"
     assert result["reasons"][0]["code"] == "cash_balance_insufficient"
     assert result["reasons"][0]["requested_cash"] == 67_640
+    assert result["reasons"][0]["available_cash"] == 50_000
 
 
 def test_cash_buy_requires_complete_account_resource_identity(tmp_path):
@@ -218,6 +220,15 @@ def test_cash_buy_requires_fresh_identity_scoped_balance(tmp_path):
     assert stale["reasons"][0]["code"] == "cash_resource_stale"
 
     row["broker_reconciled_at"] = "2026-07-28T08:00:00+09:00"
+    row["source_as_of"] = "2026-07-24T09:00:00+09:00"
+    (tmp_path / "holdings.json").write_text(json.dumps({
+        "CASH_JPY_SBI_WIFE": row,
+    }), encoding="utf-8")
+    still_stale = evaluate_cash_buying_power(action, base_dir=tmp_path, now=now)
+    assert still_stale["readiness"] == "blocked"
+    assert still_stale["reasons"][0]["code"] == "cash_resource_stale"
+
+    row["source_as_of"] = "2026-07-28T08:00:00+09:00"
     (tmp_path / "holdings.json").write_text(json.dumps({
         "CASH_JPY_SBI_WIFE": row,
     }), encoding="utf-8")

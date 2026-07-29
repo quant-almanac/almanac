@@ -227,9 +227,10 @@ def evaluate_cash_buying_power(
 ) -> dict:
     """Check an explicitly routed cash buy against that wallet only.
 
-    The wife's SBI row is an estimated reconciliation ledger by design.  It is
-    shown in NAV, but unless explicitly confirmed it must never be treated as
-    fresh buying power.
+    The wife's SBI row is a reconciliation ledger: total cash contributes to
+    NAV, while ``available_to_trade_jpy`` is the deployable amount.  Unless an
+    external snapshot explicitly confirms the row, neither amount is fresh
+    buying power.
     """
     action_type = str(action.get("type") or action.get("action_type") or "").lower()
     if action_type not in {"buy", "add", "dca"}:
@@ -289,7 +290,9 @@ def evaluate_cash_buying_power(
         row = _cash_holding_row(base_dir, route)
         if row is not None:
             try:
-                balance = float(row.get("shares", 0) or 0)
+                balance = float(
+                    row.get("available_to_trade_jpy", row.get("shares", 0)) or 0
+                )
             except (TypeError, ValueError):
                 balance = None
             status = str(row.get("balance_status") or "confirmed").lower()
@@ -299,7 +302,9 @@ def evaluate_cash_buying_power(
         row = _cash_holding_row(base_dir, route)
         if row is not None:
             try:
-                balance = float(row.get("shares", 0) or 0)
+                balance = float(
+                    row.get("available_to_trade_jpy", row.get("shares", 0)) or 0
+                )
             except (TypeError, ValueError):
                 balance = None
             status = str(row.get("balance_status") or "estimated").lower()
@@ -385,8 +390,8 @@ def evaluate_cash_buying_power(
     else:
         row = _cash_holding_row(base_dir, route) or {}
         for key in (
-            "broker_reconciled_at", "reconciled_at", "source_as_of",
-            "reported_as_of", "last_updated", "as_of",
+            "source_as_of", "reported_as_of", "broker_reconciled_at",
+            "reconciled_at", "last_updated", "as_of",
         ):
             resource_as_of = _parse_local_timestamp(
                 row.get(key), local_tz=ZoneInfo("Asia/Tokyo")

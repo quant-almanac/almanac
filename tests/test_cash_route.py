@@ -244,14 +244,34 @@ def test_wife_sbi_cash_uses_separate_estimated_ledger_and_can_reconcile(isolated
         broker=CashBroker.sbi,
         currency=CashCurrency.JPY,
         reported_balance=47_500,
+        available_to_trade=42_500,
         reported_as_of="2026-07-17",
         source="SBI CSV",
     )))
     wife = _read(isolated["holdings"])["CASH_JPY_SBI_WIFE"]
     assert result["status"] == "confirmed"
     assert wife["shares"] == 47_500
+    assert wife["available_to_trade_jpy"] == 42_500
+    assert wife["unavailable_cash_jpy"] == 5_000
     assert wife["ledger_delta_since_report_jpy"] == 0
     assert wife["reconciliation_required"] is False
+    assert wife["source_as_of"] == "2026-07-17"
+    assert wife["broker_reconciled_at"].endswith("+09:00")
+    assert wife["reconciled_at"] == wife["broker_reconciled_at"]
+
+
+def test_wife_sbi_reconcile_rejects_available_above_total(isolated) -> None:
+    with pytest.raises(HTTPException) as exc:
+        asyncio.run(cash_module.reconcile_cash(cash_module.CashReconcileRequest(
+            owner=CashOwner.wife,
+            broker=CashBroker.sbi,
+            currency=CashCurrency.JPY,
+            reported_balance=47_500,
+            available_to_trade=50_000,
+            reported_as_of="2026-07-17",
+            source="SBI CSV",
+        )))
+    assert exc.value.status_code == 422
 
 
 # ---------------------------------------------------------------------------
