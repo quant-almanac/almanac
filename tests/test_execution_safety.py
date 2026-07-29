@@ -441,3 +441,53 @@ def test_nisa_capacity_prefers_owner_profile_baseline(tmp_path) -> None:
     assert result["readiness"] == "review"
     assert result["nisa_capacity_baseline"] == "2026-05-01"
     assert result["nisa_capacity_baseline_source"] == "profile.limit_screen_as_of"
+
+
+def test_nisa_capacity_uses_route_overlay_and_fails_closed_when_stale(tmp_path) -> None:
+    from execution_reconciliation import record_route_correction
+
+    _write_nisa_base(tmp_path)
+    raw = {
+        "id": "corrected-route",
+        "ticker": "1489.T",
+        "direction": "buy",
+        "status": "executed",
+        "account": "特定",
+        "notional_jpy": 100_000,
+        "saved_at": "2026-06-11T10:00:00",
+    }
+    ledger = tmp_path / "action_executions.json"
+    ledger.write_text(json.dumps({"executions": [raw]}), encoding="utf-8")
+    record_route_correction(
+        execution_record=raw,
+        corrected_route={
+            "execution_owner": "wife",
+            "execution_broker": "sbi",
+            "execution_account": "NISA成長投資枠",
+        },
+        evidence={"row_hash": "fixture"},
+        reason="broker evidence",
+        approved_by="test",
+        state_path=tmp_path / "execution_reconciliation_state.json",
+    )
+
+    corrected = evaluate_nisa_capacity(
+        _nisa_action(),
+        base_dir=tmp_path,
+        now=datetime(2026, 6, 20, 6, 0, tzinfo=JST),
+    )
+    assert corrected["readiness"] == "ready"
+    assert corrected["nisa_capacity_remaining_jpy"] == 1_200_000
+
+    changed = {**raw, "quantity": 2}
+    ledger.write_text(json.dumps({"executions": [changed]}), encoding="utf-8")
+    stale = evaluate_nisa_capacity(
+        _nisa_action(),
+        base_dir=tmp_path,
+        now=datetime(2026, 6, 20, 6, 0, tzinfo=JST),
+    )
+    assert stale["readiness"] == "blocked"
+    assert any(
+        reason["code"] == "nisa_capacity_unattributed_activity"
+        for reason in stale["reasons"]
+    )

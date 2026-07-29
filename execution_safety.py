@@ -913,8 +913,8 @@ def evaluate_nisa_capacity(action: dict, *, base_dir: Path, now: datetime) -> di
     except Exception:
         fx_rate = 150.0
     try:
-        execution_raw = json.loads((base_dir / "action_executions.json").read_text(encoding="utf-8"))
-        executions = execution_raw.get("executions") if isinstance(execution_raw, dict) else execution_raw
+        from execution_reconciliation import load_effective_execution_records
+        executions = load_effective_execution_records(base_dir=base_dir)
     except Exception:
         executions = []
     try:
@@ -948,13 +948,16 @@ def evaluate_nisa_capacity(action: dict, *, base_dir: Path, now: datetime) -> di
         status = str(row.get("status") or "").lower()
         if row_direction != "buy" or status not in FILL_STATUSES | {PARTIAL_STATUS} | ACTIVE_ORDER_STATUSES:
             continue
-        row_account = str(row.get("account") or row.get("execution_account") or "")
-        if not is_nisa_account(row_account):
-            continue
         when, _source = effective_execution_timestamp(row)
         if when is None or not _is_strictly_after_baseline(
             when, baseline_dt=baseline_dt, baseline_day=baseline_day
         ):
+            continue
+        if row.get("execution_reconciliation_status") == "review":
+            unattributed.append(str(row.get("id") or "unknown"))
+            continue
+        row_account = str(row.get("execution_account") or row.get("account") or "")
+        if not is_nisa_account(row_account):
             continue
         sid = str(row.get("action_state_id") or "")
         if status == "ordered" and sid and sid in terminal_by_state:

@@ -233,6 +233,47 @@ def resolve_effective_execution_record(
     return result
 
 
+def load_effective_execution_records(
+    *,
+    base_dir: Optional[Path] = None,
+    execution_path: Optional[Path] = None,
+    state_path: Optional[Path] = None,
+) -> list[dict]:
+    """Load execution rows with the route-correction overlay applied.
+
+    This is the read-side boundary for route-sensitive consumers.  The raw
+    ledger remains the write/audit authority; callers receive copies and must
+    treat ``execution_reconciliation_status == "review"`` as unattributed.
+    """
+    root = Path(base_dir) if base_dir is not None else BASE_DIR
+    source = Path(execution_path) if execution_path is not None else root / "action_executions.json"
+    overlay = (
+        Path(state_path)
+        if state_path is not None
+        else root / STATE_PATH.name
+    )
+    if not source.exists():
+        return []
+    try:
+        payload = json.loads(source.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return []
+    rows = payload.get("executions") if isinstance(payload, dict) else payload
+    if not isinstance(rows, list):
+        return []
+    effective: list[dict] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        if not str(row.get("id") or "").strip():
+            legacy = dict(row)
+            legacy["execution_reconciliation_status"] = "clean_legacy_no_execution_id"
+            effective.append(legacy)
+            continue
+        effective.append(resolve_effective_execution_record(row, state_path=overlay))
+    return effective
+
+
 def _parse_date(value: object) -> Optional[date]:
     if value in (None, ""):
         return None

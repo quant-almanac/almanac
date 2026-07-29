@@ -237,6 +237,51 @@ def test_only_fully_evidenced_broker_fill_advances_position_freshness(tmp_path):
     assert confirmed["source"] == "broker_confirmed_fill:broker-123"
 
 
+def test_route_overlay_is_used_for_position_freshness(tmp_path):
+    from execution_reconciliation import record_route_correction
+
+    position = pi.PositionIdentity("husband", "rakuten", "general", "AVGO")
+    raw = {
+        "id": "broker-fill",
+        "ticker": "AVGO",
+        "status": "broker_confirmed_filled",
+        "account": "特定",
+        "external_execution_id": "broker-123",
+        "broker_source": "broker_csv",
+        "broker_reported_at": "2026-07-27T16:55:00+09:00",
+        "filled_quantity": 5,
+        "filled_price": 410.0,
+        "reconciled_at": "2026-07-27T17:00:00+09:00",
+        "reconciliation_snapshot_hash": "sha256:abc",
+    }
+    (tmp_path / "action_executions.json").write_text(
+        json.dumps({"executions": [raw]}),
+        encoding="utf-8",
+    )
+    record_route_correction(
+        execution_record=raw,
+        corrected_route={
+            "execution_owner": "husband",
+            "execution_broker": "rakuten",
+            "execution_account": "一般",
+        },
+        evidence={"row_hash": "fixture"},
+        reason="broker evidence",
+        approved_by="test",
+        state_path=tmp_path / "execution_reconciliation_state.json",
+    )
+
+    result = pi.position_freshness(
+        position,
+        base_dir=tmp_path,
+        now=datetime(2026, 7, 27, 18, 0, tzinfo=JST),
+        holdings_entry={"note": "楽天CSV保有同期 2026-07-14"},
+    )
+
+    assert result["status"] == "fresh"
+    assert result["source"] == "broker_confirmed_fill:broker-123"
+
+
 # ---------------------------------------------------------------------------
 # execution_readiness への配線: review止まり、blockedにはしない
 # ---------------------------------------------------------------------------

@@ -4,6 +4,7 @@ import pytest
 
 from execution_reconciliation import (
     classify_temporal_order,
+    load_effective_execution_records,
     record_route_correction,
     resolve_effective_execution_record,
 )
@@ -133,6 +134,30 @@ def test_base_record_change_fails_closed(tmp_path):
     assert effective["execution_reconciliation_status"] == "review"
     assert effective["execution_reconciliation_reasons"] == ["base_record_hash_mismatch"]
     assert "execution_owner" not in effective
+
+
+def test_effective_loader_applies_overlay_without_mutating_ledger(tmp_path):
+    raw = _execution()
+    ledger = tmp_path / "action_executions.json"
+    ledger.write_text(json.dumps({"executions": [raw]}), encoding="utf-8")
+    record_route_correction(
+        execution_record=raw,
+        corrected_route={
+            "execution_owner": "husband",
+            "execution_broker": "rakuten",
+            "execution_account": "NISA成長投資枠",
+        },
+        evidence={"row_hash": "x"},
+        reason="route",
+        approved_by="test",
+        state_path=tmp_path / "execution_reconciliation_state.json",
+    )
+
+    rows = load_effective_execution_records(base_dir=tmp_path)
+
+    assert rows[0]["execution_account"] == "nisa_growth"
+    assert rows[0]["execution_reconciliation_status"] == "corrected"
+    assert json.loads(ledger.read_text())["executions"][0] == raw
 
 
 @pytest.mark.parametrize(

@@ -827,14 +827,11 @@ def expire_stale_placed_actions(max_days: int = 10) -> int:
 
 def stale_ordered_execution_warnings(max_days: int = 10) -> list[dict]:
     """古い ordered 実行記録を検出するが、注文状態は推測で変更しない。"""
-    exec_path = BASE_DIR / "action_executions.json"
-    if not exec_path.exists():
-        return []
     try:
-        data = json.loads(exec_path.read_text(encoding="utf-8"))
+        from execution_reconciliation import load_effective_execution_records
+        items = load_effective_execution_records(base_dir=BASE_DIR)
     except Exception:
         return []
-    items = data.get("executions", []) if isinstance(data, dict) else (data if isinstance(data, list) else [])
     try:
         from order_intent_resolver import flag_stale_ordered_executions
         return flag_stale_ordered_executions(

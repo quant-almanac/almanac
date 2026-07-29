@@ -259,9 +259,12 @@ def _broker_confirmed_fill_timestamp(
     do not qualify.  A fill advances freshness only when the broker execution,
     quantity/price, report time and reconciliation snapshot can all be audited.
     """
-    raw = _load_json_object(base_dir / "action_executions.json") or {}
-    rows = raw.get("executions") if isinstance(raw, dict) else None
-    if not isinstance(rows, list):
+    try:
+        from execution_reconciliation import load_effective_execution_records
+        rows = load_effective_execution_records(base_dir=base_dir)
+    except Exception:
+        rows = []
+    if not rows:
         return None, "unknown"
     state_raw = _load_json_object(base_dir / "action_state.json") or {}
     state_actions = state_raw.get("actions") if isinstance(state_raw, dict) else {}
@@ -282,6 +285,8 @@ def _broker_confirmed_fill_timestamp(
     seen_external_ids: set[str] = set()
     for row in rows:
         if not isinstance(row, dict):
+            continue
+        if row.get("execution_reconciliation_status") == "review":
             continue
         state_id = str(row.get("action_state_id") or "")
         linked = state_actions.get(state_id) if state_id else None
