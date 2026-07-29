@@ -508,6 +508,60 @@ def test_build_execution_plan_view_explains_open_order_consumption():
     ]
 
 
+def test_execution_plan_view_surfaces_surplus_cash_pacing_reason() -> None:
+    plan = {
+        "status": "active",
+        "as_of": "2026-07-30T07:30:00+09:00",
+        "horizon": {
+            "month": "2026-07",
+            "week_start": "2026-07-27",
+            "week_end": "2026-08-02",
+        },
+        "budgets": {
+            "monthly_total_jpy": 700_000,
+            "monthly_discretionary_budget_jpy": 700_000,
+            "monthly_base_consumed_jpy": 1_282_549,
+            "monthly_base_remaining_jpy": 0,
+            "normal_pool_available_jpy": 0,
+            "opportunity_pool_available_jpy": 0,
+            "budget_source": "confirmed_surplus_cash",
+            "all_system_cash_is_surplus": True,
+            "confirmed_cash_jpy": 9_286_770,
+            "cash_target_pct": 7.0,
+            "cash_target_source": "market_regime_v2_state",
+            "tactical_cash_reserve_jpy": 2_084_027,
+            "protected_cash_reserve_jpy": 0,
+            "required_cash_reserve_jpy": 2_084_027,
+            "surplus_cash_above_targets_jpy": 7_202_743,
+            "surplus_cash_monthly_capacity_jpy": 700_000,
+        },
+        "consumption_summary": {
+            "remaining_normal_jpy": 0,
+            "remaining_opportunity_jpy": 0,
+        },
+        "items": [],
+        "warnings": [],
+        "no_action_rationale": [{
+            "reason_code": "monthly_surplus_deployment_budget_consumed",
+            "message": "確認済み余剰現金はありますが、今月の配備ペース上限を既存の買付で消化済みです。",
+        }],
+    }
+
+    view = today._build_execution_plan_view(
+        plan,
+        board=[],
+        synthesis={},
+        now=datetime(2026, 7, 30, 8, 0, 0),
+    )
+
+    assert view["today_decision"]["code"] == "monthly_surplus_deployment_budget_consumed"
+    assert view["today_decision"]["label"] == "今月の配備枠は消化済み"
+    assert view["budgets"]["confirmed_cash_jpy"] == 9_286_770
+    assert view["budgets"]["cash_target_pct"] == 7.0
+    assert view["budgets"]["surplus_cash_above_targets_jpy"] == 7_202_743
+    assert view["budgets"]["surplus_cash_monthly_capacity_jpy"] == 700_000
+
+
 def test_build_execution_plan_view_reports_missing_state():
     view = today._build_execution_plan_view({}, board=[], synthesis={}, now=datetime(2026, 7, 10, 7, 0, 0))
 

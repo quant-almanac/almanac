@@ -175,7 +175,7 @@ The VaR path records forecasts and applies a Kupiec proportion-of-failures test.
 
 Inputs cover index distance from MA50/MA200, market breadth, VIX, HY OAS and rates. Rates distinguish a tightening shock, easing support, stress easing, restrictive real/nominal levels and curve inversion. Coverage, breadth observations, risk inputs and rate inputs must meet eligibility requirements. A two-evaluation confirmation prevents one noisy reading from flipping the committed level.
 
-A separate shock overlay can stop discretionary buying but does not sell after a crash merely to raise cash to the target. All confirmed cash inside the represented accounts is investable surplus capital; the protected lifestyle reserve is zero, while tactical cash, settlement, collateral, fees, tax and existing order reservations still apply.
+A separate shock overlay can stop discretionary buying but does not sell after a crash merely to raise cash to the target. All confirmed cash inside the represented accounts is investable surplus capital; the protected lifestyle reserve is zero, while tactical cash, settlement, collateral, fees, tax and existing order reservations still apply. The execution plan deploys only the confirmed balance above the tactical target, applies a monthly pacing cap, and treats cash authority as event-based rather than expiring it solely because time elapsed.
 
 ## 12. Policy, readiness and invalidation
 

@@ -320,6 +320,15 @@ export interface ExecutionPlan {
     max_single_opportunity_action_jpy?: number
     h2_hard_cap_jpy?: number
     budget_source?: string
+    all_system_cash_is_surplus?: boolean
+    confirmed_cash_jpy?: number
+    cash_target_pct?: number | null
+    cash_target_source?: string | null
+    tactical_cash_reserve_jpy?: number | null
+    protected_cash_reserve_jpy?: number
+    required_cash_reserve_jpy?: number
+    surplus_cash_above_targets_jpy?: number
+    surplus_cash_monthly_capacity_jpy?: number
     scheduled_contributions_remaining_jpy?: number
   }
   consumption: {

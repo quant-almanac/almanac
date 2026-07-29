@@ -176,8 +176,16 @@ function PlanTab({ plan, onOpenModal }: { plan?: ExecutionPlan; onOpenModal: () 
         </p>
 
         <p style={{ margin: '7px 0 0', color: OPS.dim, fontSize: 12.5, lineHeight: 1.6 }}>
-          通常裁量枠 {fmtJpy(b.monthly_discretionary_budget_jpy)} · 承認済み追加資金 {fmtJpy(plan.contributions?.available_jpy)}
+          月次配備枠 {fmtJpy(b.monthly_discretionary_budget_jpy)} · 承認済み追加資金 {fmtJpy(plan.contributions?.available_jpy)}
         </p>
+        {b.all_system_cash_is_surplus && (
+          <p style={{ margin: '3px 0 0', color: OPS.dim, fontSize: 12, lineHeight: 1.55 }}>
+            確認済み現金 {fmtJpy(b.confirmed_cash_jpy)}
+            {' '}− 戦術現金 {b.cash_target_pct != null ? `${b.cash_target_pct}% (${fmtJpy(b.required_cash_reserve_jpy)})` : '未確定'}
+            {' '}＝ 余剰 {fmtJpy(b.surplus_cash_above_targets_jpy)}
+            <span style={{ color: OPS.sub }}> · 月次上限 {fmtJpy(b.surplus_cash_monthly_capacity_jpy)}</span>
+          </p>
+        )}
 
         <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap', marginTop: 11 }}>
           <Chip color={OPS.blue} bg={OPS.blueBg} mono>機会枠 残 {fmtJpy(c.remaining_opportunity_jpy)}</Chip>

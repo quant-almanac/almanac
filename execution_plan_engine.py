@@ -125,9 +125,10 @@ def horizon_for(day: date | datetime | None = None) -> dict[str, Any]:
 
 def load_plan_params() -> dict[str, Any]:
     return {
-        # A cash balance is an observation, not a discretionary-buy mandate.
-        # The user may set this recurring policy amount, but the shipped value
-        # is zero: new normal buys require an approved contribution.
+        # Confirmed portfolio cash is deployable above the current tactical
+        # cash target.  This legacy explicit amount remains an optional floor;
+        # the shipped value is zero because the surplus-cash contract is the
+        # normal source of buying power.
         "monthly_discretionary_budget_jpy": _jpy(
             _tp_get("execution_plan_monthly_discretionary_budget_jpy", 0)
         ),
@@ -146,78 +147,189 @@ def load_plan_params() -> dict[str, Any]:
 def derive_cash_info(
     account: dict[str, Any] | None,
     *,
+    holdings: dict[str, Any] | list[dict[str, Any]] | None = None,
     now: datetime | None = None,
     stale_hours: int = 72,
 ) -> tuple[dict[str, Any], list[str]]:
-    """Return data_gatherer-compatible cash_info plus freshness warnings."""
-    now = now or datetime.now()
-    comparison_now = now.replace(tzinfo=None) if now.tzinfo else now
+    """Return confirmed portfolio cash without wall-clock expiry.
+
+    Cash authority is event-based: time alone does not spend cash.  A later
+    order/fill is reserved and checked by ``execution_readiness`` against the
+    routed account resource.  Manual activity outside ALMANAC must still be
+    imported or confirmed on the Web UI.
+
+    ``stale_hours`` remains in the signature for compatibility with older
+    callers and tunable snapshots; it is intentionally not an authority rule.
+    """
+    del now, stale_hours
     warnings: list[str] = []
-    if not isinstance(account, dict) or not account:
-        return {
-            "jpy_cash": 0,
-            "usd_cash": 0,
-            "fx_rate_usdjpy": None,
-            "usd_as_jpy": 0,
-            "total_cash_jpy": 0,
-            "valid_for_budget": False,
-            "source": "missing_account_fallback",
-        }, ["cash_info_missing: account.json missing or empty; using explicit fallback budget"]
+    resources: list[dict[str, Any]] = []
+    account = account if isinstance(account, dict) else {}
 
-    try:
-        jpy_balance = float(account.get("balance", 0) or 0)
-        usd_balance = float(account.get("usd_balance", 0) or 0)
-        fx_rate = float(account.get("fx_rate_usdjpy", 0) or 0)
-    except (TypeError, ValueError):
-        return {
-            "jpy_cash": 0,
-            "usd_cash": 0,
-            "fx_rate_usdjpy": None,
-            "usd_as_jpy": 0,
-            "total_cash_jpy": 0,
-            "valid_for_budget": False,
-            "source": "malformed_account_fallback",
-        }, ["cash_info_malformed: account cash fields are not numeric; using explicit fallback budget"]
+    def _number(value: Any) -> float | None:
+        try:
+            number = float(value)
+            return number if math.isfinite(number) and number >= 0 else None
+        except (TypeError, ValueError):
+            return None
 
-    if fx_rate <= 0:
-        return {
-            "jpy_cash": 0,
-            "usd_cash": 0,
-            "fx_rate_usdjpy": None,
-            "usd_as_jpy": 0,
-            "total_cash_jpy": 0,
-            "valid_for_budget": False,
-            "source": "missing_fx_fallback",
-        }, ["cash_info_missing_fx: fx_rate_usdjpy is unavailable; using explicit fallback budget"]
+    jpy_balance = _number(account.get("balance")) or 0.0
+    usd_balance = _number(account.get("usd_balance")) or 0.0
+    fx_rate = _number(account.get("fx_rate_usdjpy"))
+    account_as_of = next(
+        (
+            account.get(key)
+            for key in ("broker_reconciled_at", "source_as_of", "last_updated", "as_of")
+            if _parse_dt(account.get(key)) is not None
+        ),
+        None,
+    )
+    account_confirmed = bool(account) and account_as_of is not None
+    if not account:
+        warnings.append("cash_info_missing: account.json missing or empty")
+    elif account_as_of is None:
+        warnings.append("cash_info_authority_missing: account cash has no source timestamp")
 
-    last_updated = _parse_dt(account.get("last_updated"))
-    valid_for_budget = True
-    source = "account_cash_derived"
-    if last_updated is None:
-        valid_for_budget = False
-        source = "stale_account_fallback"
-        warnings.append("cash_info_stale: account last_updated is missing; using explicit fallback budget")
-    else:
-        age_hours = (comparison_now - last_updated).total_seconds() / 3600
-        if age_hours > stale_hours:
-            valid_for_budget = False
-            source = "stale_account_fallback"
-            warnings.append(
-                f"cash_info_stale: account age {age_hours:.1f}h > {stale_hours}h; "
-                "using explicit fallback budget"
-            )
+    account_jpy = jpy_balance if account_confirmed else 0.0
+    account_usd = usd_balance if account_confirmed and fx_rate and fx_rate > 0 else 0.0
+    if account_confirmed and jpy_balance:
+        resources.append({
+            "resource": "account.json:JPY",
+            "currency": "JPY",
+            "available_jpy": round(account_jpy),
+            "source_as_of": account_as_of,
+        })
+    if account_confirmed and usd_balance:
+        if fx_rate and fx_rate > 0:
+            resources.append({
+                "resource": "account.json:USD",
+                "currency": "USD",
+                "available_native": usd_balance,
+                "available_jpy": round(account_usd * fx_rate),
+                "source_as_of": account_as_of,
+            })
+        else:
+            warnings.append("cash_info_missing_fx: confirmed USD cash excluded from deployment budget")
 
-    usd_as_jpy = round(usd_balance * fx_rate)
+    additional_cash_jpy = 0.0
+    holding_rows = holdings.values() if isinstance(holdings, dict) else (holdings or [])
+    for row in holding_rows:
+        if not isinstance(row, dict):
+            continue
+        ticker = str(row.get("ticker") or "").upper()
+        # CASH_JPY/CASH_USD mirror account.json and must not be double-counted.
+        if not ticker.startswith("CASH_") or ticker in {"CASH_JPY", "CASH_USD"}:
+            continue
+        if row.get("reconciliation_required") is True:
+            warnings.append(f"cash_resource_unconfirmed:{ticker}:reconciliation_required")
+            continue
+        status = str(row.get("balance_status") or "confirmed").lower()
+        if status != "confirmed":
+            warnings.append(f"cash_resource_unconfirmed:{ticker}:status={status}")
+            continue
+        source_as_of = next(
+            (
+                row.get(key)
+                for key in (
+                    "broker_reconciled_at", "source_as_of", "reported_as_of",
+                    "reconciled_at", "last_updated", "as_of",
+                )
+                if _parse_dt(row.get(key)) is not None
+            ),
+            None,
+        )
+        if source_as_of is None:
+            warnings.append(f"cash_resource_authority_missing:{ticker}")
+            continue
+        currency = "USD" if "_USD" in ticker else "JPY"
+        if currency == "JPY":
+            native = _number(row.get("available_to_trade_jpy"))
+            if native is None:
+                native = _number(row.get("shares"))
+            available_jpy = native
+        else:
+            native = _number(row.get("available_to_trade_usd"))
+            if native is None:
+                native = _number(row.get("shares"))
+            available_jpy = native * fx_rate if native is not None and fx_rate else None
+        if native is None or available_jpy is None:
+            warnings.append(f"cash_resource_amount_unresolved:{ticker}")
+            continue
+        additional_cash_jpy += available_jpy
+        resources.append({
+            "resource": ticker,
+            "currency": currency,
+            "available_native": native,
+            "available_jpy": round(available_jpy),
+            "source_as_of": source_as_of,
+        })
+
+    usd_as_jpy = round(account_usd * fx_rate) if fx_rate else 0
+    total_cash_jpy = account_jpy + usd_as_jpy + additional_cash_jpy
+    valid_for_budget = bool(resources)
     return {
-        "jpy_cash": jpy_balance,
-        "usd_cash": usd_balance,
+        "jpy_cash": account_jpy,
+        "usd_cash": account_usd,
         "fx_rate_usdjpy": fx_rate,
         "usd_as_jpy": usd_as_jpy,
-        "total_cash_jpy": jpy_balance + usd_as_jpy,
-        "account_last_updated": account.get("last_updated"),
+        "additional_confirmed_cash_jpy": round(additional_cash_jpy),
+        "total_cash_jpy": round(total_cash_jpy),
+        "account_last_updated": account_as_of,
         "valid_for_budget": valid_for_budget,
-        "source": source,
+        "source": (
+            "confirmed_cash_resources_event_based"
+            if valid_for_budget else "missing_confirmed_cash_resources"
+        ),
+        "validation_mode": "event_based",
+        "assumption": "no_unreported_external_activity",
+        "resources": resources,
     }, warnings
+
+
+def resolve_cash_target_policy(
+    *,
+    ai_analysis: dict[str, Any] | None = None,
+    market_regime: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Return the latest deterministic tactical-cash target, fail-closed."""
+    candidates: list[tuple[str, Any]] = []
+    if isinstance(market_regime, dict):
+        candidates.append(("market_regime_v2_state", market_regime.get("assessment", market_regime)))
+    if isinstance(ai_analysis, dict):
+        candidates.append(("ai_analysis.market_regime_v2", ai_analysis.get("market_regime_v2")))
+        synthesis = ai_analysis.get("synthesis")
+        if isinstance(synthesis, dict):
+            candidates.append(("ai_analysis.synthesis.market_regime_v2", synthesis.get("market_regime_v2")))
+
+    for source, candidate in candidates:
+        if not isinstance(candidate, dict):
+            continue
+        if str(candidate.get("mode") or "").lower() in {"off", "shadow"}:
+            continue
+        if str(candidate.get("status") or "").lower() in {"review", "error", "off"}:
+            continue
+        policy = candidate.get("policy")
+        if not isinstance(policy, dict):
+            continue
+        try:
+            target = float(policy.get("cash_target_pct"))
+        except (TypeError, ValueError):
+            continue
+        if not math.isfinite(target) or not 0 <= target <= 100:
+            continue
+        return {
+            "cash_target_pct": target,
+            "source": source,
+            "policy_version": policy.get("policy_version") or candidate.get("policy_version"),
+            "portfolio_label": policy.get("portfolio_label")
+            or (candidate.get("portfolio") or {}).get("committed_label"),
+        }
+    return {
+        "cash_target_pct": None,
+        "source": "unresolved",
+        "policy_version": None,
+        "portfolio_label": None,
+    }
 
 
 def scheduled_contribution_amount(occurrences: list[tuple[date, dict[str, Any]]]) -> int:
@@ -268,8 +380,9 @@ def derive_budgets(
     scheduled_contributions_jpy: int,
     horizon: dict[str, Any],
     contribution_summary: dict[str, Any] | None = None,
+    cash_target_policy: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], list[str]]:
-    """Derive policy budgets without converting cash balances into permission.
+    """Derive a paced budget from confirmed cash above the tactical target.
 
     ``scheduled_contributions_jpy`` is retained as an observability field for
     broker-managed recurring investments.  Those buys happen on another path,
@@ -277,18 +390,67 @@ def derive_budgets(
     """
     warnings: list[str] = []
     contribution_summary = contribution_summary if isinstance(contribution_summary, dict) else {}
-    base_monthly = _jpy(params.get("monthly_discretionary_budget_jpy"))
-    # Keep the historical max as a hard ceiling for an explicit recurring
-    # policy, never as a way to derive more buying power from stale cash.
+    explicit_monthly = _jpy(params.get("monthly_discretionary_budget_jpy"))
     max_monthly = _jpy(params.get("max_monthly_budget_jpy"))
-    if max_monthly > 0:
-        base_monthly = min(base_monthly, max_monthly)
+    if max_monthly > 0 and explicit_monthly > 0:
+        explicit_monthly = min(explicit_monthly, max_monthly)
+
+    try:
+        from investment_policy import cash_deployment_policy
+
+        deployment_policy = cash_deployment_policy()
+    except Exception:
+        deployment_policy = {
+            "all_system_cash_is_surplus": False,
+            "protected_cash_reserve_jpy": 0,
+        }
+    all_cash_is_surplus = bool(deployment_policy.get("all_system_cash_is_surplus"))
+    protected_reserve = _jpy(deployment_policy.get("protected_cash_reserve_jpy"))
+    cash_target_policy = cash_target_policy if isinstance(cash_target_policy, dict) else {}
+    cash_target_pct_raw = cash_target_policy.get("cash_target_pct")
+    try:
+        cash_target_pct = float(cash_target_pct_raw)
+    except (TypeError, ValueError):
+        cash_target_pct = None
+    if cash_target_pct is not None and (
+        not math.isfinite(cash_target_pct) or not 0 <= cash_target_pct <= 100
+    ):
+        cash_target_pct = None
+
+    portfolio_total = _jpy((guard or {}).get("portfolio_value"))
+    confirmed_cash = _jpy(cash_info.get("total_cash_jpy"))
+    tactical_reserve = (
+        _jpy(portfolio_total * cash_target_pct / 100)
+        if portfolio_total > 0 and cash_target_pct is not None else None
+    )
+    required_reserve = (
+        max(protected_reserve, tactical_reserve)
+        if tactical_reserve is not None else protected_reserve
+    )
+    surplus_cash = 0
+    surplus_monthly_capacity = 0
+    if all_cash_is_surplus and cash_info.get("valid_for_budget"):
+        if tactical_reserve is None:
+            warnings.append("cash_target_unresolved: confirmed cash not converted into deployment budget")
+        else:
+            surplus_cash = max(0, confirmed_cash - required_reserve)
+            surplus_monthly_capacity = min(
+                surplus_cash,
+                max_monthly if max_monthly > 0 else surplus_cash,
+            )
+    elif all_cash_is_surplus:
+        warnings.append("cash_authority_unresolved: confirmed cash not converted into deployment budget")
+
+    base_monthly = max(explicit_monthly, surplus_monthly_capacity)
     released_normal = _jpy(contribution_summary.get("released_this_month_normal_jpy"))
     released_opportunity = _jpy(contribution_summary.get("released_this_month_opportunity_jpy"))
     monthly_total = base_monthly + released_normal + released_opportunity
-    budget_source = "explicit_policy"
-    if not cash_info.get("valid_for_budget"):
-        warnings.append("cash_info_stale: cash balance is not used to create discretionary budget")
+    if surplus_monthly_capacity > explicit_monthly:
+        budget_source = "confirmed_surplus_cash"
+    elif explicit_monthly > 0:
+        budget_source = "explicit_policy"
+    else:
+        budget_source = "no_deployable_surplus"
     if scheduled_contributions_jpy:
         warnings.append("scheduled_contributions_excluded_from_discretionary_budget")
 
@@ -312,7 +474,6 @@ def derive_budgets(
     # their own bucket (normal/opportunity), so reserve allocation is explicit
     # rather than silently carved out of a salary or bonus.
 
-    portfolio_total = _jpy((guard or {}).get("portfolio_value"))
     h2_pct = _ratio(params.get("max_single_action_pct_of_portfolio"), 0.05)
     h2_hard_cap = min(_jpy(portfolio_total * h2_pct), 1_500_000) if portfolio_total > 0 else 1_500_000
 
@@ -340,6 +501,18 @@ def derive_budgets(
         "h2_hard_cap_jpy": h2_hard_cap,
         "deployment_multiplier": deployment_multiplier,
         "budget_source": budget_source,
+        "all_system_cash_is_surplus": all_cash_is_surplus,
+        "confirmed_cash_jpy": confirmed_cash,
+        "cash_target_pct": cash_target_pct,
+        "cash_target_source": cash_target_policy.get("source"),
+        "cash_target_policy_version": cash_target_policy.get("policy_version"),
+        "tactical_cash_reserve_jpy": tactical_reserve,
+        "protected_cash_reserve_jpy": protected_reserve,
+        "required_cash_reserve_jpy": required_reserve,
+        "surplus_cash_above_targets_jpy": surplus_cash,
+        "surplus_cash_monthly_capacity_jpy": _jpy(
+            surplus_monthly_capacity * deployment_multiplier
+        ),
         "scheduled_contributions_remaining_jpy": _jpy(scheduled_contributions_jpy),
     }, warnings
 
@@ -1760,7 +1933,9 @@ def build_execution_plan(
     nisa: dict[str, Any] | None,
     action_state: dict[str, Any] | None,
     executions: dict[str, Any] | list[dict[str, Any]] | None,
+    holdings: dict[str, Any] | list[dict[str, Any]] | None = None,
     ai_analysis: dict[str, Any] | None = None,
+    market_regime: dict[str, Any] | None = None,
     params: dict[str, Any] | None = None,
     now: datetime | None = None,
     contribution_occurrences: list[tuple[date, dict[str, Any]]] | None = None,
@@ -1773,7 +1948,16 @@ def build_execution_plan(
     today = now.date()
     horizon = horizon_for(today)
     params = params or load_plan_params()
-    cash_info, cash_warnings = derive_cash_info(account, now=now, stale_hours=int(params.get("cash_stale_hours") or 72))
+    cash_info, cash_warnings = derive_cash_info(
+        account,
+        holdings=holdings,
+        now=now,
+        stale_hours=int(params.get("cash_stale_hours") or 72),
+    )
+    cash_target_policy = resolve_cash_target_policy(
+        ai_analysis=ai_analysis,
+        market_regime=market_regime,
+    )
 
     if contribution_occurrences is None:
         try:
@@ -1809,6 +1993,7 @@ def build_execution_plan(
         scheduled_contributions_jpy=scheduled_jpy,
         horizon=horizon,
         contribution_summary=contribution_summary,
+        cash_target_policy=cash_target_policy,
     )
     month_start = date(today.year, today.month, 1)
     month_end = date.fromisoformat(str(horizon["month_end"]))
@@ -1883,10 +2068,33 @@ def build_execution_plan(
     consumption_summary["opportunity_pool_available_jpy"] = opportunity_pool
     rationale = no_action_rationale(items, consumption_summary)
     if normal_pool <= 0 and opportunity_pool <= 0:
-        rationale = [{
-            "reason_code": "no_approved_discretionary_funding",
-            "message": "通常裁量枠は0円です。給料・ボーナスを投資用として承認すると共通プールに反映されます。",
-        }] + rationale
+        if (
+            _jpy(budgets.get("monthly_discretionary_budget_jpy")) > 0
+            and base_consumed >= _jpy(budgets.get("monthly_discretionary_budget_jpy"))
+        ):
+            funding_reason = {
+                "reason_code": "monthly_surplus_deployment_budget_consumed",
+                "message": (
+                    "確認済み余剰現金はありますが、今月の配備ペース上限を"
+                    "既存の買付で消化済みです。翌月に自動で再計算します。"
+                ),
+            }
+        elif budgets.get("cash_target_pct") is None:
+            funding_reason = {
+                "reason_code": "cash_target_unresolved",
+                "message": "相場別の戦術現金目標を確定できないため、新規配備枠を作成しません。",
+            }
+        elif _jpy(budgets.get("surplus_cash_above_targets_jpy")) <= 0:
+            funding_reason = {
+                "reason_code": "cash_at_or_below_tactical_target",
+                "message": "確認済み現金は相場別の戦術現金目標以下のため、新規配備枠はありません。",
+            }
+        else:
+            funding_reason = {
+                "reason_code": "no_deployable_cash_authority",
+                "message": "確認済みで利用可能な余剰現金を確定できないため、新規配備枠を作成しません。",
+            }
+        rationale = [funding_reason] + rationale
     return {
         "schema_version": SCHEMA_VERSION,
         "as_of": now.astimezone().isoformat(timespec="seconds"),
@@ -1931,6 +2139,7 @@ def generate_execution_plan(*, base_dir: Path = BASE_DIR, now: datetime | None =
         effective_executions = {"executions": []}
     plan = build_execution_plan(
         account=load_json(base_dir / "account.json", {}),
+        holdings=load_json(base_dir / "holdings.json", []),
         guard=load_json(base_dir / "guard_state.json", {}),
         rebalance_report=load_json(base_dir / "rebalance_report.json", {}),
         bottom_fishing=load_json(base_dir / "bottom_fishing_signals.json", {}),
@@ -1938,6 +2147,7 @@ def generate_execution_plan(*, base_dir: Path = BASE_DIR, now: datetime | None =
         action_state=load_json(base_dir / "action_state.json", {"actions": {}}),
         executions=effective_executions,
         ai_analysis=load_json(base_dir / "ai_portfolio_analysis.json", {}),
+        market_regime=load_json(base_dir / "market_regime_v2_state.json", {}),
         contribution_ledger=load_json(base_dir / "contribution_ledger.json", {"contributions": []}),
         now=now,
         trusted_sector_catalog=sector_catalog,

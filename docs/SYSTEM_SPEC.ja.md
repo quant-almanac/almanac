@@ -175,7 +175,7 @@ VaR予測を保存してKupiec proportion-of-failures testを行います。合�
 
 indexのMA50/MA200乖離、breadth、VIX、HY OAS、金利を使います。金利はtightening shock、easing support、stress easing、restrictive real/nominal level、curve inversionを分けます。coverage、breadth件数、risk/rate入力がeligibilityを満たす必要があります。2評価確認で単発noiseによるcommitted level変更を防ぎます。
 
-別のshock overlayは裁量buyを止められますが、crash後にcash targetへ戻すための売却はしません。確認済みcashは全て余剰投資資金、生活防衛reserveは0ですが、tactical cash、settlement、collateral、fee、tax、既存order予約は残ります。
+別のshock overlayは裁量buyを止められますが、crash後にcash targetへ戻すための売却はしません。確認済みcashは全て余剰投資資金、生活防衛reserveは0ですが、tactical cash、settlement、collateral、fee、tax、既存order予約は残ります。execution planはtactical targetを超える確認済み残高だけを月次pace上限内で配備し、cash authorityは時間経過だけで失効させず後続eventで判定します。
 
 ## 12. Policy・readiness・invalidation
 

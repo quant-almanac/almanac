@@ -818,12 +818,12 @@ def test_budget_derivation_fail_closed_when_cash_missing() -> None:
 
     assert cash_info["valid_for_budget"] is False
     assert budgets["monthly_total_jpy"] == 0
-    assert budgets["budget_source"] == "explicit_policy"
+    assert budgets["budget_source"] == "no_deployable_surplus"
     assert any("cash_info_missing" in w for w in cash_warnings)
-    assert any("cash_info_stale" in w for w in budget_warnings)
+    assert any("cash_authority_unresolved" in w for w in budget_warnings)
 
 
-def test_budget_derivation_fails_closed_when_cash_stale() -> None:
+def test_confirmed_cash_authority_does_not_expire_with_wall_clock_time() -> None:
     old = datetime(2026, 7, 1, tzinfo=timezone(timedelta(hours=9)))
     cash_info, warnings = epe.derive_cash_info(
         {
@@ -836,9 +836,25 @@ def test_budget_derivation_fails_closed_when_cash_stale() -> None:
         stale_hours=72,
     )
 
-    assert cash_info["valid_for_budget"] is False
-    assert cash_info["source"] == "stale_account_fallback"
-    assert any("cash_info_stale" in w for w in warnings)
+    assert cash_info["valid_for_budget"] is True
+    assert cash_info["source"] == "confirmed_cash_resources_event_based"
+    assert cash_info["validation_mode"] == "event_based"
+    assert warnings == []
+
+
+def test_shadow_market_regime_cannot_create_live_cash_budget() -> None:
+    resolved = epe.resolve_cash_target_policy(
+        market_regime={
+            "assessment": {
+                "mode": "shadow",
+                "status": "ok",
+                "policy": {"cash_target_pct": 7.0},
+            },
+        },
+    )
+
+    assert resolved["cash_target_pct"] is None
+    assert resolved["source"] == "unresolved"
 
 
 def test_dedup_key_public_api_matches_plan_consumption() -> None:
@@ -907,7 +923,7 @@ def test_build_execution_plan_top_level_shape() -> None:
     assert plan["items"]
 
 
-def test_zero_discretionary_policy_does_not_turn_cash_or_auto_dca_into_buying_power() -> None:
+def test_confirmed_cash_without_tactical_target_fails_closed() -> None:
     plan = epe.build_execution_plan(
         account={
             "balance": 2_000_000,
@@ -938,8 +954,129 @@ def test_zero_discretionary_policy_does_not_turn_cash_or_auto_dca_into_buying_po
     assert plan["budgets"]["monthly_total_jpy"] == 0
     assert plan["budgets"]["normal_pool_available_jpy"] == 0
     assert plan["items"] == []
-    assert plan["no_action_rationale"][0]["reason_code"] == "no_approved_discretionary_funding"
+    assert plan["no_action_rationale"][0]["reason_code"] == "cash_target_unresolved"
     assert "scheduled_contributions_excluded_from_discretionary_budget" in plan["warnings"]
+
+
+def test_confirmed_surplus_cash_creates_paced_monthly_budget() -> None:
+    plan = epe.build_execution_plan(
+        account={
+            "balance": 2_000_000,
+            "usd_balance": 10_000,
+            "fx_rate_usdjpy": 150,
+            "last_updated": "2026-07-01T07:00:00",
+        },
+        holdings=[
+            {"ticker": "CASH_JPY", "shares": 2_000_000},
+            {
+                "ticker": "CASH_JPY_SBI",
+                "shares": 195_324,
+                "owner": "husband",
+                "broker": "SBI",
+                "source_as_of": "2026-07-01T07:00:00+09:00",
+            },
+            {
+                "ticker": "CASH_JPY_SBI_WIFE",
+                "shares": 239_038,
+                "available_to_trade_jpy": 215_962,
+                "balance_status": "confirmed",
+                "reconciliation_required": False,
+                "source_as_of": "2026-07-01T07:00:00+09:00",
+            },
+        ],
+        guard={
+            "portfolio_value": 30_000_000,
+            "new_entry_allowed": True,
+            "trading_allowed": True,
+        },
+        rebalance_report={
+            "buy_candidates": {
+                "currencies": [{"currency": "USD", "gap_jpy": 500_000}],
+            },
+        },
+        bottom_fishing={},
+        nisa={},
+        action_state={"actions": {}},
+        executions={"executions": []},
+        ai_analysis={
+            "market_regime_v2": {
+                "status": "ok",
+                "mode": "advisory",
+                "policy": {
+                    "cash_target_pct": 7.0,
+                    "policy_version": "market_regime_v2.1",
+                    "portfolio_label": "mild_bull",
+                },
+            },
+        },
+        params={
+            "monthly_discretionary_budget_jpy": 0,
+            "max_monthly_budget_jpy": 700_000,
+            "max_single_normal_jpy": 250_000,
+            "max_single_opportunity_jpy": 300_000,
+            "max_single_action_pct_of_portfolio": 0.05,
+            "cash_stale_hours": 72,
+        },
+        now=datetime(2026, 7, 30, 7, 30),
+        contribution_occurrences=[],
+    )
+
+    budgets = plan["budgets"]
+    assert plan["cash_info"]["total_cash_jpy"] == 3_911_286
+    assert budgets["confirmed_cash_jpy"] == 3_911_286
+    assert budgets["tactical_cash_reserve_jpy"] == 2_100_000
+    assert budgets["surplus_cash_above_targets_jpy"] == 1_811_286
+    assert budgets["monthly_discretionary_budget_jpy"] == 700_000
+    assert budgets["normal_pool_available_jpy"] == 700_000
+    assert budgets["budget_source"] == "confirmed_surplus_cash"
+    assert plan["items"]
+
+
+def test_monthly_surplus_budget_is_paced_by_existing_buys() -> None:
+    plan = epe.build_execution_plan(
+        account={
+            "balance": 3_500_000,
+            "usd_balance": 0,
+            "fx_rate_usdjpy": 150,
+            "last_updated": "2026-07-01T07:00:00",
+        },
+        guard={"portfolio_value": 30_000_000, "new_entry_allowed": True, "trading_allowed": True},
+        rebalance_report={"buy_candidates": {"currencies": [{"currency": "USD", "gap_jpy": 500_000}]}},
+        bottom_fishing={},
+        nisa={},
+        action_state={"actions": {}},
+        executions={"executions": [{
+            "id": "buy-1",
+            "ticker": "V",
+            "direction": "buy",
+            "status": "executed",
+            "notional_jpy": 800_000,
+            "saved_at": "2026-07-10T10:00:00",
+        }]},
+        ai_analysis={
+            "market_regime_v2": {
+                "status": "ok",
+                "mode": "advisory",
+                "policy": {"cash_target_pct": 7.0},
+            },
+        },
+        params={
+            "monthly_discretionary_budget_jpy": 0,
+            "max_monthly_budget_jpy": 700_000,
+            "max_single_normal_jpy": 250_000,
+            "max_single_opportunity_jpy": 300_000,
+            "max_single_action_pct_of_portfolio": 0.05,
+            "cash_stale_hours": 72,
+        },
+        now=datetime(2026, 7, 30, 7, 30),
+        contribution_occurrences=[],
+    )
+
+    assert plan["budgets"]["monthly_base_consumed_jpy"] == 800_000
+    assert plan["budgets"]["normal_pool_available_jpy"] == 0
+    assert plan["no_action_rationale"][0]["reason_code"] == (
+        "monthly_surplus_deployment_budget_consumed"
+    )
 
 
 def test_approved_contribution_creates_one_common_pool_without_priority_wallet_splitting() -> None:

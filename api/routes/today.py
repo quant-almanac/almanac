@@ -811,6 +811,16 @@ def _build_execution_plan_view(plan: dict, board: list[dict], synthesis: dict, n
     open_consumed = consumption.get("open_order_consumed_jpy")
     filled_consumed = consumption.get("filled_consumed_jpy")
     warnings = plan.get("warnings") or []
+    no_action_rows = plan.get("no_action_rationale") or []
+    first_no_action = no_action_rows[0] if no_action_rows else {}
+    first_no_action_code = (
+        str(first_no_action.get("reason_code") or "")
+        if isinstance(first_no_action, dict) else ""
+    )
+    first_no_action_message = (
+        str(first_no_action.get("message") or "")
+        if isinstance(first_no_action, dict) else str(first_no_action or "")
+    )
 
     def _float_value(value: object) -> float:
         try:
@@ -906,6 +916,18 @@ def _build_execution_plan_view(plan: dict, board: list[dict], synthesis: dict, n
             "label": "候補待ち",
             "reason": "計画残枠はありますが、今日のAI候補は確信度・予算・既存ガードを通過していません。",
         }
+    elif first_no_action_code:
+        labels = {
+            "monthly_surplus_deployment_budget_consumed": "今月の配備枠は消化済み",
+            "cash_at_or_below_tactical_target": "戦術現金を維持",
+            "cash_target_unresolved": "現金目標を確認",
+            "no_deployable_cash_authority": "現金権威を確認",
+        }
+        today_decision = {
+            "code": first_no_action_code,
+            "label": labels.get(first_no_action_code, "今日の発注 0 件"),
+            "reason": first_no_action_message or "実行計画に新規配備できない理由が記録されています。",
+        }
     elif warnings:
         today_decision = {
             "code": "warning",
@@ -940,6 +962,15 @@ def _build_execution_plan_view(plan: dict, board: list[dict], synthesis: dict, n
             "max_single_opportunity_action_jpy": budgets.get("max_single_opportunity_action_jpy"),
             "h2_hard_cap_jpy": budgets.get("h2_hard_cap_jpy"),
             "budget_source": budgets.get("budget_source"),
+            "all_system_cash_is_surplus": budgets.get("all_system_cash_is_surplus"),
+            "confirmed_cash_jpy": budgets.get("confirmed_cash_jpy"),
+            "cash_target_pct": budgets.get("cash_target_pct"),
+            "cash_target_source": budgets.get("cash_target_source"),
+            "tactical_cash_reserve_jpy": budgets.get("tactical_cash_reserve_jpy"),
+            "protected_cash_reserve_jpy": budgets.get("protected_cash_reserve_jpy"),
+            "required_cash_reserve_jpy": budgets.get("required_cash_reserve_jpy"),
+            "surplus_cash_above_targets_jpy": budgets.get("surplus_cash_above_targets_jpy"),
+            "surplus_cash_monthly_capacity_jpy": budgets.get("surplus_cash_monthly_capacity_jpy"),
             "scheduled_contributions_remaining_jpy": budgets.get("scheduled_contributions_remaining_jpy"),
         },
         "consumption": {
