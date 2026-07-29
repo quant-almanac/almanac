@@ -41,6 +41,10 @@ def test_backup_is_restorable_and_bundle_cloneable(tmp_path, monkeypatch):
     _git(root, "config", "user.email", "test@example.com")
     _git(root, "config", "user.name", "Test")
     (root / "README.md").write_text("restorable\n", encoding="utf-8")
+    (root / "execution_reconciliation_state.json").write_text(
+        json.dumps({"schema_version": 1, "corrections": [{"correction_id": "route-1"}]}),
+        encoding="utf-8",
+    )
     _git(root, "add", "README.md")
     _git(root, "commit", "-m", "test")
 
@@ -65,6 +69,9 @@ def test_backup_is_restorable_and_bundle_cloneable(tmp_path, monkeypatch):
     assert result["nested_repo_bundles"]["frontend"]["status"] == "created"
     assert result["worktree_archives"]["frontend"]["status"] == "created"
     assert read_features(restored / "data" / "disclosure_features.jsonl")[0]["feature_id"] == "f1"
+    assert json.loads(
+        (restored / "execution_reconciliation_state.json").read_text(encoding="utf-8")
+    )["corrections"][0]["correction_id"] == "route-1"
     restored_db = sqlite3.connect(restored / "nexustrader.db")
     try:
         assert restored_db.execute("SELECT COUNT(*) FROM ledger_events").fetchone()[0] == 1

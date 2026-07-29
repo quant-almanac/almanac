@@ -61,6 +61,7 @@ TARGETS = [
     'nisa_portfolio.json',
     'nisa_sale_history.json',
     'action_executions.json',
+    'execution_reconciliation_state.json',
     'trade_history.csv',
     'beliefs/agent_beliefs.json',
     'heartbeats.json',
