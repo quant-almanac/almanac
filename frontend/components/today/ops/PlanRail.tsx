@@ -413,6 +413,11 @@ export function ExecutionPlanModal({ plan, open, onClose }: { plan?: ExecutionPl
     ...plan.filtered_examples.map(item => `${item.ticker ?? '—'}: ${reasonCodeLabel(item.code)}${item.reason ? ` · ${item.reason}` : ''}`),
   ].filter(Boolean)
   const orderIntent = plan.order_intent_review ?? { count: 0, summary: {}, items: [] }
+  const deploymentPacing = b.deployment_months != null
+    ? `${b.deployment_regime_label ?? 'regime'} · ${b.deployment_months}か月 · 基準余剰 ${fmtJpy(b.deployment_basis_surplus_jpy)}`
+    : b.ordinary_deployment_allowed === false
+      ? `${b.deployment_regime_label ?? 'regime'} · 通常配備なし`
+      : b.budget_source
 
   return (
     <Modal open={open} onClose={onClose} width={940} fitViewport>
@@ -423,7 +428,7 @@ export function ExecutionPlanModal({ plan, open, onClose }: { plan?: ExecutionPl
         <p style={{ color: OPS.dim, fontFamily: OPS.mono, fontSize: 11, margin: '-10px 0 16px' }}>{plan.status}{plan.age_hours != null ? ` · ${fmtAge(plan.age_hours)}` : ''}{plan.horizon.week_start && plan.horizon.week_end ? ` · ${plan.horizon.week_start.slice(5)}–${plan.horizon.week_end.slice(5)}` : ''}</p>
 
         <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(145px, 1fr))', gap: 10 }}>
-          <ModalStat label="月次枠" value={fmtJpy(b.monthly_total_jpy)} sub={b.budget_source} />
+          <ModalStat label="今月の動的配備枠" value={fmtJpy(b.monthly_total_jpy)} sub={deploymentPacing} />
           <ModalStat label="月次残り" value={fmtJpy(c.monthly_remaining_jpy ?? b.monthly_remaining_jpy)} />
           <ModalStat label="週次通常枠" value={fmtJpy(b.weekly_normal_jpy)} />
           <ModalStat label="計画枠（通常）" value={`${pct.toFixed(1)}%`} sub={`${fmtJpy(c.normal_plan_budget_consumed_jpy)} · 残 ${fmtJpy(c.remaining_normal_jpy)}`} color={pct >= 100 ? OPS.amber : OPS.text} />
@@ -434,6 +439,20 @@ export function ExecutionPlanModal({ plan, open, onClose }: { plan?: ExecutionPl
         </div>
         <div style={{ margin: '14px 0 18px' }}><Bar pct={pct} color={pct >= 100 ? OPS.amber : OPS.gold} height={7} /></div>
 
+        {b.all_system_cash_is_surplus && (
+          <ModalBlock title="現金配備ルール">
+            <p style={detailText}>
+              確認済み現金 {fmtJpy(b.confirmed_cash_jpy)}
+              {' '}− 戦術現金 {b.cash_target_pct != null ? `${b.cash_target_pct}% (${fmtJpy(b.required_cash_reserve_jpy)})` : '未確定'}
+              {' '}＝ 現在余剰 {fmtJpy(b.surplus_cash_above_targets_jpy)}
+            </p>
+            <p style={detailText}>
+              約定後に二重縮小しない配備基準 {fmtJpy(b.deployment_basis_surplus_jpy)}
+              {' '}÷ {b.deployment_months != null ? `${b.deployment_months}か月` : '通常配備なし'}
+              {' '}＝ 今月枠 {fmtJpy(b.surplus_cash_monthly_capacity_jpy)}
+            </p>
+          </ModalBlock>
+        )}
         {reasonRows.length > 0 && <ModalBlock title="判断・除外理由">{reasonRows.slice(0, 8).map((reason, index) => <p key={index} style={detailText}><span style={{ color: OPS.gold }}>•</span> {reason}</p>)}</ModalBlock>}
         {plan.warnings.length > 0 && <ModalBlock title="警告">{plan.warnings.map((warning, index) => <p key={index} style={{ ...detailText, color: OPS.amber }}>{warning}</p>)}</ModalBlock>}
         {(c.unattributed_monthly_total_count ?? 0) > 0 && <ModalBlock title="月次帰属"> <p style={{ ...detailText, color: OPS.amber }}>未帰属の注文・約定 {c.unattributed_monthly_total_count}件（{fmtJpy(c.unattributed_monthly_total_notional_jpy)}）は月次枠に未算入です。帰属確認が完了するまで計画ゲートは enforce へ昇格しません。</p></ModalBlock>}

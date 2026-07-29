@@ -21,7 +21,20 @@ const plan: ExecutionPlan = {
   status: 'active',
   age_hours: 12,
   horizon: { month: '2026-07', week_start: '2026-07-13', week_end: '2026-07-19' },
-  budgets: { monthly_total_jpy: 300_000, scheduled_contributions_remaining_jpy: 50_000 },
+  budgets: {
+    monthly_total_jpy: 300_000,
+    scheduled_contributions_remaining_jpy: 50_000,
+    all_system_cash_is_surplus: true,
+    confirmed_cash_jpy: 9_000_000,
+    cash_target_pct: 7,
+    required_cash_reserve_jpy: 2_100_000,
+    surplus_cash_above_targets_jpy: 6_900_000,
+    deployment_basis_surplus_jpy: 7_200_000,
+    deployment_months: 3,
+    deployment_regime_label: 'mild_bull',
+    surplus_cash_monthly_capacity_jpy: 2_400_000,
+    ordinary_deployment_allowed: true,
+  },
   consumption: {
     normal_plan_budget_consumed_pct: 19.7,
     normal_plan_budget_consumed_jpy: 10_347,
@@ -52,6 +65,15 @@ describe('PlanRail', () => {
     expect(screen.getByText('通常の共通プール 参考消化 19.7%')).toBeInTheDocument()
     expect(screen.getByText(/対応した実額/)).toHaveTextContent('¥39万')
     expect(screen.getByText('帰属確認中')).toBeInTheDocument()
+  })
+
+  it('shows the dynamic deployment basis in the execution-plan modal', () => {
+    render(<PlanRail plan={plan} almanac={almanac} />)
+
+    fireEvent.click(screen.getByRole('button', { name: '計画の全文 →' }))
+    expect(screen.getByText('今月の動的配備枠')).toBeInTheDocument()
+    expect(screen.getByText('mild_bull · 3か月 · 基準余剰 ¥720万')).toBeInTheDocument()
+    expect(screen.getByText(/約定後に二重縮小しない配備基準/)).toHaveTextContent('÷ 3か月 ＝ 今月枠 ¥240万')
   })
 
   it('switches between plan, schedule, and record without refetching', () => {
