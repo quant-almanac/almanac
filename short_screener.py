@@ -2,7 +2,7 @@
 short_screener.py — レジーム別空売りスクリーニング（v2.0）
 
 変更点 (v2.0):
-  - 対象銘柄: tickers.json の short_scan_tickers から自動ロード（~150銘柄）
+  - 対象銘柄: tickers.json の all にある米国株 + short_scan_tickers の日本株
   - バッチダウンロード: yf.download(threads=True) で一括取得（逐次→高速化）
   - セクターキャッシュ: data/sector_cache.json（TTL 7日）+ 並列取得
   - 投機ティア: HIGH_RISK（C_弱気のみ）/ MED_RISK（B/C）/ STD（既存ルール）
@@ -27,7 +27,7 @@ import numpy as np
 import pandas as pd
 import requests
 import yfinance as yf
-from utils import init_yfinance_timeout
+from utils import configure_yfinance_cache, init_yfinance_timeout
 
 init_yfinance_timeout()
 
@@ -55,6 +55,9 @@ VIX_BLOCK_THRESHOLD = _get_vix_block_threshold()
 SHORT_CANDIDATES_FILE = BASE_DIR / 'short_candidates.json'
 SECTOR_STRENGTH_FILE  = BASE_DIR / 'sector_strength.json'
 SECTOR_CACHE_FILE     = BASE_DIR / 'data' / 'sector_cache.json'
+DOWNLOAD_BATCH_SIZE = 75
+DOWNLOAD_RETRY_BATCH_SIZE = 15
+MIN_DOWNLOAD_COVERAGE_PCT = 85.0
 
 # yfinance.info が 404 を返す ETF（財務諸表を持たない）
 # 呼び出し前にスキップしてログノイズを防ぐ
@@ -97,14 +100,26 @@ MED_RISK_TICKERS: frozenset[str] = frozenset({
 # ============================================================
 
 def _load_scan_tickers() -> list[str]:
-    """tickers.json の short_scan_tickers を返す。なければ all を使用。"""
+    """Return the broad US universe plus the curated JP short universe.
+
+    The former implementation used only ``short_scan_tickers`` (124 US names),
+    even though ``all`` already contains the maintained liquid US universe.
+    Preserve the curated JP set because JP borrow supply is governed by a
+    separate exchange/JSF contract.
+    """
     tickers_file = BASE_DIR / 'tickers.json'
     if not tickers_file.exists():
         return []
     try:
         with open(tickers_file, encoding='utf-8') as f:
             t = json.load(f)
-        return list(t.get('short_scan_tickers', t.get('all', [])))
+        curated = list(t.get('short_scan_tickers') or [])
+        broad = list(t.get('all') or curated)
+        values = (
+            [ticker for ticker in broad if not str(ticker).endswith('.T')]
+            + [ticker for ticker in curated if str(ticker).endswith('.T')]
+        )
+        return list(dict.fromkeys(str(ticker) for ticker in values if ticker))
     except Exception:
         return []
 
@@ -378,11 +393,40 @@ def _short_execution_metadata(ticker: str, *, horizon_days: int = 10) -> tuple[d
 # バッチ価格ダウンロード
 # ============================================================
 
-def _bulk_download(tickers: list[str]) -> dict[str, dict]:
-    """
-    yf.download で一括 OHLCV 取得（逐次処理を廃止し大幅に高速化）。
-    戻り値: { ticker: {'close': pd.Series, 'volume': pd.Series} }
-    """
+def _extract_downloaded_prices(raw: pd.DataFrame, tickers: list[str]) -> dict[str, dict]:
+    """Extract usable OHLCV series from one yfinance response."""
+    if raw is None or raw.empty:
+        return {}
+    result: dict[str, dict] = {}
+    if isinstance(raw.columns, pd.MultiIndex):
+        try:
+            close_df = raw['Close']
+            volume_df = raw['Volume']
+        except KeyError:
+            return {}
+        for ticker in tickers:
+            if ticker not in close_df.columns or ticker not in volume_df.columns:
+                continue
+            close = close_df[ticker].dropna()
+            volume = volume_df[ticker].dropna()
+            if len(close) >= 52:
+                result[ticker] = {'close': close, 'volume': volume}
+        return result
+
+    if len(tickers) != 1:
+        return {}
+    ticker = tickers[0]
+    try:
+        close = raw['Close'].dropna()
+        volume = raw['Volume'].dropna()
+    except KeyError:
+        return {}
+    if len(close) >= 52:
+        result[ticker] = {'close': close, 'volume': volume}
+    return result
+
+
+def _download_price_batch(tickers: list[str], *, threads: bool) -> dict[str, dict]:
     if not tickers:
         return {}
     try:
@@ -390,37 +434,46 @@ def _bulk_download(tickers: list[str]) -> dict[str, dict]:
             tickers,
             period='4mo',
             auto_adjust=True,
-            threads=True,
+            threads=threads,
             progress=False,
         )
-    except Exception:
+    except Exception as exc:
+        print(f'  ⚠️ OHLCV取得バッチ失敗({len(tickers)}銘柄): {type(exc).__name__}: {exc}')
         return {}
+    return _extract_downloaded_prices(raw, tickers)
 
-    if raw.empty:
+
+def _bulk_download(tickers: list[str]) -> dict[str, dict]:
+    """
+    yf.download で一括 OHLCV 取得（逐次処理を廃止し大幅に高速化）。
+    戻り値: { ticker: {'close': pd.Series, 'volume': pd.Series} }
+    """
+    unique_tickers = list(dict.fromkeys(tickers))
+    if not unique_tickers:
         return {}
-
     result: dict[str, dict] = {}
+    for start in range(0, len(unique_tickers), DOWNLOAD_BATCH_SIZE):
+        batch = unique_tickers[start:start + DOWNLOAD_BATCH_SIZE]
+        result.update(_download_price_batch(batch, threads=True))
 
-    if isinstance(raw.columns, pd.MultiIndex):
-        # 複数銘柄: columns = (field, ticker)
-        close_df  = raw['Close']
-        volume_df = raw['Volume']
-        for t in tickers:
-            if t not in close_df.columns:
-                continue
-            close  = close_df[t].dropna()
-            volume = volume_df[t].dropna()
-            if len(close) >= 52:
-                result[t] = {'close': close, 'volume': volume}
-    else:
-        # 単一銘柄
-        t      = tickers[0]
-        close  = raw['Close'].dropna()
-        volume = raw['Volume'].dropna()
-        if len(close) >= 52:
-            result[t] = {'close': close, 'volume': volume}
-
+    missing = [ticker for ticker in unique_tickers if ticker not in result]
+    for start in range(0, len(missing), DOWNLOAD_RETRY_BATCH_SIZE):
+        batch = missing[start:start + DOWNLOAD_RETRY_BATCH_SIZE]
+        result.update(_download_price_batch(batch, threads=False))
     return result
+
+
+def _passes_metadata_prefilter(indicators: dict, regime: str) -> bool:
+    """Limit expensive sector/short-ratio lookups to technical possibilities."""
+    rsi = float(indicators.get('rsi') or 0.0)
+    pct = float(indicators.get('pct_from_ma50') or 0.0)
+    if regime == 'A_強気':
+        return rsi >= 80 and pct >= 20.0
+    if regime == 'B_中立':
+        return rsi >= 62 or pct >= 8.0
+    if regime == 'C_弱気':
+        return rsi >= 65 or pct >= 10.0
+    return False
 
 
 # ============================================================
@@ -695,6 +748,7 @@ def screen_candidates(
         as_of       : str    — 実行時刻
         scanned     : int    — スキャン銘柄数
     """
+    configure_yfinance_cache("short_screener", base_dir=BASE_DIR)
     as_of = datetime.now().strftime('%Y-%m-%d %H:%M')
     output_path = (BASE_DIR / 'short_candidates_morning.json') if morning else SHORT_CANDIDATES_FILE
 
@@ -729,31 +783,38 @@ def screen_candidates(
                 scan_tickers.append(t)
     from insider_restrictions import filter_allowed_tickers
     scan_tickers = filter_allowed_tickers(scan_tickers)
+    from pseudo_tickers import is_pseudo_market_ticker
+    scan_tickers = [
+        ticker for ticker in scan_tickers
+        if not is_pseudo_market_ticker(ticker)
+    ]
 
     # 弱セクター取得
     weak_sectors = _get_weak_sectors()
-
-    # セクターキャッシュ事前取得（初回は並列フェッチ）
-    print(f'[{as_of}] セクターキャッシュ確認...')
-    _prefetch_sector_cache(scan_tickers)
 
     # バッチ価格ダウンロード
     print(f'  バッチDL開始: {len(scan_tickers)}銘柄...')
     price_data = _bulk_download(scan_tickers)
     print(f'  取得完了: {len(price_data)}銘柄')
 
-    candidates = []
+    preliminary: dict[str, dict] = {}
     for ticker in scan_tickers:
-        if ticker not in price_data:
+        if ticker not in price_data or not _tier_allows_regime(ticker, regime):
             continue
+        downloaded = price_data[ticker]
+        indicators = _calc_indicators(downloaded['close'], downloaded['volume'])
+        preliminary[ticker] = indicators
 
-        # 投機ティアゲート（HIGH_RISK は C_弱気のみ）
-        if not _tier_allows_regime(ticker, regime):
-            continue
+    metadata_tickers = [
+        ticker
+        for ticker, indicators in preliminary.items()
+        if _passes_metadata_prefilter(indicators, regime)
+    ]
+    print(f'[{as_of}] セクター・shortRatio確認: {len(metadata_tickers)}銘柄...')
+    _prefetch_sector_cache(metadata_tickers)
 
-        # 指標計算
-        pd_data    = price_data[ticker]
-        indicators = _calc_indicators(pd_data['close'], pd_data['volume'])
+    candidates = []
+    for ticker, indicators in preliminary.items():
 
         # セクター情報（キャッシュから）
         sector_info = _get_sector_cached(ticker)
@@ -930,6 +991,24 @@ def screen_candidates(
         pass
 
     shortable_count = sum(1 for c in candidates if c.get('shortable'))
+    requested_us = sum(1 for ticker in scan_tickers if not ticker.endswith('.T'))
+    requested_jp = len(scan_tickers) - requested_us
+    downloaded_us = sum(1 for ticker in price_data if not ticker.endswith('.T'))
+    downloaded_jp = len(price_data) - downloaded_us
+    candidate_us = sum(1 for candidate in candidates if not candidate['ticker'].endswith('.T'))
+    candidate_jp = len(candidates) - candidate_us
+    shortable_us = sum(
+        1 for candidate in candidates
+        if not candidate['ticker'].endswith('.T') and candidate.get('shortable')
+    )
+    shortable_jp = shortable_count - shortable_us
+    coverage_pct = round(len(price_data) / len(scan_tickers) * 100, 1) if scan_tickers else 0.0
+    data_quality = 'ok' if coverage_pct >= MIN_DOWNLOAD_COVERAGE_PCT else 'degraded'
+    if data_quality == 'degraded':
+        print(
+            f'  ⚠️ 価格取得率 {coverage_pct:.1f}% '
+            f'({len(price_data)}/{len(scan_tickers)}) < {MIN_DOWNLOAD_COVERAGE_PCT:.0f}%'
+        )
     result = {
         'vix':             vix,
         'regime':          regime,
@@ -938,10 +1017,22 @@ def screen_candidates(
         'shortable_count': shortable_count,
         'as_of':           as_of,
         'scanned':         len(price_data),
+        'universe_requested': len(scan_tickers),
+        'universe_requested_us': requested_us,
+        'universe_requested_jp': requested_jp,
+        'price_data_count': len(price_data),
+        'price_data_us': downloaded_us,
+        'price_data_jp': downloaded_jp,
+        'price_data_coverage_pct': coverage_pct,
+        'data_quality': data_quality,
+        'candidate_count_us': candidate_us,
+        'candidate_count_jp': candidate_jp,
+        'shortable_count_us': shortable_us,
+        'shortable_count_jp': shortable_jp,
         'message':         (
             f'VIX={vix:.1f} / レジーム={regime} / '
             f'{len(candidates)}件検出 (うち借株可 {shortable_count}件 / '
-            f'スキャン{len(price_data)}銘柄)'
+            f'価格取得{len(price_data)}/{len(scan_tickers)}銘柄)'
         ),
     }
     _save_candidates(result, output_path)
@@ -1038,7 +1129,8 @@ if __name__ == '__main__':
     parser.add_argument('--regime', choices=['A_強気', 'B_中立', 'C_弱気'],
                         help='レジームを強制指定（省略時は regime_state.json から自動判定）')
     parser.add_argument('--tickers', nargs='+', metavar='TICKER',
-                        help='スキャン対象ティッカー（省略時は tickers.json の short_scan_tickers）')
+                        help=('スキャン対象ティッカー（省略時は tickers.json の '
+                              'all［米国］+ short_scan_tickers［日本］）'))
     parser.add_argument('--alert', action='store_true',
                         help='deprecated: JSON/UI only; no Telegram is sent')
     parser.add_argument('--last', action='store_true',

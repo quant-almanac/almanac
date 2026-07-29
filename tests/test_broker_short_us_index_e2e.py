@@ -59,6 +59,9 @@ def test_sync_writes_file_and_builder_marks_shortable(tmp_path):
     data = json.loads(f.read_text(encoding="utf-8"))
     assert data["tickers"]["AAPL"]["rakuten"] is True
     assert "TINY" not in data["tickers"]
+    assert data["universe_count"] == 2
+    assert data["eligible_count"] == 1
+    assert data["excluded_count"] == 1
 
     led = su.build_short_universe(["AAPL", "TINY"], now=NOW, base_dir=tmp_path)
     assert led["tickers"]["AAPL"]["shortable"] is True, led["tickers"]["AAPL"]["reasons"]
@@ -66,3 +69,12 @@ def test_sync_writes_file_and_builder_marks_shortable(tmp_path):
     # 近似でも human_execution_only / 自動発注なしは不変
     assert led["tickers"]["AAPL"]["human_execution_only"] is True
     assert led["tickers"]["AAPL"]["executable"] is False
+
+
+def test_scan_tickers_uses_broad_all_universe(tmp_path):
+    (tmp_path / "tickers.json").write_text(json.dumps({
+        "all": ["AAPL", "MSFT", "7203.T"],
+        "short_scan_tickers": ["AAPL"],
+    }), encoding="utf-8")
+
+    assert ix._scan_tickers(tmp_path) == ["AAPL", "MSFT"]

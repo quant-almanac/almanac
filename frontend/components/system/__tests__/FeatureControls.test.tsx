@@ -17,7 +17,15 @@ const features = [
     auto_order_enabled: false,
     reason: 'ユーザー設定でOFFです',
     blockers: [],
+    warnings: ['最新の価格取得率が46.7%です'],
     eligible_instruments: 88,
+    availability_universe_instruments: 679,
+    availability_coverage_pct: 13.0,
+    latest_scan_requested: 157,
+    latest_scan_downloaded: 75,
+    latest_scan_coverage_pct: 47.8,
+    latest_candidates: 11,
+    latest_shortable: 9,
     source_note: '発注画面が権威',
     source_age_hours: 24,
   },
@@ -83,6 +91,11 @@ describe('FeatureControls', () => {
     const us = await screen.findByTestId('feature-us_short')
     expect(within(us).getAllByText('OFF')).toHaveLength(2)
     expect(within(us).getByText('ユーザー設定でOFFです')).toBeInTheDocument()
+    expect(within(us).getByText(/最新の価格取得率/)).toBeInTheDocument()
+    expect(within(us).getByText(/借株proxy 88\/679/)).toBeInTheDocument()
+    expect(within(us).getByText(/最新価格 75\/157/)).toBeInTheDocument()
+    expect(within(us).getByText('候補 11')).toBeInTheDocument()
+    expect(within(us).getByText('借株可 9')).toBeInTheDocument()
     expect(within(us).getByRole('switch')).toHaveAttribute('aria-checked', 'false')
 
     const ginn = screen.getByTestId('feature-ginn')

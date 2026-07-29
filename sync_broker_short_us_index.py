@@ -2,7 +2,8 @@
 
 楽天証券の米株信用 売建対象は「S&P500/NASDAQ100/NYダウ構成 OR 時価総額≥$5B
 (かつ月間平均売買代金≥$50M)」の中から当社選定。機械可読な公式リスト/APIは
-無いため、index 構成(repo の tickers.json)∪ 時価総額≥$5B(yfinance)で近似し、
+無いため、tickers.json の all にある米国株を母集団とし、その中から
+index 構成(repo の tickers.json)∪ 時価総額≥$5B(yfinance)で近似して
 data/broker_short_us.json を生成する。
 
 これは近似であり、最終的な売建可否は発注画面が権威(human_execution_only)。
@@ -43,7 +44,10 @@ def _scan_tickers(base_dir: Path) -> list[str]:
         d = json.loads((Path(base_dir) / "tickers.json").read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return []
-    return [t for t in (d.get("short_scan_tickers") or []) if not str(t).endswith(".T")]
+    broad = d.get("all") or d.get("short_scan_tickers") or []
+    return list(dict.fromkeys(
+        str(t) for t in broad if t and not str(t).endswith(".T")
+    ))
 
 
 def classify_us_eligibility(ticker: str, *, market_cap: Optional[float],
@@ -76,14 +80,18 @@ def build_broker_us(tickers, *, index_members: set[str],
 
 
 def _fetch_market_caps(tickers: list[str]) -> dict[str, Optional[float]]:
-    """yfinance で時価総額を並列取得(best-effort)。取得不能は None=fail-closed。"""
+    """Fetch market caps in parallel (best-effort, unknown is fail-closed)."""
     import yfinance as yf
 
     def _one(t: str):
         try:
-            return t, yf.Ticker(t).info.get("marketCap")
+            value = yf.Ticker(t).fast_info.market_cap
+            return t, value
         except Exception:
-            return t, None
+            try:
+                return t, yf.Ticker(t).info.get("marketCap")
+            except Exception:
+                return t, None
 
     caps: dict[str, Optional[float]] = {}
     with ThreadPoolExecutor(max_workers=10) as ex:
@@ -103,6 +111,8 @@ def sync(*, base_dir: Path = BASE_DIR, tickers: Optional[list[str]] = None,
     tickers = tickers if tickers is not None else _scan_tickers(base_dir)
     index_members = index_members if index_members is not None else _load_index_members(base_dir)
     if market_caps is None and use_mktcap:
+        from utils import configure_yfinance_cache
+        configure_yfinance_cache("broker_short_us_index", base_dir=base_dir)
         # index 外の銘柄だけ時価総額を確認(index 内は無条件で eligible)
         need = [t for t in tickers if t not in index_members]
         market_caps = _fetch_market_caps(need) if need else {}
@@ -112,6 +122,10 @@ def sync(*, base_dir: Path = BASE_DIR, tickers: Optional[list[str]] = None,
         "generated_at": now.isoformat(),
         "source": "rule_based_index_or_mktcap (楽天 米株信用 売建基準の近似)",
         "note": "近似。最終売建可否は発注画面が権威(human_execution_only)。HTBは実コストが2.0%超の場合あり。",
+        "universe_count": len(tickers),
+        "eligible_count": len(entries),
+        "excluded_count": len(tickers) - len(entries),
+        "index_members_count": len(index_members),
         "tickers": entries,
     }
     data_dir = base_dir / "data"

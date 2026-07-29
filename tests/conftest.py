@@ -28,6 +28,14 @@ def _isolate_llm_call_log(tmp_path, monkeypatch):
     return log
 
 
+@pytest.fixture(autouse=True)
+def _isolate_yfinance_sqlite_cache(tmp_path, monkeypatch):
+    """Keep yfinance SQLite/cache files out of production during tests."""
+    cache_root = tmp_path / "yfinance-cache"
+    monkeypatch.setenv("ALMANAC_YFINANCE_CACHE_DIR", str(cache_root))
+    return cache_root
+
+
 # ---------------------------------------------------------------------------
 # 本番状態ファイルの保護
 #

@@ -187,6 +187,45 @@ def _age_hours(value: Any) -> float | None:
     return max(0.0, (datetime.now(timezone.utc) - parsed).total_seconds() / 3600.0)
 
 
+def _latest_short_pipeline(root: Path, market: str) -> dict[str, Any]:
+    """Read the latest screener funnel without conflating its stages."""
+    payload = _load_json(root / "short_candidates.json", {})
+    payload = payload if isinstance(payload, dict) else {}
+    candidates = payload.get("candidates")
+    candidates = candidates if isinstance(candidates, list) else []
+    is_jp = market == "JP"
+
+    def _belongs(row: Any) -> bool:
+        ticker = str(row.get("ticker") or "") if isinstance(row, dict) else ""
+        return bool(ticker) and ticker.endswith(".T") == is_jp
+
+    market_candidates = [row for row in candidates if _belongs(row)]
+    suffix = "jp" if is_jp else "us"
+    requested = payload.get(f"universe_requested_{suffix}")
+    downloaded = payload.get(f"price_data_{suffix}")
+    candidate_count = payload.get(f"candidate_count_{suffix}")
+    shortable_count = payload.get(f"shortable_count_{suffix}")
+    if not isinstance(candidate_count, int):
+        candidate_count = len(market_candidates)
+    if not isinstance(shortable_count, int):
+        shortable_count = sum(
+            1 for row in market_candidates
+            if isinstance(row, dict) and row.get("shortable") is True
+        )
+    coverage = None
+    if isinstance(requested, int) and requested > 0 and isinstance(downloaded, int):
+        coverage = round(downloaded / requested * 100, 1)
+    return {
+        "latest_scan_requested": requested if isinstance(requested, int) else None,
+        "latest_scan_downloaded": downloaded if isinstance(downloaded, int) else None,
+        "latest_scan_coverage_pct": coverage,
+        "latest_candidates": candidate_count,
+        "latest_shortable": shortable_count,
+        "latest_scan_as_of": payload.get("as_of"),
+        "latest_scan_status": payload.get("data_quality"),
+    }
+
+
 def _short_readiness(key: str, root: Path) -> dict[str, Any]:
     if key == "us_short":
         payload = _load_json(root / "data" / "broker_short_us.json", {})
@@ -196,6 +235,16 @@ def _short_readiness(key: str, root: Path) -> dict[str, Any]:
             1 for row in tickers.values()
             if isinstance(row, dict) and (row.get("rakuten") is True or row.get("sbi") is True)
         )
+        universe_count = payload.get("universe_count") if isinstance(payload, dict) else None
+        if not isinstance(universe_count, int):
+            ticker_config = _load_json(root / "tickers.json", {})
+            broad = ticker_config.get("all") if isinstance(ticker_config, dict) else []
+            universe_count = sum(
+                1 for ticker in (broad or [])
+                if ticker and not str(ticker).endswith(".T")
+            )
+        if not universe_count:
+            universe_count = len(tickers)
         as_of = payload.get("generated_at") if isinstance(payload, dict) else None
         age = _age_hours(as_of)
         blockers: list[str] = []
@@ -205,14 +254,26 @@ def _short_readiness(key: str, root: Path) -> dict[str, Any]:
             blockers.append("借株可否データの取得時刻を確認できません")
         elif age > 168:
             blockers.append(f"借株可否データが{age / 24:.1f}日経過しています")
+        pipeline = _latest_short_pipeline(root, "US")
+        warnings: list[str] = []
+        latest_coverage = pipeline.get("latest_scan_coverage_pct")
+        if isinstance(latest_coverage, (int, float)) and latest_coverage < 85:
+            warnings.append(f"最新の価格取得率が{latest_coverage:.1f}%です")
         return {
             "ready": not blockers,
             "blockers": blockers,
+            "warnings": warnings,
             "eligible_instruments": eligible,
+            "availability_universe_instruments": universe_count,
+            "availability_coverage_pct": (
+                round(eligible / universe_count * 100, 1)
+                if universe_count else None
+            ),
             "source_as_of": as_of,
             "source_age_hours": round(age, 1) if age is not None else None,
             "source": "data/broker_short_us.json",
             "source_note": "基準ベースの近似。最終可否・料率は発注画面が権威",
+            **pipeline,
         }
 
     loanable = _load_json(root / "data" / "jp_loanable_state.json", {})
@@ -230,10 +291,22 @@ def _short_readiness(key: str, root: Path) -> dict[str, Any]:
         blockers.append("貸借銘柄データが未取得または期限切れです")
     if jsf_age is None or jsf_age > 72:
         blockers.append("日証金データが未取得または期限切れです")
+    pipeline = _latest_short_pipeline(root, "JP")
+    warnings = []
+    latest_coverage = pipeline.get("latest_scan_coverage_pct")
+    if isinstance(latest_coverage, (int, float)) and latest_coverage < 85:
+        warnings.append(f"最新の価格取得率が{latest_coverage:.1f}%です")
+    eligible = sum(1 for value in loanable_rows.values() if value is True)
     return {
         "ready": not blockers,
         "blockers": blockers,
-        "eligible_instruments": sum(1 for value in loanable_rows.values() if value is True),
+        "warnings": warnings,
+        "eligible_instruments": eligible,
+        "availability_universe_instruments": len(loanable_rows),
+        "availability_coverage_pct": (
+            round(eligible / len(loanable_rows) * 100, 1)
+            if loanable_rows else None
+        ),
         "source_as_of": min(
             [value for value in (loanable_as_of, jsf_as_of) if value],
             default=None,
@@ -244,6 +317,7 @@ def _short_readiness(key: str, root: Path) -> dict[str, Any]:
         ), 1),
         "source": "data/jp_loanable_state.json + data/jsf_lending_state.json",
         "source_note": "銘柄ごとの貸借可否・逆日歩・規制を発注前に再確認",
+        **pipeline,
     }
 
 
@@ -271,9 +345,13 @@ def _short_status(key: str, *, base_dir: Path | str | None = None) -> dict[str, 
         "auto_order_enabled": False,
         "reason": reason,
         "blockers": readiness["blockers"],
+        "warnings": readiness.get("warnings", []),
         "updated_at": state_entry.get("updated_at"),
         "updated_by": state_entry.get("updated_by"),
-        **{k: v for k, v in readiness.items() if k not in {"ready", "blockers"}},
+        **{
+            k: v for k, v in readiness.items()
+            if k not in {"ready", "blockers", "warnings"}
+        },
     }
 
 

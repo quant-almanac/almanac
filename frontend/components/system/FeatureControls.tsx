@@ -19,10 +19,20 @@ export interface FeatureStatus {
   auto_order_enabled: boolean
   reason: string
   blockers: string[]
+  warnings?: string[]
   updated_at?: string | null
   updated_by?: string | null
   control_hint?: string
   eligible_instruments?: number
+  availability_universe_instruments?: number
+  availability_coverage_pct?: number | null
+  latest_scan_requested?: number | null
+  latest_scan_downloaded?: number | null
+  latest_scan_coverage_pct?: number | null
+  latest_candidates?: number | null
+  latest_shortable?: number | null
+  latest_scan_as_of?: string | null
+  latest_scan_status?: string | null
   source_as_of?: string | null
   source_age_hours?: number | null
   source?: string
@@ -134,13 +144,40 @@ export default function FeatureControls() {
               <Chip color={effectiveColor} mono>{effectiveLabel}</Chip>
               {feature.configured_enabled && !feature.effective_enabled && <Chip color={OPS.amber} bg={OPS.amberBg} mono>FAIL-CLOSED</Chip>}
               {feature.auto_order_enabled === false && <Chip color={OPS.dim} mono>自動注文なし</Chip>}
-              {feature.eligible_instruments != null && <span style={{ color: OPS.dim, fontSize: 10.5 }}>確認対象 {feature.eligible_instruments}銘柄</span>}
             </div>
             <div style={{ color: OPS.sub, fontSize: 11.5, lineHeight: 1.6, marginTop: 6 }}>{feature.reason}</div>
             {feature.blockers.length > 0 && <div style={{ color: OPS.amber, fontSize: 10.5, lineHeight: 1.55, marginTop: 3 }}>
               無効理由: {feature.blockers.join(' / ')}
             </div>}
+            {(feature.warnings?.length ?? 0) > 0 && <div style={{ color: OPS.amber, fontSize: 10.5, lineHeight: 1.55, marginTop: 3 }}>
+              注意: {feature.warnings?.join(' / ')}
+            </div>}
             <div style={{ color: OPS.dim, fontSize: 10.5, lineHeight: 1.55, marginTop: 3 }}>{feature.description}</div>
+            {feature.category === 'short' && <div
+              data-testid={`feature-${feature.key}-funnel`}
+              style={{
+                display: 'flex',
+                gap: 10,
+                flexWrap: 'wrap',
+                color: OPS.dim,
+                fontFamily: OPS.mono,
+                fontSize: 10,
+                marginTop: 5,
+              }}
+            >
+              {feature.eligible_instruments != null && <span>
+                借株proxy {feature.eligible_instruments}
+                {feature.availability_universe_instruments != null ? `/${feature.availability_universe_instruments}` : ''}
+                {feature.availability_coverage_pct != null ? ` (${feature.availability_coverage_pct}%)` : ''}
+              </span>}
+              {feature.latest_scan_downloaded != null && <span>
+                最新価格 {feature.latest_scan_downloaded}
+                {feature.latest_scan_requested != null ? `/${feature.latest_scan_requested}` : ''}
+                {feature.latest_scan_coverage_pct != null ? ` (${feature.latest_scan_coverage_pct}%)` : ''}
+              </span>}
+              {feature.latest_candidates != null && <span>候補 {feature.latest_candidates}</span>}
+              {feature.latest_shortable != null && <span>借株可 {feature.latest_shortable}</span>}
+            </div>}
             {feature.source_note && <div style={{ color: OPS.dim, fontSize: 10, marginTop: 3 }}>
               根拠: {feature.source_note}
               {feature.source_age_hours != null ? ` · ${feature.source_age_hours}時間前` : ''}

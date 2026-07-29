@@ -59,6 +59,36 @@ def test_enabled_switch_still_fails_closed_without_borrow_source(tmp_path):
     assert any("借株可否データがありません" in reason for reason in status["blockers"])
 
 
+def test_us_short_status_separates_proxy_and_latest_funnel(tmp_path):
+    _write_us_source(tmp_path, tickers={
+        "AAPL": {"rakuten": True},
+        "MSFT": {"rakuten": True},
+    })
+    (tmp_path / "tickers.json").write_text(json.dumps({
+        "all": ["AAPL", "MSFT", "NVDA", "7203.T"],
+    }), encoding="utf-8")
+    (tmp_path / "short_candidates.json").write_text(json.dumps({
+        "as_of": "2026-07-29 18:30",
+        "data_quality": "degraded",
+        "universe_requested_us": 3,
+        "price_data_us": 2,
+        "candidate_count_us": 1,
+        "shortable_count_us": 1,
+        "candidates": [{"ticker": "AAPL", "shortable": True}],
+    }), encoding="utf-8")
+
+    status = fc.set_feature("us_short", True, actor="test", base_dir=tmp_path)
+
+    assert status["eligible_instruments"] == 2
+    assert status["availability_universe_instruments"] == 3
+    assert status["availability_coverage_pct"] == 66.7
+    assert status["latest_scan_requested"] == 3
+    assert status["latest_scan_downloaded"] == 2
+    assert status["latest_candidates"] == 1
+    assert status["latest_shortable"] == 1
+    assert status["warnings"] == ["最新の価格取得率が66.7%です"]
+
+
 def test_disclosure_config_loader_applies_runtime_state(tmp_path, monkeypatch):
     from disclosure_shadow_book import load_config
 

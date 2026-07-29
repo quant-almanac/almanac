@@ -26,6 +26,46 @@ _fx_cache: dict = {}              # {pair: (rate, fetched_at)}
 _logger = logging.getLogger(__name__)
 
 
+def configure_yfinance_cache(
+    namespace: str,
+    *,
+    base_dir: Path | str | None = None,
+) -> Path:
+    """Give one workflow its own writable yfinance SQLite cache.
+
+    yfinance stores timezone, cookie and ISIN data in SQLite.  Sharing the
+    default cache between concurrently scheduled screeners can make a partial
+    batch fail before price retrieval.  A stable per-workflow directory keeps
+    reuse within a workflow while avoiding cross-process cache contention.
+    """
+    safe_namespace = "".join(
+        character if character.isalnum() or character in {"-", "_"} else "_"
+        for character in str(namespace)
+    ).strip("_")
+    if not safe_namespace:
+        raise ValueError("namespace must contain at least one safe character")
+
+    configured_root = os.environ.get("ALMANAC_YFINANCE_CACHE_DIR")
+    if configured_root:
+        cache_root = Path(configured_root)
+    else:
+        state_root = Path(
+            os.environ.get("ALMANAC_STATE_DIR")
+            or base_dir
+            or Path(__file__).resolve().parent
+        )
+        cache_root = state_root / "data" / "yfinance_cache"
+    cache_dir = cache_root / safe_namespace
+    cache_dir.mkdir(parents=True, exist_ok=True)
+
+    import yfinance as yf
+
+    # Despite the historical name this configures timezone, cookie and ISIN
+    # caches in yfinance 1.x.
+    yf.set_tz_cache_location(str(cache_dir))
+    return cache_dir
+
+
 def init_yfinance_timeout(timeout: int = YF_TIMEOUT) -> None:
     """yfinance のグローバル curl_cffi セッションに timeout を設定する。
     各スクリプトの冒頭で1回呼ぶだけで全 yf.Ticker / yf.download に適用される。
