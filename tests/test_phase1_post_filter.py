@@ -2834,6 +2834,51 @@ def test_jp_kabu_mini_request_without_local_eligibility_falls_back_to_standard_l
     assert saved["items"][0]["reason"] == "too_small"
 
 
+def test_shadow_post_filter_suppresses_kabu_mini_persistence(monkeypatch, tmp_path):
+    _silence_external_filters(monkeypatch)
+    monkeypatch.setattr(tunable_params, "get", _tp_get)
+    verification_path = tmp_path / "data" / "kabu_mini_verification_needed.json"
+    monkeypatch.setattr(
+        kabu_mini_eligibility,
+        "VERIFICATION_NEEDED_PATH",
+        verification_path,
+        raising=False,
+    )
+    synthesis = {
+        "overall_stance": "aggressive",
+        "priority_actions": [{
+            "ticker": "7203.T",
+            "type": "buy",
+            "amount_hint": "1株",
+            "action": "7203.T 1株をかぶミニで現物買い",
+            "decision_price": 5000.0,
+            "execution_channel": "rakuten_kabu_mini_open",
+            "confidence_pct": 74,
+        }],
+    }
+
+    result = analyst._phase1_post_filter(
+        synthesis,
+        30_000_000,
+        positions=[{
+            "ticker": "7203.T",
+            "current_price": 5000.0,
+            "currency": "JPY",
+            "shares": 0,
+            "value_jpy": 0,
+        }],
+        cash_info={
+            "total_cash_jpy": 10_000_000,
+            "usd_as_jpy": 0,
+            "jpy_cash": 10_000_000,
+        },
+        side_effects=False,
+    )
+
+    assert result["kabu_mini_verification_write_suppressed"] is True
+    assert not verification_path.exists()
+
+
 def test_jp_kabu_mini_request_over_cap_without_local_eligibility_is_visible(monkeypatch, tmp_path):
     _silence_external_filters(monkeypatch)
     monkeypatch.setattr(tunable_params, "get", _tp_get)

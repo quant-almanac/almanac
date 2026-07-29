@@ -32,7 +32,7 @@ from __future__ import annotations
 import copy
 import math
 from dataclasses import dataclass
-from typing import Optional
+from typing import Callable, Optional
 
 from kelly_sizing import suggest_size_pct
 from position_identity import position_identity_for_action
@@ -212,6 +212,9 @@ class KellyShadowDecision:
     modified: tuple
     capped_count: int
     non_actionable_count: int
+    post_filter_applied: bool
+    post_filter_filtered_count: int
+    post_filter_review_count: int
 
 
 def run_kelly_shadow(
@@ -224,6 +227,7 @@ def run_kelly_shadow(
     require_position_identity: bool = False,
     kelly_stats: Optional[dict] = None,
     lot_unit_jpy: float = 1.0,
+    post_filter: Optional[Callable[[list[dict]], dict]] = None,
 ) -> KellyShadowDecision:
     """反実仮想の影経路本体。
 
@@ -266,12 +270,75 @@ def run_kelly_shadow(
     # apply_policy_gate は pure function (副作用なし) なので、ここで
     # 何度呼んでも実経路には一切影響しない。
     decision = apply_policy_gate(capped_actions, policy_ctx)
+    accepted = list(decision.accepted)
+    rejected = list(decision.rejected)
+    post_filter_applied = post_filter is not None
+    post_filter_filtered_count = 0
+    post_filter_review_count = 0
+
+    if post_filter is not None:
+        filtered_synthesis = post_filter(
+            [copy.deepcopy(action) for action in accepted if isinstance(action, dict)]
+        )
+        if not isinstance(filtered_synthesis, dict):
+            raise TypeError("Kelly shadow post_filter must return a synthesis dict")
+        accepted = [
+            action
+            for action in (filtered_synthesis.get("priority_actions") or [])
+            if isinstance(action, dict)
+        ]
+        post_filtered = [
+            action
+            for action in (
+                list(filtered_synthesis.get("_filtered_actions") or [])
+                + list(filtered_synthesis.get("order_intent_deferred_actions") or [])
+            )
+            if isinstance(action, dict)
+        ]
+        post_filter_filtered_count = len(post_filtered)
+        post_filter_review_count = sum(
+            1
+            for action in accepted
+            if str(action.get("execution_readiness") or "") != "ready"
+        )
+        rejected.extend(post_filtered)
+
+    # Final invariant: a downstream minimum-notional/rounding rule must never
+    # enlarge a counterfactual buy beyond Kelly's absolute addable amount.
+    # Treat this as a normal non-actionable business state, not an assertion.
+    final_accepted: list[dict] = []
+    for action in accepted:
+        shadow = action.get("kelly_shadow")
+        if not isinstance(shadow, dict):
+            final_accepted.append(action)
+            continue
+        addable = shadow.get("addable_jpy")
+        notional = _action_notional_jpy(action)
+        if (
+            isinstance(addable, (int, float))
+            and notional is not None
+            and notional > float(addable) + 1e-9
+        ):
+            rejected_action = copy.deepcopy(action)
+            rejected_action["actionable"] = False
+            rejected_action["filtered_reason"] = "kelly_cap_post_filter_violation"
+            rejected_action["kelly_shadow"]["non_actionable_reason"] = (
+                f"post-filter後の元本 ¥{notional:,.0f} が "
+                f"Kelly追加可能額 ¥{float(addable):,.0f} を超過"
+            )
+            rejected.append(rejected_action)
+            non_actionable_count += 1
+            continue
+        final_accepted.append(action)
 
     return KellyShadowDecision(
         evaluated=tuple(evaluated_actions),
-        accepted=tuple(decision.accepted),
-        rejected=tuple(decision.rejected),
+        accepted=tuple(final_accepted),
+        rejected=tuple(rejected),
         modified=tuple(decision.modified),
         capped_count=capped_count,
         non_actionable_count=non_actionable_count,
+        post_filter_applied=post_filter_applied,
+        post_filter_filtered_count=post_filter_filtered_count,
+        post_filter_review_count=post_filter_review_count,
     )

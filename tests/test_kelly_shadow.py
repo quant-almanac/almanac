@@ -243,3 +243,69 @@ def test_run_kelly_shadow_returns_capped_and_non_actionable_counts():
     assert decision.capped_count == 1
     avgo = next(a for a in decision.evaluated if a.get('ticker') == 'AVGO')
     assert avgo['notional_jpy'] < 5_000_000
+
+
+def test_run_kelly_shadow_applies_side_effect_free_post_filter_after_policy():
+    actions = [
+        {'ticker': 'AVGO', 'type': 'add', 'notional_jpy': 100_000, 'tier': 'long'},
+        {'ticker': 'NVDA', 'type': 'add', 'notional_jpy': 100_000, 'tier': 'long'},
+    ]
+    seen = []
+
+    def _post_filter(rows):
+        seen.extend(rows)
+        return {
+            'priority_actions': [row for row in rows if row['ticker'] == 'AVGO'],
+            '_filtered_actions': [
+                {**row, 'filtered_reason': 'cooldown'}
+                for row in rows if row['ticker'] == 'NVDA'
+            ],
+        }
+
+    decision = ks.run_kelly_shadow(
+        actions,
+        PolicyContext(),
+        portfolio_total_jpy=10_000_000,
+        current_holdings_by_ticker={'AVGO': 0, 'NVDA': 0},
+        kelly_stats={
+            ticker: {
+                'win_rate': 0.6, 'avg_win_pct': 0.05, 'avg_loss_pct': 0.03,
+                'n': 20, 'sufficient': True,
+            }
+            for ticker in ('AVGO', 'NVDA')
+        },
+        post_filter=_post_filter,
+    )
+
+    assert {row['ticker'] for row in seen} == {'AVGO', 'NVDA'}
+    assert [row['ticker'] for row in decision.accepted] == ['AVGO']
+    assert any(row.get('ticker') == 'NVDA' for row in decision.rejected)
+    assert decision.post_filter_applied is True
+    assert decision.post_filter_filtered_count == 1
+
+
+def test_post_filter_cannot_raise_notional_above_kelly_cap():
+    action = {'ticker': 'AVGO', 'type': 'add', 'notional_jpy': 5_000_000, 'tier': 'long'}
+
+    def _bad_post_filter(rows):
+        rows[0]['notional_jpy'] = 900_000
+        rows[0]['estimated_notional_jpy'] = 900_000
+        return {'priority_actions': rows}
+
+    decision = ks.run_kelly_shadow(
+        [action],
+        PolicyContext(),
+        portfolio_total_jpy=10_000_000,
+        current_holdings_by_ticker={'AVGO': 0},
+        kelly_stats={
+            'AVGO': {
+                'win_rate': 0.6, 'avg_win_pct': 0.05, 'avg_loss_pct': 0.03,
+                'n': 20, 'sufficient': True,
+            },
+        },
+        post_filter=_bad_post_filter,
+    )
+
+    assert decision.accepted == ()
+    assert decision.non_actionable_count == 1
+    assert decision.rejected[-1]['filtered_reason'] == 'kelly_cap_post_filter_violation'

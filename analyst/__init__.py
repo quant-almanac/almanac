@@ -6693,6 +6693,7 @@ def _phase1_post_filter(
     execution_plan: dict | None = None,
     rebalance_medium: dict | None = None,
     now: datetime | None = None,
+    side_effects: bool = True,
 ) -> dict:
     """
     Phase 1 post-filter:
@@ -8525,13 +8526,15 @@ def _phase1_post_filter(
         "reason_counts": reason_counts,
         "count_conservation_ok": len(actions) == len(kept) + len(filtered) + len(deferred),
     }
-    if kabu_mini_verification_needed:
+    if kabu_mini_verification_needed and side_effects:
         try:
             from kabu_mini_eligibility import record_kabu_mini_verification_needed
             record_kabu_mini_verification_needed(kabu_mini_verification_needed)
             synthesis.pop("kabu_mini_verification_write_error", None)
         except Exception as exc:
             synthesis["kabu_mini_verification_write_error"] = str(exc)
+    elif kabu_mini_verification_needed:
+        synthesis["kabu_mini_verification_write_suppressed"] = True
     synthesis["decision_boundary_audit"] = _build_decision_boundary_audit(
         kept,
         filtered,
@@ -8657,6 +8660,36 @@ def _phase1_post_filter(
         print("  📱 telegram_message を no-action 用に再構築")
 
     return synthesis
+
+
+def _prepare_kelly_shadow_synthesis(
+    actions: list[dict],
+    *,
+    synthesis: dict,
+    data: dict,
+    regime_bull_confirmed: bool,
+) -> dict:
+    """Build the isolated synthesis object consumed by Kelly's post-filter.
+
+    Only immutable analysis inputs and copies of model output are carried into
+    this lane.  The returned object is never published, logged, registered in
+    action state, or used to replace the real ``priority_actions``.
+    """
+    import copy
+
+    shadow = {
+        "analysis_id": synthesis.get("analysis_id"),
+        "decision_snapshot_id": synthesis.get("decision_snapshot_id"),
+        "decision_snapshot_hash": synthesis.get("decision_snapshot_hash"),
+        "overall_stance": synthesis.get("overall_stance"),
+        "leverage_health": copy.deepcopy(synthesis.get("leverage_health") or {}),
+        "context_blocks": copy.deepcopy(synthesis.get("context_blocks") or {}),
+        "priority_actions": copy.deepcopy(actions),
+        "policy_filtered_actions": [],
+    }
+    _normalize_jpx_action_units(shadow)
+    _apply_stance_guard(shadow, data, regime_bull_confirmed)
+    return shadow
 
 
 # ── AI推奨事後検証ログ ───────────────────────────────────
@@ -9505,6 +9538,7 @@ def run_analysis(force: bool = False) -> dict:
         from action_stage_log import new_analysis_id as _new_analysis_id
     _asl_analysis_id = _new_analysis_id()
     data["analysis_id"] = _asl_analysis_id
+    _analysis_now = datetime.now(ZoneInfo("Asia/Tokyo"))
 
     # Approved investment-policy limits are live in observation mode first.
     # Household concentration aggregates the same instrument across accounts,
@@ -10866,6 +10900,22 @@ def run_analysis(force: bool = False) -> dict:
                     current_holdings_by_position=_kelly_holdings_by_position,
                     require_position_identity=True,
                     kelly_stats=_kelly_agg_stats(),
+                    post_filter=lambda _actions: _phase1_post_filter(
+                        _prepare_kelly_shadow_synthesis(
+                            _actions,
+                            synthesis=synthesis,
+                            data=data,
+                            regime_bull_confirmed=_regime_bull_confirmed,
+                        ),
+                        float(data.get("portfolio_total") or 0),
+                        fx_rate=_kelly_fx,
+                        positions=data.get("positions"),
+                        cash_info=data.get("cash_info"),
+                        execution_plan=data.get("execution_plan"),
+                        rebalance_medium=data.get("rebalance_medium"),
+                        now=_analysis_now,
+                        side_effects=False,
+                    ),
                 )
                 synthesis["kelly_shadow_decision"] = {
                     "accepted_count": len(_kelly_shadow_decision.accepted),
@@ -10873,6 +10923,13 @@ def run_analysis(force: bool = False) -> dict:
                     "modified_count": len(_kelly_shadow_decision.modified),
                     "capped_count": _kelly_shadow_decision.capped_count,
                     "non_actionable_count": _kelly_shadow_decision.non_actionable_count,
+                    "post_filter_applied": _kelly_shadow_decision.post_filter_applied,
+                    "post_filter_filtered_count": (
+                        _kelly_shadow_decision.post_filter_filtered_count
+                    ),
+                    "post_filter_review_count": (
+                        _kelly_shadow_decision.post_filter_review_count
+                    ),
                     "evaluated_actions": [
                         dict(action) for action in _kelly_shadow_decision.evaluated
                         if isinstance(action, dict)
@@ -10965,6 +11022,7 @@ def run_analysis(force: bool = False) -> dict:
             cash_info=data.get("cash_info"),
             execution_plan=data.get("execution_plan"),
             rebalance_medium=data.get("rebalance_medium"),
+            now=_analysis_now,
         )
     except Exception as _pe:
         _pf_quarantined = _quarantine_post_filter_failure(synthesis, _pe)
