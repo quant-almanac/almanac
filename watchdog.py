@@ -94,6 +94,9 @@ EXPECTED_INTERVALS = {
     # missed slot is visible without generating intraday false positives.
     'auto_tune':        {'max_stale_sec': 26 * 3600, 'weekday_only': True},
     'backup_manager':    {'max_stale_sec': 26 * 3600, 'weekday_only': False},
+    # 毎月1日06:00。翌月の実行までに十分な猶予を持たせつつ、2回連続で
+    # 欠落すれば stale になる。疑似現金/MMFは再構築対象外。
+    'parquet_rebuilder': {'max_stale_sec': 40 * 24 * 3600, 'weekday_only': False},
     # 以下は heartbeat 未登録・優先度低のため監視対象外（必要になったら復活）:
     #   'short_screener', 'weekly_report', 'portfolio_agent'
 }

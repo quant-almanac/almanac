@@ -16,6 +16,7 @@ assets/*.png
 data/ohlcv/*.parquet
 data/edgar_cache/
 models/*.pt
+models/ginn/
 *.db
 *.db-shm
 *.db-wal

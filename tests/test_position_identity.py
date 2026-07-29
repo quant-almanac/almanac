@@ -8,10 +8,9 @@ execution_readiness.portfolio_snapshot_health() のファイル全体判定が
 と誤判定される一因になった。旧チェックは risk_increasing (買い系) でしか
 評価されず、売り系には鮮度チェックが一切無かった。
 
-ユーザー判断: 実データで測定すると 39 ポジション中 35 件が72時間超の
-staleとなり (証券会社同期が実際に13日止まっている)、既存の72h=blocked
-基準をそのまま適用すると発注機能が事実上停止する。そのため stale/degraded/
-unknown はいずれも review 止まりとし、blocked にはしない。
+2026-07-30 のユーザー判断で、証券会社確認済みの数量・取得原価は時間経過
+だけでは失効させない契約へ変更した。snapshot 後に同一 PositionIdentity の
+約定が発生した場合だけ invalidated にし、再照合を要求する。
 """
 from __future__ import annotations
 
@@ -111,14 +110,14 @@ def test_holding_with_unknown_owner_fails_closed():
 # ---------------------------------------------------------------------------
 
 
-def test_stale_position_matches_the_actual_incident_math():
-    """2026-07-27 インシデントの実数値を再現する。"""
+def test_old_position_snapshot_remains_valid_without_later_events():
+    """経過時間は監査情報として残すが、それだけでは失効させない。"""
     position = pi.PositionIdentity("husband", "rakuten", "general", "AVGO")
     now = datetime(2026, 7, 27, 18, 0)
     entry = {"note": "楽天CSV保有同期 2026-07-14"}
 
     result = pi.position_freshness(position, base_dir=Path("."), now=now, holdings_entry=entry)
-    assert result["status"] == "stale"
+    assert result["status"] == "fresh"
     assert result["synced_at"] == "2026-07-14T00:00:00+09:00"
     assert result["age_hours"] == pytest.approx(330.0, abs=1.0)  # 13.75日
 
@@ -132,10 +131,11 @@ def test_unrelated_ticker_update_does_not_refresh_this_position():
     """
     now = datetime(2026, 7, 27, 18, 0)
     avgo = pi.PositionIdentity("husband", "rakuten", "general", "AVGO")
-    avgo_entry = {"note": "楽天CSV保有同期 2026-07-14"}  # 古いまま
+    avgo_entry = {"note": "楽天CSV保有同期 2026-07-14"}
 
     result = pi.position_freshness(avgo, base_dir=Path("."), now=now, holdings_entry=avgo_entry)
-    assert result["status"] == "stale"  # LLY が7/23に更新されていても関係ない
+    assert result["status"] == "fresh"
+    assert result["synced_at"] == "2026-07-14T00:00:00+09:00"
 
 
 def test_fresh_position_within_24h():
@@ -146,15 +146,16 @@ def test_fresh_position_within_24h():
     assert result["status"] == "fresh"
 
 
-def test_degraded_between_24_and_72_hours():
+def test_position_does_not_degrade_between_24_and_72_hours():
     position = pi.PositionIdentity("husband", "rakuten", "general", "NVDA")
     now = datetime(2026, 7, 27, 18, 0)
     entry = {"note": "楽天CSV保有同期 2026-07-25"}  # 2日前 = 48h
     result = pi.position_freshness(position, base_dir=Path("."), now=now, holdings_entry=entry)
-    assert result["status"] == "degraded"
+    assert result["status"] == "fresh"
+    assert result["age_hours"] == 66.0
 
 
-def test_old_source_snapshot_is_not_refreshed_by_late_reconciliation_time(tmp_path):
+def test_source_as_of_remains_the_audit_timestamp_without_time_expiry(tmp_path):
     position = pi.PositionIdentity("wife", "sbi", "nisa_growth", "1489.T")
     now = datetime(2026, 7, 29, 18, 0, tzinfo=JST)
     entry = {
@@ -162,7 +163,7 @@ def test_old_source_snapshot_is_not_refreshed_by_late_reconciliation_time(tmp_pa
         "broker_reconciled_at": "2026-07-29T17:00:00+09:00",
     }
     result = pi.position_freshness(position, base_dir=tmp_path, now=now, holdings_entry=entry)
-    assert result["status"] == "stale"
+    assert result["status"] == "fresh"
     assert result["source"] == "holding.source_as_of"
 
 
@@ -182,7 +183,7 @@ def test_no_matching_holding_is_unknown():
     assert result["source"] == "unknown"
 
 
-def test_internal_portfolio_applied_does_not_advance_position_freshness(tmp_path):
+def test_internal_portfolio_applied_invalidates_broker_snapshot(tmp_path):
     position = pi.PositionIdentity("husband", "rakuten", "general", "AVGO")
     (tmp_path / "action_executions.json").write_text(json.dumps({
         "executions": [{
@@ -203,11 +204,12 @@ def test_internal_portfolio_applied_does_not_advance_position_freshness(tmp_path
         holdings_entry={"note": "楽天CSV保有同期 2026-07-14"},
     )
 
-    assert result["status"] == "stale"
+    assert result["status"] == "invalidated"
     assert result["source"] == "holdings_note_legacy"
+    assert result["invalidating_event"]["execution_id"] is None
 
 
-def test_only_fully_evidenced_broker_fill_advances_position_freshness(tmp_path):
+def test_broker_fill_requires_a_newer_position_snapshot(tmp_path):
     position = pi.PositionIdentity("husband", "rakuten", "general", "AVGO")
     base = {
         "ticker": "AVGO",
@@ -218,6 +220,7 @@ def test_only_fully_evidenced_broker_fill_advances_position_freshness(tmp_path):
         "external_execution_id": "broker-123",
         "broker_source": "broker_csv",
         "broker_reported_at": "2026-07-27T16:55:00+09:00",
+        "saved_at": "2026-07-27T17:00:00+09:00",
         "filled_quantity": 5,
         "filled_price": 410.0,
         "reconciled_at": "2026-07-27T17:00:00+09:00",
@@ -231,7 +234,7 @@ def test_only_fully_evidenced_broker_fill_advances_position_freshness(tmp_path):
         now=datetime(2026, 7, 27, 18, 0, tzinfo=JST),
         holdings_entry={"note": "楽天CSV保有同期 2026-07-14"},
     )
-    assert incomplete["status"] == "stale"
+    assert incomplete["status"] == "invalidated"
 
     (tmp_path / "action_executions.json").write_text(json.dumps({
         "executions": [{
@@ -245,8 +248,16 @@ def test_only_fully_evidenced_broker_fill_advances_position_freshness(tmp_path):
         now=datetime(2026, 7, 27, 18, 0, tzinfo=JST),
         holdings_entry={"note": "楽天CSV保有同期 2026-07-14"},
     )
-    assert confirmed["status"] == "fresh"
-    assert confirmed["source"] == "broker_confirmed_fill:broker-123"
+    assert confirmed["status"] == "invalidated"
+    assert confirmed["invalidating_event"]["temporal_order"]["temporal_order"] != "before_snapshot"
+
+    reconciled = pi.position_freshness(
+        position,
+        base_dir=tmp_path,
+        now=datetime(2026, 7, 27, 19, 0, tzinfo=JST),
+        holdings_entry={"source_as_of": "2026-07-27T18:00:00+09:00"},
+    )
+    assert reconciled["status"] == "fresh"
 
 
 def test_route_overlay_is_used_for_position_freshness(tmp_path):
@@ -290,8 +301,8 @@ def test_route_overlay_is_used_for_position_freshness(tmp_path):
         holdings_entry={"note": "楽天CSV保有同期 2026-07-14"},
     )
 
-    assert result["status"] == "fresh"
-    assert result["source"] == "broker_confirmed_fill:broker-123"
+    assert result["status"] == "invalidated"
+    assert result["invalidating_event"]["execution_position_identity"] == position.key
 
 
 # ---------------------------------------------------------------------------
@@ -303,8 +314,7 @@ def _write_holdings(tmp_path: Path, entries: dict) -> None:
     (tmp_path / "holdings.json").write_text(json.dumps(entries), encoding="utf-8")
 
 
-def test_stale_sell_action_is_review_not_blocked(tmp_path):
-    """本件の直接再現: 売り系 (trim) には旧コードで鮮度チェックが皆無だった。"""
+def test_old_sell_snapshot_is_ready_without_later_events(tmp_path):
     now = datetime(2026, 7, 27, 18, 0, tzinfo=JST)
     _write_holdings(tmp_path, {
         "AVGO_ippan": {"ticker": "AVGO", "account": "一般", "broker": "楽天証券", "owner": "husband",
@@ -322,19 +332,11 @@ def test_stale_sell_action_is_review_not_blocked(tmp_path):
     result = classify_execution_readiness(action, base_dir=tmp_path, now=now)
 
     codes = {row["code"] for row in result["execution_block_reasons"]}
-    assert "position_broker_sync_stale" in codes
-    stale_row = next(r for r in result["execution_block_reasons"] if r["code"] == "position_broker_sync_stale")
-    assert stale_row.get("status") == "stale"
-    # 本題: stale であっても全体の execution_readiness は blocked まで
-    # 上がらない (review 止まり)。この fixture には他に blocked を招く
-    # 要因が無いため、これは position_broker_sync_stale 自体の severity を
-    # 直接反映する。
-    assert result["execution_readiness"] == "review"
+    assert not any(code.startswith("position_broker_") for code in codes)
+    assert result["execution_readiness"] == "ready"
 
 
-def test_buy_action_also_gets_position_level_freshness_check(tmp_path):
-    """買い系は従来からファイル全体チェックがあったが、ポジション単位の
-    チェックも additive に効くこと。"""
+def test_buy_action_does_not_expire_position_by_age(tmp_path):
     now = datetime(2026, 7, 27, 18, 0, tzinfo=JST)
     _write_holdings(tmp_path, {
         "AVGO_ippan": {"ticker": "AVGO", "account": "一般", "broker": "楽天証券", "owner": "husband",
@@ -355,7 +357,7 @@ def test_buy_action_also_gets_position_level_freshness_check(tmp_path):
     }
     result = classify_execution_readiness(action, base_dir=tmp_path, now=now)
     codes = {row["code"] for row in result["execution_block_reasons"]}
-    assert "position_broker_sync_stale" in codes
+    assert not any(code.startswith("position_broker_") for code in codes)
 
 
 def test_fresh_holding_produces_no_freshness_reason(tmp_path):
@@ -395,19 +397,11 @@ def test_missing_execution_routing_skips_check_without_crashing(tmp_path):
 
 
 @pytest.mark.parametrize("note,expected_code", [
-    ("楽天CSV保有同期 2026-07-14", "position_broker_sync_stale"),     # 330h
-    ("楽天CSV保有同期 2026-07-25", "position_broker_sync_degraded"),  # 48h
+    ("楽天CSV保有同期 2026-07-14", None),
+    ("楽天CSV保有同期 2026-07-25", None),
     ("手入力・日付なし", "position_broker_sync_unknown"),
 ])
-def test_severity_never_escalates_to_blocked_from_this_check_alone(tmp_path, note, expected_code):
-    """ユーザー判断: ポートフォリオ全体の同期停止を blocked にすると発注機能が
-    事実上停止するため、stale/degraded/unknown はいずれも review 止まり。
-
-    fixture は position_broker_sync_* 以外の理由で blocked にならないよう
-    健全な状態 (execution_plan active, holding_shares_before 十分) にした
-    うえで、この特定コードが混ざっても execution_readiness が blocked に
-    到達しないことを実際の関門呼び出しで確認する (source文字列の一致に
-    頼らない)。"""
+def test_only_unknown_timestamp_requires_review_without_an_event(tmp_path, note, expected_code):
     now = datetime(2026, 7, 27, 18, 0, tzinfo=JST)
     _write_holdings(tmp_path, {
         "AVGO_ippan": {"ticker": "AVGO", "account": "一般", "broker": "楽天証券", "owner": "husband",
@@ -425,7 +419,10 @@ def test_severity_never_escalates_to_blocked_from_this_check_alone(tmp_path, not
     result = classify_execution_readiness(action, base_dir=tmp_path, now=now)
 
     codes = {row["code"] for row in result["execution_block_reasons"]}
-    assert expected_code in codes
+    if expected_code is None:
+        assert not any(code.startswith("position_broker_") for code in codes)
+    else:
+        assert expected_code in codes
     assert result["execution_readiness"] != "blocked"
 
 

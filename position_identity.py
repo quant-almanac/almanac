@@ -31,11 +31,11 @@ from pathlib import Path
 from typing import Optional
 from zoneinfo import ZoneInfo
 
-# 鮮度の閾値は execution_readiness.portfolio_snapshot_health() の
-# file-wide 版 (72h=stale / 24h=degraded) とそろえる。ポジション単位に
-# しても「何時間で危険域か」という運用上の意味は変えない。
-DEGRADED_AFTER_HOURS = 24.0
-STALE_AFTER_HOURS = 72.0
+# 証券会社で一度確認した数量・取得原価は、時間経過だけでは変化しない。
+# 2026-07-30 のユーザー判断により、ポジション snapshot は固定時間 TTL
+# ではなく event-based validity とする。同一 PositionIdentity に対する
+# snapshot 後の fill / 訂正不能な約定が見つかったときだけ invalidated に
+# 落とす。市場価格・ニュース等の時系列データの TTL とは別契約である。
 
 
 @dataclass(frozen=True)
@@ -248,87 +248,73 @@ def _parse_sync_timestamp(entry: dict) -> tuple[datetime | None, str]:
     )
 
 
-def _broker_confirmed_fill_timestamp(
-    position: PositionIdentity,
-    *,
-    base_dir: Path,
-) -> tuple[datetime | None, str]:
-    """Return the latest externally evidenced fill for this exact position.
-
-    Internal ``portfolio_applied`` and ordinary ``executed`` rows deliberately
-    do not qualify.  A fill advances freshness only when the broker execution,
-    quantity/price, report time and reconciliation snapshot can all be audited.
-    """
-    try:
-        from execution_reconciliation import load_effective_execution_records
-        rows = load_effective_execution_records(base_dir=base_dir)
-    except Exception:
-        rows = []
-    if not rows:
-        return None, "unknown"
-    state_raw = _load_json_object(base_dir / "action_state.json") or {}
-    state_actions = state_raw.get("actions") if isinstance(state_raw, dict) else {}
-    if not isinstance(state_actions, dict):
-        state_actions = {}
-
-    required = (
-        "external_execution_id",
-        "broker_source",
-        "broker_reported_at",
-        "filled_quantity",
-        "filled_price",
-        "reconciled_at",
-        "reconciliation_snapshot_hash",
-    )
-    latest: datetime | None = None
-    latest_id = ""
-    seen_external_ids: set[str] = set()
-    for row in rows:
-        if not isinstance(row, dict):
-            continue
-        if row.get("execution_reconciliation_status") == "review":
-            continue
-        state_id = str(row.get("action_state_id") or "")
-        linked = state_actions.get(state_id) if state_id else None
-        merged = {**(linked if isinstance(linked, dict) else {}), **row}
-        status = str(
-            merged.get("event_type")
-            or merged.get("status")
-            or merged.get("reconciliation_status")
-            or ""
-        ).lower()
-        confirmed = bool(merged.get("broker_confirmed_filled")) or status in {
-            "broker_confirmed_filled",
-            "broker_confirmed",
-        }
-        if not confirmed or any(merged.get(key) in (None, "") for key in required):
-            continue
-        candidate = position_identity_for_action(merged)
-        if candidate != position:
-            continue
-        external_id = str(merged["external_execution_id"])
-        if external_id in seen_external_ids:
-            continue
-        seen_external_ids.add(external_id)
-        try:
-            reconciled_at = datetime.fromisoformat(
-                str(merged["reconciled_at"]).replace("Z", "+00:00")
-            )
-        except ValueError:
-            continue
-        if latest is None or _as_jst(reconciled_at) > _as_jst(latest):
-            latest = reconciled_at
-            latest_id = external_id
-    return (
-        (latest, f"broker_confirmed_fill:{latest_id}")
-        if latest is not None
-        else (None, "unknown")
-    )
-
-
 def _as_jst(value: datetime) -> datetime:
     jst = ZoneInfo("Asia/Tokyo")
     return value.replace(tzinfo=jst) if value.tzinfo is None else value.astimezone(jst)
+
+
+def _snapshot_invalidating_execution(
+    position: PositionIdentity,
+    *,
+    base_dir: Path,
+    snapshot_as_of: datetime,
+) -> dict | None:
+    """Return the first post-snapshot fill that invalidates this position.
+
+    A complete broker snapshot remains authoritative until a position-changing
+    event occurs.  Open orders are handled by the order-intent/sizing gates and
+    do not by themselves rewrite inventory.  A fill after the snapshot (or a
+    same-day/date-only fill whose order cannot be proven) requires a new broker
+    reconciliation.  Unknown route metadata for the same ticker also fails
+    closed because it may refer to this exact owner/account.
+    """
+    try:
+        from execution_reconciliation import (
+            execution_temporal_order,
+            load_effective_execution_records,
+        )
+        from execution_safety import is_fill_record
+
+        rows = load_effective_execution_records(base_dir=base_dir)
+    except Exception:
+        return {
+            "reason": "execution_ledger_unreadable",
+            "execution_id": None,
+        }
+
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        status = str(
+            row.get("event_type")
+            or row.get("status")
+            or row.get("reconciliation_status")
+            or ""
+        ).lower()
+        externally_confirmed_fill = bool(
+            row.get("broker_confirmed_filled")
+        ) or status in {"broker_confirmed_filled", "broker_confirmed"}
+        if not (is_fill_record(row) or externally_confirmed_fill):
+            continue
+        if str(row.get("ticker") or "").strip().upper() != position.canonical_instrument_id:
+            continue
+        temporal = execution_temporal_order(row, snapshot_as_of.isoformat())
+        if temporal.get("temporal_order") == "before_snapshot":
+            continue
+        candidate = position_identity_for_action(row)
+        if candidate is not None and candidate != position:
+            continue
+        return {
+            "reason": str(
+                temporal.get("temporal_order") or "temporal_order_unknown"
+            ),
+            "execution_id": row.get("id") or row.get("action_state_id"),
+            "execution_position_identity": (
+                candidate.key if candidate is not None else None
+            ),
+            "temporal_order": temporal,
+        }
+    return None
 
 
 def position_freshness(
@@ -338,7 +324,7 @@ def position_freshness(
     now: datetime,
     holdings_entry: dict | None = None,
 ) -> dict:
-    """このポジション固有の鮮度を返す。
+    """このポジション固有の証券会社確認状態を返す。
 
     他銘柄の更新や無関係な約定 (action_executions.json 側のイベント) には
     一切影響されない。「鮮度を進めてよいのは broker_confirmed_filled または
@@ -348,48 +334,50 @@ def position_freshness(
 
     Returns:
         {
-          "status": "fresh" | "degraded" | "stale" | "unknown",
+          "status": "fresh" | "invalidated" | "unknown",
           "synced_at": ISO-8601 timestamp | None,
           "age_hours": float | None,
-          "source": "holdings_note" | "unknown",
+          "source": str,
+          "validation_mode": "event_based",
         }
     """
     entry = holdings_entry if holdings_entry is not None else _find_holding_entry(position, base_dir=base_dir)
 
     if entry is None:
-        return {"status": "unknown", "synced_at": None, "age_hours": None, "source": "unknown"}
+        return {
+            "status": "unknown",
+            "synced_at": None,
+            "age_hours": None,
+            "source": "unknown",
+            "validation_mode": "event_based",
+        }
 
     holding_sync, holding_source = _parse_sync_timestamp(entry)
-    fill_sync, fill_source = _broker_confirmed_fill_timestamp(
-        position,
-        base_dir=base_dir,
-    )
-    candidates = [
-        (timestamp, source)
-        for timestamp, source in (
-            (holding_sync, holding_source),
-            (fill_sync, fill_source),
-        )
-        if timestamp is not None
-    ]
-    if not candidates:
-        return {"status": "unknown", "synced_at": None, "age_hours": None, "source": "unknown"}
-    synced_at, source = max(candidates, key=lambda item: _as_jst(item[0]))
+    if holding_sync is None:
+        return {
+            "status": "unknown",
+            "synced_at": None,
+            "age_hours": None,
+            "source": "unknown",
+            "validation_mode": "event_based",
+        }
+    synced_at, source = holding_sync, holding_source
 
     synced_jst = _as_jst(synced_at)
     now_jst = _as_jst(now)
     age_hours = max(0.0, (now_jst - synced_jst).total_seconds() / 3600)
-
-    if age_hours > STALE_AFTER_HOURS:
-        status = "stale"
-    elif age_hours > DEGRADED_AFTER_HOURS:
-        status = "degraded"
-    else:
-        status = "fresh"
+    invalidating = _snapshot_invalidating_execution(
+        position,
+        base_dir=base_dir,
+        snapshot_as_of=synced_jst,
+    )
+    status = "invalidated" if invalidating else "fresh"
 
     return {
         "status": status,
         "synced_at": synced_jst.isoformat(),
         "age_hours": round(age_hours, 1),
         "source": source,
+        "validation_mode": "event_based",
+        "invalidating_event": invalidating,
     }

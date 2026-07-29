@@ -1015,27 +1015,14 @@ def evaluate_nisa_capacity(action: dict, *, base_dir: Path, now: datetime) -> di
             "requested_jpy": round(requested),
         })
 
-    baseline_for_age = baseline_dt.astimezone(JST).date() if baseline_dt else baseline_day
-    age_days = (now.astimezone(JST).date() - baseline_for_age).days if baseline_for_age else None
-    stale_reason = None
-    if age_days is not None and age_days > 30:
-        stale_reason = {
-            "code": "nisa_capacity_stale",
-            "message": f"NISA残枠の基準日が{age_days}日前",
-            "baseline": str(baseline_raw),
-            "age_days": age_days,
-        }
-
     blocked_codes = {
         "nisa_capacity_unattributed_activity",
         "nisa_notional_missing",
         "nisa_capacity_insufficient",
     }
     blocked = any(reason.get("code") in blocked_codes for reason in reasons)
-    if stale_reason:
-        reasons.append(stale_reason)
     return {
-        "readiness": "blocked" if blocked else ("review" if stale_reason else "ready"),
+        "readiness": "blocked" if blocked else "ready",
         "reasons": reasons,
         "execution_owner": owner,
         "execution_broker": broker,
@@ -1043,4 +1030,6 @@ def evaluate_nisa_capacity(action: dict, *, base_dir: Path, now: datetime) -> di
         "nisa_capacity_baseline_source": baseline_source,
         "nisa_capacity_remaining_jpy": round(remaining),
         "nisa_capacity_baseline": baseline_raw,
+        "nisa_capacity_validation_mode": "event_based",
+        "nisa_capacity_assumption": "no_unreported_external_activity",
     }

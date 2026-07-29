@@ -185,7 +185,7 @@ def test_cash_buy_requires_complete_account_resource_identity(tmp_path):
     assert result["reasons"][0]["code"] == "cash_resource_identity_missing"
 
 
-def test_cash_buy_requires_fresh_identity_scoped_balance(tmp_path):
+def test_cash_buy_requires_confirmed_identity_scoped_balance_without_time_expiry(tmp_path):
     now = datetime(2026, 7, 28, 9, 0, tzinfo=JST)
     action = {
         "ticker": "1489.T",
@@ -215,18 +215,18 @@ def test_cash_buy_requires_fresh_identity_scoped_balance(tmp_path):
     (tmp_path / "holdings.json").write_text(json.dumps({
         "CASH_JPY_SBI_WIFE": row,
     }), encoding="utf-8")
-    stale = evaluate_cash_buying_power(action, base_dir=tmp_path, now=now)
-    assert stale["readiness"] == "blocked"
-    assert stale["reasons"][0]["code"] == "cash_resource_stale"
+    old_but_valid = evaluate_cash_buying_power(action, base_dir=tmp_path, now=now)
+    assert old_but_valid["readiness"] == "ready"
+    assert old_but_valid["cash_resource_validation_mode"] == "event_based"
 
     row["broker_reconciled_at"] = "2026-07-28T08:00:00+09:00"
     row["source_as_of"] = "2026-07-24T09:00:00+09:00"
     (tmp_path / "holdings.json").write_text(json.dumps({
         "CASH_JPY_SBI_WIFE": row,
     }), encoding="utf-8")
-    still_stale = evaluate_cash_buying_power(action, base_dir=tmp_path, now=now)
-    assert still_stale["readiness"] == "blocked"
-    assert still_stale["reasons"][0]["code"] == "cash_resource_stale"
+    source_is_authority = evaluate_cash_buying_power(action, base_dir=tmp_path, now=now)
+    assert source_is_authority["readiness"] == "ready"
+    assert source_is_authority["cash_resource_as_of"].startswith("2026-07-24")
 
     row["source_as_of"] = "2026-07-28T08:00:00+09:00"
     (tmp_path / "holdings.json").write_text(json.dumps({
@@ -238,6 +238,43 @@ def test_cash_buy_requires_fresh_identity_scoped_balance(tmp_path):
         fresh["account_resource_identity"]
         == "wife|sbi|nisa_growth|JPY|cash"
     )
+
+
+def test_cash_snapshot_is_invalidated_by_later_fill(tmp_path):
+    now = datetime(2026, 7, 28, 9, 0, tzinfo=JST)
+    (tmp_path / "holdings.json").write_text(json.dumps({
+        "CASH_JPY_SBI_WIFE": {
+            "ticker": "CASH_JPY_SBI_WIFE",
+            "shares": 50_000,
+            "currency": "JPY",
+            "balance_status": "confirmed",
+            "reconciliation_required": False,
+            "source_as_of": "2026-07-27T09:00:00+09:00",
+        },
+    }), encoding="utf-8")
+    (tmp_path / "action_executions.json").write_text(json.dumps({
+        "executions": [{
+            "id": "later-fill",
+            "ticker": "1489.T",
+            "status": "executed",
+            "execution_owner": "wife",
+            "execution_broker": "sbi",
+            "execution_account": "NISA成長投資枠",
+            "saved_at": "2026-07-27T12:00:00+09:00",
+        }],
+    }), encoding="utf-8")
+    result = evaluate_cash_buying_power({
+        "ticker": "1489.T",
+        "type": "buy",
+        "quantity": 1,
+        "limit_price": 3_000,
+        "execution_owner": "wife",
+        "execution_broker": "sbi",
+        "execution_account": "NISA成長投資枠",
+    }, base_dir=tmp_path, now=now)
+
+    assert result["readiness"] == "blocked"
+    assert result["reasons"][0]["code"] == "cash_resource_snapshot_invalidated"
 
 
 def test_exit_quantity_over_requested_account_inventory_is_blocked(tmp_path):
@@ -602,17 +639,19 @@ def test_generic_nisa_buy_is_blocked_when_route_is_unknown(tmp_path):
     )
 
 
-def test_stale_portfolio_snapshot_blocks_risk_increasing_order(tmp_path):
+def test_old_portfolio_snapshot_does_not_expire_by_time_alone(tmp_path):
     now = datetime(2026, 7, 14, 6, 0, tzinfo=JST)
     _write_base(tmp_path, now, snapshot_hours=80)
     result = classify_execution_readiness({
         "ticker": "XLF", "type": "buy", "order_type": "limit", "limit_price": 55,
     }, base_dir=tmp_path, now=now)
-    assert result["execution_readiness"] == "blocked"
-    assert any(row["code"] == "portfolio_snapshot_stale" for row in result["execution_block_reasons"])
+    assert not any(
+        row["code"].startswith("portfolio_snapshot_")
+        for row in result["execution_block_reasons"]
+    )
 
 
-def test_execution_synced_holdings_do_not_degrade_after_24_hours(tmp_path):
+def test_legacy_ledgers_do_not_degrade_after_24_hours(tmp_path):
     now = datetime(2026, 7, 17, 6, 0, tzinfo=JST)
     holdings_at = now - timedelta(hours=30)
     _write_base(tmp_path, now, snapshot_hours=30)
@@ -632,11 +671,11 @@ def test_execution_synced_holdings_do_not_degrade_after_24_hours(tmp_path):
     health = portfolio_snapshot_health(tmp_path, now=now)
 
     assert health["status"] == "fresh"
-    assert health["holdings_age_hours"] == 30.0
-    assert health["execution_ledger_current"] is True
+    assert health["validation_mode"] == "event_based"
+    assert health["legacy_ledgers_only"] is True
 
 
-def test_execution_after_holdings_snapshot_keeps_degraded_status(tmp_path):
+def test_aggregate_health_does_not_use_unscoped_execution_timestamp(tmp_path):
     now = datetime(2026, 7, 17, 6, 0, tzinfo=JST)
     _write_base(tmp_path, now, snapshot_hours=30)
     (tmp_path / "account.json").write_text(
@@ -654,8 +693,8 @@ def test_execution_after_holdings_snapshot_keeps_degraded_status(tmp_path):
 
     health = portfolio_snapshot_health(tmp_path, now=now)
 
-    assert health["status"] == "degraded"
-    assert health["execution_ledger_current"] is False
+    assert health["status"] == "fresh"
+    assert health["validation_mode"] == "event_based"
 
 
 def test_date_only_snapshot_timestamp_uses_file_mtime(tmp_path):

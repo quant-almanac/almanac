@@ -91,9 +91,34 @@ def _passing_meta(**overrides) -> dict:
         "validation_metrics": {"mse": 0.01, "garch_baseline_mse": 0.01},
         "feature_coverage": 0.98,
         "inference_contract_complete": True,
+        "validation_scheme": gm.VALIDATION_SCHEME,
+        "scaler_artifact": {
+            "file": gm.SCALER_FILENAME,
+            "sha256": "a" * 64,
+            "ticker_count": 1,
+        },
     }
     base.update(overrides)
     return base
+
+
+def _write_inference_scaler(tmp_path: Path, *, ticker: str = "TEST") -> dict:
+    payload = {
+        "schema_version": 1,
+        "scaler_version": gm.SCALER_VERSION,
+        "feature_schema_version": gm.FEATURE_SCHEMA_VERSION,
+        "feature_transformation_version": gm.FEATURE_TRANSFORMATION_VERSION,
+        "tickers": {
+            ticker: {"r_std": 0.01, "sigma_mu": 0.02},
+        },
+    }
+    path = tmp_path / gm.SCALER_FILENAME
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    return {
+        "file": gm.SCALER_FILENAME,
+        "sha256": gm._sha256_file(path),
+        "ticker_count": 1,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -317,9 +342,15 @@ def test_validated_model_is_actually_used_when_torch_and_predict_succeed(tmp_pat
     if not obj.is_available():
         pytest.skip("torch model not constructible in this environment")
     torch.save(obj.model.state_dict(), gm.MODEL_PATH)
-    gm.META_PATH.write_text(json.dumps(_passing_meta(trained_at="2026-01-01T00:00:00")), encoding="utf-8")
+    scaler_artifact = _write_inference_scaler(tmp_path)
+    gm.META_PATH.write_text(json.dumps(_passing_meta(
+        trained_at="2026-01-01T00:00:00",
+        scaler_artifact=scaler_artifact,
+    )), encoding="utf-8")
 
-    r = gm.forecast_ginn_result(_synthetic_returns(n=300), garch_sigma=0.3)
+    r = gm.forecast_ginn_result(
+        _synthetic_returns(n=300), garch_sigma=0.3, ticker="TEST"
+    )
     assert r["used_model"] == "ginn"
     assert r["model_version"] == "2026-01-01T00:00:00"
     assert r["fallback_reason"] is None
@@ -349,7 +380,7 @@ def test_risk_engine_label_reflects_actual_fallback(monkeypatch):
     """risk_engine.py:449 が無条件で 'GINN+GJR-GARCH' を表示していた欠陥の回帰。"""
     import risk_engine
 
-    def _fake_gjr_fallback(returns, garch_sigma, seq_len=60):
+    def _fake_gjr_fallback(returns, garch_sigma, seq_len=60, ticker=None):
         return {"forecast_vol": garch_sigma, "used_model": "gjr_garch",
                 "fallback_reason": "insufficient_validation_samples:0<30", "model_version": None}
 
@@ -363,7 +394,7 @@ def test_risk_engine_label_reflects_actual_fallback(monkeypatch):
 def test_risk_engine_label_is_ginn_when_actually_used(monkeypatch):
     import risk_engine
 
-    def _fake_gjr_success(returns, garch_sigma, seq_len=60):
+    def _fake_gjr_success(returns, garch_sigma, seq_len=60, ticker=None):
         return {"forecast_vol": garch_sigma * 1.1, "used_model": "ginn",
                 "fallback_reason": None, "model_version": "2026-01-01T00:00:00"}
 
@@ -463,10 +494,15 @@ def test_train_ginn_produces_nonzero_validation_with_short_lookback(tmp_path, mo
     assert meta["validation_metrics"]["garch_baseline_mse"] is not None
     assert meta["feature_coverage"] == 1.0  # 合成データに欠損なし
     assert meta["forward_observations"] == 0
-    assert meta["inference_contract_complete"] is False
-    assert meta["validation_scheme"] == "chronological_80_20_single_holdout"
-    assert meta["promotion_policy_version"] == "4A_chronological_holdout_v1"
+    assert meta["inference_contract_complete"] is True
+    assert meta["validation_scheme"] == gm.VALIDATION_SCHEME
+    assert meta["promotion_policy_version"] == "4A_walk_forward_persisted_scaler_v2"
+    assert (candidate_dir / gm.SCALER_FILENAME).is_file()
+    assert (
+        meta["scaler_artifact"]["sha256"]
+        == gm._sha256_file(candidate_dir / gm.SCALER_FILENAME)
+    )
     assert meta["model_sha256"] == gm._sha256_file(candidate_dir / "model.pt")
     assert result["promoted"] is False
-    assert result["promotion_reason"] == "inference_contract_incomplete"
+    assert result["promotion_reason"].startswith("garch_ratio_degraded")
     assert not gm.CURRENT_POINTER_PATH.exists()

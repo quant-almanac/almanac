@@ -39,7 +39,11 @@ SKIP_TICKERS = {
     'SLIM_SP500', 'SLIM_ORCAN', 'MNXACT',
     'IFREE_FANGPLUS', 'NOMURA_SEMI',
     'AVGO_特定', 'AVGO_一般',
-    'CASH_JPY', 'CASH_USD', 'CASH_JPY_SBI',
+    'CASH_JPY', 'CASH_USD', 'CASH_JPY_SBI', 'CASH_JPY_SBI_WIFE',
+    'GS_MMF_USD',
+}
+SKIP_ASSET_TYPES = {
+    'cash', 'currency', 'money_market_fund', 'mmf', 'external_cash',
 }
 
 # yfinance period: 過去 2 年でリスク計算には十分。長期分析なら period='max' を CLI で指定。
@@ -59,8 +63,19 @@ def _list_holdings_tickers() -> List[str]:
     for key, pos in data.items():
         if key in SKIP_TICKERS:
             continue
+        if isinstance(pos, dict):
+            asset_type = str(
+                pos.get('asset_type') or pos.get('instrument_type') or ''
+            ).strip().lower()
+            if asset_type in SKIP_ASSET_TYPES:
+                continue
         t = pos.get('ticker', key) if isinstance(pos, dict) else key
-        if isinstance(t, str) and t and t not in SKIP_TICKERS:
+        if (
+            isinstance(t, str)
+            and t
+            and t not in SKIP_TICKERS
+            and not t.startswith('CASH_')
+        ):
             tickers.append(t)
     return sorted(set(tickers))
 

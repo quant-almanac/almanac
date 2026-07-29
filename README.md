@@ -240,6 +240,10 @@ Recording a fill is deliberately separated from applying it to the portfolio. An
 
 Broker exports may later prove that the recorded route was wrong. The original execution remains immutable; a separate atomic reconciliation overlay may correct only owner, broker and account, and every safety/reporting consumer resolves the same effective route. Quantity, price or trade-date corrections use a different correction type rather than being smuggled into a route fix. A malformed overlay fails closed to `review`. Cost basis is also accepted only from a broker position snapshot whose identity, quantity and as-of ordering can be reconciled; a same-day fill with no usable time is treated as temporally unknown rather than guessed before or after the snapshot.
 
+Broker-confirmed positions, cash, NISA capacity and hedge balances use **event-based validity**, not a rolling 72-hour expiry. Time passing does not change a share count or cost basis. A known fill after the snapshot invalidates the affected position or wallet until it is reconciled again; missing timestamps or ambiguous routing fail closed. Trades, transfers or deposits made outside ALMANAC must therefore be imported or recorded—the system cannot invalidate a balance for an event it cannot observe. Market inputs such as prices, volatility and news remain time-sensitive and keep their own freshness limits.
+
+The execution plan keeps unattributed legacy activity visible, but only risk-increasing purchases (`buy` / `add` / `DCA` / margin buys) block monthly-budget enforcement. Sales and unpriced exits remain audit warnings; they do not consume a purchase budget or prevent the plan from moving out of observe mode.
+
 ### 9. The record, and auditing it
 
 The ledger subsystem creates three SQLite tables.
@@ -373,7 +377,7 @@ The second term penalises divergence from the GARCH estimate. **It cannot be cla
 
 Runtime use is fail-closed. A legacy model without validation metadata, or a candidate that fails the predeclared validation thresholds, is rejected and the forecast falls back to GJR-GARCH. The model name carried into tier artifacts, the Today API and the dashboard is the model actually used—not an unconditional “GINN” label. This safety gate does not make the research model validated; it prevents an unvalidated model from entering decisions.
 
-Training writes a versioned candidate bundle (`model.pt` plus a manifest), but current candidates are deliberately non-promotable: training uses per-ticker normalisation statistics while inference cannot yet load and route the same scaler artifact. The central gate therefore reports `inference_contract_incomplete` and keeps GJR-GARCH active. Model and manifest checksums are both verified before a bundle can be read. Rolling-origin walk-forward validation and post-promotion forward measurement are also not implemented yet; their manifest fields remain empty and must not be read as final out-of-sample evidence.
+Training uses three expanding rolling-origin folds. Each fold fits its normalisation statistics and GARCH baseline only on its training window, then evaluates the following validation window; after validation, a fresh candidate is refit on the available history. The versioned bundle stores `model.pt`, a manifest and the per-ticker scaler artifact used by inference, each protected by checksums. Promotion requires the predeclared sample, ticker-coverage, feature-coverage, data-age and GARCH-relative-error thresholds; inference also requires an explicit ticker route and the matching persisted scaler. Post-promotion performance is still measured only on subsequently observed data: `forward_observations` and `forward_metrics` remain empty until such observations exist, and the walk-forward validation must not be described as a final untouched test set.
 
 **Risk is computed on current holdings, not the NAV series.** That series is short and older accounting bugs contaminated part of it, so `portfolio_risk_returns.py` reconstructs daily returns by applying today's weights to historical prices.
 
@@ -490,7 +494,7 @@ Reading requires no API key. Authentication applies only to writes — recording
 
 ### Tests
 
-At this snapshot, pytest collects **3,073 tests across 229 `test_*.py` files**. The count basis is `pytest tests/ -q --collect-only` for cases and `find tests -type f -name 'test_*.py'` for files.
+At this snapshot, pytest collects **3,075 tests across 229 `test_*.py` files**. The count basis is `pytest tests/ -q --collect-only` for cases and `find tests -type f -name 'test_*.py'` for files.
 
 The composition matters more than the count: **16 files are named for the invariant they hold down** — specifically, filenames containing `safety`, `gating`, `policy`, `guard`, `integrity`, or `privacy`. A sample:
 
@@ -534,7 +538,7 @@ Terms used above, for readers who don't work in finance or haven't seen the hous
 | **VIX** | The market's expectation of near-term US equity volatility. Higher means a more unstable market |
 | **Black-Litterman** | A way to combine the market's implied view with additional return views. ALMANAC consumes only rows marked as independent; tier-LLM-derived rows are audit-only |
 | **GJR-GARCH** | A volatility model that allows downside moves to raise expected volatility more than upside moves — the asymmetry real markets show |
-| **GINN** | A research neural network whose volatility forecast is trained both on realised moves and on a GARCH estimate; ALMANAC keeps it out of decisions until its validation and inference contracts are complete |
+| **GINN** | A research neural network whose volatility forecast is trained both on realised moves and on a GARCH estimate; a candidate enters decisions only after the walk-forward validation, persisted-scaler and promotion contracts all pass |
 | **LSTM** | A neural-network layer designed for sequences, so earlier observations can influence a later forecast |
 | **Softplus** | A smooth output transformation that keeps a predicted volatility above zero |
 | **Regime** | Which state the market is in (bull / neutral / bear / crash). The same action can be reasonable in one and reckless in another |

@@ -372,6 +372,8 @@ def test_build_execution_plan_view_explains_open_order_consumption():
             "remaining_opportunity_jpy": 30000,
             "unattributed_monthly_total_count": 2,
             "unattributed_monthly_total_notional_jpy": 130000,
+            "unattributed_monthly_buy_total_count": 0,
+            "unattributed_monthly_buy_total_notional_jpy": 0,
         },
         "no_action_rationale": [
             {
@@ -456,7 +458,7 @@ def test_build_execution_plan_view_explains_open_order_consumption():
     assert view["consumption"]["normal_open_order_matched_notional_jpy"] == 0
     assert view["consumption"]["normal_filled_matched_notional_jpy"] == 0
     assert view["consumption"]["opportunity_matched_notional_jpy"] == 0
-    assert view["consumption"]["monthly_attribution_incomplete"] is True
+    assert view["consumption"]["monthly_attribution_incomplete"] is False
     assert view["filtered_summary"] == {"plan_consumed_by_open_order": 1}
     assert view["filtered_examples"] == [{
         "ticker": "META",

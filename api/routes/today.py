@@ -870,7 +870,10 @@ def _build_execution_plan_view(plan: dict, board: list[dict], synthesis: dict, n
         else None
     )
     monthly_attribution_incomplete = _float_value(
-        consumption.get("unattributed_monthly_total_count")
+        consumption.get(
+            "unattributed_monthly_buy_total_count",
+            consumption.get("unattributed_monthly_total_count"),
+        )
     ) > 0
 
     if board:

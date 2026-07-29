@@ -29,106 +29,68 @@ def _parse_local_timestamp(value: object, *, local_tz: ZoneInfo) -> datetime | N
         return None
 
 
-def _file_timestamp(path: Path, *, now: datetime, timestamp_keys: tuple[str, ...]) -> datetime | None:
-    try:
-        raw = json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
-        return None
-    dt = None
-    if isinstance(raw, dict):
-        for key in timestamp_keys:
-            value = raw.get(key)
-            # A date-only value describes the business date, not midnight as
-            # the snapshot creation time.  Treating 2026-07-14 as 00:00 made a
-            # file imported late that evening look >24h old the next morning.
-            # Use another precise key or the file mtime instead.
-            if re.fullmatch(r"\d{4}-\d{2}-\d{2}", str(value or "").strip()):
-                continue
-            dt = _parse_local_timestamp(value, local_tz=ZoneInfo("Asia/Tokyo"))
-            if dt:
-                break
-    if dt is None:
-        try:
-            dt = datetime.fromtimestamp(path.stat().st_mtime, tz=now.tzinfo)
-        except Exception:
-            return None
-    return dt.astimezone(now.tzinfo)
-
-
-def _file_age_hours(path: Path, *, now: datetime, timestamp_keys: tuple[str, ...]) -> float | None:
-    dt = _file_timestamp(path, now=now, timestamp_keys=timestamp_keys)
-    if dt is None:
-        return None
-    return max(0.0, (now - dt).total_seconds() / 3600)
-
-
-def _latest_applied_execution_at(base_dir: Path, *, now: datetime) -> datetime | None:
-    """Newest execution that explicitly says its portfolio mutation succeeded."""
-    try:
-        raw = json.loads((base_dir / "action_executions.json").read_text(encoding="utf-8"))
-    except Exception:
-        return None
-    rows = raw.get("executions") if isinstance(raw, dict) else None
-    if not isinstance(rows, list):
-        return None
-    latest = None
-    terminal = {"executed", "partial", "filled", "done"}
-    for row in rows:
-        if not isinstance(row, dict):
-            continue
-        if str(row.get("status") or "").lower() not in terminal:
-            continue
-        if row.get("portfolio_applied") is not True:
-            continue
-        dt = None
-        for key in ("portfolio_applied_at", "executed_at_time", "saved_at"):
-            dt = _parse_local_timestamp(row.get(key), local_tz=ZoneInfo("Asia/Tokyo"))
-            if dt:
-                break
-        if dt is not None:
-            dt = dt.astimezone(now.tzinfo)
-            latest = dt if latest is None or dt > latest else latest
-    return latest
-
-
 def portfolio_snapshot_health(base_dir: Path, *, now: datetime) -> dict:
-    account_age = _file_age_hours(base_dir / "account.json", now=now, timestamp_keys=("last_updated", "as_of"))
-    holdings_path = base_dir / "holdings.json"
-    holdings_at = _file_timestamp(holdings_path, now=now, timestamp_keys=("last_updated", "as_of"))
-    holdings_age = max(0.0, (now - holdings_at).total_seconds() / 3600) if holdings_at else None
-    latest_applied_at = _latest_applied_execution_at(base_dir, now=now)
+    """Return event-based broker snapshot validity.
 
-    # holdings.json is a quantity ledger, not a market-price feed.  Between
-    # daily analyses it remains execution-current when the latest explicitly
-    # applied fill and the holdings write are the same transaction.  Extend
-    # the soft 24h window to at most seven days in that case; periodic broker
-    # reconciliation is still required beyond the hard window.
-    execution_ledger_current = bool(
-        holdings_at
-        and latest_applied_at
-        and holdings_age is not None
-        and 24 < holdings_age <= 24 * 7
-        and latest_applied_at <= holdings_at + timedelta(seconds=5)
-    )
-    effective_holdings_age = 24.0 if execution_ledger_current else holdings_age
-    known = [age for age in (account_age, effective_holdings_age) if age is not None]
-    max_age = max(known) if known else None
-    if max_age is None:
+    Quantity and broker cost basis do not decay merely because 72 hours pass.
+    The exact PositionIdentity check later in ``classify_execution_readiness``
+    invalidates an affected route when a post-snapshot fill appears.  This
+    aggregate check therefore verifies only that complete broker snapshots and
+    the local ledgers exist; cash sufficiency is evaluated independently.
+    """
+    snapshot_paths = sorted(base_dir.glob("broker_position_snapshot_*.json"))
+    complete_count = 0
+    invalid_count = 0
+    source_times: list[datetime] = []
+    for path in snapshot_paths:
+        payload = _load_json_object(path)
+        if payload is None:
+            invalid_count += 1
+            continue
+        if payload.get("complete") is True:
+            complete_count += 1
+        else:
+            invalid_count += 1
+        for key in ("reconciled_at", "source_as_of"):
+            value = _parse_local_timestamp(
+                payload.get(key), local_tz=ZoneInfo("Asia/Tokyo")
+            )
+            if value is not None:
+                source_times.append(value.astimezone(now.tzinfo))
+                break
+
+    holdings_path = base_dir / "holdings.json"
+    account_path = base_dir / "account.json"
+    ledgers_present = holdings_path.is_file() and account_path.is_file()
+    if not ledgers_present:
         status = "unknown"
-    elif max_age > 72:
-        status = "stale"
-    elif max_age > 24:
-        status = "degraded"
+    elif not snapshot_paths:
+        # Backward-compatible local/public deployments may still keep the
+        # verified baseline only in account.json + holdings.json.  Treat that
+        # baseline as event-based rather than reintroducing a time TTL.
+        status = "fresh"
+    elif invalid_count or complete_count != len(snapshot_paths):
+        status = "invalidated"
     else:
         status = "fresh"
+    oldest = min(source_times) if source_times else None
+    age_hours = (
+        max(0.0, (now - oldest).total_seconds() / 3600)
+        if oldest is not None
+        else None
+    )
     return {
         "status": status,
-        "max_age_hours": round(max_age, 1) if max_age is not None else None,
-        "account_age_hours": round(account_age, 1) if account_age is not None else None,
-        "holdings_age_hours": round(holdings_age, 1) if holdings_age is not None else None,
-        "execution_ledger_current": execution_ledger_current,
-        "latest_applied_execution_at": latest_applied_at.isoformat() if latest_applied_at else None,
-        "holdings_snapshot_at": holdings_at.isoformat() if holdings_at else None,
+        "validation_mode": "event_based",
+        "snapshot_count": len(snapshot_paths),
+        "complete_snapshot_count": complete_count,
+        "invalid_snapshot_count": invalid_count,
+        "snapshot_age_hours_informational": (
+            round(age_hours, 1) if age_hours is not None else None
+        ),
+        "oldest_snapshot_at": oldest.isoformat() if oldest else None,
+        "ledgers_present": ledgers_present,
+        "legacy_ledgers_only": bool(ledgers_present and not snapshot_paths),
     }
 
 
@@ -216,6 +178,73 @@ def _requested_buy_notional(action: dict, *, currency: str) -> float | None:
         estimated = _positive_number(action.get("estimated_notional_jpy"))
         if estimated is not None:
             return estimated
+    return None
+
+
+def _cash_snapshot_invalidating_execution(
+    *,
+    base_dir: Path,
+    owner: str,
+    broker: str,
+    snapshot_as_of: datetime,
+) -> dict | None:
+    """Return a known fill after the broker-confirmed cash snapshot.
+
+    Cash does not expire with wall-clock time, but a later trade can change it.
+    SBI and other brokers may share buying power across tax-account labels, so
+    matching is deliberately owner+broker scoped rather than account scoped.
+    An unattributed fill is treated conservatively because it may belong to the
+    same wallet; an explicitly different owner or broker is ignored.
+    """
+    try:
+        from execution_reconciliation import (
+            execution_temporal_order,
+            load_effective_execution_records,
+        )
+        from execution_safety import (
+            canonical_broker,
+            canonical_owner,
+            is_fill_record,
+        )
+
+        rows = load_effective_execution_records(base_dir=base_dir)
+    except Exception:
+        return {"reason": "execution_ledger_unreadable", "execution_id": None}
+
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        status = str(
+            row.get("event_type")
+            or row.get("status")
+            or row.get("reconciliation_status")
+            or ""
+        ).lower()
+        externally_confirmed_fill = bool(
+            row.get("broker_confirmed_filled")
+        ) or status in {"broker_confirmed_filled", "broker_confirmed"}
+        if not (is_fill_record(row) or externally_confirmed_fill):
+            continue
+        row_owner = canonical_owner(
+            row.get("execution_owner") or row.get("owner")
+        )
+        row_broker = canonical_broker(
+            row.get("execution_broker") or row.get("broker")
+        )
+        if row_owner and row_owner != owner:
+            continue
+        if row_broker and row_broker != broker:
+            continue
+        temporal = execution_temporal_order(row, snapshot_as_of.isoformat())
+        if temporal.get("temporal_order") == "before_snapshot":
+            continue
+        return {
+            "reason": str(
+                temporal.get("temporal_order") or "temporal_order_unknown"
+            ),
+            "execution_id": row.get("id") or row.get("action_state_id"),
+            "temporal_order": temporal,
+        }
     return None
 
 
@@ -413,27 +442,33 @@ def evaluate_cash_buying_power(
     details.update({
         "cash_resource_as_of": resource_as_of.isoformat(),
         "cash_resource_age_hours": round(age_hours, 1),
+        "cash_resource_validation_mode": "event_based",
+        "cash_resource_assumption": "no_unreported_external_activity",
     })
-    if age_hours > 72:
+    invalidating = _cash_snapshot_invalidating_execution(
+        base_dir=base_dir,
+        owner=owner,
+        broker=broker,
+        snapshot_as_of=resource_as_of,
+    )
+    if invalidating is not None:
         return {
             "required": True,
             "readiness": "blocked",
             "reasons": [{
-                "code": "cash_resource_stale",
-                "message": f"{route} の残高が72時間超更新されていません",
+                "code": "cash_resource_snapshot_invalidated",
+                "message": (
+                    f"{route} のsnapshot後に現金を変えうる約定があるため、"
+                    "買付余力を再照合してください"
+                ),
+                "invalidating_event": invalidating,
                 **details,
             }],
         }
-    if age_hours > 24:
-        return {
-            "required": True,
-            "readiness": "review",
-            "reasons": [{
-                "code": "cash_resource_degraded",
-                "message": f"{route} の残高が24時間超前です",
-                **details,
-            }],
-        }
+    # Broker-confirmed cash is event-based: time alone does not spend it.
+    # Orders/fills are reserved by the intent/execution ledgers.  A manual
+    # deposit, withdrawal or trade performed outside ALMANAC must be imported;
+    # otherwise no local system can observe it.
     return {"required": True, "readiness": "ready", "reasons": [], **details}
 
 
@@ -451,6 +486,7 @@ def classify_execution_readiness(
     readiness = "ready"
     reasons: list[dict] = []
     advisories: list[dict] = []
+    nisa_result: dict = {}
 
     def add(level: str, code: str, message: str, **extra) -> None:
         nonlocal readiness
@@ -539,13 +575,9 @@ def classify_execution_readiness(
     # 無関係な銘柄の約定を見て「全ポジション新鮮」と誤判定しうる
     # (2026-07-27 インシデント: LLY の約定で AVGO/XLF が ready 判定された)。
     # さらに risk_increasing (買い系) でしか評価されず、売り系には鮮度
-    # チェックが一切無かった。ここでは対象ポジション固有の証券会社同期日
-    # (holdings.json の note) だけを見る。
-    #
-    # 運用判断: ポートフォリオ全体の同期が実際に長期間止まっている場合が
-    # あり (実測 35/39 ポジションが72h超)、これを blocked にすると発注機能が
-    # 事実上停止する。stale/degraded/unknown はいずれも review 止まりとし、
-    # 人間の確認を促すに留める — 自動で止めない。
+    # チェックが一切無かった。ここでは対象ポジション固有の証券会社snapshot
+    # と、その後に同一identityへ発生した約定イベントだけを見る。時間経過
+    # だけでは失効させず、既知の後続約定があれば再照合までreviewにする。
     if (action_type in EXIT_ACTION_TYPES or risk_increasing) and not action.get(
         "scheduled_contribution"
     ):
@@ -560,21 +592,12 @@ def classify_execution_readiness(
             )
         elif position is not None:
             freshness = position_freshness(position, base_dir=base_dir, now=now)
-            if freshness["status"] == "stale":
+            if freshness["status"] == "invalidated":
                 add(
                     "review",
-                    "position_broker_sync_stale",
-                    f"{ticker} の証券会社同期が{freshness.get('age_hours')}時間前"
-                    f"（{freshness.get('synced_at')}）のままです。最新の保有・"
-                    "残高を確認してから執行してください",
-                    **freshness,
-                )
-            elif freshness["status"] == "degraded":
-                add(
-                    "review",
-                    "position_broker_sync_degraded",
-                    f"{ticker} の証券会社同期がやや古い状態です"
-                    f"（{freshness.get('synced_at')}）",
+                    "position_broker_snapshot_invalidated",
+                    f"{ticker} は証券会社snapshot後の売買イベントがあるため、"
+                    "対象ポジションを再照合してください",
                     **freshness,
                 )
             elif freshness["status"] == "unknown":
@@ -724,20 +747,13 @@ def classify_execution_readiness(
             "取引所カレンダーを確認できないため、発注前に市場セッションを再確認する",
             **market_context,
         )
-    if risk_increasing:
+    if risk_increasing and not action.get("scheduled_contribution"):
         snapshot = portfolio_snapshot_health(base_dir, now=now)
-        if snapshot["status"] in {"stale", "unknown"}:
+        if snapshot["status"] in {"invalidated", "unknown"}:
             add(
                 "blocked",
-                "portfolio_snapshot_stale",
-                f"口座・保有スナップショットが72時間超または不明 ({snapshot.get('max_age_hours')}h)",
-                **snapshot,
-            )
-        elif snapshot["status"] == "degraded":
-            add(
-                "review",
-                "portfolio_snapshot_degraded",
-                f"口座・保有スナップショットが24時間超 ({snapshot.get('max_age_hours')}h)",
+                "portfolio_snapshot_invalid",
+                "口座・保有スナップショットが不足・不完全です",
                 **snapshot,
             )
 

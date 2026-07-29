@@ -26,7 +26,6 @@ from fx_hedge_manager import (
 from position_identity import position_identity_for_holding
 
 BASE_DIR = Path(__file__).parent
-MAX_ACTUAL_HEDGE_AGE_HOURS = 72.0
 
 
 def _actual_state_path() -> Path:
@@ -93,13 +92,9 @@ def _actual_notional_contract(
     except (TypeError, ValueError):
         if state.get("source_as_of") not in (None, ""):
             issues.append("actual_hedge_source_as_of_invalid")
-    if source_as_of is not None:
-        age_hours = max(
-            0.0,
-            (_as_jst(now) - _as_jst(source_as_of)).total_seconds() / 3600,
-        )
-        if age_hours > MAX_ACTUAL_HEDGE_AGE_HOURS:
-            issues.append("actual_hedge_state_stale")
+    # Broker-confirmed hedge inventory is event-based.  Elapsed time alone
+    # cannot change notional; a later overlay execution must invalidate or
+    # replace this state through the reconciliation path.
     return amount, sorted(set(issues)), (
         _as_jst(source_as_of).isoformat() if source_as_of is not None else None
     )

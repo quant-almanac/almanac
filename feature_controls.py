@@ -768,17 +768,12 @@ def _broker_reconciliation_status(root: Path) -> dict[str, Any]:
     parsed_times = [parsed for value in source_times if (parsed := _parse_time(value))]
     oldest = min(parsed_times).isoformat() if parsed_times else None
     complete = sum(1 for _, payload in rows if payload.get("complete") is True)
-    ages = [_age_hours(value) for value in source_times]
-    fresh = bool(rows) and complete == len(rows) and all(
-        age is not None and age <= 96 for age in ages
-    )
+    valid = bool(rows) and complete == len(rows)
     blockers = []
     if not rows:
         blockers.append("broker_position_snapshots_missing")
     if rows and complete != len(rows):
         blockers.append("broker_position_snapshot_incomplete")
-    if rows and not fresh:
-        blockers.append("broker_position_snapshot_stale")
     return _read_only_status(
         key="broker_reconciliation",
         label="証券会社照合",
@@ -786,17 +781,18 @@ def _broker_reconciliation_status(root: Path) -> dict[str, Any]:
         description="owner・broker・account・instrument単位の数量と資金の権威を保持します。",
         mode="broker_snapshot",
         configured_enabled=True,
-        effective_enabled=fresh,
+        effective_enabled=valid,
         reason=(
-            f"{complete}/{len(rows)}証券会社のsnapshotが完全かつ期限内です"
-            if fresh else "証券会社snapshotが不足・不完全・期限切れです"
+            f"{complete}/{len(rows)}証券会社のsnapshotが完全です。"
+            "時間では失効せず、後続売買イベントで対象identityだけ再照合になります"
+            if valid else "証券会社snapshotが不足または不完全です"
         ),
         blockers=blockers,
         source="broker_position_snapshot_*.json + execution_reconciliation_state.json",
         source_as_of=oldest,
-        max_age_hours=96,
-        source_note="売却数量と買付資金は対象identityのbroker照合が最終権威",
-        control_hint="証券会社CSV/画面との再照合だけが鮮度を進めます",
+        max_age_hours=None,
+        source_note="確認済み残高はevent-based。時間経過だけでは失効しません",
+        control_hint="売買・移管等が発生した対象identityだけ再照合します",
         metrics=[
             {"label": "完全", "value": complete},
             {"label": "取得済み", "value": len(rows)},
@@ -859,17 +855,29 @@ def _ginn_status(root: Path) -> dict[str, Any]:
     disabled = os.environ.get("ALMANAC_DISABLE_GINN", "").strip().lower() in {"1", "true", "yes"}
     pointer = _load_json(root / "models" / "ginn" / "current.json", {})
     version = pointer.get("version") if isinstance(pointer, dict) else None
+    active_pointer_version = version
     manifest = root / "models" / "ginn" / str(version) / "manifest.json" if version else None
     manifest_payload = _load_json(manifest, {}) if manifest else {}
     promoted = False
     rejection_reason = "promoted_bundle_missing"
+    source_kind = "active" if version else "legacy"
+    candidate_manifests = sorted(
+        (root / "models" / "ginn").glob("*/manifest.json"),
+        key=lambda path: path.stat().st_mtime_ns,
+        reverse=True,
+    )
+    latest_candidate_manifest = candidate_manifests[0] if candidate_manifests else None
     if root.resolve() == BASE_DIR.resolve():
         cache_key = str(root.resolve())
         pointer_path = root / "models" / "ginn" / "current.json"
         legacy_manifest_path = root / "models" / "ginn_meta.json"
         signature = tuple(
-            path.stat().st_mtime_ns if path.exists() else None
-            for path in (pointer_path, legacy_manifest_path)
+            path.stat().st_mtime_ns if path is not None and path.exists() else None
+            for path in (
+                pointer_path,
+                legacy_manifest_path,
+                latest_candidate_manifest,
+            )
         )
         now_mono = time.monotonic()
         cached = _GINN_GATE_CACHE.get(cache_key)
@@ -882,6 +890,7 @@ def _ginn_status(root: Path) -> dict[str, Any]:
             manifest_payload = dict(cached.get("manifest_payload") or {})
             promoted = bool(cached.get("promoted"))
             rejection_reason = cached.get("rejection_reason")
+            source_kind = str(cached.get("source_kind") or source_kind)
         else:
             try:
                 from ginn_model import (
@@ -889,17 +898,40 @@ def _ginn_status(root: Path) -> dict[str, Any]:
                     _meets_promotion_criteria,
                     _resolve_active_bundle,
                 )
-                model_path, manifest_path, active_version, pointer_error = _resolve_active_bundle()
-                version = active_version
-                manifest_payload = _load_ginn_meta(manifest_path) or {}
-                if pointer_error:
-                    rejection_reason = pointer_error
-                elif not model_path.exists():
-                    rejection_reason = "model_file_missing"
-                elif not manifest_payload:
-                    rejection_reason = "manifest_missing"
+                if not active_pointer_version and latest_candidate_manifest is not None:
+                    source_kind = "latest_candidate"
+                    version = latest_candidate_manifest.parent.name
+                    model_path = latest_candidate_manifest.parent / "model.pt"
+                    manifest_payload = _load_ginn_meta(
+                        latest_candidate_manifest
+                    ) or {}
+                    if not model_path.exists():
+                        rejection_reason = "candidate_model_file_missing"
+                    elif not manifest_payload:
+                        rejection_reason = "candidate_manifest_missing"
+                    else:
+                        eligible, gate_reason = _meets_promotion_criteria(
+                            manifest_payload
+                        )
+                        promoted = False
+                        rejection_reason = (
+                            "candidate_not_promoted"
+                            if eligible else gate_reason
+                        )
                 else:
-                    promoted, rejection_reason = _meets_promotion_criteria(manifest_payload)
+                    model_path, manifest_path, active_version, pointer_error = _resolve_active_bundle()
+                    version = active_version
+                    if active_version:
+                        source_kind = "active"
+                    manifest_payload = _load_ginn_meta(manifest_path) or {}
+                    if pointer_error:
+                        rejection_reason = pointer_error
+                    elif not model_path.exists():
+                        rejection_reason = "model_file_missing"
+                    elif not manifest_payload:
+                        rejection_reason = "manifest_missing"
+                    else:
+                        promoted, rejection_reason = _meets_promotion_criteria(manifest_payload)
             except Exception:
                 rejection_reason = "promotion_gate_unavailable"
             _GINN_GATE_CACHE[cache_key] = {
@@ -909,6 +941,7 @@ def _ginn_status(root: Path) -> dict[str, Any]:
                 "manifest_payload": dict(manifest_payload),
                 "promoted": promoted,
                 "rejection_reason": rejection_reason,
+                "source_kind": source_kind,
             }
     else:
         promoted = bool(version and manifest and manifest.exists())
@@ -918,11 +951,11 @@ def _ginn_status(root: Path) -> dict[str, Any]:
         else None
     )
     source_age = _age_hours(source_as_of)
-    source_name = (
-        "models/ginn/current.json + promoted bundle manifest"
-        if version
-        else "models/ginn_meta.json (legacy・default-deny)"
-    )
+    source_name = {
+        "active": "models/ginn/current.json + promoted bundle manifest",
+        "latest_candidate": "models/ginn/<latest candidate>/manifest.json",
+        "legacy": "models/ginn_meta.json (legacy・default-deny)",
+    }.get(source_kind, "models/ginn_meta.json (legacy・default-deny)")
     effective = promoted and not disabled
     if disabled:
         reason = "緊急無効化フラグでGARCH固定です"
@@ -930,6 +963,21 @@ def _ginn_status(root: Path) -> dict[str, Any]:
         reason = f"GINNは{rejection_reason}のためGARCHへfail-closedしています"
     else:
         reason = "検証・昇格済みbundleを利用できます"
+    validation_metrics = (
+        manifest_payload.get("validation_metrics")
+        if isinstance(manifest_payload, dict)
+        else {}
+    ) or {}
+    validation_mse = validation_metrics.get("mse")
+    garch_mse = validation_metrics.get("garch_baseline_mse")
+    try:
+        garch_ratio = (
+            round(float(validation_mse) / float(garch_mse), 2)
+            if float(garch_mse) > 0
+            else None
+        )
+    except (TypeError, ValueError):
+        garch_ratio = None
     return {
         "key": "ginn",
         "label": "GINNボラティリティ",
@@ -955,9 +1003,17 @@ def _ginn_status(root: Path) -> dict[str, Any]:
         ),
         "source_note": (
             "current.jsonが指す検証・昇格済みbundleだけをロード"
-            if version else "legacy modelは監査用に保持しますが推論には使用しません"
+            if source_kind == "active"
+            else "最新候補は監査表示のみで、current.jsonへ昇格していません"
+            if source_kind == "latest_candidate"
+            else "legacy modelは監査用に保持しますが推論には使用しません"
         ),
         "control_hint": "モデル昇格ゲートが権威のため、この画面から強制ONにはできません",
+        "metrics": [
+            {"label": "validation件数", "value": manifest_payload.get("n_validation")},
+            {"label": "validation銘柄数", "value": manifest_payload.get("n_validation_tickers")},
+            {"label": "GARCH比MSE", "value": garch_ratio},
+        ],
     }
 
 

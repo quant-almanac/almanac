@@ -2,7 +2,8 @@
 
 An absent hedge position is not the same as a broker-confirmed zero.  This
 module writes ``fx_actual_hedge_state.json`` only when every required broker
-has supplied a fresh, complete position snapshot. Embedded currency-hedged
+has supplied a complete position snapshot. Broker balances use event-based
+validity: elapsed time alone does not invalidate them. Embedded currency-hedged
 ETFs are deliberately excluded: they are represented by ``fx_exposure`` as a
 property of the asset, while this state contains only overlay instruments such
 as FX forwards and currency futures.
@@ -23,7 +24,6 @@ from utils import atomic_write_json
 
 BASE_DIR = Path(__file__).parent
 JST = ZoneInfo("Asia/Tokyo")
-MAX_SNAPSHOT_AGE_HOURS = 72.0
 OVERLAY_VEHICLE_TYPES = frozenset({"fx_forward", "fx_spot", "currency_future"})
 
 
@@ -49,8 +49,14 @@ def build_actual_hedge_state(
     *,
     required_brokers: Iterable[str],
     now: Optional[datetime] = None,
-    max_age_hours: float = MAX_SNAPSHOT_AGE_HOURS,
+    max_age_hours: Optional[float] = None,
 ) -> dict:
+    """Validate complete broker snapshots and calculate actual overlay notional.
+
+    ``max_age_hours`` is retained only for call compatibility and deliberately
+    ignored. A confirmed hedge balance is invalidated by a later execution
+    event, not by the wall clock.
+    """
     now = (now or datetime.now(JST)).astimezone(JST)
     required = {canonical_broker(item) for item in required_brokers if canonical_broker(item)}
     issues: list[str] = []
@@ -81,8 +87,6 @@ def build_actual_hedge_state(
         source_as_of = _parse_time(snapshot.get("source_as_of"))
         if source_as_of is None:
             issues.append(f"broker_snapshot_source_as_of_invalid:{broker}")
-        elif max(0.0, (now - source_as_of).total_seconds() / 3600) > max_age_hours:
-            issues.append(f"broker_snapshot_stale:{broker}")
         digest = str(snapshot.get("reconciliation_snapshot_hash") or "")
         if not digest:
             issues.append(f"broker_snapshot_hash_missing:{broker}")
@@ -133,7 +137,11 @@ def build_actual_hedge_state(
         "broker_source": "complete_position_snapshots:" + ",".join(sorted(required)),
         "source_as_of": source_as_of.isoformat(),
         "reconciliation_snapshot_hash": combined_hash,
-        "broker_evidence": evidence, "generated_at": now.isoformat(), "issues": [],
+        "broker_evidence": evidence,
+        "generated_at": now.isoformat(),
+        "validation_mode": "event_based",
+        "assumption": "no_unreported_external_activity",
+        "issues": [],
     }
 
 

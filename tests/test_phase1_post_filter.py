@@ -1657,6 +1657,8 @@ def test_execution_plan_consumed_item_filters_normal_buy(monkeypatch):
             "monthly_consumed_jpy": 0,
             "unattributed_monthly_total_count": 2,
             "unattributed_monthly_total_notional_jpy": 130_000,
+            "unattributed_monthly_buy_total_count": 0,
+            "unattributed_monthly_buy_total_notional_jpy": 0,
         },
     }
     synthesis = {
@@ -1701,6 +1703,8 @@ def test_execution_plan_observe_mode_keeps_would_be_filtered_action(monkeypatch)
             "monthly_consumed_jpy": 0,
             "unattributed_monthly_total_count": 2,
             "unattributed_monthly_total_notional_jpy": 130_000,
+            "unattributed_monthly_buy_total_count": 0,
+            "unattributed_monthly_buy_total_notional_jpy": 0,
         },
     }
     synthesis = {
@@ -1728,8 +1732,10 @@ def test_execution_plan_observe_mode_keeps_would_be_filtered_action(monkeypatch)
     assert result["post_filter"]["execution_plan_gate"]["would_filter_count"] == 1
     assert result["post_filter"]["execution_plan_gate"]["monthly_attribution"] == {
         "available": True,
-        "unattributed_count": 2,
-        "unattributed_notional_jpy": 130_000,
+        "unattributed_count": 0,
+        "unattributed_notional_jpy": 0,
+        "all_unattributed_count": 2,
+        "all_unattributed_notional_jpy": 130_000,
     }
 
 

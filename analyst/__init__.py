@@ -1548,6 +1548,7 @@ def _compute_ginn_vol(tickers: list[str]) -> tuple[str, dict, dict]:
             if len(prices) < 62:
                 continue
             returns = prices.pct_change().dropna()
+            returns.attrs["canonical_instrument_id"] = ticker
             if len(returns) < 60:
                 continue
             from risk_engine import estimate_gjr_garch as _gjr
@@ -8486,10 +8487,28 @@ def _phase1_post_filter(
     plan_gate_report["monthly_attribution"] = {
         "available": has_monthly_ledger,
         "unattributed_count": (
-            _plan_nonnegative_int(plan_consumption.get("unattributed_monthly_total_count"))
+            _plan_nonnegative_int(
+                plan_consumption.get(
+                    "unattributed_monthly_buy_total_count",
+                    plan_consumption.get("unattributed_monthly_total_count"),
+                )
+            )
             if has_monthly_ledger else 0
         ),
         "unattributed_notional_jpy": (
+            _plan_nonnegative_int(
+                plan_consumption.get(
+                    "unattributed_monthly_buy_total_notional_jpy",
+                    plan_consumption.get("unattributed_monthly_total_notional_jpy"),
+                )
+            )
+            if has_monthly_ledger else 0
+        ),
+        "all_unattributed_count": (
+            _plan_nonnegative_int(plan_consumption.get("unattributed_monthly_total_count"))
+            if has_monthly_ledger else 0
+        ),
+        "all_unattributed_notional_jpy": (
             _plan_nonnegative_int(plan_consumption.get("unattributed_monthly_total_notional_jpy"))
             if has_monthly_ledger else 0
         ),

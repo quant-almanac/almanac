@@ -61,6 +61,13 @@ MIN_VALIDATION_TICKERS = 3        # 1銘柄だけの validation を「汎化し�
 MAX_GARCH_RATIO_DEGRADATION = 1.5  # GINN の validation MSE が GARCH 基準の何倍まで許容か
 MAX_DATA_AGE_DAYS = 10             # 週次 cron を1回逃しても許容する程度の余裕
 MIN_FEATURE_COVERAGE = 0.90        # 学習対象銘柄群の平均データ充足率
+WALK_FORWARD_TRAIN_FRACTIONS = (0.60, 0.70, 0.80)
+WALK_FORWARD_VALIDATION_FRACTION = 0.10
+VALIDATION_SCHEME = "rolling_origin_expanding_3fold_v1"
+FEATURE_SCHEMA_VERSION = "ginn_v1_constant_aux"
+FEATURE_TRANSFORMATION_VERSION = "ginn_normalization_v2_persisted_scaler"
+SCALER_VERSION = "per_ticker_train_stats_v2"
+SCALER_FILENAME = "scalers.json"
 
 
 def _sha256_file(path: Path) -> str:
@@ -173,6 +180,17 @@ def _meets_promotion_criteria(meta: dict) -> tuple[bool, str | None]:
     # scaler artifact と ticker routing が実装されるまで候補は昇格不能にする。
     if meta.get("inference_contract_complete") is not True:
         return False, "inference_contract_incomplete"
+    if meta.get("validation_scheme") != VALIDATION_SCHEME:
+        return False, "walk_forward_validation_missing"
+    scaler = meta.get("scaler_artifact")
+    if not isinstance(scaler, dict):
+        return False, "scaler_artifact_missing"
+    if (
+        scaler.get("file") != SCALER_FILENAME
+        or not isinstance(scaler.get("sha256"), str)
+        or len(scaler.get("sha256") or "") != 64
+    ):
+        return False, "scaler_artifact_invalid"
 
     n_validation = meta.get("n_validation")
     if not isinstance(n_validation, int) or n_validation < MIN_VALIDATION_SAMPLES:
@@ -326,6 +344,168 @@ def _build_sequences(
     return np.array(X, dtype=np.float32), np.array(y, dtype=np.float32), fit_stats
 
 
+def _daily_garch_sigma(
+    returns: pd.Series,
+    *,
+    estimator,
+) -> float:
+    """Fit GARCH on the supplied history only and return daily sigma."""
+    try:
+        result = estimator(returns, use_ginn=False)
+        annual = result.get(
+            "forecast_vol", float(returns.std()) * np.sqrt(252)
+        )
+        value = float(annual) / np.sqrt(252)
+    except Exception:
+        value = float(returns.std())
+    if not np.isfinite(value) or value <= 0:
+        value = float(returns.std())
+    return max(value, 1e-9)
+
+
+def _dataset_for_boundary(
+    *,
+    returns_df: pd.DataFrame,
+    tickers: list[str],
+    seq_len: int,
+    train_fraction: float,
+    validation_fraction: float,
+    estimator,
+) -> dict:
+    """Build one expanding-window train/validation fold.
+
+    Every ticker fits its scaler and GARCH baseline only on data available at
+    the fold's train boundary. Validation targets lie strictly after that
+    boundary and use the train tail only as input context.
+    """
+    train_X: list[np.ndarray] = []
+    train_y: list[np.ndarray] = []
+    train_sigma: list[np.ndarray] = []
+    validation_X: list[np.ndarray] = []
+    validation_y: list[np.ndarray] = []
+    validation_sigma: list[np.ndarray] = []
+    validation_tickers: set[str] = set()
+    scaler_by_ticker: dict[str, dict] = {}
+
+    for ticker in tickers:
+        if ticker not in returns_df.columns:
+            continue
+        r = returns_df[ticker].dropna()
+        if len(r) < seq_len + 30:
+            continue
+        train_end = int(len(r) * train_fraction)
+        validation_end = min(
+            len(r),
+            train_end + max(1, int(len(r) * validation_fraction)),
+        )
+        if train_end <= seq_len + 2 or validation_end <= train_end:
+            continue
+        r_train = r.iloc[:train_end]
+        r_until_validation_end = r.iloc[:validation_end]
+        sigma_value = _daily_garch_sigma(r_train, estimator=estimator)
+        sigma_train = pd.Series(sigma_value, index=r_train.index)
+        sigma_validation = pd.Series(
+            sigma_value, index=r_until_validation_end.index
+        )
+        X_train, y_train, fit_stats = _build_sequences(
+            r_train,
+            sigma_train,
+            None,
+            None,
+            seq_len=seq_len,
+            fit_stats=None,
+        )
+        X_validation, y_validation, _ = _build_sequences(
+            r_until_validation_end,
+            sigma_validation,
+            None,
+            None,
+            seq_len=seq_len,
+            fit_stats=fit_stats,
+            min_target_pos=train_end,
+        )
+        if len(X_train) == 0 or len(X_validation) == 0:
+            continue
+        train_X.append(X_train)
+        train_y.append(y_train)
+        train_sigma.append(
+            np.full(len(y_train), sigma_value, dtype=np.float32)
+        )
+        validation_X.append(X_validation)
+        validation_y.append(y_validation)
+        validation_sigma.append(
+            np.full(len(y_validation), sigma_value, dtype=np.float32)
+        )
+        validation_tickers.add(str(ticker))
+        scaler_by_ticker[str(ticker).upper()] = {
+            "r_std": float(fit_stats["r_std"]),
+            "sigma_mu": float(fit_stats["sigma_mu"]),
+        }
+
+    return {
+        "X_train": np.vstack(train_X) if train_X else np.empty((0, seq_len, 4), dtype=np.float32),
+        "y_train": np.concatenate(train_y) if train_y else np.empty((0,), dtype=np.float32),
+        "sigma_train": np.concatenate(train_sigma) if train_sigma else np.empty((0,), dtype=np.float32),
+        "X_validation": (
+            np.vstack(validation_X)
+            if validation_X
+            else np.empty((0, seq_len, 4), dtype=np.float32)
+        ),
+        "y_validation": (
+            np.concatenate(validation_y)
+            if validation_y
+            else np.empty((0,), dtype=np.float32)
+        ),
+        "sigma_validation": (
+            np.concatenate(validation_sigma)
+            if validation_sigma
+            else np.empty((0,), dtype=np.float32)
+        ),
+        "validation_tickers": validation_tickers,
+        "scalers": scaler_by_ticker,
+    }
+
+
+def _train_model(
+    *,
+    X: np.ndarray,
+    y: np.ndarray,
+    sigma: np.ndarray,
+    epochs: int,
+    lr: float,
+    garch_lambda: float,
+    random_seed: int,
+):
+    """Train a fresh deterministic model for one fold or final bundle."""
+    torch, _ = _get_torch()
+    if torch is None:
+        raise RuntimeError("torch_unavailable")
+    np.random.seed(random_seed)
+    torch.manual_seed(random_seed)
+    obj = GINNModel(input_size=4, hidden_size=64, num_layers=2)
+    if not obj.is_available():
+        raise RuntimeError("model_unavailable")
+    model = obj.model
+    device = obj._device
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    X_tensor = torch.FloatTensor(X).to(device)
+    y_tensor = torch.FloatTensor(y).to(device)
+    sigma_tensor = torch.FloatTensor(sigma).to(device)
+    final_loss = 0.0
+    for _ in range(epochs):
+        model.train()
+        optimizer.zero_grad()
+        prediction = model(X_tensor)
+        realized_mse = torch.mean((prediction - y_tensor) ** 2)
+        garch_mse = torch.mean((prediction - sigma_tensor) ** 2)
+        loss = realized_mse + garch_lambda * garch_mse
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        optimizer.step()
+        final_loss = float(loss.item())
+    return model, device, final_loss
+
+
 def train_ginn(
     tickers: list[str] | None = None,
     lookback_days: int = 1260,
@@ -366,28 +546,103 @@ def train_ginn(
     if returns_df.empty:
         return {'success': False, 'error': 'リターンデータ取得失敗'}
 
-    ginn_obj = GINNModel(input_size=4, hidden_size=64, num_layers=2)
-    if not ginn_obj.is_available():
-        return {'success': False, 'error': 'PyTorchモデル初期化失敗'}
+    # Rolling-origin walk-forward validation.  Each fold trains a fresh model
+    # on an expanding prefix, then evaluates only the next chronological block.
+    # The promotion metrics are fixed before looking at the candidate.
+    fold_metrics: list[dict] = []
+    validation_predictions: list[np.ndarray] = []
+    validation_targets: list[np.ndarray] = []
+    validation_garch: list[np.ndarray] = []
+    validation_ticker_union: set[str] = set()
+    for fold_index, train_fraction in enumerate(
+        WALK_FORWARD_TRAIN_FRACTIONS, start=1
+    ):
+        fold = _dataset_for_boundary(
+            returns_df=returns_df,
+            tickers=list(map(str, tickers)),
+            seq_len=seq_len,
+            train_fraction=train_fraction,
+            validation_fraction=WALK_FORWARD_VALIDATION_FRACTION,
+            estimator=estimate_gjr_garch,
+        )
+        if len(fold["X_train"]) == 0 or len(fold["X_validation"]) == 0:
+            continue
+        fold_model, fold_device, fold_loss = _train_model(
+            X=fold["X_train"],
+            y=fold["y_train"],
+            sigma=fold["sigma_train"],
+            epochs=epochs,
+            lr=lr,
+            garch_lambda=garch_lambda,
+            random_seed=random_seed + fold_index,
+        )
+        fold_model.eval()
+        with torch.no_grad():
+            prediction = (
+                fold_model(
+                    torch.FloatTensor(fold["X_validation"]).to(fold_device)
+                )
+                .cpu()
+                .numpy()
+            )
+        validation_predictions.append(prediction)
+        validation_targets.append(fold["y_validation"])
+        validation_garch.append(fold["sigma_validation"])
+        validation_ticker_union.update(fold["validation_tickers"])
+        fold_mse = float(np.mean((prediction - fold["y_validation"]) ** 2))
+        fold_garch_mse = float(
+            np.mean((fold["sigma_validation"] - fold["y_validation"]) ** 2)
+        )
+        fold_metrics.append({
+            "fold": fold_index,
+            "train_fraction": train_fraction,
+            "validation_fraction": WALK_FORWARD_VALIDATION_FRACTION,
+            "n_train": int(len(fold["X_train"])),
+            "n_validation": int(len(fold["X_validation"])),
+            "validation_tickers": int(len(fold["validation_tickers"])),
+            "train_loss": round(fold_loss, 8),
+            "mse": round(fold_mse, 8),
+            "garch_baseline_mse": round(fold_garch_mse, 8),
+        })
 
-    model = ginn_obj.model
-    device = ginn_obj._device
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    n_validation = sum(len(values) for values in validation_targets)
+    n_validation_tickers = len(validation_ticker_union)
+    validation_mse = (
+        float(
+            np.mean(
+                (
+                    np.concatenate(validation_predictions)
+                    - np.concatenate(validation_targets)
+                )
+                ** 2
+            )
+        )
+        if validation_targets
+        else None
+    )
+    garch_baseline_mse = (
+        float(
+            np.mean(
+                (
+                    np.concatenate(validation_garch)
+                    - np.concatenate(validation_targets)
+                )
+                ** 2
+            )
+        )
+        if validation_targets
+        else None
+    )
 
-    # P2-8: 時系列 train/validation split（先頭 80% train / 末尾 20% validation, shuffle=False 強制）
-    # 銘柄ごとに chronological に分け、結合する。
-    #
-    # Stage 4A: validation のシーケンス構築は r_test 単独ではなく「train+validation の
-    # 結合系列 (=r 全体)」に対して行い、min_target_pos=split_idx で
-    # 「ターゲットは validation 区間以降のみ」を強制する。入力ウィンドウは
-    # train の末尾へ跨ってよい (2026-07-27 インシデントの根本原因である
-    # 「validation 区間が seq_len 日以下だとサンプル 0 件になる」問題を解消)。
-    all_X_tr, all_y_tr, all_σ_tr = [], [], []
-    all_X_va, all_y_va, all_σ_va = [], [], []
-    n_validation_tickers = 0
+    # Fit the deployable candidate on all currently available observations.
+    # Its per-ticker scalers are persisted and become part of the inference
+    # contract; forecast never re-fits them on the live window.
+    final_X: list[np.ndarray] = []
+    final_y: list[np.ndarray] = []
+    final_sigma: list[np.ndarray] = []
+    final_scalers: dict[str, dict] = {}
     coverages: list[float] = []
     data_end: pd.Timestamp | None = None
-
     for ticker in tickers:
         if ticker not in returns_df.columns:
             continue
@@ -400,91 +655,53 @@ def train_ginn(
         if data_end is None or r.index[-1] > data_end:
             data_end = r.index[-1]
 
-        # P2-8: train/validation を r の chronological 境界で分ける
-        split_idx = int(len(r) * 0.8)
-        r_train = r.iloc[:split_idx]
-
-        # GJR-GARCH σ は train のみで推定 (validation 区間の ground truth を汚染しない)
-        try:
-            garch_res = estimate_gjr_garch(r_train, use_ginn=False)
-            garch_sigma_val = garch_res.get('forecast_vol', r_train.std() * np.sqrt(252)) / np.sqrt(252)
-        except Exception:
-            garch_sigma_val = float(r_train.std())
-        garch_sigma_train = pd.Series(garch_sigma_val, index=r_train.index)
-        garch_sigma_full  = pd.Series(garch_sigma_val, index=r.index)
-
-        # train で fit_stats を確定、validation は同じ stats を再利用（data leak 防止）
-        X_tr, y_tr, fit_stats = _build_sequences(
-            r_train, garch_sigma_train, None, None, seq_len=seq_len, fit_stats=None,
+        garch_sigma_val = _daily_garch_sigma(
+            r, estimator=estimate_gjr_garch
         )
-        X_va, y_va, _ = _build_sequences(
-            r, garch_sigma_full, None, None, seq_len=seq_len, fit_stats=fit_stats,
-            min_target_pos=split_idx,
+        sigma_series = pd.Series(garch_sigma_val, index=r.index)
+        X_train, y_train, fit_stats = _build_sequences(
+            r,
+            sigma_series,
+            None,
+            None,
+            seq_len=seq_len,
+            fit_stats=None,
         )
-        if len(X_tr) == 0:
+        if len(X_train) == 0:
             continue
+        final_X.append(X_train)
+        final_y.append(y_train)
+        final_sigma.append(
+            np.full(len(y_train), garch_sigma_val, dtype=np.float32)
+        )
+        final_scalers[str(ticker).upper()] = {
+            "r_std": float(fit_stats["r_std"]),
+            "sigma_mu": float(fit_stats["sigma_mu"]),
+        }
 
-        all_X_tr.append(X_tr)
-        all_y_tr.append(y_tr)
-        all_σ_tr.append(np.full(len(y_tr), float(garch_sigma_val), dtype=np.float32))
-
-        if len(X_va) > 0:
-            all_X_va.append(X_va)
-            all_y_va.append(y_va)
-            all_σ_va.append(np.full(len(y_va), float(garch_sigma_val), dtype=np.float32))
-            n_validation_tickers += 1
-
-    if not all_X_tr:
+    if not final_X:
         return {'success': False, 'error': 'シーケンス構築失敗（データ不足）'}
-
-    X_train = torch.FloatTensor(np.vstack(all_X_tr)).to(device)
-    y_train = torch.FloatTensor(np.concatenate(all_y_tr)).to(device)
-    σ_train = torch.FloatTensor(np.concatenate(all_σ_tr)).to(device)
-
-    has_validation = bool(all_X_va)
-    if has_validation:
-        X_validation = torch.FloatTensor(np.vstack(all_X_va)).to(device)
-        y_validation = torch.FloatTensor(np.concatenate(all_y_va)).to(device)
-        σ_validation_np = np.concatenate(all_σ_va)
-
-    n_train = len(X_train)
-    n_validation = len(X_validation) if has_validation else 0
-    print(f"  GINN学習開始: train={n_train} validation={n_validation} サンプル, {epochs}エポック, device={device}")
-
-    model.train()
-    final_loss = 0.0
-    validation_mse = None
-    garch_baseline_mse = None
-
-    for epoch in range(epochs):
-        model.train()
-        optimizer.zero_grad()
-        pred = model(X_train)
-
-        # GINN損失: MSE(pred, |ε_t|) + λ・MSE(pred, σ_GARCH)
-        mse_realized = torch.mean((pred - y_train) ** 2)
-        mse_garch    = torch.mean((pred - σ_train) ** 2)
-        loss         = mse_realized + garch_lambda * mse_garch
-
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        optimizer.step()
-
-        final_loss = float(loss.item())
-        if (epoch + 1) % 10 == 0:
-            print(f"    Epoch {epoch+1}/{epochs}: train_loss={final_loss:.6f}")
-
-    # P2-8/4A: train 終了後に validation MSE を測定（過学習検知）。
-    # 比較対象として GARCH 定数予測の MSE も同じターゲットで測る
-    # (_meets_promotion_criteria の GARCH 比許容悪化率チェックに使う)。
-    if has_validation:
-        model.eval()
-        with torch.no_grad():
-            validation_mse = float(torch.mean((model(X_validation) - y_validation) ** 2).item())
-        y_validation_np = y_validation.cpu().numpy() if hasattr(y_validation, 'cpu') else np.asarray(y_validation)
-        garch_baseline_mse = float(np.mean((σ_validation_np - y_validation_np) ** 2))
+    final_X_array = np.vstack(final_X)
+    final_y_array = np.concatenate(final_y)
+    final_sigma_array = np.concatenate(final_sigma)
+    model, device, final_loss = _train_model(
+        X=final_X_array,
+        y=final_y_array,
+        sigma=final_sigma_array,
+        epochs=epochs,
+        lr=lr,
+        garch_lambda=garch_lambda,
+        random_seed=random_seed,
+    )
+    n_train = len(final_X_array)
+    print(
+        f"  GINN walk-forward: train={n_train} validation={n_validation} "
+        f"folds={len(fold_metrics)} epochs={epochs} device={device}"
+    )
+    if validation_mse is not None and garch_baseline_mse is not None:
         print(
-            f"  Validation MSE: {validation_mse:.6f} (GARCH基準 {garch_baseline_mse:.6f}, "
+            f"  Walk-forward MSE: {validation_mse:.6f} "
+            f"(GARCH基準 {garch_baseline_mse:.6f}, "
             f"比={validation_mse / garch_baseline_mse:.2f}x)"
         )
 
@@ -495,9 +712,22 @@ def train_ginn(
     candidate_dir = BUNDLE_ROOT / version
     candidate_dir.mkdir(parents=True, exist_ok=False)
     candidate_model_path = candidate_dir / "model.pt"
+    candidate_scaler_path = candidate_dir / SCALER_FILENAME
     candidate_manifest_path = candidate_dir / "manifest.json"
     torch.save(model.state_dict(), candidate_model_path)
     model_sha256 = _sha256_file(candidate_model_path)
+    _atomic_write_json(candidate_scaler_path, {
+        "schema_version": 1,
+        "scaler_version": SCALER_VERSION,
+        "feature_schema_version": FEATURE_SCHEMA_VERSION,
+        "feature_transformation_version": FEATURE_TRANSFORMATION_VERSION,
+        "tickers": final_scalers,
+        "auxiliary_features": {
+            "vix": {"mode": "constant", "value": 0.2, "scale": 30.0},
+            "regime": {"mode": "constant", "value": 1.0, "scale": 3.0},
+        },
+    })
+    scaler_sha256 = _sha256_file(candidate_scaler_path)
     meta = {
         'schema_version':           2,
         'model_version':            version,
@@ -511,20 +741,24 @@ def train_ginn(
         'validation_metrics': {
             'mse':                round(validation_mse, 6) if validation_mse is not None else None,
             'garch_baseline_mse': round(garch_baseline_mse, 6) if garch_baseline_mse is not None else None,
-        } if has_validation else None,
+            'folds':              fold_metrics,
+        } if validation_mse is not None else None,
         'feature_coverage':         feature_coverage,
         # Stage 4A時点では forward 評価パイプライン (真に未観測のデータでの継続測定) が
         # 未実装のため常に空。将来 recommendation_verifier.py 相当の仕組みで埋める。
         'forward_observations':     0,
         'forward_metrics':          None,
-        # Stage 4B: train 時の scaler artifact と inference ticker routing が
-        # bundle 契約へ入るまで False。False の候補は中央ゲートが昇格を拒否する。
-        'inference_contract_complete': False,
-        'promotion_policy_version': '4A_chronological_holdout_v1',
-        'validation_scheme':         'chronological_80_20_single_holdout',
-        'feature_schema_version':    'ginn_v1_constant_aux',
-        'feature_transformation_version': 'ginn_normalization_v1',
-        'scaler_version':            'per_ticker_train_stats_v1',
+        'inference_contract_complete': True,
+        'promotion_policy_version': '4A_walk_forward_persisted_scaler_v2',
+        'validation_scheme':         VALIDATION_SCHEME,
+        'feature_schema_version':    FEATURE_SCHEMA_VERSION,
+        'feature_transformation_version': FEATURE_TRANSFORMATION_VERSION,
+        'scaler_version':            SCALER_VERSION,
+        'scaler_artifact': {
+            'file': SCALER_FILENAME,
+            'sha256': scaler_sha256,
+            'ticker_count': len(final_scalers),
+        },
         'model_sha256':              model_sha256,
         'random_seed':               random_seed,
         'code_revision':             _git_revision(),
@@ -539,7 +773,7 @@ def train_ginn(
         'epochs':       epochs,
         'seq_len':      seq_len,
         'garch_lambda': garch_lambda,
-        'split':        'chronological_80_20_shuffle_False_with_train_tail_context',
+        'split':        'rolling_origin_expanding_3fold_then_full_refit',
     }
     promoted, promotion_reason = _meets_promotion_criteria(meta)
     meta['promotion'] = {
@@ -555,6 +789,7 @@ def train_ginn(
             'version': version,
             'model_sha256': model_sha256,
             'manifest_sha256': _sha256_file(candidate_manifest_path),
+            'scaler_sha256': scaler_sha256,
             'promoted_at': datetime.now(timezone.utc).isoformat(),
             'promotion_policy_version': meta['promotion_policy_version'],
         })
@@ -574,10 +809,55 @@ def train_ginn(
     }
 
 
+def _load_inference_scaler(
+    *,
+    manifest: dict,
+    manifest_path: Path,
+    ticker: str,
+) -> tuple[dict | None, str | None]:
+    artifact = manifest.get("scaler_artifact")
+    if not isinstance(artifact, dict):
+        return None, "scaler_artifact_missing"
+    filename = str(artifact.get("file") or "")
+    if filename != SCALER_FILENAME:
+        return None, "scaler_artifact_invalid"
+    path = manifest_path.parent / filename
+    if not path.is_file():
+        return None, "scaler_file_missing"
+    expected = str(artifact.get("sha256") or "")
+    if not expected or _sha256_file(path) != expected:
+        return None, "scaler_checksum_mismatch"
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None, "scaler_payload_invalid"
+    if (
+        not isinstance(payload, dict)
+        or payload.get("scaler_version") != SCALER_VERSION
+        or payload.get("feature_schema_version") != FEATURE_SCHEMA_VERSION
+        or payload.get("feature_transformation_version")
+        != FEATURE_TRANSFORMATION_VERSION
+    ):
+        return None, "scaler_schema_mismatch"
+    rows = payload.get("tickers")
+    row = rows.get(ticker.upper()) if isinstance(rows, dict) else None
+    if not isinstance(row, dict):
+        return None, f"ticker_scaler_missing:{ticker.upper()}"
+    try:
+        r_std = float(row["r_std"])
+        sigma_mu = float(row["sigma_mu"])
+    except (KeyError, TypeError, ValueError):
+        return None, f"ticker_scaler_invalid:{ticker.upper()}"
+    if not np.isfinite(r_std) or not np.isfinite(sigma_mu) or r_std <= 0 or sigma_mu <= 0:
+        return None, f"ticker_scaler_invalid:{ticker.upper()}"
+    return {"r_std": r_std, "sigma_mu": sigma_mu}, None
+
+
 def forecast_ginn_result(
     returns: pd.Series,
     garch_sigma: float,
     seq_len: int = 60,
+    ticker: str | None = None,
 ) -> dict:
     """
     GINNで翌日の予測ボラティリティを返す（年率換算）。モデル境界の中央安全ゲート。
@@ -645,6 +925,22 @@ def forecast_ginn_result(
         })
         return _fallback(reason)
 
+    routed_ticker = str(
+        ticker
+        or returns.attrs.get("canonical_instrument_id")
+        or returns.attrs.get("ticker")
+        or ""
+    ).strip().upper()
+    if not routed_ticker:
+        return _fallback("ticker_routing_missing")
+    fit_stats, scaler_error = _load_inference_scaler(
+        manifest=meta,
+        manifest_path=active_manifest_path,
+        ticker=routed_ticker,
+    )
+    if scaler_error:
+        return _fallback(scaler_error)
+
     torch, nn = _get_torch()
     if torch is None:
         return _fallback("torch_unavailable")
@@ -670,7 +966,14 @@ def forecast_ginn_result(
         garch_sigma_daily = garch_sigma / np.sqrt(252)
         garch_s = pd.Series(garch_sigma_daily, index=r.index)
 
-        X, _, _ = _build_sequences(r, garch_s, None, None, seq_len=seq_len)
+        X, _, _ = _build_sequences(
+            r,
+            garch_s,
+            None,
+            None,
+            seq_len=seq_len,
+            fit_stats=fit_stats,
+        )
         if len(X) == 0:
             return _fallback("empty_input_sequence")
 
@@ -690,6 +993,7 @@ def forecast_ginn_result(
             "used_model": "ginn",
             "fallback_reason": None,
             "model_version": active_version or meta.get("model_version") or meta.get("trained_at"),
+            "ticker": routed_ticker,
         }
 
     except Exception as e:
@@ -701,13 +1005,16 @@ def forecast_ginn(
     returns: pd.Series,
     garch_sigma: float,
     seq_len: int = 60,
+    ticker: str | None = None,
 ) -> float:
     """互換 wrapper。既存の呼び出し元・CLI が float を期待するため残す。
 
     新規コードは forecast_ginn_result() を使い、used_model で GARCH
     フォールバックか GINN かを区別すること (この wrapper では区別できない)。
     """
-    return forecast_ginn_result(returns, garch_sigma, seq_len)["forecast_vol"]
+    return forecast_ginn_result(
+        returns, garch_sigma, seq_len, ticker=ticker
+    )["forecast_vol"]
 
 
 # ============================================================

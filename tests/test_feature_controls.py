@@ -183,6 +183,42 @@ def test_ginn_status_reuses_the_central_gate_for_five_minutes(
     assert calls["resolve"] == 1
 
 
+def test_ginn_status_surfaces_latest_rejected_candidate_without_activating_it(
+    tmp_path,
+    monkeypatch,
+):
+    candidate = tmp_path / "models" / "ginn" / "candidate-v2"
+    candidate.mkdir(parents=True)
+    (candidate / "model.pt").write_bytes(b"candidate")
+    (candidate / "manifest.json").write_text(json.dumps({
+        "trained_at": datetime.now(timezone.utc).isoformat(),
+        "data_end": datetime.now(timezone.utc).date().isoformat(),
+        "n_validation": 2304,
+        "n_validation_tickers": 23,
+        "validation_metrics": {
+            "mse": 0.002444,
+            "garch_baseline_mse": 0.000300,
+        },
+        "feature_coverage": 1.0,
+        "inference_contract_complete": True,
+        "validation_scheme": "rolling_origin_expanding_3fold_v1",
+        "scaler_artifact": {
+            "file": "scalers.json",
+            "sha256": "a" * 64,
+        },
+    }), encoding="utf-8")
+    monkeypatch.setattr(fc, "BASE_DIR", tmp_path)
+    fc._GINN_GATE_CACHE.clear()
+
+    status = fc._ginn_status(tmp_path)
+
+    assert status["effective_enabled"] is False
+    assert status["source"] == "models/ginn/<latest candidate>/manifest.json"
+    assert status["model_version"] == "candidate-v2"
+    assert status["blockers"][0].startswith("garch_ratio_degraded")
+    assert status["metrics"][-1] == {"label": "GARCH比MSE", "value": 8.15}
+
+
 def test_options_status_reuses_the_cache_summary_for_five_minutes(
     tmp_path,
     monkeypatch,

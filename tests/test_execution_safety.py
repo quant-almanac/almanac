@@ -313,7 +313,7 @@ def test_nisa_capacity_datetime_baseline_is_strictly_after_not_at(tmp_path) -> N
     assert result["nisa_capacity_remaining_jpy"] == 1_200_000
 
 
-def test_nisa_capacity_stale_baseline_requires_review(tmp_path) -> None:
+def test_nisa_capacity_baseline_does_not_expire_by_time_alone(tmp_path) -> None:
     _write_nisa_base(tmp_path, last_updated="2026-05-01")
 
     result = evaluate_nisa_capacity(
@@ -322,8 +322,8 @@ def test_nisa_capacity_stale_baseline_requires_review(tmp_path) -> None:
         now=datetime(2026, 6, 20, 6, 0, tzinfo=JST),
     )
 
-    assert result["readiness"] == "review"
-    assert any(reason["code"] == "nisa_capacity_stale" for reason in result["reasons"])
+    assert result["readiness"] == "ready"
+    assert result["nisa_capacity_validation_mode"] == "event_based"
 
 
 def test_nisa_capacity_insufficient_or_unattributed_activity_blocks(tmp_path) -> None:
@@ -438,7 +438,7 @@ def test_nisa_capacity_prefers_owner_profile_baseline(tmp_path) -> None:
         now=datetime(2026, 6, 20, 6, 0, tzinfo=JST),
     )
 
-    assert result["readiness"] == "review"
+    assert result["readiness"] == "ready"
     assert result["nisa_capacity_baseline"] == "2026-05-01"
     assert result["nisa_capacity_baseline_source"] == "profile.limit_screen_as_of"
 
