@@ -28,6 +28,26 @@ def test_synthesis_failure_distinguishes_error_empty_from_valid_no_trade():
     })
 
 
+def test_catalyst_layer_receives_the_run_analysis_id(monkeypatch, tmp_path):
+    import almanac.observability.catalyst_layer as catalyst_layer
+
+    captured = {}
+
+    def _run(**kwargs):
+        captured.update(kwargs)
+        return types.SimpleNamespace(n_hypotheses_total=0)
+
+    monkeypatch.setattr(analyst, "BASE_DIR", tmp_path)
+    monkeypatch.setattr(catalyst_layer, "run", _run)
+    monkeypatch.setattr(catalyst_layer, "compact_for_opus", lambda *_a, **_k: "")
+
+    assert analyst._load_catalyst_context_for_opus(
+        {},
+        analysis_id="analysis-from-run",
+    ) == ""
+    assert captured["analysis_id"] == "analysis-from-run"
+
+
 def test_screen_candidate_bullish_support_accepts_current_debate_schema():
     assert analyst._screen_candidate_has_bullish_support({
         "ai_debate": {"bull": "出来高急増と52週高値更新は強いブレイクアウト"}
@@ -121,7 +141,11 @@ def test_final_synthesis_logs_llm_usage(monkeypatch):
     monkeypatch.setattr(analyst, "fmt_news_section", lambda news, tickers=None: "")
     monkeypatch.setattr(analyst, "fmt_earnings_section", lambda earnings, tickers=None: "")
     monkeypatch.setattr(analyst, "_load_bl_views_for_opus", lambda: "")
-    monkeypatch.setattr(analyst, "_load_catalyst_context_for_opus", lambda scenario=None: "")
+    monkeypatch.setattr(
+        analyst,
+        "_load_catalyst_context_for_opus",
+        lambda scenario=None, **_kwargs: "",
+    )
     monkeypatch.setattr(analyst, "_format_beliefs_context", lambda beliefs, max_items=15: "")
     monkeypatch.setattr(analyst, "_load_beliefs", lambda: [])
     monkeypatch.setattr(analyst, "_format_execution_quality_for_prompt", lambda eq: "")

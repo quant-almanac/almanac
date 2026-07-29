@@ -3496,7 +3496,11 @@ def _load_bl_views_for_opus() -> str:
         return ""
 
 
-def _load_catalyst_context_for_opus(scenario: dict | None = None) -> str:
+def _load_catalyst_context_for_opus(
+    scenario: dict | None = None,
+    *,
+    analysis_id: str | None = None,
+) -> str:
     """Run the catalyst layer and return a compact text block for Opus injection.
 
     AI autonomy v2: the pipeline runs, writes to ``catalyst_hypothesis_log.jsonl``
@@ -3507,13 +3511,14 @@ def _load_catalyst_context_for_opus(scenario: dict | None = None) -> str:
     daily analysis is never blocked by a catalyst pipeline failure.
     """
     try:
-        import uuid as _uuid
         from almanac.observability.catalyst_layer import (
             compact_for_opus as _compact,
             run as _catalyst_run,
         )
 
-        analysis_id = str(_uuid.uuid4())
+        if not analysis_id:
+            from almanac.observability.ids import new_analysis_id
+            analysis_id = new_analysis_id()
         analysis_date = datetime.now().strftime("%Y-%m-%d")
 
         # Extract scenario readiness for the compact_for_opus admission threshold
@@ -3583,6 +3588,7 @@ def _synthesize(long_a: dict, medium_a: dict, short_positions_a: dict,
                 currency_breakdown_whole: dict | None = None,
                 currency_breakdown_long: dict | None = None,
                 current_currency_policy: dict | None = None,
+                analysis_id: str | None = None,
                 decision_snapshot_id: str | None = None,
                 decision_snapshot_hash: str | None = None,
                 decision_enriched_snapshot=None,
@@ -3681,6 +3687,7 @@ def _synthesize(long_a: dict, medium_a: dict, short_positions_a: dict,
         freeze_decision_snapshot(
             decision_enriched_snapshot,
             decision_snapshot_id=decision_snapshot_id,
+            analysis_id=analysis_id,
             stage="synthesis",
             model_ids={"opus": _model_router.MODEL_REGISTRY.get("opus", "")},
             base_dir=BASE_DIR,
@@ -4069,6 +4076,7 @@ VIX={market_meta.get('vix','不明')} {market_meta.get('vix_level','')} / 米10Y
                     "priority_actions": [],
                     "hold_notes": [],
                     "model_used": _synthesis_model,
+                    **({"analysis_id": analysis_id} if analysis_id else {}),
                 }
 
             thinking_text = ""
@@ -4136,6 +4144,8 @@ VIX={market_meta.get('vix','不明')} {market_meta.get('vix_level','')} / 米10Y
                     _context_blocks = {}
                     result_dict["context_blocks"] = _context_blocks
                 _context_blocks["catalyst"] = bool(catalyst_ctx.strip())
+                if analysis_id:
+                    result_dict["analysis_id"] = analysis_id
             if thinking_signature and not thinking_text:
                 print(f"  💭 Opus thinking fired (signature={len(thinking_signature)}chars, body encrypted by Anthropic)")
 
@@ -4166,6 +4176,8 @@ VIX={market_meta.get('vix','不明')} {market_meta.get('vix_level','')} / 米10Y
             for action in result_dict.get("priority_actions") or []:
                 if not isinstance(action, dict):
                     continue
+                if analysis_id:
+                    action["analysis_id"] = analysis_id
                 if decision_snapshot_id:
                     action["decision_snapshot_id"] = decision_snapshot_id
                     action["decision_snapshot_hash"] = decision_snapshot_hash
@@ -4295,6 +4307,7 @@ VIX={market_meta.get('vix','不明')} {market_meta.get('vix_level','')} / 米10Y
                 "telegram_message": "⚠️ AI分析でエラーが発生しました",
                 "risk_warnings": [], "opportunity_highlights": [], "weekly_theme": "-",
                 "geopolitical_note": "",
+                **({"analysis_id": analysis_id} if analysis_id else {}),
             }
 
     return {
@@ -4302,6 +4315,7 @@ VIX={market_meta.get('vix','不明')} {market_meta.get('vix_level','')} / 米10Y
         "telegram_message": "⚠️ API過負荷でAI分析失敗",
         "risk_warnings": [], "opportunity_highlights": [], "weekly_theme": "-",
         "geopolitical_note": "",
+        **({"analysis_id": analysis_id} if analysis_id else {}),
     }
 
 
@@ -7162,6 +7176,16 @@ def _phase1_post_filter(
                 "同一tickerの既存注文にPositionIdentityがなく重複数量を確定できない"
             )
             return action
+        analysis_id = str(
+            action.get("analysis_id") or synthesis.get("analysis_id") or ""
+        ).strip()
+        if not analysis_id:
+            action["exit_sizing_status"] = "review"
+            action["exit_sizing_reason"] = (
+                "analysis_idが未発行のためexit sizingの再現キーを確定できない"
+            )
+            return action
+        action["analysis_id"] = analysis_id
 
         cost_basis_validation: dict = {}
 
@@ -7184,7 +7208,7 @@ def _phase1_post_filter(
             position=identity,
             normalized_direction="sell",
             plan_item_id=str(action.get("plan_item_id") or f"drift:{ticker}"),
-            analysis_id=str(action.get("analysis_id") or "pending-analysis"),
+            analysis_id=analysis_id,
             snapshot_hash=str(action.get("decision_snapshot_hash") or "missing-snapshot"),
             current_qty=sleeve_current_qty,
             current_weight=float(report.get("actual_pct") or 0) / 100.0,
@@ -9472,6 +9496,16 @@ def run_analysis(force: bool = False) -> dict:
     print("📊 データ収集中…")
     data = gather_data()
 
+    # One run-wide ID is issued before any catalyst/tier/synthesis work.  It is
+    # distinct from decision_snapshot_id (the immutable input artifact key)
+    # but is available to every downstream record from the start of analysis.
+    try:
+        from almanac.observability.ids import new_analysis_id as _new_analysis_id
+    except Exception:
+        from action_stage_log import new_analysis_id as _new_analysis_id
+    _asl_analysis_id = _new_analysis_id()
+    data["analysis_id"] = _asl_analysis_id
+
     # Approved investment-policy limits are live in observation mode first.
     # Household concentration aggregates the same instrument across accounts,
     # but never mutates actions until the shadow breaches have been reviewed.
@@ -9575,7 +9609,10 @@ def run_analysis(force: bool = False) -> dict:
 
     # Catalyst context is synthesis-only, but still part of the same analysis
     # input set.  Acquire it before the decision snapshot is frozen.
-    _frozen_catalyst_context = _load_catalyst_context_for_opus(data.get("scenario"))
+    _frozen_catalyst_context = _load_catalyst_context_for_opus(
+        data.get("scenario"),
+        analysis_id=_asl_analysis_id,
+    )
     data["catalyst_context"] = _frozen_catalyst_context
 
     _decision_snapshot_id: str | None = None
@@ -9615,6 +9652,7 @@ def run_analysis(force: bool = False) -> dict:
     freeze_decision_snapshot(
         _tier_enriched_snapshot,
         decision_snapshot_id=_decision_snapshot_id,
+        analysis_id=_asl_analysis_id,
         stage="tier",
         code_revision=_code_revision,
         model_ids={
@@ -9729,6 +9767,24 @@ def run_analysis(force: bool = False) -> dict:
         short_positions_analysis = _collect_tier_result("Swing分析")
         margin_long_analysis     = _collect_tier_result("MarginLong分析")
         short_selling_analysis   = _collect_tier_result("ShortSell分析")
+
+        for _tier_result in (
+            long_analysis,
+            medium_analysis,
+            short_positions_analysis,
+            margin_long_analysis,
+            short_selling_analysis,
+        ):
+            if isinstance(_tier_result, dict):
+                _tier_result["analysis_id"] = _asl_analysis_id
+                for _action_key in (
+                    "priority_actions",
+                    "margin_long_picks",
+                    "short_opportunities",
+                ):
+                    for _tier_action in _tier_result.get(_action_key) or []:
+                        if isinstance(_tier_action, dict):
+                            _tier_action["analysis_id"] = _asl_analysis_id
 
         for fut in not_done:
             fut.cancel()
@@ -10274,6 +10330,7 @@ def run_analysis(force: bool = False) -> dict:
             currency_breakdown_whole=data.get("currency_breakdown_whole"),
             currency_breakdown_long=data.get("currency_breakdown_long"),
             current_currency_policy=data.get("current_currency_policy"),
+            analysis_id=_asl_analysis_id,
             decision_snapshot_id=_decision_snapshot_id,
             decision_snapshot_hash=_decision_snapshot_hash,
             decision_enriched_snapshot=_tier_enriched_snapshot,
@@ -10348,6 +10405,7 @@ def run_analysis(force: bool = False) -> dict:
                             currency_breakdown_whole=data.get("currency_breakdown_whole"),
                             currency_breakdown_long=data.get("currency_breakdown_long"),
                             current_currency_policy=data.get("current_currency_policy"),
+                            analysis_id=_asl_analysis_id,
                             decision_snapshot_id=_decision_snapshot_id,
                             decision_snapshot_hash=_decision_snapshot_hash,
                             decision_enriched_snapshot=_tier_enriched_snapshot,
@@ -10519,8 +10577,7 @@ def run_analysis(force: bool = False) -> dict:
                     existing_holds.append(f"{h.get('ticker','')}: {h.get('action','')}")
                 synthesis["hold_notes"] = existing_holds
 
-    # action_stage_log: ランごとの識別子を生成
-    _asl_analysis_id = None
+    # action_stage_log: run-wide ID was issued before catalyst/tier work.
     _asl_scenario_key = (data.get("scenario") or {}).get("key", "") if isinstance(data, dict) else ""
     _asl_regime = ((data.get("regime") or {}).get("regime", "") if isinstance(data, dict) else "")
     _asl_dd_stage = ((data.get("risk") or {}).get("actual_dd_stage", "") if isinstance(data, dict) else "")
@@ -10561,16 +10618,9 @@ def run_analysis(force: bool = False) -> dict:
                 pass
             out.append(_row)
         return out
+    _asl_opus = None
     try:
-        # F7: action_stage_log と既存 observability ログで同一 run を join できるよう、
-        # ID は almanac.observability.ids.new_analysis_id() に一本化する。
-        # (action_stage_log.new_analysis_id は後方互換 fallback として残す)
         from action_stage_log import log_opus_raw as _asl_opus
-        try:
-            from almanac.observability.ids import new_analysis_id as _asl_new_id
-        except Exception:
-            from action_stage_log import new_analysis_id as _asl_new_id
-        _asl_analysis_id = _asl_new_id()
         synthesis["analysis_id"] = _asl_analysis_id
         for _action in synthesis.get("priority_actions") or []:
             if isinstance(_action, dict):
@@ -10578,12 +10628,9 @@ def run_analysis(force: bool = False) -> dict:
     except Exception:
         pass
 
-    # Stage 1B: analysis_id (action/ログ結合用) と decision_snapshot_id
-    # (analysis_snapshot.decision_snapshot_state.json への参照) を紐付ける。
-    # 2つの ID が別モジュールで独立発行されているのは意図的 (1B の
-    # decision_snapshot は tier LLM 呼び出し開始時点、analysis_id は
-    # synthesis 完了後に発行される) — ここで橋渡しするだけで、どちらの
-    # 発行タイミングも変更しない。
+    # Stage 1B: analysis_id (run/action/log join) and decision_snapshot_id
+    # (immutable input-artifact key) remain distinct but are issued before the
+    # first tier call and linked in both snapshot stages and synthesis.
     if _decision_snapshot_id:
         synthesis["decision_snapshot_id"] = _decision_snapshot_id
 
@@ -10630,7 +10677,7 @@ def run_analysis(force: bool = False) -> dict:
         synthesis["priority_actions"] = _asl_with_estimates(synthesis.get("priority_actions", []))
         synthesis["raw_priority_actions"] = [dict(a) for a in synthesis.get("priority_actions", [])]
         # action_stage_log: opus_raw ステージを記録
-        if _asl_analysis_id:
+        if _asl_analysis_id and _asl_opus is not None:
             try:
                 _asl_opus(
                     analysis_id=_asl_analysis_id, as_of=_asl_as_of,

@@ -81,6 +81,7 @@ class EnrichedSnapshot:
 @dataclass(frozen=True)
 class DecisionSnapshot:
     decision_snapshot_id: str
+    analysis_id: Optional[str]
     stage: str
     frozen_at: str
     enriched: EnrichedSnapshot
@@ -447,6 +448,7 @@ def _enriched_snapshot_from_dict(d: dict) -> EnrichedSnapshot:
 def _decision_snapshot_from_dict(d: dict) -> DecisionSnapshot:
     return DecisionSnapshot(
         decision_snapshot_id=d["decision_snapshot_id"],
+        analysis_id=d.get("analysis_id"),
         stage=d["stage"],
         frozen_at=d["frozen_at"],
         enriched=_enriched_snapshot_from_dict(d["enriched"]),
@@ -464,6 +466,7 @@ def freeze_decision_snapshot(
     enriched: EnrichedSnapshot,
     *,
     decision_snapshot_id: str,
+    analysis_id: Optional[str] = None,
     stage: str,
     code_revision: Optional[str] = None,
     model_ids: Optional[dict] = None,
@@ -496,6 +499,7 @@ def freeze_decision_snapshot(
 
     snapshot = DecisionSnapshot(
         decision_snapshot_id=decision_snapshot_id,
+        analysis_id=analysis_id,
         stage=stage,
         frozen_at=now.isoformat(),
         enriched=enriched,

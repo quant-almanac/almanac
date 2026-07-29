@@ -303,14 +303,17 @@ def test_freeze_persists_atomically(tmp_path):
     enriched = _sample_enriched(tmp_path, now)
     result = snap.freeze_decision_snapshot(
         enriched, decision_snapshot_id="abc123", stage="tier",
+        analysis_id="analysis-123",
         code_revision="deadbeef", model_ids={"sonnet": "claude-sonnet-5"},
         now=now, base_dir=tmp_path,
     )
     assert result.decision_snapshot_id == "abc123"
+    assert result.analysis_id == "analysis-123"
     assert result.stage == "tier"
     path = tmp_path / "decision_snapshot_state.json"
     assert path.exists()
     on_disk = json.loads(path.read_text(encoding="utf-8"))
+    assert on_disk["abc123"]["tier"]["analysis_id"] == "analysis-123"
     assert on_disk["abc123"]["tier"]["code_revision"] == "deadbeef"
     # 一時ファイルが残っていない (atomic replace されている)
     assert not (tmp_path / "decision_snapshot_state.tmp").exists()
@@ -357,11 +360,13 @@ def test_resolve_decision_snapshot_round_trips(tmp_path):
     now = datetime(2026, 7, 27, 6, 0, 0)
     enriched = _sample_enriched(tmp_path, now)
     snap.freeze_decision_snapshot(enriched, decision_snapshot_id="lookup-me", stage="tier",
+                                    analysis_id="analysis-lookup",
                                     code_revision="r1", now=now, base_dir=tmp_path)
 
     full = snap.resolve_decision_snapshot("lookup-me", base_dir=tmp_path)
     assert "tier" in full
     tier_only = snap.resolve_decision_snapshot("lookup-me", stage="tier", base_dir=tmp_path)
+    assert tier_only["analysis_id"] == "analysis-lookup"
     assert tier_only["code_revision"] == "r1"
     assert snap.resolve_decision_snapshot("no-such-id", base_dir=tmp_path) is None
     assert snap.resolve_decision_snapshot("lookup-me", stage="synthesis", base_dir=tmp_path) is None

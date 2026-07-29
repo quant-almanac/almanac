@@ -796,6 +796,68 @@ def test_deterministic_exit_sizing_keeps_all_quantity_surfaces_consistent(monkey
     assert "残25株" in action["execution_note"]
 
 
+def test_deterministic_exit_sizing_requires_a_real_analysis_id(monkeypatch):
+    _silence_external_filters(monkeypatch)
+    monkeypatch.setattr(tunable_params, "get", _tp_get)
+    monkeypatch.setattr("broker_reconcile.load_action_executions", lambda: [])
+    synthesis = {
+        "decision_snapshot_hash": "snapshot-sizing-contract",
+        "overall_stance": "neutral",
+        "priority_actions": [{
+            "ticker": "XLF",
+            "tier": "Medium",
+            "type": "trim",
+            "amount_hint": "20株",
+            "action": "Medium層のXLF 55株のうち20株を売却",
+            "reason": "Medium層の構造化ドリフトを解消する。",
+            "execution_account": "特定",
+            "execution_owner": "husband",
+            "execution_broker": "rakuten",
+            "decision_price": 57.52,
+            "currency": "USD",
+        }],
+    }
+    positions = [{
+        "key": "XLF",
+        "ticker": "XLF",
+        "current_price": 57.52,
+        "currency": "USD",
+        "shares": 80,
+        "value_jpy": 753_498,
+        "investment_type": "medium",
+        "account": "特定",
+        "owner": "husband",
+        "broker": "rakuten",
+        "broker_quantity": 80,
+        "broker_total_cost_basis_jpy": 640_000,
+        "broker_cost_basis_source": "rakuten_assetbalance_csv",
+        "broker_cost_basis_as_of": "2026-07-28",
+    }]
+    rebalance_medium = {
+        "positions": [{
+            "ticker": "XLF",
+            "position_identity_key": "husband|rakuten|specific|XLF",
+            "actual_pct": 18.5,
+            "target_pct": 5.7,
+            "value_jpy": 753_498,
+            "shares": 80,
+        }],
+    }
+
+    result = analyst._phase1_post_filter(
+        synthesis,
+        30_000_000,
+        fx_rate=163.78,
+        positions=positions,
+        rebalance_medium=rebalance_medium,
+    )
+
+    action = result["priority_actions"][0]
+    assert action["exit_sizing_status"] == "review"
+    assert "analysis_id" in action["exit_sizing_reason"]
+    assert "exit_sizing_evaluation_key" not in action
+
+
 def test_exit_action_uses_exact_execution_account_and_marks_oversell() -> None:
     action = {
         "ticker": "AVGO",

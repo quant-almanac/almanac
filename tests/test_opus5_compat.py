@@ -334,6 +334,7 @@ def _run_synthesize():
         market_meta={"vix": 15, "us10y_yield": {}, "us2y_yield": {}},
         news=[], earnings={},
         cash_info={"total_cash_jpy": 0, "fx_rate_usdjpy": 150},
+        analysis_id="analysis-test",
     )
 
 
@@ -400,6 +401,8 @@ def test_truncated_non_empty_result_is_not_accepted_and_is_retried(monkeypatch):
     assert seen_max_tokens[1] > seen_max_tokens[0], "retry must raise max_tokens"
     # The accepted result is the complete one.
     assert result.get("overall_stance") == "neutral"
+    assert result.get("analysis_id") == "analysis-test"
+    assert result["priority_actions"][0]["analysis_id"] == "analysis-test"
     # The truncated attempt is recorded as such, not as "ok".
     assert any(r.get("status") == "max_tokens" for r in rows), [r.get("status") for r in rows]
 
@@ -433,3 +436,4 @@ def test_persistently_truncated_synthesis_returns_error_not_partial(monkeypatch)
     assert "max_tokens_truncated" in (result.get("error") or ""), result.get("error")
     # Crucially: the partial actions must NOT be surfaced as real decisions.
     assert result.get("priority_actions") == []
+    assert result.get("analysis_id") == "analysis-test"
