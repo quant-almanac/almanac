@@ -181,20 +181,20 @@ def _requested_buy_notional(action: dict, *, currency: str) -> float | None:
     return None
 
 
-def _cash_snapshot_invalidating_execution(
+def _cash_snapshot_execution_authority(
     *,
     base_dir: Path,
     owner: str,
     broker: str,
     snapshot_as_of: datetime,
-) -> dict | None:
-    """Return a known fill after the broker-confirmed cash snapshot.
+) -> dict:
+    """Resolve fills after a cash snapshot into an authority chain.
 
     Cash does not expire with wall-clock time, but a later trade can change it.
     SBI and other brokers may share buying power across tax-account labels, so
     matching is deliberately owner+broker scoped rather than account scoped.
-    An unattributed fill is treated conservatively because it may belong to the
-    same wallet; an explicitly different owner or broker is ignored.
+    A complete broker-confirmed Web fill that was applied locally advances the
+    authority timestamp; an unattributed or incomplete fill invalidates it.
     """
     try:
         from execution_reconciliation import (
@@ -208,9 +208,19 @@ def _cash_snapshot_invalidating_execution(
         )
 
         rows = load_effective_execution_records(base_dir=base_dir)
+        from position_identity import is_complete_broker_confirmed_fill
+        from execution_safety import parse_timestamp
     except Exception:
-        return {"reason": "execution_ledger_unreadable", "execution_id": None}
+        return {
+            "authority_as_of": snapshot_as_of,
+            "authority_source": "cash_snapshot",
+            "invalidating_event": {
+                "reason": "execution_ledger_unreadable",
+                "execution_id": None,
+            },
+        }
 
+    candidates: list[tuple[datetime | None, dict, str, str]] = []
     for row in rows:
         if not isinstance(row, dict):
             continue
@@ -235,17 +245,64 @@ def _cash_snapshot_invalidating_execution(
             continue
         if row_broker and row_broker != broker:
             continue
-        temporal = execution_temporal_order(row, snapshot_as_of.isoformat())
+        event_time = None
+        for field in (
+            "reconciled_at",
+            "broker_reported_at",
+            "executed_at_time",
+            "saved_at",
+        ):
+            event_time = parse_timestamp(row.get(field))
+            if event_time is not None:
+                break
+        candidates.append((event_time, row, row_owner, row_broker))
+
+    candidates.sort(
+        key=lambda item: (
+            item[0] is None,
+            item[0] or datetime.max.replace(tzinfo=ZoneInfo("Asia/Tokyo")),
+        )
+    )
+    authority_as_of = snapshot_as_of
+    authority_source = "cash_snapshot"
+    for event_time, row, row_owner, row_broker in candidates:
+        temporal = execution_temporal_order(row, authority_as_of.isoformat())
         if temporal.get("temporal_order") == "before_snapshot":
             continue
+        if (
+            row_owner == owner
+            and row_broker == broker
+            and event_time is not None
+            and is_complete_broker_confirmed_fill(row)
+            and row.get("execution_reconciliation_status") != "review"
+        ):
+            if event_time.tzinfo is None:
+                event_time = event_time.replace(tzinfo=ZoneInfo("Asia/Tokyo"))
+            event_time = event_time.astimezone(authority_as_of.tzinfo)
+            authority_as_of = max(authority_as_of, event_time)
+            authority_source = (
+                "broker_confirmed_web_fill"
+                if row.get("broker_source") == "web_manual_confirmation"
+                else "broker_confirmed_fill"
+            )
+            continue
         return {
-            "reason": str(
-                temporal.get("temporal_order") or "temporal_order_unknown"
-            ),
-            "execution_id": row.get("id") or row.get("action_state_id"),
-            "temporal_order": temporal,
+            "authority_as_of": authority_as_of,
+            "authority_source": authority_source,
+            "invalidating_event": {
+                "reason": str(
+                    temporal.get("temporal_order") or "temporal_order_unknown"
+                ),
+                "execution_id": row.get("id") or row.get("action_state_id"),
+                "temporal_order": temporal,
+                "broker_confirmation_complete": is_complete_broker_confirmed_fill(row),
+            },
         }
-    return None
+    return {
+        "authority_as_of": authority_as_of,
+        "authority_source": authority_source,
+        "invalidating_event": None,
+    }
 
 
 def evaluate_cash_buying_power(
@@ -445,12 +502,22 @@ def evaluate_cash_buying_power(
         "cash_resource_validation_mode": "event_based",
         "cash_resource_assumption": "no_unreported_external_activity",
     })
-    invalidating = _cash_snapshot_invalidating_execution(
+    authority = _cash_snapshot_execution_authority(
         base_dir=base_dir,
         owner=owner,
         broker=broker,
         snapshot_as_of=resource_as_of,
     )
+    effective_resource_as_of = authority["authority_as_of"]
+    details.update({
+        "cash_resource_as_of": effective_resource_as_of.isoformat(),
+        "cash_resource_age_hours": round(
+            max(0.0, (now - effective_resource_as_of).total_seconds() / 3600),
+            1,
+        ),
+        "cash_resource_authority_source": authority["authority_source"],
+    })
+    invalidating = authority["invalidating_event"]
     if invalidating is not None:
         return {
             "required": True,

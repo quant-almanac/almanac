@@ -214,6 +214,26 @@ def _load_short_candidates() -> list:
     return []
 
 
+def _load_short_product_controls() -> dict[str, bool]:
+    """Return broker/product switches separately from the regime policy.
+
+    ``short_allowed`` below is a market-regime recommendation.  It must not be
+    presented as the user's broker/product capability: a bullish regime can
+    discourage broad directional shorts while an explicitly enabled,
+    borrow-verified overheat candidate remains available for human review.
+    """
+    try:
+        from feature_controls import configured_short_features
+
+        configured = configured_short_features(base_dir=BASE_DIR)
+        return {
+            "US": bool(configured.get("us_short", False)),
+            "JP": bool(configured.get("jp_short", True)),
+        }
+    except Exception:
+        return {"US": False, "JP": True}
+
+
 def _tunable_value(key: str, fallback):
     try:
         from tunable_params import get as _tp_get
@@ -278,6 +298,7 @@ def get_strategy() -> dict:
     briefing = _load_briefing()
     short_candidates = _load_short_candidates()
     long_candidates = _load_long_term_candidates()
+    short_product_enabled = _load_short_product_controls()
 
     scenario_key = detect_scenario(regime, guard)
     scenario = _apply_tunable_cash_target(scenario_key, SCENARIOS[scenario_key])
@@ -314,6 +335,13 @@ def get_strategy() -> dict:
         "cash_ratio_target": scenario["cash_ratio_target"],
         "long_bias": scenario["long_bias"],
         "short_allowed": scenario["short_allowed"],
+        "short_regime_policy": {
+            "broad_directional_allowed": scenario["short_allowed"],
+            "meaning": (
+                "market-regime recommendation only; not a broker/product switch"
+            ),
+        },
+        "short_product_enabled": short_product_enabled,
         "leverage_allowed": scenario["leverage_allowed"],
         "actions": scenario["actions"],
         "opportunity": scenario["opportunity"],

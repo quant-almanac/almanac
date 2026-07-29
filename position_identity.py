@@ -253,20 +253,69 @@ def _as_jst(value: datetime) -> datetime:
     return value.replace(tzinfo=jst) if value.tzinfo is None else value.astimezone(jst)
 
 
-def _snapshot_invalidating_execution(
+_BROKER_CONFIRMATION_FIELDS = (
+    "external_execution_id",
+    "broker_source",
+    "broker_reported_at",
+    "filled_quantity",
+    "filled_price",
+    "reconciled_at",
+    "reconciliation_snapshot_hash",
+)
+
+
+def is_complete_broker_confirmed_fill(row: dict, *, require_applied: bool = True) -> bool:
+    """Whether this fill can extend authority without another broker CSV."""
+    from execution_safety import parse_timestamp
+
+    if not bool(row.get("broker_confirmed_filled")):
+        return False
+    if any(row.get(field) in (None, "") for field in _BROKER_CONFIRMATION_FIELDS):
+        return False
+    if position_identity_for_action(row) is None:
+        return False
+    if require_applied and not bool(row.get("portfolio_applied") or row.get("portfolio_updated")):
+        return False
+    try:
+        if float(row.get("filled_quantity")) <= 0 or float(row.get("filled_price")) <= 0:
+            return False
+    except (TypeError, ValueError):
+        return False
+    return (
+        parse_timestamp(row.get("broker_reported_at")) is not None
+        and parse_timestamp(row.get("reconciled_at")) is not None
+    )
+
+
+def _broker_event_authority_time(row: dict) -> datetime | None:
+    from execution_safety import parse_timestamp
+
+    for field in (
+        "reconciled_at",
+        "broker_reported_at",
+        "executed_at_time",
+        "saved_at",
+    ):
+        parsed = parse_timestamp(row.get(field))
+        if parsed is not None:
+            return _as_jst(parsed)
+    return None
+
+
+def _resolve_position_execution_authority(
     position: PositionIdentity,
     *,
     base_dir: Path,
     snapshot_as_of: datetime,
-) -> dict | None:
-    """Return the first post-snapshot fill that invalidates this position.
+) -> dict:
+    """Resolve post-snapshot fills into an event-based authority chain.
 
     A complete broker snapshot remains authoritative until a position-changing
-    event occurs.  Open orders are handled by the order-intent/sizing gates and
-    do not by themselves rewrite inventory.  A fill after the snapshot (or a
-    same-day/date-only fill whose order cannot be proven) requires a new broker
-    reconciliation.  Unknown route metadata for the same ticker also fails
-    closed because it may refer to this exact owner/account.
+    event occurs.  A complete Web/broker-confirmed fill that was applied to the
+    local portfolio advances authority for the exact PositionIdentity.
+    Unconfirmed, incomplete, unapplied, or ambiguously routed fills invalidate
+    it.  This permits initial snapshot + Web delta entry without weakening the
+    broker-evidence boundary.
     """
     try:
         from execution_reconciliation import (
@@ -278,10 +327,15 @@ def _snapshot_invalidating_execution(
         rows = load_effective_execution_records(base_dir=base_dir)
     except Exception:
         return {
-            "reason": "execution_ledger_unreadable",
-            "execution_id": None,
+            "authority_as_of": _as_jst(snapshot_as_of),
+            "authority_source": "holding_snapshot",
+            "invalidating_event": {
+                "reason": "execution_ledger_unreadable",
+                "execution_id": None,
+            },
         }
 
+    candidates: list[tuple[datetime | None, dict, PositionIdentity | None]] = []
     for row in rows:
         if not isinstance(row, dict):
             continue
@@ -298,23 +352,70 @@ def _snapshot_invalidating_execution(
             continue
         if str(row.get("ticker") or "").strip().upper() != position.canonical_instrument_id:
             continue
-        temporal = execution_temporal_order(row, snapshot_as_of.isoformat())
-        if temporal.get("temporal_order") == "before_snapshot":
-            continue
         candidate = position_identity_for_action(row)
         if candidate is not None and candidate != position:
             continue
+        candidates.append((_broker_event_authority_time(row), row, candidate))
+
+    candidates.sort(
+        key=lambda item: (
+            item[0] is None,
+            item[0] or datetime.max.replace(tzinfo=ZoneInfo("Asia/Tokyo")),
+        )
+    )
+    authority_as_of = _as_jst(snapshot_as_of)
+    authority_source = "holding_snapshot"
+    for event_time, row, candidate in candidates:
+        temporal = execution_temporal_order(row, authority_as_of.isoformat())
+        if temporal.get("temporal_order") == "before_snapshot":
+            continue
+        if (
+            candidate == position
+            and event_time is not None
+            and is_complete_broker_confirmed_fill(row)
+            and row.get("execution_reconciliation_status") != "review"
+        ):
+            authority_as_of = max(authority_as_of, event_time)
+            authority_source = (
+                "broker_confirmed_web_fill"
+                if row.get("broker_source") == "web_manual_confirmation"
+                else "broker_confirmed_fill"
+            )
+            continue
         return {
-            "reason": str(
-                temporal.get("temporal_order") or "temporal_order_unknown"
-            ),
-            "execution_id": row.get("id") or row.get("action_state_id"),
-            "execution_position_identity": (
-                candidate.key if candidate is not None else None
-            ),
-            "temporal_order": temporal,
+            "authority_as_of": authority_as_of,
+            "authority_source": authority_source,
+            "invalidating_event": {
+                "reason": str(
+                    temporal.get("temporal_order") or "temporal_order_unknown"
+                ),
+                "execution_id": row.get("id") or row.get("action_state_id"),
+                "execution_position_identity": (
+                    candidate.key if candidate is not None else None
+                ),
+                "temporal_order": temporal,
+                "broker_confirmation_complete": is_complete_broker_confirmed_fill(row),
+            },
         }
-    return None
+    return {
+        "authority_as_of": authority_as_of,
+        "authority_source": authority_source,
+        "invalidating_event": None,
+    }
+
+
+def _snapshot_invalidating_execution(
+    position: PositionIdentity,
+    *,
+    base_dir: Path,
+    snapshot_as_of: datetime,
+) -> dict | None:
+    """Compatibility view returning only the invalidating event."""
+    return _resolve_position_execution_authority(
+        position,
+        base_dir=base_dir,
+        snapshot_as_of=snapshot_as_of,
+    )["invalidating_event"]
 
 
 def position_freshness(
@@ -365,19 +466,25 @@ def position_freshness(
 
     synced_jst = _as_jst(synced_at)
     now_jst = _as_jst(now)
-    age_hours = max(0.0, (now_jst - synced_jst).total_seconds() / 3600)
-    invalidating = _snapshot_invalidating_execution(
+    authority = _resolve_position_execution_authority(
         position,
         base_dir=base_dir,
         snapshot_as_of=synced_jst,
     )
+    effective_synced_at = authority["authority_as_of"]
+    age_hours = max(0.0, (now_jst - effective_synced_at).total_seconds() / 3600)
+    invalidating = authority["invalidating_event"]
     status = "invalidated" if invalidating else "fresh"
 
     return {
         "status": status,
-        "synced_at": synced_jst.isoformat(),
+        "synced_at": effective_synced_at.isoformat(),
         "age_hours": round(age_hours, 1),
-        "source": source,
+        "source": (
+            authority["authority_source"]
+            if authority["authority_source"] != "holding_snapshot"
+            else source
+        ),
         "validation_mode": "event_based",
         "invalidating_event": invalidating,
     }

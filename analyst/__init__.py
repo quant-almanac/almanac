@@ -80,6 +80,31 @@ def _env_bool(name: str, default: bool = False) -> bool:
     return str(raw).strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _currency_policy_synthesis_verdict(
+    ingest_result: dict,
+    *,
+    mode: str | None = None,
+) -> dict:
+    """Separate candidate validation from execution authority."""
+    resolved_mode = str(
+        mode or os.environ.get("ALMANAC_CURRENCY_POLICY_MODE", "shadow")
+    ).strip().lower()
+    if resolved_mode not in {"off", "shadow", "advisory"}:
+        resolved_mode = "shadow"
+    candidate_validated = bool(ingest_result.get("actionable"))
+    return {
+        "actionable": False,
+        "candidate_validated": candidate_validated,
+        "verdict": ingest_result.get("verdict"),
+        "reason": ingest_result.get("reason"),
+        "clamped": bool(ingest_result.get("clamped")),
+        "basis": "long_tier",
+        "mode": resolved_mode,
+        "execution_effect": "none",
+        "effective_source": "static_fallback",
+    }
+
+
 def _tier_llm_timeout_seconds() -> float:
     return max(30.0, _env_float("ALMANAC_TIER_LLM_TIMEOUT_SECONDS", 300.0))
 
@@ -1426,6 +1451,22 @@ def _build_shared_market_context(data: dict) -> str:
         f"long_tier（target/rebalance判定専用）: {json.dumps(data.get('currency_breakdown_long', {}), ensure_ascii=False)}\n"
         "USD不足/超過を述べる場合は必ず母数を明記し、long_tierの判断にwhole_portfolio比率を流用しない。"
     )
+    short_products = sc.get("short_product_enabled") or {}
+    broad_short_allowed = bool(
+        (sc.get("short_regime_policy") or {}).get(
+            "broad_directional_allowed",
+            sc.get("short_allowed", False),
+        )
+    )
+    short_policy_text = (
+        "## 空売りの二層契約（混同禁止）\n"
+        f"商品・口座機能: US={bool(short_products.get('US', False))} / "
+        f"JP={bool(short_products.get('JP', False))}\n"
+        f"相場レジーム上の広範な方向性ショート推奨: {broad_short_allowed}\n"
+        "後者がFalseでも商品機能OFFを意味しない。借株確認済みで "
+        "shortable=true の候補は、候補固有の observe_only / "
+        "human_execution_only / margin 制約を維持したまま評価する。"
+    )
 
     return f"""## 本日の日付: {today}
 ※ニュース記事の日付を必ず本日日付と照合すること。過去イベントを「今後の予定」として戦略に組み込まないこと。
@@ -1449,7 +1490,8 @@ spy_above={data['regime'].get('spy_above')}, nk_above={data['regime'].get('nk_ab
 ## 現在のシナリオ: {sc.get('key')} — {sc.get('name','')}
 推奨アクション: {json.dumps(sc.get('actions',[])[:3], ensure_ascii=False)}
 ハイリターン機会: {json.dumps(sc.get('high_return_opportunities',[])[:4], ensure_ascii=False)}
-空売り許可: {sc.get('short_allowed', False)} / レバレッジ許可: {sc.get('leverage_allowed', False)}
+{short_policy_text}
+レバレッジ許可: {sc.get('leverage_allowed', False)}
 
 ## リスク指標（ポートフォリオ全体）
 {json.dumps(data.get('risk', {}), ensure_ascii=False)}{nss_text}
@@ -1487,6 +1529,21 @@ def _build_public_market_context(data: dict) -> str:
         nss_text = f"\n## FinBERTニュース感情集計（過去24h / {nss.get('as_of','')}）\n強気{pos}件 / 弱気{neg}件 / 中立{neu}件（計{total}件） → {sentiment_bias}"
 
     regime_consensus_text = _compute_regime_consensus(data, public_only=True)
+    short_products = sc.get("short_product_enabled") or {}
+    broad_short_allowed = bool(
+        (sc.get("short_regime_policy") or {}).get(
+            "broad_directional_allowed",
+            sc.get("short_allowed", False),
+        )
+    )
+    short_policy_text = (
+        "## 空売りの二層契約（混同禁止）\n"
+        f"商品・口座機能: US={bool(short_products.get('US', False))} / "
+        f"JP={bool(short_products.get('JP', False))}\n"
+        f"相場レジーム上の広範な方向性ショート推奨: {broad_short_allowed}\n"
+        "後者がFalseでも商品機能OFFを意味しない。候補固有の借株可否・"
+        "observe_only・human_execution_onlyを優先する。"
+    )
 
     return f"""## 本日の日付: {today}
 ※ニュース記事の日付を必ず本日日付と照合すること。過去イベントを「今後の予定」として戦略に組み込まないこと。
@@ -1509,7 +1566,8 @@ spy_above={data.get('regime', {}).get('spy_above')}, nk_above={data.get('regime'
 ## 現在のシナリオ: {sc.get('key')} — {sc.get('name','')}
 推奨アクション: {json.dumps(sc.get('actions',[])[:3], ensure_ascii=False)}
 ハイリターン機会: {json.dumps(sc.get('high_return_opportunities',[])[:4], ensure_ascii=False)}
-空売り許可: {sc.get('short_allowed', False)} / レバレッジ許可: {sc.get('leverage_allowed', False)}{nss_text}
+{short_policy_text}
+レバレッジ許可: {sc.get('leverage_allowed', False)}{nss_text}
 {regime_consensus_text + chr(10) if regime_consensus_text else ""}"""
 
 
@@ -2438,6 +2496,74 @@ def _analyze_short_selling(data: dict, shared_ctx: str = "") -> dict:
         return result
     except Exception as e:
         return {"error": str(e), "margin_health": "warning", "summary": "分析エラー（マージン状況を手動確認してください）"}
+
+
+def _apply_short_permission_contract(result: dict, data: dict) -> dict:
+    """Attach deterministic short authority and correct product/regime conflation."""
+    if not isinstance(result, dict):
+        return result
+    scenario = data.get("scenario") if isinstance(data, dict) else {}
+    scenario = scenario if isinstance(scenario, dict) else {}
+    products = scenario.get("short_product_enabled")
+    products = products if isinstance(products, dict) else {}
+    product_enabled = {
+        "US": bool(products.get("US", False)),
+        "JP": bool(products.get("JP", False)),
+    }
+    broad_allowed = bool(
+        (scenario.get("short_regime_policy") or {}).get(
+            "broad_directional_allowed",
+            scenario.get("short_allowed", False),
+        )
+    )
+    candidates = (
+        ((data.get("screening") or {}).get("short_candidates") or [])
+        if isinstance(data, dict)
+        else []
+    )
+    shortable = [
+        row for row in candidates
+        if isinstance(row, dict) and row.get("shortable") is True
+    ]
+    result["short_permission_contract"] = {
+        "product_enabled": product_enabled,
+        "broad_directional_regime_allowed": broad_allowed,
+        "shortable_candidates": len(shortable),
+        "candidate_execution_authority": (
+            "per-candidate borrow, margin, observe_only and human_execution_only gates"
+        ),
+    }
+    conflict_markers = (
+        "システム全体で空売り許可がFalse",
+        "空売り許可が無",
+        "空売り禁止のため",
+    )
+    corrected_fields: list[str] = []
+    if any(product_enabled.values()):
+        for field in ("short_not_recommended", "crisis_strategy", "news_impact"):
+            value = result.get(field)
+            if not isinstance(value, str) or not any(marker in value for marker in conflict_markers):
+                continue
+            corrected_fields.append(field)
+            if field == "short_not_recommended":
+                result[field] = (
+                    "空売りの商品・口座機能は有効。現在のレジームでは広範な"
+                    "方向性ショートを原則推奨しないが、借株確認済み候補は"
+                    "候補固有の証拠金・流動性・observe_only・人間実行関門で評価する。"
+                )
+            elif field == "crisis_strategy":
+                result[field] = (
+                    "空売りの商品機能は有効。危機時も一律に許可・禁止せず、"
+                    "借株可否、証拠金、踏み上げリスクと候補固有の実行関門を優先する。"
+                )
+            else:
+                result[field] = (
+                    "ニュースは候補根拠として評価する。商品機能のON/OFFはニュースや"
+                    "レジーム文言から推測せず、候補固有の借株・実行関門を権威とする。"
+                )
+    if corrected_fields:
+        result["permission_conflict_corrected"] = corrected_fields
+    return result
 
 
 # ── Red Team OpenAI互換ヘルパー ──────────────────────────────────
@@ -9831,6 +9957,10 @@ def run_analysis(force: bool = False) -> dict:
         short_positions_analysis = _collect_tier_result("Swing分析")
         margin_long_analysis     = _collect_tier_result("MarginLong分析")
         short_selling_analysis   = _collect_tier_result("ShortSell分析")
+        short_selling_analysis = _apply_short_permission_contract(
+            short_selling_analysis,
+            data,
+        )
 
         for _tier_result in (
             long_analysis,
@@ -10542,7 +10672,8 @@ def run_analysis(force: bool = False) -> dict:
         _ensure_information_lane_verdicts(synthesis)
 
         # 2026-07 AI動的外貨比率: AI の currency_target_recommendation を currency_policy で
-        # 検証し、valid なら state/log に保存する (次回 rebalance が採用)。自動発注はしない。
+        # 検証し、valid なら候補として state/log に保存する。economic exposure resolver
+        # 完成までは static target が実配分の権威であり、自動発注もしない。
         # 無効/期限切れ/自信不足/basis不一致は不採用 (log には残るが state 更新せず)。
         # 急変クランプの基準は「現在有効な目標」なので resolve で baseline を取得する。
         try:
@@ -10553,14 +10684,15 @@ def run_analysis(force: bool = False) -> dict:
                 _baseline_targets, _ = currency_policy.resolve_effective_targets(static=_STATIC_CCY)
                 _ccy_res = currency_policy.ingest(_ccy_rec, current_targets=_baseline_targets)
                 # 監査用に採否を synthesis へ反映 (UI/履歴で参照可能・自動適用はしない)。
-                synthesis["currency_policy_verdict"] = {
-                    "actionable": _ccy_res["actionable"],
-                    "verdict": _ccy_res["verdict"],
-                    "reason": _ccy_res["reason"],
-                    "clamped": _ccy_res["clamped"],
-                    "basis": "long_tier",
-                }
-                print(f"  💱 currency policy: {_ccy_res['verdict']} (actionable={_ccy_res['actionable']})")
+                synthesis["currency_policy_verdict"] = (
+                    _currency_policy_synthesis_verdict(_ccy_res)
+                )
+                print(
+                    "  💱 currency policy: "
+                    f"{_ccy_res['verdict']} "
+                    f"(candidate_validated={_ccy_res['actionable']}, "
+                    "execution_effect=none)"
+                )
         except Exception as _ccy_e:
             print(f"  ⚠️ currency policy ingest 失敗: {_ccy_e}")
 

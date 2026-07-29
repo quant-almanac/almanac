@@ -260,6 +260,41 @@ def test_wife_sbi_cash_uses_separate_estimated_ledger_and_can_reconcile(isolated
     assert wife["reconciled_at"] == wife["broker_reconciled_at"]
 
 
+def test_web_confirmed_wife_sbi_cash_event_keeps_balance_authoritative(isolated) -> None:
+    req = CashRequest(
+        currency=CashCurrency.JPY,
+        amount=10_000.0,
+        broker=CashBroker.sbi,
+        owner=cash_module.CashOwner.wife,
+        broker_confirmed=True,
+        external_transaction_id="sbi-cash-123",
+        broker_reported_at="2026-07-30T09:15:00+09:00",
+    )
+    _apply_cash_change(req, TxType.deposit)
+    wife = _read(isolated["holdings"])["CASH_JPY_SBI_WIFE"]
+    tx = _read(isolated["tx_file"])["transactions"][-1]
+    assert wife["balance_status"] == "confirmed"
+    assert wife["reconciliation_required"] is False
+    assert wife["source_as_of"] == "2026-07-30T09:15:00+09:00"
+    assert tx["broker_confirmed"] is True
+    assert tx["external_transaction_id"] == "sbi-cash-123"
+
+
+def test_web_confirmed_cash_event_rejects_duplicate_broker_id(isolated) -> None:
+    req = CashRequest(
+        currency=CashCurrency.JPY,
+        amount=10_000.0,
+        broker=CashBroker.rakuten,
+        broker_confirmed=True,
+        external_transaction_id="rakuten-cash-123",
+        broker_reported_at="2026-07-30T09:15:00+09:00",
+    )
+    _apply_cash_change(req, TxType.deposit)
+    with pytest.raises(HTTPException) as exc:
+        _apply_cash_change(req, TxType.deposit)
+    assert exc.value.status_code == 409
+
+
 def test_wife_sbi_reconcile_rejects_available_above_total(isolated) -> None:
     with pytest.raises(HTTPException) as exc:
         asyncio.run(cash_module.reconcile_cash(cash_module.CashReconcileRequest(

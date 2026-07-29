@@ -633,6 +633,7 @@ def test_objective_17_regime_shift_stance_context_surfaces_precondition(monkeypa
     )
 
     assert "現在のシナリオ: CRASH" in context
-    assert "空売り許可: True" in context
+    assert "相場レジーム上の広範な方向性ショート推奨: True" in context
+    assert "後者がFalseでも商品機能OFFを意味しない" in context
     assert "VIX: 32" in context
     assert "BULL->BEAR shift candidate" in context

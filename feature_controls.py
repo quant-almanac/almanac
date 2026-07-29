@@ -784,7 +784,8 @@ def _broker_reconciliation_status(root: Path) -> dict[str, Any]:
         effective_enabled=valid,
         reason=(
             f"{complete}/{len(rows)}証券会社のsnapshotが完全です。"
-            "時間では失効せず、後続売買イベントで対象identityだけ再照合になります"
+            "時間では失効しません。証券会社画面で確認した約定・入出金をWeb登録すれば"
+            "権威が前進し、不完全または未登録の後続イベントだけ再照合対象になります"
             if valid else "証券会社snapshotが不足または不完全です"
         ),
         blockers=blockers,
@@ -792,7 +793,10 @@ def _broker_reconciliation_status(root: Path) -> dict[str, Any]:
         source_as_of=oldest,
         max_age_hours=None,
         source_note="確認済み残高はevent-based。時間経過だけでは失効しません",
-        control_hint="売買・移管等が発生した対象identityだけ再照合します",
+        control_hint=(
+            "初回snapshot後はWebの「証券会社確認済み」実績入力で継続できます。"
+            "ALMANAC外の未登録取引がある場合だけCSV等で再照合します"
+        ),
         metrics=[
             {"label": "完全", "value": complete},
             {"label": "取得済み", "value": len(rows)},

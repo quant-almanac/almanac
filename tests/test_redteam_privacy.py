@@ -39,8 +39,14 @@ def _data_with_book() -> dict:
     return {
         "market_meta": {"vix": 18.2, "vix_level": "低位",
                         "us10y_yield": {"value": 4.2, "change_pct": 0.1}},
-        "scenario": {"key": "neutral", "name": "中立",
-                     "actions": [], "high_return_opportunities": []},
+        "scenario": {
+            "key": "BULL",
+            "name": "弱い強気",
+            "actions": [],
+            "high_return_opportunities": [],
+            "short_allowed": False,
+            "short_product_enabled": {"US": True, "JP": True},
+        },
         "regime": {"spy_above": True, "nk_above": False, "macro_score": 5},
         "news_sentiment_summary": {"positive": 5, "negative": 2, "neutral": 3,
                                    "total": 10, "as_of": "2026-06-04"},
@@ -233,6 +239,9 @@ def test_public_market_context_excludes_book() -> None:
                  "リスク指標", "12000000"):
         assert leak not in ctx, f"book leaked into public context: {leak}"
     assert "VIX" in ctx and "18.2" in ctx          # public data still present
+    assert "商品・口座機能: US=True / JP=True" in ctx
+    assert "相場レジーム上の広範な方向性ショート推奨: False" in ctx
+    assert "後者がFalseでも商品機能OFFを意味しない" in ctx
 
 
 def test_external_redteam_user_is_public_only() -> None:

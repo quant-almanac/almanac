@@ -17,6 +17,7 @@ from datetime import date, timedelta
 import pytest
 
 import currency_policy as cp
+from analyst import _currency_policy_synthesis_verdict
 import rebalance_engine as re
 
 
@@ -321,3 +322,20 @@ def test_currency_policy_files_are_backed_up():
     import backup_manager
     assert "currency_policy_state.json" in backup_manager.TARGETS
     assert "currency_policy_log.jsonl" in backup_manager.TARGETS
+
+
+def test_synthesis_verdict_separates_candidate_from_execution_authority():
+    verdict = _currency_policy_synthesis_verdict(
+        {
+            "actionable": True,
+            "verdict": "accepted",
+            "reason": "valid",
+            "clamped": False,
+        },
+        mode="shadow",
+    )
+    assert verdict["candidate_validated"] is True
+    assert verdict["actionable"] is False
+    assert verdict["mode"] == "shadow"
+    assert verdict["execution_effect"] == "none"
+    assert verdict["effective_source"] == "static_fallback"

@@ -501,6 +501,36 @@ def _load_effective_execution_log() -> dict:
 
 
 def _validate_broker_confirmation(req: ExecutionRequest) -> None:
+    # Web confirmation is an attested event, not an uploaded broker snapshot.
+    # Hash its immutable evidence server-side so recurring full CSV snapshots
+    # are not required merely to preserve freshness.
+    if (
+        req.broker_confirmed_filled
+        and req.broker_source == "web_manual_confirmation"
+        and not req.reconciliation_snapshot_hash
+    ):
+        evidence_payload = {
+            "external_execution_id": req.external_execution_id,
+            "broker_source": req.broker_source,
+            "broker_reported_at": req.broker_reported_at,
+            "filled_quantity": req.filled_quantity,
+            "filled_price": req.filled_price,
+            "execution_owner": req.execution_owner,
+            "execution_broker": req.execution_broker,
+            "account": req.account.value if req.account else None,
+            "ticker": req.ticker,
+            "direction": req.direction.value,
+        }
+        digest = hashlib.sha256(
+            json.dumps(
+                evidence_payload,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        req.reconciliation_snapshot_hash = f"sha256:{digest}"
+
     evidence_fields = {
         "external_execution_id": req.external_execution_id,
         "broker_source": req.broker_source,
@@ -552,12 +582,18 @@ def _validate_broker_confirmation(req: ExecutionRequest) -> None:
             raise HTTPException(status_code=422, detail=f"{label} は ISO-8601 形式が必要です") from exc
 
 
-def _reject_duplicate_external_execution(req: ExecutionRequest) -> None:
+def _reject_duplicate_external_execution(
+    req: ExecutionRequest,
+    *,
+    exclude_execution_id: Optional[str] = None,
+) -> None:
     if not req.broker_confirmed_filled:
         return
     data = _load_execution_log()
     for row in data.get("executions", []):
         if not isinstance(row, dict):
+            continue
+        if exclude_execution_id and str(row.get("id") or "") == exclude_execution_id:
             continue
         if (
             str(row.get("external_execution_id") or "") == req.external_execution_id
@@ -2651,6 +2687,15 @@ class ExecutionPatchRequest(BaseModel):
     note:     Optional[str]      = None
     status:   Optional[Status]   = None
     currency: Optional[Currency] = None
+    broker_confirmed_filled: Optional[bool] = None
+    external_execution_id: Optional[str] = None
+    broker_source: Optional[str] = None
+    broker_reported_at: Optional[str] = None
+    filled_quantity: Optional[float] = None
+    filled_price: Optional[float] = None
+    executed_at_time: Optional[str] = None
+    reconciled_at: Optional[str] = None
+    reconciliation_snapshot_hash: Optional[str] = None
 
     @field_validator("price", "quantity")
     @classmethod
@@ -2689,6 +2734,22 @@ async def patch_execution(exec_id: str, req: ExecutionPatchRequest):
 
             rec.update(patch)
             rec["edited_at"] = datetime.now().isoformat(timespec="seconds")
+            if rec.get("broker_confirmed_filled"):
+                try:
+                    confirmation_req = ExecutionRequest(**rec)
+                except Exception as exc:
+                    raise HTTPException(
+                        status_code=422,
+                        detail=f"broker-confirmed fill の入力が不正です: {exc}",
+                    ) from exc
+                _validate_broker_confirmation(confirmation_req)
+                _reject_duplicate_external_execution(
+                    confirmation_req,
+                    exclude_execution_id=exec_id,
+                )
+                rec["reconciliation_snapshot_hash"] = (
+                    confirmation_req.reconciliation_snapshot_hash
+                )
             try:
                 from execution_quality import _compute_shortfall_bps
                 _shortfall_bps = _compute_shortfall_bps(

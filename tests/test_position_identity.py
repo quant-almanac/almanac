@@ -209,7 +209,7 @@ def test_internal_portfolio_applied_invalidates_broker_snapshot(tmp_path):
     assert result["invalidating_event"]["execution_id"] is None
 
 
-def test_broker_fill_requires_a_newer_position_snapshot(tmp_path):
+def test_complete_broker_fill_advances_position_authority_without_new_snapshot(tmp_path):
     position = pi.PositionIdentity("husband", "rakuten", "general", "AVGO")
     base = {
         "ticker": "AVGO",
@@ -224,6 +224,7 @@ def test_broker_fill_requires_a_newer_position_snapshot(tmp_path):
         "filled_quantity": 5,
         "filled_price": 410.0,
         "reconciled_at": "2026-07-27T17:00:00+09:00",
+        "broker_confirmed_filled": True,
     }
     (tmp_path / "action_executions.json").write_text(json.dumps({
         "executions": [{**base}],
@@ -240,6 +241,7 @@ def test_broker_fill_requires_a_newer_position_snapshot(tmp_path):
         "executions": [{
             **base,
             "reconciliation_snapshot_hash": "sha256:abc",
+            "portfolio_applied": True,
         }],
     }), encoding="utf-8")
     confirmed = pi.position_freshness(
@@ -248,8 +250,9 @@ def test_broker_fill_requires_a_newer_position_snapshot(tmp_path):
         now=datetime(2026, 7, 27, 18, 0, tzinfo=JST),
         holdings_entry={"note": "楽天CSV保有同期 2026-07-14"},
     )
-    assert confirmed["status"] == "invalidated"
-    assert confirmed["invalidating_event"]["temporal_order"]["temporal_order"] != "before_snapshot"
+    assert confirmed["status"] == "fresh"
+    assert confirmed["source"] == "broker_confirmed_fill"
+    assert confirmed["synced_at"] == "2026-07-27T17:00:00+09:00"
 
     reconciled = pi.position_freshness(
         position,
@@ -276,6 +279,8 @@ def test_route_overlay_is_used_for_position_freshness(tmp_path):
         "filled_price": 410.0,
         "reconciled_at": "2026-07-27T17:00:00+09:00",
         "reconciliation_snapshot_hash": "sha256:abc",
+        "broker_confirmed_filled": True,
+        "portfolio_applied": True,
     }
     (tmp_path / "action_executions.json").write_text(
         json.dumps({"executions": [raw]}),
@@ -301,8 +306,8 @@ def test_route_overlay_is_used_for_position_freshness(tmp_path):
         holdings_entry={"note": "楽天CSV保有同期 2026-07-14"},
     )
 
-    assert result["status"] == "invalidated"
-    assert result["invalidating_event"]["execution_position_identity"] == position.key
+    assert result["status"] == "fresh"
+    assert result["source"] == "broker_confirmed_fill"
 
 
 # ---------------------------------------------------------------------------

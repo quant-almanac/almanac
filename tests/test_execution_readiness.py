@@ -277,6 +277,47 @@ def test_cash_snapshot_is_invalidated_by_later_fill(tmp_path):
     assert result["reasons"][0]["code"] == "cash_resource_snapshot_invalidated"
 
 
+def test_complete_web_fill_advances_cash_authority_without_new_snapshot(tmp_path):
+    now = datetime(2026, 7, 28, 9, 0, tzinfo=JST)
+    (tmp_path / "holdings.json").write_text(json.dumps({
+        "CASH_JPY_SBI_WIFE": {
+            "ticker": "CASH_JPY_SBI_WIFE",
+            "shares": 47_000,
+            "available_to_trade_jpy": 47_000,
+            "currency": "JPY",
+            "balance_status": "confirmed",
+            "reconciliation_required": False,
+            "source_as_of": "2026-07-27T09:00:00+09:00",
+        },
+    }), encoding="utf-8")
+    (tmp_path / "action_executions.json").write_text(json.dumps({
+        "executions": [{
+            "id": "web-fill", "ticker": "1489.T", "status": "executed",
+            "direction": "buy", "account": "NISA成長投資枠",
+            "execution_owner": "wife", "execution_broker": "sbi",
+            "broker_confirmed_filled": True,
+            "external_execution_id": "sbi-123",
+            "broker_source": "web_manual_confirmation",
+            "broker_reported_at": "2026-07-27T12:00:00+09:00",
+            "filled_quantity": 1, "filled_price": 3_000,
+            "reconciled_at": "2026-07-27T12:05:00+09:00",
+            "reconciliation_snapshot_hash": "sha256:web",
+            "portfolio_applied": True,
+            "saved_at": "2026-07-27T12:05:00+09:00",
+        }],
+    }), encoding="utf-8")
+
+    result = evaluate_cash_buying_power({
+        "ticker": "1489.T", "type": "buy", "quantity": 1,
+        "limit_price": 3_000, "execution_owner": "wife",
+        "execution_broker": "sbi", "execution_account": "NISA成長投資枠",
+    }, base_dir=tmp_path, now=now)
+
+    assert result["readiness"] == "ready"
+    assert result["cash_resource_authority_source"] == "broker_confirmed_web_fill"
+    assert result["cash_resource_as_of"] == "2026-07-27T12:05:00+09:00"
+
+
 def test_exit_quantity_over_requested_account_inventory_is_blocked(tmp_path):
     now = datetime(2026, 7, 14, 6, 0, tzinfo=JST)
     _write_base(tmp_path, now)

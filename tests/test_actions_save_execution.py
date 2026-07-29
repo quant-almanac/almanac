@@ -454,6 +454,26 @@ def test_duplicate_broker_execution_id_is_rejected_before_second_apply(isolated)
     assert record["reconciliation_snapshot_hash"] == "sha256:fixture"
 
 
+def test_web_broker_confirmation_gets_server_side_evidence_hash(isolated) -> None:
+    req = ExecutionRequest(
+        ticker="7203.T", direction="buy", quantity=1, price=1_000.0,
+        currency="JPY", account="特定", status="executed",
+        execution_owner="husband", execution_broker="rakuten",
+        broker_confirmed_filled=True,
+        external_execution_id="rakuten-web-123",
+        broker_source="web_manual_confirmation",
+        broker_reported_at="2026-07-28T08:55:00+09:00",
+        filled_quantity=1, filled_price=1_000.0,
+        reconciled_at="2026-07-28T09:00:00+09:00",
+    )
+
+    asyncio.run(actions.save_execution(req))
+    record = _read(isolated["executions"])["executions"][0]
+    assert record["broker_confirmed_filled"] is True
+    assert record["broker_source"] == "web_manual_confirmation"
+    assert record["reconciliation_snapshot_hash"].startswith("sha256:")
+
+
 def test_save_execution_preserves_analysis_id_in_execution_record_and_stage_log(isolated) -> None:
     """AI提案からの実行は、元のanalysis_idで後追いできるように残す。"""
     files = isolated

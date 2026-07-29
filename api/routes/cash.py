@@ -82,6 +82,9 @@ class CashRequest(BaseModel):
     broker:      CashBroker = CashBroker.rakuten
     owner:       CashOwner = CashOwner.husband
     description: Optional[str] = None
+    broker_confirmed: bool = False
+    external_transaction_id: Optional[str] = None
+    broker_reported_at: Optional[str] = None
 
     @field_validator("amount")
     @classmethod
@@ -191,6 +194,29 @@ def _prepare_cash_change(req: CashRequest, tx_type: TxType) -> tuple[dict, dict,
     account = deepcopy(original_account)
     holdings = deepcopy(original_holdings)
     tx_log = deepcopy(original_tx_log)
+    txs = tx_log.get("transactions", []) if isinstance(tx_log, dict) else []
+    if not isinstance(txs, list):
+        raise HTTPException(status_code=500, detail="cash_transactions.json の transactions が list ではありません")
+    if req.broker_confirmed:
+        if not req.external_transaction_id or not req.broker_reported_at:
+            raise HTTPException(
+                status_code=422,
+                detail="証券会社確認済みの入出金には取引IDと取引日時が必要です",
+            )
+        from execution_safety import parse_timestamp
+        if parse_timestamp(req.broker_reported_at) is None:
+            raise HTTPException(status_code=422, detail="broker_reported_at は ISO-8601 形式が必要です")
+        duplicate = next(
+            (
+                row for row in txs
+                if isinstance(row, dict)
+                and row.get("broker") == req.broker.value
+                and row.get("external_transaction_id") == req.external_transaction_id
+            ),
+            None,
+        )
+        if duplicate is not None:
+            raise HTTPException(status_code=409, detail="同じ証券会社取引IDは既に記録済みです")
 
     # ── account.json 更新内容の検証 ──
     if req.currency == CashCurrency.JPY and req.broker == CashBroker.rakuten and req.owner == CashOwner.husband:
@@ -208,6 +234,11 @@ def _prepare_cash_change(req: CashRequest, tx_type: TxType) -> tuple[dict, dict,
 
     _sync_account_cash_totals(account)
     account["last_updated"] = datetime.now().date().isoformat()
+    if req.broker_confirmed and req.broker == CashBroker.rakuten and req.owner == CashOwner.husband:
+        reconciled_at = datetime.now(SYSTEM_LOCAL_TZ).isoformat(timespec="seconds")
+        account["source_as_of"] = req.broker_reported_at
+        account["broker_reconciled_at"] = reconciled_at
+        account["reconciled_at"] = reconciled_at
 
     # ── holdings.json 同期内容の検証 ──
     key = _holdings_key(req.currency, req.broker, req.owner)
@@ -243,15 +274,25 @@ def _prepare_cash_change(req: CashRequest, tx_type: TxType) -> tuple[dict, dict,
             float(h.get("ledger_delta_since_report_jpy", 0) or 0) + amount_signed,
             2,
         )
-        h["balance_status"] = "estimated"
-        h["reconciliation_required"] = True
+        if req.broker_confirmed:
+            h["reported_balance_jpy"] = round(float(h["shares"]), 2)
+            h["reported_available_to_trade_jpy"] = round(next_available, 2)
+            h["reported_as_of"] = req.broker_reported_at
+            h["ledger_delta_since_report_jpy"] = 0
+            h["balance_status"] = "confirmed"
+            h["reconciliation_required"] = False
+        else:
+            h["balance_status"] = "estimated"
+            h["reconciliation_required"] = True
+    if req.broker_confirmed:
+        reconciled_at = datetime.now(SYSTEM_LOCAL_TZ).isoformat(timespec="seconds")
+        h["source_as_of"] = req.broker_reported_at
+        h["broker_reconciled_at"] = reconciled_at
+        h["reconciled_at"] = reconciled_at
+        h["reconciliation_source"] = "web_manual_confirmation"
     holdings[key] = h
 
     # ── 監査ログ append ──
-    txs = tx_log.get("transactions", []) if isinstance(tx_log, dict) else []
-    if not isinstance(txs, list):
-        raise HTTPException(status_code=500, detail="cash_transactions.json の transactions が list ではありません")
-
     new_tx = {
         "id":          f"tx_{uuid4().hex[:12]}",
         "timestamp":   datetime.now().isoformat(timespec="seconds"),
@@ -262,6 +303,9 @@ def _prepare_cash_change(req: CashRequest, tx_type: TxType) -> tuple[dict, dict,
         "cash_route":  key,
         "amount":      req.amount,
         "description": req.description or "",
+        "broker_confirmed": req.broker_confirmed,
+        "external_transaction_id": req.external_transaction_id,
+        "broker_reported_at": req.broker_reported_at,
         "new_balance_jpy": account.get("balance"),
         "new_balance_usd": account.get("usd_balance"),
         "new_total_cash":  account.get("total_cash"),

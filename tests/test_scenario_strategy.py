@@ -1,4 +1,5 @@
 import scenario_strategy
+import analyst
 from scenario_strategy import SCENARIOS
 import json
 
@@ -19,6 +20,11 @@ def test_bull_strategy_uses_aggressive_cash_target(monkeypatch):
     monkeypatch.setattr(scenario_strategy, "_load_long_term_candidates", lambda: [])
     monkeypatch.setattr(
         scenario_strategy,
+        "_load_short_product_controls",
+        lambda: {"US": True, "JP": True},
+    )
+    monkeypatch.setattr(
+        scenario_strategy,
         "_tunable_value",
         lambda key, fallback: 0 if key == "target_cash_pct_aggressive" else fallback,
     )
@@ -28,6 +34,61 @@ def test_bull_strategy_uses_aggressive_cash_target(monkeypatch):
     assert strategy["scenario"] == "BULL"
     assert strategy["cash_ratio_target"] == 0
     assert strategy["leverage_allowed"] is True
+    assert strategy["short_allowed"] is False
+    assert strategy["short_regime_policy"]["broad_directional_allowed"] is False
+    assert strategy["short_product_enabled"] == {"US": True, "JP": True}
+
+
+def test_short_product_controls_are_not_the_regime_permission(tmp_path, monkeypatch):
+    monkeypatch.setattr(scenario_strategy, "BASE_DIR", tmp_path)
+    (tmp_path / "disclosure_shadow_config.json").write_text(
+        json.dumps({"us_short_enabled": False, "jp_short_enabled": True}),
+        encoding="utf-8",
+    )
+    (tmp_path / "feature_control_state.json").write_text(
+        json.dumps({
+            "features": {
+                "us_short": {"enabled": True},
+                "jp_short": {"enabled": False},
+            }
+        }),
+        encoding="utf-8",
+    )
+    assert scenario_strategy._load_short_product_controls() == {
+        "US": True,
+        "JP": False,
+    }
+
+
+def test_short_permission_contract_corrects_product_off_conflation():
+    result = analyst._apply_short_permission_contract(
+        {
+            "short_not_recommended": "システム全体で空売り許可がFalse",
+            "crisis_strategy": "空売り許可が無いためショート不可",
+            "news_impact": "空売り禁止のため見送り",
+        },
+        {
+            "scenario": {
+                "short_allowed": False,
+                "short_product_enabled": {"US": True, "JP": True},
+            },
+            "screening": {
+                "short_candidates": [
+                    {"ticker": "DE", "shortable": True},
+                    {"ticker": "GM", "shortable": False},
+                ]
+            },
+        },
+    )
+    assert result["short_permission_contract"]["product_enabled"]["US"] is True
+    assert result["short_permission_contract"]["broad_directional_regime_allowed"] is False
+    assert result["short_permission_contract"]["shortable_candidates"] == 1
+    assert set(result["permission_conflict_corrected"]) == {
+        "short_not_recommended",
+        "crisis_strategy",
+        "news_impact",
+    }
+    assert "システム全体で空売り許可がFalse" not in result["short_not_recommended"]
 
 
 def test_crash_does_not_raise_cash_after_the_drop():
