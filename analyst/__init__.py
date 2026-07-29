@@ -8630,6 +8630,10 @@ def _phase1_post_filter(
             )
             if has_monthly_ledger else 0
         ),
+        "unattributed_budget_treatment": (
+            str(plan_consumption.get("unattributed_buy_budget_treatment") or "")
+            if has_monthly_ledger else ""
+        ),
         "all_unattributed_count": (
             _plan_nonnegative_int(plan_consumption.get("unattributed_monthly_total_count"))
             if has_monthly_ledger else 0

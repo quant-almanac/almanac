@@ -22,18 +22,22 @@ def _nonnegative_int(value: Any) -> int:
         return 0
 
 
-def _monthly_attribution_snapshot(value: Any) -> dict[str, int | bool]:
+def _monthly_attribution_snapshot(value: Any) -> dict[str, int | bool | str]:
     """Normalize the plan's month-to-date attribution coverage snapshot."""
     if not isinstance(value, dict) or value.get("available") is not True:
         return {
             "available": False,
             "unattributed_count": 0,
             "unattributed_notional_jpy": 0,
+            "unattributed_budget_treatment": "",
         }
     return {
         "available": True,
         "unattributed_count": _nonnegative_int(value.get("unattributed_count")),
         "unattributed_notional_jpy": _nonnegative_int(value.get("unattributed_notional_jpy")),
+        "unattributed_budget_treatment": str(
+            value.get("unattributed_budget_treatment") or ""
+        ),
     }
 
 
@@ -157,7 +161,11 @@ def evaluate_enforce_readiness(
         blockers.append(f"plan_metadata_mismatches_present: {mismatch_count}")
     if observe_rows and not monthly_attribution["available"]:
         blockers.append("monthly_attribution_unavailable")
-    elif monthly_attribution["unattributed_count"]:
+    elif (
+        monthly_attribution["unattributed_count"]
+        and monthly_attribution["unattributed_budget_treatment"]
+        != "charged_to_monthly_base_budget"
+    ):
         blockers.append(
             "legacy_monthly_attribution_incomplete: "
             f"count={monthly_attribution['unattributed_count']}, "

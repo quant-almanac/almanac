@@ -1734,6 +1734,7 @@ def test_execution_plan_observe_mode_keeps_would_be_filtered_action(monkeypatch)
         "available": True,
         "unattributed_count": 0,
         "unattributed_notional_jpy": 0,
+        "unattributed_budget_treatment": "",
         "all_unattributed_count": 2,
         "all_unattributed_notional_jpy": 130_000,
     }

@@ -157,6 +157,7 @@ def test_build_observation_counts_batch_error_and_mismatch() -> None:
         "available": True,
         "unattributed_count": 0,
         "unattributed_notional_jpy": 0,
+        "unattributed_budget_treatment": "",
     }
 
 
@@ -179,7 +180,27 @@ def test_readiness_blocks_unattributed_monthly_activity_even_with_sample() -> No
         "available": True,
         "unattributed_count": 2,
         "unattributed_notional_jpy": 130_000,
+        "unattributed_budget_treatment": "",
     }
     assert readiness["blockers"] == [
         "legacy_monthly_attribution_incomplete: count=2, notional_jpy=130000",
     ]
+
+
+def test_readiness_accepts_unattributed_buys_charged_to_shared_monthly_budget() -> None:
+    readiness = epo.evaluate_enforce_readiness([{
+        "mode": "observe",
+        "trading_date": "2026-07-10",
+        "classification_count": 20,
+        "classification_error_count": 0,
+        "metadata_mismatch_count": 0,
+        "monthly_attribution": {
+            "available": True,
+            "unattributed_count": 2,
+            "unattributed_notional_jpy": 130_000,
+            "unattributed_budget_treatment": "charged_to_monthly_base_budget",
+        },
+    }])
+
+    assert readiness["ready_for_enforce"] is True
+    assert readiness["blockers"] == []

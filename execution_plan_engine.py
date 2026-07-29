@@ -2059,6 +2059,13 @@ def build_execution_plan(
         period_end=date.fromisoformat(str(horizon["week_end"])),
     )
     consumption_summary.update(monthly_consumption)
+    # Unlinked legacy buys cannot evade the new shared monthly pool. They are
+    # conservatively charged to the base allowance above, so downstream
+    # observe-to-enforce readiness must not treat their missing objective ID as
+    # an unbounded-budget gap.
+    consumption_summary["unattributed_buy_budget_treatment"] = (
+        "charged_to_monthly_base_budget"
+    )
     consumption_summary["monthly_remaining_jpy"] = monthly_remaining
     # The shared pools are authoritative.  Item-level consumption remains an
     # explanatory trace only and must not recreate the old split-wallet model.

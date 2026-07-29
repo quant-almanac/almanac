@@ -879,12 +879,18 @@ def _build_execution_plan_view(plan: dict, board: list[dict], synthesis: dict, n
         if weekly_normal > 0 and not shared_normal_pool
         else None
     )
-    monthly_attribution_incomplete = _float_value(
+    unattributed_budget_treatment = str(
+        consumption.get("unattributed_buy_budget_treatment") or ""
+    )
+    monthly_attribution_incomplete = (
+        unattributed_budget_treatment != "charged_to_monthly_base_budget"
+        and _float_value(
         consumption.get(
             "unattributed_monthly_buy_total_count",
             consumption.get("unattributed_monthly_total_count"),
         )
-    ) > 0
+        ) > 0
+    )
 
     if board:
         today_decision = {
@@ -981,6 +987,7 @@ def _build_execution_plan_view(plan: dict, board: list[dict], synthesis: dict, n
             "monthly_filled_consumed_jpy": consumption.get("monthly_filled_consumed_jpy"),
             "monthly_consumed_jpy": consumption.get("monthly_consumed_jpy"),
             "monthly_remaining_jpy": consumption.get("monthly_remaining_jpy"),
+            "unattributed_buy_budget_treatment": unattributed_budget_treatment,
             "unattributed_monthly_open_order_count": consumption.get("unattributed_monthly_open_order_count"),
             "unattributed_monthly_open_order_notional_jpy": consumption.get("unattributed_monthly_open_order_notional_jpy"),
             "unattributed_monthly_filled_count": consumption.get("unattributed_monthly_filled_count"),

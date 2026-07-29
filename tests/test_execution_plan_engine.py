@@ -1074,6 +1074,9 @@ def test_monthly_surplus_budget_is_paced_by_existing_buys() -> None:
 
     assert plan["budgets"]["monthly_base_consumed_jpy"] == 800_000
     assert plan["budgets"]["normal_pool_available_jpy"] == 0
+    assert plan["consumption_summary"]["unattributed_buy_budget_treatment"] == (
+        "charged_to_monthly_base_budget"
+    )
     assert plan["no_action_rationale"][0]["reason_code"] == (
         "monthly_surplus_deployment_budget_consumed"
     )
