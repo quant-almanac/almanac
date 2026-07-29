@@ -113,7 +113,7 @@ tax表示/action consumerはAPI、analyst、NISA、ESPP、rebalanceにもあり�
 | live | `event_ledger.py`, `event_ledger_backfill.py`, `cash_transactions_backfill.py` | append-only eventと制御backfill |
 | live | `nav_recorder.py`, `benchmark_tracker.py` | measured NAVとbenchmark |
 | maintenance | `nav_backfill.py`, `ledger_fx_reprice.py`, `ledger_trade_corrections.py`, `opening_balance_backfill_9432.py` | explicitなestimated/correction |
-| live | `broker_balance_import.py`, `broker_position_import.py`, `broker_reconcile.py`, `broker_reconcile_cron.py` | broker証拠、position/cash取込、ledger照合 |
+| live | `broker_balance_import.py`, `broker_position_import.py`, `broker_reconcile.py`, `broker_reconcile_cron.py`, `broker_cost_basis.py`, `execution_reconciliation.py` | broker証拠、position/cash取込、route修正overlay、取得原価の採用判定、ledger照合 |
 | maintenance | `sync_broker_short_us.py`, `sync_broker_short_us_index.py`, `sync_jp_loanable.py`, `sync_jp_short_taisyaku.py`, `sync_jsf_lending.py` | borrowability/broker universe同期 |
 | live | `config_clean_baseline.py`, `backup_manager.py` | clean計測境界と復元可能backup |
 

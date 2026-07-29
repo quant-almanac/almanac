@@ -63,7 +63,8 @@ flowchart TD
     G --> H["Deterministic post-processing<br/>routing · size · limit context"]
     H --> I{"Policy Engine<br/>deterministic gate"}
     I -->|rejected| J["Logged with a reason<br/>never reaches the user as an action"]
-    I -->|accepted / modified| K["action_state.json<br/>+ recommendation log"]
+    I -->|accepted / modified| M["Post-filter + readiness<br/>orders · freshness · account scope"]
+    M --> K["action_state.json<br/>+ recommendation log"]
     K --> L["Dashboard + Telegram<br/>human decides and places the order"]
 ```
 
@@ -71,7 +72,7 @@ Each stage exists for a reason:
 
 **Freshness first.** Every input the gate depends on — the macro-event calendar, technical state, VIX, earnings proximity, scenario snapshot — is checked *before* analysis starts and refreshed when its own staleness rule requires it. A stale calendar would otherwise be silently read as "no important events coming up," which is the difference between an earnings blackout firing and not firing. Refresh failures are printed rather than swallowed, and the readiness gate treats a missing calendar as `review`, not as "clear."
 
-The analysis then freezes a two-stage **decision snapshot**. The base snapshot contains holdings, cash, prices, FX, macro, news and screening data; after the held and candidate tickers are known, an enriched snapshot adds their chart and options payloads. Every tier and the final synthesis receive the same content hash, source timestamps and payload hashes, and external re-fetches are forbidden after the enriched snapshot is sealed. A separate execution-quote snapshot may refresh price, spread and market status just before an order, but it may only reprice or downgrade an action—not rewrite the investment thesis or confidence.
+The analysis then freezes a two-stage **decision snapshot**. The base snapshot contains holdings, cash, prices, FX, macro, news and screening data; after the held and candidate tickers are known, an enriched snapshot adds their chart and options payloads. A single run-wide `analysis_id` is issued before catalyst or tier work begins and follows the catalyst, every tier result, final synthesis, action, stage log and both snapshot stages. Every tier and the final synthesis receive the same content hash, source timestamps and payload hashes, and external re-fetches are forbidden after the enriched snapshot is sealed. A separate execution-quote snapshot may refresh price, spread and market status just before an order, but it may only reprice or downgrade an action—not rewrite the investment thesis or confidence.
 
 **Five specialists, not one generalist.** The portfolio is split by holding intent — long-term core, medium-term, swing — plus two credit-side lanes (margin-long, short-sell). Each gets its own analysis with its own prompt and its own risk vocabulary. They run in parallel with a per-call timeout, and a tier that times out degrades that lane rather than failing the whole run.
 
@@ -233,6 +234,8 @@ proposal → readiness (ready | review | blocked) → human places the order at 
 
 Recording a fill is deliberately separated from applying it to the portfolio. An execution whose account/route cannot be determined unambiguously is stored as a *fact that happened* and held as `portfolio_application_pending` rather than being guessed into the wrong account — because a wrong attribution silently corrupts every downstream tax lot, NISA allowance, and performance figure. Writes are idempotent through a client-generated key, so a double-submitted form cannot become two trades.
 
+Broker exports may later prove that the recorded route was wrong. The original execution remains immutable; a separate atomic reconciliation overlay may correct only owner, broker and account, and every safety/reporting consumer resolves the same effective route. Quantity, price or trade-date corrections use a different correction type rather than being smuggled into a route fix. A malformed overlay fails closed to `review`. Cost basis is also accepted only from a broker position snapshot whose identity, quantity and as-of ordering can be reconciled; a same-day fill with no usable time is treated as temporally unknown rather than guessed before or after the snapshot.
+
 ### 9. The record, and auditing it
 
 The ledger subsystem creates three SQLite tables.
@@ -380,7 +383,7 @@ Training writes a versioned candidate bundle (`model.pt` plus a manifest), but c
 kelly = 0.5 × (p·b − q) / b     p = win rate, b = average win ÷ average loss
 ```
 
-p and b come from graded **buy/add/DCA recommendation signals**, not executed trades. Duplicate recommendations from the same analysis are removed, statistics are separated into 5-, 20- and 60-business-day horizons, and at least 20 observations are required for the requested horizon. A counterfactual shadow path applies the cap before the same policy rules and records what would have changed; it never mutates the real action, action state, execution plan or notifications. Signal statistics remain ticker/direction/horizon scoped, while the current holding used for sizing is resolved by owner + broker + account + instrument. Missing identity or an unproven zero holding makes the shadow cap unobservable rather than assuming zero.
+p and b come from graded **buy/add/DCA recommendation signals**, not executed trades. Duplicate recommendations from the same analysis are removed, statistics are separated into 5-, 20- and 60-business-day horizons, and at least 20 observations are required for the requested horizon. A counterfactual shadow path applies the cap before the same policy rules, then runs the same post-filter and readiness checks without persistence; a final invariant rejects any downstream rounding or minimum-notional change that would raise the result above the Kelly cap. It never mutates the real action, action state, execution plan or notifications. Signal statistics remain ticker/direction/horizon scoped, while the current holding used for sizing is resolved by owner + broker + account + instrument. Missing identity or an unproven zero holding makes the shadow cap unobservable rather than assuming zero.
 
 ### Adding on the way down
 

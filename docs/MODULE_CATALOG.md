@@ -113,7 +113,7 @@ Tax display and action consumers also exist in API, analyst, NISA, ESPP and reba
 | live | `event_ledger.py`, `event_ledger_backfill.py`, `cash_transactions_backfill.py` | Append-only events and controlled backfill |
 | live | `nav_recorder.py`, `benchmark_tracker.py` | Measured NAV and benchmark |
 | maintenance | `nav_backfill.py`, `ledger_fx_reprice.py`, `ledger_trade_corrections.py`, `opening_balance_backfill_9432.py` | Explicit estimated/correction paths |
-| live | `broker_balance_import.py`, `broker_position_import.py`, `broker_reconcile.py`, `broker_reconcile_cron.py` | Broker evidence, position/cash import and ledger comparison |
+| live | `broker_balance_import.py`, `broker_position_import.py`, `broker_reconcile.py`, `broker_reconcile_cron.py`, `broker_cost_basis.py`, `execution_reconciliation.py` | Broker evidence, position/cash import, route-correction overlay, cost-basis admission and ledger comparison |
 | maintenance | `sync_broker_short_us.py`, `sync_broker_short_us_index.py`, `sync_jp_loanable.py`, `sync_jp_short_taisyaku.py`, `sync_jsf_lending.py` | Borrowability and broker-universe synchronization |
 | live | `config_clean_baseline.py`, `backup_manager.py` | Clean measurement boundary and recoverable backup |
 
