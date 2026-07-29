@@ -12,15 +12,17 @@ from __future__ import annotations
 
 import json
 import os
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from utils import atomic_write_json, process_lock
 
 BASE_DIR = Path(__file__).parent
 DEFAULT_CONFIG_PATH = BASE_DIR / "disclosure_shadow_config.json"
 SCHEMA_VERSION = 1
+SYSTEM_LOCAL_TZ = ZoneInfo("Asia/Tokyo")
 
 _SHORT_FEATURES = {
     "us_short": {
@@ -176,7 +178,7 @@ def _parse_time(value: Any) -> datetime | None:
     except (TypeError, ValueError):
         return None
     if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
+        parsed = parsed.replace(tzinfo=SYSTEM_LOCAL_TZ)
     return parsed.astimezone(timezone.utc)
 
 
@@ -185,6 +187,68 @@ def _age_hours(value: Any) -> float | None:
     if parsed is None:
         return None
     return max(0.0, (datetime.now(timezone.utc) - parsed).total_seconds() / 3600.0)
+
+
+def _freshness_status(
+    *,
+    exists: bool,
+    age_hours: float | None,
+    max_age_hours: float | None,
+) -> str:
+    if not exists:
+        return "missing"
+    if max_age_hours is None:
+        return "not_applicable"
+    if age_hours is None:
+        return "unknown"
+    return "stale" if age_hours > max_age_hours else "fresh"
+
+
+def _read_only_status(
+    *,
+    key: str,
+    label: str,
+    category: str,
+    description: str,
+    mode: str,
+    configured_enabled: bool,
+    effective_enabled: bool,
+    reason: str,
+    blockers: list[str] | None = None,
+    warnings: list[str] | None = None,
+    source: str | None = None,
+    source_as_of: Any = None,
+    max_age_hours: float | None = None,
+    source_note: str | None = None,
+    control_hint: str,
+    metrics: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    age = _age_hours(source_as_of)
+    return {
+        "key": key,
+        "label": label,
+        "category": category,
+        "description": description,
+        "configured_enabled": configured_enabled,
+        "effective_enabled": effective_enabled,
+        "mutable": False,
+        "mode": mode,
+        "auto_order_enabled": False,
+        "reason": reason,
+        "blockers": blockers or [],
+        "warnings": warnings or [],
+        "source": source,
+        "source_as_of": source_as_of,
+        "source_age_hours": round(age, 1) if age is not None else None,
+        "freshness_status": _freshness_status(
+            exists=source_as_of is not None or max_age_hours is None,
+            age_hours=age,
+            max_age_hours=max_age_hours,
+        ),
+        "source_note": source_note,
+        "control_hint": control_hint,
+        "metrics": metrics or [],
+    }
 
 
 def _latest_short_pipeline(root: Path, market: str) -> dict[str, Any]:
@@ -269,8 +333,15 @@ def _short_readiness(key: str, root: Path) -> dict[str, Any]:
                 round(eligible / universe_count * 100, 1)
                 if universe_count else None
             ),
+            "availability_label": "借株proxy該当",
+            "availability_metric_kind": "proxy_eligibility_rate",
             "source_as_of": as_of,
             "source_age_hours": round(age, 1) if age is not None else None,
+            "freshness_status": _freshness_status(
+                exists=bool(tickers),
+                age_hours=age,
+                max_age_hours=168,
+            ),
             "source": "data/broker_short_us.json",
             "source_note": "基準ベースの近似。最終可否・料率は発注画面が権威",
             **pipeline,
@@ -307,6 +378,8 @@ def _short_readiness(key: str, root: Path) -> dict[str, Any]:
             round(eligible / len(loanable_rows) * 100, 1)
             if loanable_rows else None
         ),
+        "availability_label": "貸借可能",
+        "availability_metric_kind": "loanable_eligibility_rate",
         "source_as_of": min(
             [value for value in (loanable_as_of, jsf_as_of) if value],
             default=None,
@@ -315,6 +388,14 @@ def _short_readiness(key: str, root: Path) -> dict[str, Any]:
             [value for value in (loanable_age, jsf_age) if value is not None],
             default=0.0,
         ), 1),
+        "freshness_status": (
+            "missing" if not loanable_rows
+            else "stale" if any(
+                value is None or value > 72
+                for value in (loanable_age, jsf_age)
+            )
+            else "fresh"
+        ),
         "source": "data/jp_loanable_state.json + data/jsf_lending_state.json",
         "source_note": "銘柄ごとの貸借可否・逆日歩・規制を発注前に再確認",
         **pipeline,
@@ -355,6 +436,348 @@ def _short_status(key: str, *, base_dir: Path | str | None = None) -> dict[str, 
     }
 
 
+def _margin_long_status(root: Path) -> dict[str, Any]:
+    payload = _load_json(root / "margin_long_candidates.json", {})
+    payload = payload if isinstance(payload, dict) else {}
+    as_of = payload.get("generated_at")
+    age = _age_hours(as_of)
+    candidates = payload.get("candidates")
+    candidates = candidates if isinstance(candidates, list) else []
+    blocked = bool(payload.get("blocked"))
+    fresh = age is not None and age <= 72
+    effective = bool(payload) and fresh and not blocked
+    blockers = []
+    if not payload:
+        blockers.append("margin_long_candidates_missing")
+    elif not fresh:
+        blockers.append("margin_long_candidates_stale")
+    if blocked:
+        blockers.append("margin_long_market_gate_blocked")
+    reason = (
+        f"信用買い候補を{len(candidates)}件生成しています。注文は人間実行です"
+        if effective else
+        "相場・VIXの安全関門が信用買い候補を停止しています"
+        if blocked else
+        "信用買い候補の最新成果物を確認できません"
+    )
+    return _read_only_status(
+        key="margin_long",
+        label="信用買い候補",
+        category="candidate",
+        description="押し目反発候補を抽出し、証拠金・集中・相場関門へ渡します。",
+        mode="human_execution_only",
+        configured_enabled=True,
+        effective_enabled=effective,
+        reason=reason,
+        blockers=blockers,
+        source="margin_long_candidates.json",
+        source_as_of=as_of,
+        max_age_hours=72,
+        source_note="候補生成の権威。発注可否は後段の安全関門と証券会社画面で確定",
+        control_hint="候補レーンは常時評価し、相場・VIX・証拠金関門が停止権限を持ちます",
+        metrics=[{"label": "候補", "value": len(candidates)}],
+    )
+
+
+def _options_status(root: Path) -> dict[str, Any]:
+    cache_dir = root / "data" / "options_cache"
+    timestamps: list[datetime] = []
+    total = 0
+    fresh_count = 0
+    for path in cache_dir.glob("*.json") if cache_dir.is_dir() else ():
+        total += 1
+        payload = _load_json(path, {})
+        fetched_at = payload.get("fetched_at") if isinstance(payload, dict) else None
+        parsed = _parse_time(fetched_at)
+        if parsed is None:
+            continue
+        timestamps.append(parsed)
+        if (datetime.now(timezone.utc) - parsed).total_seconds() <= 24 * 3600:
+            fresh_count += 1
+    latest = max(timestamps).isoformat() if timestamps else None
+    effective = fresh_count > 0
+    return _read_only_status(
+        key="options_signals",
+        label="オプション指標",
+        category="signal",
+        description="IV・skew・put/callを分析根拠として使います。オプション注文は生成しません。",
+        mode="analysis_signal_only",
+        configured_enabled=True,
+        effective_enabled=effective,
+        reason=(
+            f"24時間以内のオプション指標が{fresh_count}銘柄あります"
+            if effective else "24時間以内のオプション指標がありません"
+        ),
+        blockers=[] if effective else ["fresh_options_cache_missing"],
+        source="data/options_cache/*.json",
+        source_as_of=latest,
+        max_age_hours=24,
+        source_note="options_fetcher が生成する分析用キャッシュ",
+        control_hint="分析シグナル専用です。注文商品としての有効化権限はありません",
+        metrics=[
+            {"label": "新鮮", "value": fresh_count},
+            {"label": "全キャッシュ", "value": total},
+        ],
+    )
+
+
+def _tax_basis_status() -> dict[str, Any]:
+    mode = str(os.environ.get("ALMANAC_TAX_BASIS_MODE", "compare")).strip().lower()
+    if mode not in {"legacy", "compare", "total_average"}:
+        mode = "compare"
+    reason = {
+        "legacy": "旧計算を表示元にしています",
+        "compare": "旧計算と総平均法を同一入力で比較しています",
+        "total_average": "総平均法の計算を表示元にしています",
+    }[mode]
+    return _read_only_status(
+        key="tax_basis",
+        label="税務取得費",
+        category="policy",
+        description="取得費の算出元を切り替えます。証券会社の年間取引報告書が最終権威です。",
+        mode=mode,
+        configured_enabled=True,
+        effective_enabled=True,
+        reason=reason,
+        source="ALMANAC_TAX_BASIS_MODE + tax_lot.py",
+        max_age_hours=None,
+        source_note="モードは算出元だけを変え、API schemaは共通です",
+        control_hint="環境変数 ALMANAC_TAX_BASIS_MODE が権威です",
+    )
+
+
+def _privacy_status() -> dict[str, Any]:
+    try:
+        from almanac.llm_safety import get_privacy_mode
+        mode = get_privacy_mode()
+    except Exception:
+        mode = "strict_local"
+    reason = {
+        "strict_local": "保有情報を含む外部AI呼び出しを禁止しています",
+        "anthropic_book_aware": "保有情報を含む呼び出しをAnthropicだけに許可しています",
+        "multi_provider_book_aware": "許可済みの複数AIへ保有情報を含む呼び出しを許可しています",
+    }.get(mode, "不明な値をstrict_localへ縮退しています")
+    return _read_only_status(
+        key="privacy_mode",
+        label="AIプライバシー",
+        category="policy",
+        description="保有・残高を含むbook-awareデータを外部AIへ送れる範囲を制限します。",
+        mode=mode,
+        configured_enabled=True,
+        effective_enabled=True,
+        reason=reason,
+        source="ALMANAC_PRIVACY_MODE + almanac/llm_safety.py",
+        max_age_hours=None,
+        source_note="未設定・不正値はstrict_localへfail-closed",
+        control_hint="秘密設定の ALMANAC_PRIVACY_MODE が権威です",
+    )
+
+
+def _currency_policy_status(root: Path) -> dict[str, Any]:
+    mode = str(os.environ.get("ALMANAC_CURRENCY_POLICY_MODE", "shadow")).strip().lower()
+    if mode not in {"off", "shadow", "advisory"}:
+        mode = "shadow"
+    state = _load_json(root / "currency_policy_state.json", {})
+    state = state if isinstance(state, dict) else {}
+    as_of = state.get("as_of")
+    valid_until = state.get("valid_until")
+    try:
+        not_expired = date.fromisoformat(str(valid_until)) >= datetime.now(SYSTEM_LOCAL_TZ).date()
+    except (TypeError, ValueError):
+        not_expired = False
+    valid = (
+        state.get("basis") == "long_tier"
+        and isinstance(state.get("usd_target_pct"), (int, float))
+        and isinstance(state.get("jpy_target_pct"), (int, float))
+        and abs(float(state["usd_target_pct"]) + float(state["jpy_target_pct"]) - 100) <= 0.01
+        and not_expired
+    )
+    effective = mode != "off" and valid
+    blockers = []
+    if not state:
+        blockers.append("currency_policy_state_missing")
+    elif not valid:
+        blockers.append("currency_policy_state_invalid_or_expired")
+    if mode == "off":
+        blockers.append("currency_policy_mode_off")
+    return _read_only_status(
+        key="currency_policy",
+        label="動的通貨方針",
+        category="shadow",
+        description="USD/JPY配分案を観測します。経済通貨resolver完成までは静的目標を維持します。",
+        mode=mode,
+        configured_enabled=mode != "off",
+        effective_enabled=effective,
+        reason=(
+            "動的案を記録していますが、実配分には静的目標を適用しています"
+            if effective else "動的通貨方針は実効入力として使われていません"
+        ),
+        blockers=blockers,
+        source="currency_policy_state.json + ALMANAC_CURRENCY_POLICY_MODE",
+        source_as_of=as_of,
+        max_age_hours=24 * 14,
+        source_note="現段階のshadow/advisoryはstatic fallbackが実配分の権威",
+        control_hint="環境変数とeconomic exposure resolverの検証ゲートが権威です",
+        metrics=[
+            {"label": "USD案", "value": state.get("usd_target_pct")},
+            {"label": "JPY案", "value": state.get("jpy_target_pct")},
+        ],
+    )
+
+
+def _market_regime_status(root: Path) -> dict[str, Any]:
+    state = _load_json(root / "market_regime_v2_state.json", {})
+    state = state if isinstance(state, dict) else {}
+    assessment = state.get("assessment")
+    assessment = assessment if isinstance(assessment, dict) else {}
+    portfolio = assessment.get("portfolio")
+    portfolio = portfolio if isinstance(portfolio, dict) else {}
+    mode = str(
+        assessment.get("mode")
+        or os.environ.get("ALMANAC_MARKET_REGIME_V2_MODE", "advisory")
+    ).lower()
+    if mode not in {"off", "shadow", "advisory"}:
+        mode = "shadow"
+    as_of = assessment.get("evaluated_at") or state.get("updated_at")
+    age = _age_hours(as_of)
+    eligible = bool(portfolio.get("eligible"))
+    effective = mode != "off" and eligible and age is not None and age <= 48
+    label = portfolio.get("committed_label") or portfolio.get("raw_label")
+    blockers = []
+    if not assessment:
+        blockers.append("market_regime_assessment_missing")
+    elif not eligible:
+        blockers.append("market_regime_input_coverage_insufficient")
+    if age is None or age > 48:
+        blockers.append("market_regime_assessment_stale")
+    if mode == "off":
+        blockers.append("market_regime_mode_off")
+    return _read_only_status(
+        key="market_regime_v2",
+        label="5段階レジーム",
+        category="policy",
+        description="トレンド・市場幅・VIX・信用・長期金利から相場状態を判定します。",
+        mode=mode,
+        configured_enabled=mode != "off",
+        effective_enabled=effective,
+        reason=(
+            f"{label}を実効判定として使用しています"
+            if effective else "レジーム判定は停止または安全側に縮退しています"
+        ),
+        blockers=blockers,
+        source="market_regime_v2_state.json + ALMANAC_MARKET_REGIME_V2_MODE",
+        source_as_of=as_of,
+        max_age_hours=48,
+        source_note="advisoryは提案とサイズ上限へ反映しますが自動注文しません",
+        control_hint="環境変数と入力カバレッジ・ヒステリシスが権威です",
+        metrics=[
+            {"label": "判定", "value": label},
+            {"label": "score", "value": portfolio.get("score")},
+        ],
+    )
+
+
+def _analysis_snapshot_status(root: Path) -> dict[str, Any]:
+    state = _load_json(root / "decision_snapshot_state.json", {})
+    state = state if isinstance(state, dict) else {}
+    latest: dict[str, Any] | None = None
+    latest_at: datetime | None = None
+    latest_analysis_id: str | None = None
+    for analysis_id, stages in state.items():
+        if not isinstance(stages, dict):
+            continue
+        for stage in ("tier", "synthesis"):
+            record = stages.get(stage)
+            if not isinstance(record, dict):
+                continue
+            parsed = _parse_time(record.get("frozen_at"))
+            if parsed is not None and (latest_at is None or parsed > latest_at):
+                latest, latest_at, latest_analysis_id = record, parsed, str(analysis_id)
+    as_of = latest.get("frozen_at") if latest else None
+    base = (((latest or {}).get("enriched") or {}).get("base") or {})
+    freshnesses = [
+        row.get("freshness_status")
+        for row in base.values()
+        if isinstance(row, dict)
+    ]
+    bad = sum(1 for value in freshnesses if value in {"stale", "missing", "unknown"})
+    effective = latest is not None
+    warnings = [f"凍結入力に要確認が{bad}件あります"] if bad else []
+    return _read_only_status(
+        key="analysis_snapshot",
+        label="AnalysisSnapshot",
+        category="data",
+        description="分析開始時の保有・価格・FX・ニュース等を凍結し、後段で同じ入力を使います。",
+        mode="frozen_context",
+        configured_enabled=True,
+        effective_enabled=effective,
+        reason=(
+            f"最新分析 {latest_analysis_id} の入力を凍結しています"
+            if effective else "凍結済み分析入力がありません"
+        ),
+        blockers=[] if effective else ["decision_snapshot_missing"],
+        warnings=warnings,
+        source="decision_snapshot_state.json",
+        source_as_of=as_of,
+        max_age_hours=48,
+        source_note="snapshot hashは不変性を示し、各入力のfreshnessは別に判定します",
+        control_hint="分析パイプラインが自動生成する監査情報です",
+        metrics=[
+            {"label": "入力", "value": len(freshnesses)},
+            {"label": "要確認", "value": bad},
+        ],
+    )
+
+
+def _broker_reconciliation_status(root: Path) -> dict[str, Any]:
+    rows = []
+    for path in sorted(root.glob("broker_position_snapshot_*.json")):
+        payload = _load_json(path, {})
+        if isinstance(payload, dict) and payload:
+            rows.append((path.name, payload))
+    source_times = [
+        payload.get("source_as_of") or payload.get("reconciled_at")
+        for _, payload in rows
+    ]
+    parsed_times = [parsed for value in source_times if (parsed := _parse_time(value))]
+    oldest = min(parsed_times).isoformat() if parsed_times else None
+    complete = sum(1 for _, payload in rows if payload.get("complete") is True)
+    ages = [_age_hours(value) for value in source_times]
+    fresh = bool(rows) and complete == len(rows) and all(
+        age is not None and age <= 96 for age in ages
+    )
+    blockers = []
+    if not rows:
+        blockers.append("broker_position_snapshots_missing")
+    if rows and complete != len(rows):
+        blockers.append("broker_position_snapshot_incomplete")
+    if rows and not fresh:
+        blockers.append("broker_position_snapshot_stale")
+    return _read_only_status(
+        key="broker_reconciliation",
+        label="証券会社照合",
+        category="data",
+        description="owner・broker・account・instrument単位の数量と資金の権威を保持します。",
+        mode="broker_snapshot",
+        configured_enabled=True,
+        effective_enabled=fresh,
+        reason=(
+            f"{complete}/{len(rows)}証券会社のsnapshotが完全かつ期限内です"
+            if fresh else "証券会社snapshotが不足・不完全・期限切れです"
+        ),
+        blockers=blockers,
+        source="broker_position_snapshot_*.json + execution_reconciliation_state.json",
+        source_as_of=oldest,
+        max_age_hours=96,
+        source_note="売却数量と買付資金は対象identityのbroker照合が最終権威",
+        control_hint="証券会社CSV/画面との再照合だけが鮮度を進めます",
+        metrics=[
+            {"label": "完全", "value": complete},
+            {"label": "取得済み", "value": len(rows)},
+        ],
+    )
+
+
 def _analysis_shadow_status(
     key: str,
     *,
@@ -369,23 +792,39 @@ def _analysis_shadow_status(
     decision = decision if isinstance(decision, dict) else {}
     mode = str(decision.get("mode") or "shadow")
     present = bool(decision)
+    as_of = payload.get("as_of") if isinstance(payload, dict) else None
+    age = _age_hours(as_of)
+    fresh = age is not None and age <= 48
     return {
         "key": key,
         "label": label,
         "category": "shadow",
         "description": description,
         "configured_enabled": mode != "off",
-        "effective_enabled": present and mode != "off",
+        "effective_enabled": present and mode != "off" and fresh,
         "mutable": False,
         "mode": mode,
         "auto_order_enabled": False,
         "reason": (
             "影実行の結果を記録しています。実アクションや注文は変更しません"
-            if present and mode != "off"
+            if present and mode != "off" and fresh
             else "最新分析に影実行結果がなく、実効状態を確認できません"
         ),
-        "blockers": [] if present else ["latest_shadow_result_missing"],
-        "updated_at": payload.get("as_of") if isinstance(payload, dict) else None,
+        "blockers": (
+            [] if present and fresh
+            else ["latest_shadow_result_stale"] if present
+            else ["latest_shadow_result_missing"]
+        ),
+        "updated_at": as_of,
+        "source": "ai_portfolio_analysis.json",
+        "source_as_of": as_of,
+        "source_age_hours": round(age, 1) if age is not None else None,
+        "freshness_status": _freshness_status(
+            exists=present,
+            age_hours=age,
+            max_age_hours=48,
+        ),
+        "source_note": "最新分析内の影実行decisionが権威",
         "control_hint": "安全性検証後に別の有効化判断が必要です",
     }
 
@@ -395,12 +834,47 @@ def _ginn_status(root: Path) -> dict[str, Any]:
     pointer = _load_json(root / "models" / "ginn" / "current.json", {})
     version = pointer.get("version") if isinstance(pointer, dict) else None
     manifest = root / "models" / "ginn" / str(version) / "manifest.json" if version else None
-    promoted = bool(version and manifest and manifest.exists())
+    manifest_payload = _load_json(manifest, {}) if manifest else {}
+    promoted = False
+    rejection_reason = "promoted_bundle_missing"
+    if root.resolve() == BASE_DIR.resolve():
+        try:
+            from ginn_model import (
+                _load_ginn_meta,
+                _meets_promotion_criteria,
+                _resolve_active_bundle,
+            )
+            model_path, manifest_path, active_version, pointer_error = _resolve_active_bundle()
+            version = active_version
+            manifest_payload = _load_ginn_meta(manifest_path) or {}
+            if pointer_error:
+                rejection_reason = pointer_error
+            elif not model_path.exists():
+                rejection_reason = "model_file_missing"
+            elif not manifest_payload:
+                rejection_reason = "manifest_missing"
+            else:
+                promoted, rejection_reason = _meets_promotion_criteria(manifest_payload)
+        except Exception:
+            rejection_reason = "promotion_gate_unavailable"
+    else:
+        promoted = bool(version and manifest and manifest.exists())
+    source_as_of = (
+        (manifest_payload.get("data_end") or manifest_payload.get("trained_at"))
+        if isinstance(manifest_payload, dict)
+        else None
+    )
+    source_age = _age_hours(source_as_of)
+    source_name = (
+        "models/ginn/current.json + promoted bundle manifest"
+        if version
+        else "models/ginn_meta.json (legacy・default-deny)"
+    )
     effective = promoted and not disabled
     if disabled:
         reason = "緊急無効化フラグでGARCH固定です"
     elif not promoted:
-        reason = "昇格済みGINN bundleがないためGARCHへfail-closedしています"
+        reason = f"GINNは{rejection_reason}のためGARCHへfail-closedしています"
     else:
         reason = "検証・昇格済みbundleを利用できます"
     return {
@@ -414,8 +888,22 @@ def _ginn_status(root: Path) -> dict[str, Any]:
         "mode": "promoted_bundle_only",
         "auto_order_enabled": False,
         "reason": reason,
-        "blockers": [] if effective else ["promoted_bundle_missing_or_disabled"],
+        "blockers": [] if effective else [
+            "disabled_by_env" if disabled else str(rejection_reason)
+        ],
         "model_version": version,
+        "source": source_name,
+        "source_as_of": source_as_of,
+        "source_age_hours": round(source_age, 1) if source_age is not None else None,
+        "freshness_status": _freshness_status(
+            exists=bool(manifest_payload),
+            age_hours=source_age,
+            max_age_hours=24 * 10,
+        ),
+        "source_note": (
+            "current.jsonが指す検証・昇格済みbundleだけをロード"
+            if version else "legacy modelは監査用に保持しますが推論には使用しません"
+        ),
         "control_hint": "モデル昇格ゲートが権威のため、この画面から強制ONにはできません",
     }
 
@@ -428,6 +916,8 @@ def _auto_tune_status() -> dict[str, Any]:
         status = {"mode": "unknown", "disabled_reason": str(exc)[:160]}
     mode = str(status.get("mode") or "off")
     enabled = mode != "off"
+    as_of = status.get("last_run")
+    age = _age_hours(as_of)
     return {
         "key": "auto_tune",
         "label": "Auto Tune",
@@ -443,8 +933,17 @@ def _auto_tune_status() -> dict[str, Any]:
             if mode == "apply" else "推奨だけを記録します" if mode == "shadow" else "停止中です"
         ),
         "blockers": [],
-        "updated_at": status.get("last_run"),
-        "control_hint": "同じ画面のAuto Tune欄で変更できます",
+        "updated_at": as_of,
+        "source": "tuning_auto_state.json + auto_tune.get_status()",
+        "source_as_of": as_of,
+        "source_age_hours": round(age, 1) if age is not None else None,
+        "freshness_status": _freshness_status(
+            exists=as_of is not None,
+            age_hours=age,
+            max_age_hours=26,
+        ),
+        "source_note": "tuning_auto_state.jsonのmodeが実行権威",
+        "control_hint": "/tuning のAuto Tune欄で変更できます",
     }
 
 
@@ -457,6 +956,8 @@ def _execution_plan_status(root: Path) -> dict[str, Any]:
     plan = _load_json(root / "execution_plan_state.json", {})
     active = isinstance(plan, dict) and plan.get("status") == "active"
     effective = active and mode == "enforce"
+    as_of = plan.get("as_of") if isinstance(plan, dict) else None
+    age = _age_hours(as_of)
     return {
         "key": "execution_plan",
         "label": "月次・週次実行計画ゲート",
@@ -472,7 +973,16 @@ def _execution_plan_status(root: Path) -> dict[str, Any]:
             if effective else "観測モードのため、計画との不整合は記録のみです"
         ),
         "blockers": [] if active else ["execution_plan_not_active"],
-        "updated_at": plan.get("as_of") if isinstance(plan, dict) else None,
+        "updated_at": as_of,
+        "source": "execution_plan_state.json + execution_plan_gate_mode",
+        "source_as_of": as_of,
+        "source_age_hours": round(age, 1) if age is not None else None,
+        "freshness_status": _freshness_status(
+            exists=bool(plan),
+            age_hours=age,
+            max_age_hours=24 * 35,
+        ),
+        "source_note": "stateのactive状態とtunable_paramsのgate modeを分離して表示",
         "control_hint": "下の運用パラメータ execution_plan_gate_mode が権威です",
     }
 
@@ -485,6 +995,20 @@ def get_feature_status(
     root = _root(base_dir)
     if key in _SHORT_FEATURES:
         return _short_status(key, base_dir=base_dir)
+    if key == "margin_long":
+        return _margin_long_status(root)
+    if key == "options_signals":
+        return _options_status(root)
+    if key == "market_regime_v2":
+        return _market_regime_status(root)
+    if key == "analysis_snapshot":
+        return _analysis_snapshot_status(root)
+    if key == "broker_reconciliation":
+        return _broker_reconciliation_status(root)
+    if key == "tax_basis":
+        return _tax_basis_status()
+    if key == "privacy_mode":
+        return _privacy_status()
     if key == "kelly_shadow":
         return _analysis_shadow_status(
             key,
@@ -507,6 +1031,8 @@ def get_feature_status(
         return _auto_tune_status()
     if key == "execution_plan":
         return _execution_plan_status(root)
+    if key == "currency_policy":
+        return _currency_policy_status(root)
     raise KeyError(key)
 
 
@@ -517,9 +1043,17 @@ def list_feature_statuses(
     keys = (
         "us_short",
         "jp_short",
+        "margin_long",
+        "options_signals",
+        "market_regime_v2",
         "ginn",
+        "analysis_snapshot",
+        "broker_reconciliation",
+        "tax_basis",
+        "privacy_mode",
         "kelly_shadow",
         "fx_hedge_shadow",
+        "currency_policy",
         "execution_plan",
         "auto_tune",
     )

@@ -21,11 +21,17 @@ const features = [
     eligible_instruments: 88,
     availability_universe_instruments: 679,
     availability_coverage_pct: 13.0,
+    availability_label: '借株proxy該当',
     latest_scan_requested: 157,
     latest_scan_downloaded: 75,
     latest_scan_coverage_pct: 47.8,
     latest_candidates: 11,
     latest_shortable: 9,
+    latest_scan_as_of: '2026-07-29T18:30:00+09:00',
+    latest_scan_status: 'degraded',
+    source: 'data/broker_short_us.json',
+    source_as_of: '2026-07-29T18:00:00+09:00',
+    freshness_status: 'fresh',
     source_note: '発注画面が権威',
     source_age_hours: 24,
   },
@@ -41,6 +47,8 @@ const features = [
     auto_order_enabled: false,
     reason: '昇格済みGINN bundleがありません',
     blockers: ['promoted_bundle_missing_or_disabled'],
+    source: 'models/ginn/current.json + promoted manifest',
+    freshness_status: 'missing',
     control_hint: 'モデル昇格ゲートが権威です',
   },
 ]
@@ -92,10 +100,13 @@ describe('FeatureControls', () => {
     expect(within(us).getAllByText('OFF')).toHaveLength(2)
     expect(within(us).getByText('ユーザー設定でOFFです')).toBeInTheDocument()
     expect(within(us).getByText(/最新の価格取得率/)).toBeInTheDocument()
-    expect(within(us).getByText(/借株proxy 88\/679/)).toBeInTheDocument()
+    expect(within(us).getByText(/借株proxy該当 88\/679/)).toBeInTheDocument()
     expect(within(us).getByText(/最新価格 75\/157/)).toBeInTheDocument()
     expect(within(us).getByText('候補 11')).toBeInTheDocument()
     expect(within(us).getByText('借株可 9')).toBeInTheDocument()
+    expect(within(us).getByText(/最新スキャン: 2026-07-29T18:30/)).toBeInTheDocument()
+    expect(within(us).getByTestId('feature-us_short-authority')).toHaveTextContent('data/broker_short_us.json')
+    expect(within(us).getByTestId('feature-us_short-authority')).toHaveTextContent('新鮮')
     expect(within(us).getByRole('switch')).toHaveAttribute('aria-checked', 'false')
 
     const ginn = screen.getByTestId('feature-ginn')
@@ -103,6 +114,7 @@ describe('FeatureControls', () => {
     expect(within(ginn).getByText('FAIL-CLOSED')).toBeInTheDocument()
     expect(within(ginn).getByText('参照のみ')).toBeInTheDocument()
     expect(within(ginn).getByText(/モデル昇格ゲートが権威/)).toBeInTheDocument()
+    expect(within(ginn).getByTestId('feature-ginn-authority')).toHaveTextContent('models/ginn/current.json')
   })
 
   it('toggles a mutable feature through the authenticated write helper', async () => {

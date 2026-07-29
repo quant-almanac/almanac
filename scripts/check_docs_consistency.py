@@ -18,6 +18,22 @@ _MODULE = re.compile(r"`([^`/]+\.py)`")
 _README_HEADING = re.compile(r"^(#{2,6})\s+.+$", re.MULTILINE)
 _START = "<!-- ROOT_MODULES_START -->"
 _END = "<!-- ROOT_MODULES_END -->"
+_README_RUNTIME_MARKERS = {
+    "README.md": (
+        "Only the two short-candidate switches are mutable",
+        "US proxy-eligibility rate",
+        "JP loanable-eligibility rate",
+        "excludes that individual ticker fail-closed",
+        "authority source, last confirmation time, freshness, and job heartbeats",
+    ),
+    "README.ja.md": (
+        "変更可能なのは日米の空売り候補スイッチだけ",
+        "米国はproxy適格率",
+        "日本株は実データの貸借可能率",
+        "その銘柄だけを fail-closed で除外",
+        "最終確認時刻、鮮度、ジョブのheartbeat",
+    ),
+}
 
 
 def numbered_sections(path: Path) -> list[str]:
@@ -103,6 +119,12 @@ def check() -> list[str]:
     for link in ("docs/SYSTEM_SPEC.ja.md", "docs/MODULE_CATALOG.ja.md"):
         if link not in readme_ja:
             failures.append(f"README.ja.md: missing link to {link}")
+
+    readmes = {"README.md": readme, "README.ja.md": readme_ja}
+    for name, markers in _README_RUNTIME_MARKERS.items():
+        for marker in markers:
+            if marker not in readmes[name]:
+                failures.append(f"{name}: missing runtime-contract marker: {marker}")
 
     for path in (CATALOG_EN, CATALOG_JA):
         entries = catalog_module_entries(path)

@@ -17,6 +17,16 @@ interface SystemStatus {
   model_routes: Array<{ role: string; model: string; adapter: string }>
   guards: Record<string, number>
   feature_modes: Record<string, string>
+  heartbeat_statuses: Array<{
+    key: string
+    status: string
+    freshness_status: string
+    monitored: boolean
+    last_run_iso?: string | null
+    age_hours?: number | null
+    max_age_hours?: number | null
+    error?: string | null
+  }>
   schedules: { auto_tune?: { timezone?: string; weekdays?: string[]; times?: string[]; source?: string } }
 }
 
@@ -34,9 +44,8 @@ export default function DesignPage() {
   return <OpsPage en="SYSTEM STATUS" title="システム" subtitle="ハードコードした設計説明ではなく、現在のモデル、ガード、実行モード、データ鮮度を表示する。" right={<Chip color={systemColor} mono>{systemLabel}</Chip>}>
     {isLoading && <Loading />}
     {error && <Panel><span role="alert" style={{ color: OPS.redSoft }}>/api/system/status を取得できません。</span></Panel>}
+    <FeatureControls />
     {data && <>
-      <FeatureControls />
-
       <Grid cols={2} gap={16}>
         <Panel pad="18px 20px">
           <PanelTitle>運用状態</PanelTitle>
@@ -60,12 +69,49 @@ export default function DesignPage() {
         {data.model_routes.map((route, index) => <tr key={route.role} style={{ borderTop: index ? `1px solid ${OPS.hairline}` : 'none' }}><td style={cell}>{route.role}</td><td style={{ ...cell, color: OPS.gold, fontFamily: OPS.mono }}>{route.model}</td><td style={{ ...cell, color: OPS.dim }}>{route.adapter}</td></tr>)}
       </tbody></table></div></div>
 
+      <HeartbeatPanel rows={data.heartbeat_statuses ?? []} />
+
       <p style={{ fontSize: 11, color: OPS.dim, marginTop: 24 }}>状態生成 {data.generated_at.slice(0, 19).replace('T', ' ')} · 値はAPIと運用stateから取得しています。</p>
     </>}
   </OpsPage>
 }
 
+function HeartbeatPanel({ rows }: { rows: SystemStatus['heartbeat_statuses'] }) {
+  const colorFor = (status: string) => status === 'fresh'
+    ? OPS.green
+    : status === 'error'
+      ? OPS.redSoft
+      : status === 'stale' || status === 'missing' || status === 'warning'
+        ? OPS.amber
+        : OPS.dim
+  return <div style={{ marginTop: 22 }} data-testid="heartbeat-statuses">
+    <PanelTitle>ジョブ heartbeat</PanelTitle>
+    <p style={{ color: OPS.dim, fontSize: 11, lineHeight: 1.6, margin: '5px 0 9px' }}>
+      watchdogの監視対象は期限と成否を評価し、対象外のheartbeatも最終成功時刻を隠さず表示します。
+    </p>
+    <div style={{ overflowX: 'auto' }}>
+      <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 11.5 }}>
+        <thead><tr>
+          <th style={headCell}>ジョブ</th>
+          <th style={headCell}>鮮度</th>
+          <th style={headCell}>最終実行</th>
+          <th style={headCell}>経過 / 期限</th>
+          <th style={headCell}>詳細</th>
+        </tr></thead>
+        <tbody>{rows.map((row, index) => <tr key={row.key} style={{ borderTop: index ? `1px solid ${OPS.hairline}` : 'none' }}>
+          <td style={{ ...cell, fontFamily: OPS.mono }}>{row.key}</td>
+          <td style={cell}><Chip color={colorFor(row.freshness_status)} mono>{row.freshness_status}</Chip>{!row.monitored && <span style={{ color: OPS.dim, marginLeft: 7 }}>監視対象外</span>}</td>
+          <td style={{ ...cell, fontFamily: OPS.mono }}>{row.last_run_iso?.slice(0, 19).replace('T', ' ') ?? '未実行'}</td>
+          <td style={{ ...cell, fontFamily: OPS.mono }}>{row.age_hours != null ? `${row.age_hours}h` : '—'} / {row.max_age_hours != null ? `${row.max_age_hours}h` : '—'}</td>
+          <td style={{ ...cell, color: row.error ? OPS.amber : OPS.dim }}>{row.error ?? row.status}</td>
+        </tr>)}</tbody>
+      </table>
+    </div>
+  </div>
+}
+
 function StatusRow({ label, value, color = OPS.sub, tail }: { label: string; value: string; color?: string; tail?: React.ReactNode }) {
   return <div style={{ display: 'grid', gridTemplateColumns: '130px minmax(0,1fr) auto', gap: 10, alignItems: 'center', padding: '9px 0', borderTop: `1px solid ${OPS.hairline}`, fontSize: 12.5 }}><span style={{ color: OPS.dim }}>{label}</span><span style={{ color, fontFamily: OPS.mono, overflowWrap: 'anywhere' }}>{value}</span>{tail}</div>
 }
+const headCell: React.CSSProperties = { padding: '7px 8px', color: OPS.dim, textAlign: 'left', fontWeight: 500 }
 const cell: React.CSSProperties = { padding: '9px 8px', color: OPS.sub, verticalAlign: 'top' }

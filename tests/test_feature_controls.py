@@ -82,11 +82,48 @@ def test_us_short_status_separates_proxy_and_latest_funnel(tmp_path):
     assert status["eligible_instruments"] == 2
     assert status["availability_universe_instruments"] == 3
     assert status["availability_coverage_pct"] == 66.7
+    assert status["availability_label"] == "借株proxy該当"
+    assert status["availability_metric_kind"] == "proxy_eligibility_rate"
     assert status["latest_scan_requested"] == 3
     assert status["latest_scan_downloaded"] == 2
     assert status["latest_candidates"] == 1
     assert status["latest_shortable"] == 1
     assert status["warnings"] == ["最新の価格取得率が66.7%です"]
+
+
+def test_feature_inventory_exposes_major_modes_and_only_shorts_are_mutable(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.delenv("ALMANAC_PRIVACY_MODE", raising=False)
+    payload = fc.list_feature_statuses(base_dir=tmp_path)
+    statuses = {row["key"]: row for row in payload["features"]}
+
+    assert list(statuses) == [
+        "us_short",
+        "jp_short",
+        "margin_long",
+        "options_signals",
+        "market_regime_v2",
+        "ginn",
+        "analysis_snapshot",
+        "broker_reconciliation",
+        "tax_basis",
+        "privacy_mode",
+        "kelly_shadow",
+        "fx_hedge_shadow",
+        "currency_policy",
+        "execution_plan",
+        "auto_tune",
+    ]
+    assert {key for key, row in statuses.items() if row["mutable"]} == {
+        "us_short",
+        "jp_short",
+    }
+    assert all("source" in row for row in statuses.values())
+    assert all("freshness_status" in row for row in statuses.values())
+    assert statuses["tax_basis"]["control_hint"].startswith("環境変数")
+    assert statuses["privacy_mode"]["mode"] == "strict_local"
 
 
 def test_disclosure_config_loader_applies_runtime_state(tmp_path, monkeypatch):

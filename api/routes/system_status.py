@@ -12,6 +12,76 @@ router = APIRouter()
 BASE_DIR = Path(__file__).parent.parent.parent
 
 
+def _heartbeat_rows(
+    heartbeats: dict,
+    *,
+    health: dict | None = None,
+) -> list[dict]:
+    """Normalize raw heartbeats and watchdog verdicts for the System UI."""
+    from watchdog import EXPECTED_INTERVALS, evaluate_health
+
+    evaluation = health if health is not None else evaluate_health()
+    stale_by_key = {
+        str(row.get("script")): row
+        for row in evaluation.get("stale", [])
+        if isinstance(row, dict) and row.get("script")
+    }
+    error_by_key = {
+        str(row.get("script")): row
+        for row in evaluation.get("errors", [])
+        if isinstance(row, dict) and row.get("script")
+    }
+    ok = {str(key) for key in evaluation.get("ok", [])}
+    keys = sorted(set(EXPECTED_INTERVALS) | set(heartbeats))
+    rows = []
+    for key in keys:
+        raw = heartbeats.get(key)
+        raw = raw if isinstance(raw, dict) else {}
+        cfg = EXPECTED_INTERVALS.get(key)
+        last_run_ts = raw.get("last_run_ts")
+        age_hours = None
+        if isinstance(last_run_ts, (int, float)):
+            age_hours = round(
+                max(0.0, datetime.now(timezone.utc).timestamp() - float(last_run_ts))
+                / 3600,
+                1,
+            )
+        if key in error_by_key:
+            freshness = "error"
+            detail = error_by_key[key].get("error") or raw.get("error")
+        elif key in stale_by_key:
+            freshness = "stale"
+            detail = stale_by_key[key].get("reason")
+        elif key in ok:
+            freshness = "fresh"
+            detail = None
+        elif raw.get("status") == "error":
+            freshness = "error"
+            detail = raw.get("error")
+        elif raw.get("status") in {"warn", "warning"}:
+            freshness = "warning"
+            detail = raw.get("error") or f"raw_status_{raw.get('status')}"
+        elif raw:
+            freshness = "unmonitored"
+            detail = None
+        else:
+            freshness = "missing"
+            detail = "never_run"
+        rows.append({
+            "key": key,
+            "status": raw.get("status") or ("missing" if not raw else "unknown"),
+            "freshness_status": freshness,
+            "monitored": cfg is not None,
+            "last_run_iso": raw.get("last_run_iso"),
+            "age_hours": age_hours,
+            "max_age_hours": (
+                round(cfg["max_stale_sec"] / 3600, 1) if cfg else None
+            ),
+            "error": detail,
+        })
+    return rows
+
+
 @router.get("/api/system/status")
 async def get_system_status():
     from api.routes.dashboard import _build_data_health
@@ -38,6 +108,8 @@ async def get_system_status():
     ]
     execution_plan = load_json(BASE_DIR / "execution_plan_state.json", default={}) or {}
     heartbeats = load_json(BASE_DIR / "heartbeats.json", default={}) or {}
+    heartbeats = heartbeats if isinstance(heartbeats, dict) else {}
+    heartbeat_statuses = _heartbeat_rows(heartbeats)
     auto_tune = get_auto_tune_status()
     return {
         "generated_at": datetime.now(timezone.utc).isoformat(),
@@ -60,5 +132,6 @@ async def get_system_status():
         },
         "feature_controls": list_feature_statuses(),
         "heartbeats": heartbeats,
+        "heartbeat_statuses": heartbeat_statuses,
         "schedules": {"auto_tune": auto_tune.get("schedule") or {}},
     }

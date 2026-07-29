@@ -16,7 +16,9 @@ The objective function is explicit and version-controlled ([`objective.md`](obje
 
 The checked-in default is not “every product is off.” It separates **always-on measurement** from **authority to change an action**: cash securities and non-leveraged funds are active; margin and short candidates are conditional on the safety gates; options are analysis signals only; half-Kelly sizing and FX hedging run in shadow; tax basis runs in comparison mode; and GINN is rejected unless a validated model has been promoted, falling back to GJR-GARCH. The execution-plan gate starts in observe mode, and none of these modes can place a broker order. The complete activation contract is in [`objective.md`](objective.md#8-機能商品の有効化契約).
 
-The dashboard's **System** page shows both the configured switch and the effective state for the main operating features, together with the reason a feature is stopped. US and JP short-candidate lanes can be switched there; their runtime override is kept in the local, git-ignored `feature_control_state.json`. For each short lane, the page shows the funnel separately: configured universe, borrow-availability proxy coverage, latest price-download coverage, detected candidates, and candidates that pass the borrow proxy. The US scan starts from the maintained broad US universe; missing broker or price data stays fail-closed. A switch does not bypass borrow-data freshness, regulation, liquidity, squeeze, or insider gates, and short orders remain human-only. Model promotion and shadow features are shown read-only because their validation gate—not a UI switch—is authoritative.
+The dashboard's **System** page is a live operating inventory, not a static feature list. It shows configured and effective state, stop reasons, authority source, last confirmation time, freshness, and job heartbeats for short and margin candidates, options signals, market regime, GINN, frozen analysis inputs, broker reconciliation, tax basis, privacy, Kelly and FX shadows, currency policy, the execution plan, and Auto Tune. **Only the two short-candidate switches are mutable** there; every other row is read-only and names the state, environment variable, or validation gate that has authority and where it must be changed.
+
+For each short lane, the funnel keeps unlike counts separate: configured universe, the **US proxy-eligibility rate** or **JP loanable-eligibility rate**, latest price-download rate, detected candidates, and candidates that pass the per-ticker borrow gate. Missing broker or price data excludes that individual ticker fail-closed; it does not by itself mean the entire lane is off. A lane stops only when a required source is missing or stale, while low scan coverage remains visible as a degradation warning. Runtime overrides are kept in the local, git-ignored `feature_control_state.json`. A switch never bypasses freshness, regulation, liquidity, squeeze, or insider gates, and short orders remain human-only.
 
 Every confirmed cash balance loaded into this deployment is treated as surplus investment capital; the protected lifestyle reserve inside ALMANAC is JPY 0. Market-regime rules may still retain tactical cash, and the zero reserve does not bypass the existing account, freshness, order-intent, settlement, tax, fee or collateral checks. Any household emergency reserve belongs outside the accounts represented here.
 
@@ -480,7 +482,7 @@ The current snapshot exposes 20 routes, split by purpose.
 | `/scenarios`, `/strategy` | Scenarios and strategy |
 | `/disclosures` | Disclosure feed |
 | `/tuning`, `/admin` | Parameter tuning and administration |
-| `/agent`, `/design` | Agent output and design review |
+| `/agent`, `/design` | Agent output; live feature authority, freshness and job-health review |
 
 Reading requires no API key. Authentication applies only to writes — recording a fill, changing a setting.
 
@@ -488,7 +490,7 @@ Reading requires no API key. Authentication applies only to writes — recording
 
 ### Tests
 
-At this snapshot, pytest collects **3,054 tests across 227 `test_*.py` files**. The count basis is `pytest tests/ -q --collect-only` for cases and `find tests -type f -name 'test_*.py'` for files.
+At this snapshot, pytest collects **3,069 tests across 229 `test_*.py` files**. The count basis is `pytest tests/ -q --collect-only` for cases and `find tests -type f -name 'test_*.py'` for files.
 
 The composition matters more than the count: **16 files are named for the invariant they hold down** — specifically, filenames containing `safety`, `gating`, `policy`, `guard`, `integrity`, or `privacy`. A sample:
 

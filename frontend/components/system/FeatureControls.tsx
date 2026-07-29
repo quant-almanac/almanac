@@ -35,9 +35,13 @@ export interface FeatureStatus {
   latest_scan_status?: string | null
   source_as_of?: string | null
   source_age_hours?: number | null
+  freshness_status?: string
   source?: string
   source_note?: string
   model_version?: string | null
+  availability_label?: string
+  availability_metric_kind?: string
+  metrics?: Array<{ label: string; value: unknown }>
 }
 
 interface FeatureResponse {
@@ -51,6 +55,17 @@ const CATEGORY_LABEL: Record<string, string> = {
   shadow: '影実行',
   policy: '方針',
   automation: '自動化',
+  candidate: '候補',
+  signal: '分析シグナル',
+  data: '入力・監査',
+}
+
+const FRESHNESS_LABEL: Record<string, string> = {
+  fresh: '新鮮',
+  stale: '期限切れ',
+  missing: '未取得',
+  unknown: '時刻不明',
+  not_applicable: '時刻対象外',
 }
 
 export default function FeatureControls() {
@@ -115,8 +130,10 @@ export default function FeatureControls() {
             : OPS.dim
         const effectiveLabel = feature.effective_enabled
           ? '実効 ON'
-          : feature.configured_enabled
+          : feature.configured_enabled && feature.blockers.length > 0
             ? '設定ON・安全停止'
+            : feature.configured_enabled
+              ? '設定ON・観測中'
             : 'OFF'
         return <div
           key={feature.key}
@@ -142,7 +159,7 @@ export default function FeatureControls() {
           <div style={{ flex: '1 1 300px' }}>
             <div style={{ display: 'flex', alignItems: 'center', gap: 7, flexWrap: 'wrap' }}>
               <Chip color={effectiveColor} mono>{effectiveLabel}</Chip>
-              {feature.configured_enabled && !feature.effective_enabled && <Chip color={OPS.amber} bg={OPS.amberBg} mono>FAIL-CLOSED</Chip>}
+              {feature.configured_enabled && !feature.effective_enabled && feature.blockers.length > 0 && <Chip color={OPS.amber} bg={OPS.amberBg} mono>FAIL-CLOSED</Chip>}
               {feature.auto_order_enabled === false && <Chip color={OPS.dim} mono>自動注文なし</Chip>}
             </div>
             <div style={{ color: OPS.sub, fontSize: 11.5, lineHeight: 1.6, marginTop: 6 }}>{feature.reason}</div>
@@ -166,7 +183,7 @@ export default function FeatureControls() {
               }}
             >
               {feature.eligible_instruments != null && <span>
-                借株proxy {feature.eligible_instruments}
+                {feature.availability_label ?? '借株適格'} {feature.eligible_instruments}
                 {feature.availability_universe_instruments != null ? `/${feature.availability_universe_instruments}` : ''}
                 {feature.availability_coverage_pct != null ? ` (${feature.availability_coverage_pct}%)` : ''}
               </span>}
@@ -178,9 +195,32 @@ export default function FeatureControls() {
               {feature.latest_candidates != null && <span>候補 {feature.latest_candidates}</span>}
               {feature.latest_shortable != null && <span>借株可 {feature.latest_shortable}</span>}
             </div>}
-            {feature.source_note && <div style={{ color: OPS.dim, fontSize: 10, marginTop: 3 }}>
-              根拠: {feature.source_note}
+            {feature.category === 'short' && (feature.latest_scan_as_of || feature.latest_scan_status) && <div style={{ color: OPS.dim, fontSize: 10, marginTop: 3 }}>
+              最新スキャン: {feature.latest_scan_as_of ?? '時刻不明'}
+              {feature.latest_scan_status ? ` · ${feature.latest_scan_status}` : ''}
+            </div>}
+            {(feature.metrics?.length ?? 0) > 0 && <div style={{
+              display: 'flex',
+              gap: 10,
+              flexWrap: 'wrap',
+              color: OPS.dim,
+              fontFamily: OPS.mono,
+              fontSize: 10,
+              marginTop: 5,
+            }}>
+              {feature.metrics?.map(metric => <span key={metric.label}>{metric.label} {String(metric.value ?? '—')}</span>)}
+            </div>}
+            {(feature.source || feature.source_as_of || feature.updated_at) && <div
+              data-testid={`feature-${feature.key}-authority`}
+              style={{ color: OPS.dim, fontSize: 10, marginTop: 4 }}
+            >
+              権威: {feature.source ?? '運用state'}
+              {(feature.source_as_of || feature.updated_at) ? ` · 最終確認 ${feature.source_as_of ?? feature.updated_at}` : ''}
               {feature.source_age_hours != null ? ` · ${feature.source_age_hours}時間前` : ''}
+              {feature.freshness_status ? ` · ${FRESHNESS_LABEL[feature.freshness_status] ?? feature.freshness_status}` : ''}
+            </div>}
+            {feature.source_note && <div style={{ color: OPS.dim, fontSize: 10, marginTop: 3 }}>
+              判定境界: {feature.source_note}
             </div>}
             {!feature.mutable && feature.control_hint && <div style={{ color: OPS.blue, fontSize: 10, marginTop: 3 }}>変更方法: {feature.control_hint}</div>}
           </div>
