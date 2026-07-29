@@ -214,6 +214,22 @@ def _apply_position_to_record(
     rec["currency"] = pos.currency
     rec["shares"] = round(pos.quantity, 4)
     rec["entry_price"] = round(pos.entry_price, 6)
+    # Keep the broker-reported JPY valuation and cumulative unrealized P/L
+    # together.  Their difference is the broker's displayed total acquisition
+    # cost for this exact position snapshot.  It is additive evidence; existing
+    # entry_price/cost fields remain unchanged for compatibility.
+    rec["broker_quantity"] = round(pos.quantity, 4)
+    if pos.value_jpy is not None:
+        rec["broker_position_value_jpy"] = round(float(pos.value_jpy), 2)
+    if pos.unrealized_jpy is not None:
+        rec["broker_unrealized_jpy"] = round(float(pos.unrealized_jpy), 2)
+    if pos.value_jpy is not None and pos.unrealized_jpy is not None:
+        rec["broker_total_cost_basis_jpy"] = round(
+            float(pos.value_jpy) - float(pos.unrealized_jpy), 2
+        )
+        rec["broker_cost_basis_source"] = "rakuten_assetbalance_csv"
+        if as_of:
+            rec["broker_cost_basis_as_of"] = as_of
     rec["investment_type"] = rec.get("investment_type") or "long"
     if pos.quantity_unit == "口":
         rec["unit"] = "口"

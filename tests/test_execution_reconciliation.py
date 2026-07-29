@@ -163,3 +163,13 @@ def test_naive_exact_timestamps_use_jst():
         "requires_review": False,
         "comparison_basis": "exact_timestamp",
     }
+
+
+def test_date_only_snapshot_never_invents_midnight_for_exact_trade():
+    result = classify_temporal_order(
+        snapshot_as_of="2026-07-16",
+        trade_date="2026-07-16",
+        trade_timestamp="2026-07-16T09:00:00",
+    )
+    assert result["temporal_order"] == "temporal_order_unknown"
+    assert result["comparison_basis"] == "date_only"

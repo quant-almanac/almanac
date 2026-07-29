@@ -255,8 +255,16 @@ def classify_temporal_order(
     with only ``trade_date`` follow the explicit three-way date contract:
     before -> safe, after -> reconciliation required, same day -> unknown.
     """
-    snapshot_dt = parse_timestamp(snapshot_as_of, naive_tz=SYSTEM_LOCAL_TZ)
-    trade_dt = parse_timestamp(trade_timestamp, naive_tz=SYSTEM_LOCAL_TZ)
+    snapshot_has_time = "T" in str(snapshot_as_of or "") or " " in str(snapshot_as_of or "")
+    trade_has_time = "T" in str(trade_timestamp or "") or " " in str(trade_timestamp or "")
+    snapshot_dt = (
+        parse_timestamp(snapshot_as_of, naive_tz=SYSTEM_LOCAL_TZ)
+        if snapshot_has_time else None
+    )
+    trade_dt = (
+        parse_timestamp(trade_timestamp, naive_tz=SYSTEM_LOCAL_TZ)
+        if trade_has_time else None
+    )
     if snapshot_dt is not None and trade_dt is not None:
         if trade_dt < snapshot_dt:
             status = "before_snapshot"
@@ -293,9 +301,12 @@ def classify_temporal_order(
 
 def execution_temporal_order(record: dict, snapshot_as_of: object) -> dict:
     timestamp, source = effective_execution_timestamp(record)
+    trade_date = record.get("trade_date")
+    if not trade_date and timestamp is not None:
+        trade_date = timestamp.astimezone(SYSTEM_LOCAL_TZ).date().isoformat()
     result = classify_temporal_order(
         snapshot_as_of=snapshot_as_of,
-        trade_date=record.get("trade_date"),
+        trade_date=trade_date,
         trade_timestamp=timestamp.isoformat() if timestamp else None,
     )
     result["execution_timestamp_source"] = source

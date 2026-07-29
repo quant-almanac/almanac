@@ -583,6 +583,21 @@ def classify_execution_readiness(
     if action_type in EXIT_ACTION_TYPES and not (
         action.get("holding_scope_unresolved") or action.get("holding_scope_ambiguous")
     ):
+        exit_sizing_status = str(action.get("exit_sizing_status") or "")
+        if exit_sizing_status == "review":
+            add(
+                "review",
+                "exit_sizing_requires_review",
+                str(action.get("exit_sizing_reason") or "決定論的な売却数量を確定できません"),
+                cost_basis_status=action.get("exit_cost_basis_status"),
+                cost_basis_reason=action.get("exit_cost_basis_reason"),
+            )
+        elif exit_sizing_status == "non_actionable":
+            add(
+                "blocked",
+                "exit_sizing_non_actionable",
+                str(action.get("exit_sizing_reason") or "決定論的な売却数量は0単位です"),
+            )
         from execution_safety import evaluate_exit_route_consistency
 
         route_result = evaluate_exit_route_consistency(action, base_dir=base_dir)

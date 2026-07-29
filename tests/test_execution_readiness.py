@@ -94,6 +94,28 @@ def test_zero_discretionary_funding_does_not_block_sell(tmp_path):
     }
 
 
+def test_exit_sizing_review_cannot_be_promoted_to_ready(tmp_path):
+    now = datetime(2026, 7, 14, 6, 0, tzinfo=JST)
+    _write_base(tmp_path, now)
+    result = classify_execution_readiness({
+        "ticker": "XLF",
+        "type": "sell",
+        "execution_owner": "husband",
+        "execution_broker": "rakuten",
+        "execution_account": "特定",
+        "holding_shares_before": 80,
+        "quantity": 20,
+        "exit_sizing_status": "review",
+        "exit_sizing_reason": "取得原価が不明",
+        "exit_cost_basis_status": "review",
+        "exit_cost_basis_reason": "broker_total_cost_basis_missing",
+    }, base_dir=tmp_path, now=now)
+    assert result["execution_readiness"] != "ready"
+    assert "exit_sizing_requires_review" in {
+        row["code"] for row in result["execution_block_reasons"]
+    }
+
+
 def test_wife_sbi_estimated_cash_is_not_buying_power(tmp_path):
     (tmp_path / "holdings.json").write_text(json.dumps({
         "CASH_JPY_SBI_WIFE": {

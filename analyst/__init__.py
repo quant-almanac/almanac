@@ -6900,6 +6900,12 @@ def _phase1_post_filter(
     order_state_conflicts = _with_optional_now(_order_state_conflicts_by_direction, days=_done_days)
     open_state_intents = _open_action_state_by_direction()
     recent_execution_rows = _with_optional_now(_load_recent_executions, days=max(14, _ff_days))
+    try:
+        from broker_reconcile import load_action_executions
+
+        all_execution_rows = load_action_executions()
+    except Exception:
+        all_execution_rows = list(recent_execution_rows)
     open_execution_intents: dict[tuple[str, str], list[dict]] = {}
     for execution_row in recent_execution_rows:
         if not isinstance(execution_row, dict):
@@ -6966,7 +6972,9 @@ def _phase1_post_filter(
                 owner = route_matches[0]
         lot = {
             "key": pos.get("key"),
+            "ticker": tk,
             "current_price": pos.get("current_price") or pos.get("price"),
+            "entry_price": pos.get("entry_price"),
             "currency": pos.get("currency"),
             "shares": float(pos.get("shares") or 0),
             "value_jpy": float(pos.get("value_jpy") or 0),
@@ -6974,6 +6982,15 @@ def _phase1_post_filter(
             "account": pos.get("account"),
             "broker": broker,
             "owner": owner,
+            "broker_quantity": pos.get("broker_quantity"),
+            "broker_position_value_jpy": pos.get("broker_position_value_jpy"),
+            "broker_unrealized_jpy": pos.get("broker_unrealized_jpy"),
+            "broker_total_cost_basis_jpy": pos.get("broker_total_cost_basis_jpy"),
+            "broker_cost_basis_source": pos.get("broker_cost_basis_source"),
+            "broker_cost_basis_as_of": pos.get("broker_cost_basis_as_of"),
+            "source_as_of": pos.get("source_as_of"),
+            "broker_reconciled_at": pos.get("broker_reconciled_at"),
+            "reconciliation_snapshot_hash": pos.get("reconciliation_snapshot_hash"),
         }
         bucket = holdings_price_map.setdefault(tk, {
             "current_price": lot["current_price"],
@@ -7154,11 +7171,20 @@ def _phase1_post_filter(
             )
             return action
 
+        cost_basis_validation: dict = {}
+
         def _cost_basis(position, qty):
-            # The current total-average engine is account-keyed and cannot yet
-            # prove owner+broker scope.  Treat it as unknown instead of mixing
-            # two brokers that happen to use the same account label.
-            return None
+            from broker_cost_basis import validate_broker_cost_basis
+
+            resolved = validate_broker_cost_basis(
+                position=position,
+                quantity=qty,
+                holding=holding,
+                executions=all_execution_rows,
+            )
+            cost_basis_validation.clear()
+            cost_basis_validation.update(resolved)
+            return resolved.get("estimate") if resolved.get("status") == "ready" else None
 
         from exit_sizing import compute_exit_size
         from rebalance_engine import MEDIUM_DRIFT_TRIGGER
@@ -7189,6 +7215,17 @@ def _phase1_post_filter(
         action["exit_sizing_max_step_basis"] = (
             "min(physical_position_quantity,medium_sleeve_quantity)"
         )
+        action["exit_cost_basis_status"] = cost_basis_validation.get("status")
+        action["exit_cost_basis_reason"] = cost_basis_validation.get("reason")
+        if result.cost_basis is not None:
+            action["exit_cost_basis"] = {
+                "amount_jpy": round(float(result.cost_basis.amount_jpy), 2),
+                "source": result.cost_basis.source,
+                "method": result.cost_basis.method,
+                "as_of": result.cost_basis.as_of,
+                "reconciled": result.cost_basis.reconciled,
+                "data_quality_issues": list(result.cost_basis.data_quality_issues),
+            }
         if abs(result.final_qty) > 0:
             final_qty = (
                 int(abs(result.final_qty))
@@ -7198,6 +7235,12 @@ def _phase1_post_filter(
             remaining_qty = max(0, physical_current_qty - float(final_qty))
             original_action = str(action.get("action") or "")
             original_note = str(action.get("execution_note") or "")
+            action.setdefault("llm_action_draft", {
+                "action": original_action,
+                "amount_hint": action.get("amount_hint"),
+                "quantity": action.get("quantity"),
+                "execution_note": original_note,
+            })
             action["requested_sell_quantity"] = final_qty
             action["quantity"] = final_qty
             action["holding_shares_before"] = (

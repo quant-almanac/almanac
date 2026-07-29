@@ -724,6 +724,7 @@ def test_exit_action_resolves_duplicate_ticker_by_tier_and_account(monkeypatch):
 def test_deterministic_exit_sizing_keeps_all_quantity_surfaces_consistent(monkeypatch):
     _silence_external_filters(monkeypatch)
     monkeypatch.setattr(tunable_params, "get", _tp_get)
+    monkeypatch.setattr("broker_reconcile.load_action_executions", lambda: [])
     synthesis = {
         "analysis_id": "analysis-sizing-contract",
         "decision_snapshot_hash": "snapshot-sizing-contract",
@@ -753,6 +754,10 @@ def test_deterministic_exit_sizing_keeps_all_quantity_surfaces_consistent(monkey
         "account": "特定",
         "owner": "husband",
         "broker": "rakuten",
+        "broker_quantity": 80,
+        "broker_total_cost_basis_jpy": 640_000,
+        "broker_cost_basis_source": "rakuten_assetbalance_csv",
+        "broker_cost_basis_as_of": "2026-07-28",
     }]
     rebalance_medium = {
         "positions": [{
@@ -781,6 +786,10 @@ def test_deterministic_exit_sizing_keeps_all_quantity_surfaces_consistent(monkey
     assert action["holding_shares_after"] == 25
     assert action["exit_sizing_quantity_basis"] == "medium_sleeve_quantity"
     assert action["exit_sizing_sleeve_quantity"] == 80
+    assert action["exit_sizing_status"] == "actionable"
+    assert action["exit_cost_basis_status"] == "ready"
+    assert action["exit_cost_basis"]["amount_jpy"] == 440_000
+    assert action["llm_action_draft"]["amount_hint"] == "20株"
     assert "55株売却" in action["action"]
     assert "保有80株→売却後25株" in action["action"]
     assert "20株" not in action["action"]

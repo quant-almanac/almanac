@@ -339,6 +339,18 @@ def build_portfolio_snapshot(
             'entry_date':      entry_date_str,
             'entry_price':     entry_price,
             'holding_days':    holding_days,
+            # Additive broker-basis/provenance fields used by deterministic
+            # exit readiness.  Do not rename legacy fields in this migration.
+            'broker_quantity': info.get('broker_quantity'),
+            'broker_position_value_jpy': info.get('broker_position_value_jpy'),
+            'broker_unrealized_jpy': info.get('broker_unrealized_jpy'),
+            'broker_total_cost_basis_jpy': info.get('broker_total_cost_basis_jpy'),
+            'broker_cost_basis_source': info.get('broker_cost_basis_source'),
+            'broker_cost_basis_as_of': info.get('broker_cost_basis_as_of'),
+            'source_as_of': info.get('source_as_of'),
+            'broker_reconciled_at': info.get('broker_reconciled_at'),
+            'reconciliation_snapshot_hash': info.get('reconciliation_snapshot_hash'),
+            'broker_source': info.get('broker_source'),
         })
 
     # 持株会を追加

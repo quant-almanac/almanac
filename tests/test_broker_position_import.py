@@ -56,6 +56,12 @@ def test_build_reconciled_holdings_updates_and_adds(tmp_path):
     )
 
     assert next_holdings["6762.T"]["shares"] == 100
+    assert next_holdings["6762.T"]["broker_quantity"] == 100
+    assert next_holdings["6762.T"]["broker_position_value_jpy"] == 299300
+    assert next_holdings["6762.T"]["broker_unrealized_jpy"] == 54400
+    assert next_holdings["6762.T"]["broker_total_cost_basis_jpy"] == 244900
+    assert next_holdings["6762.T"]["broker_cost_basis_source"] == "rakuten_assetbalance_csv"
+    assert next_holdings["6762.T"]["broker_cost_basis_as_of"] == "2026-05-17"
     assert next_holdings["SLIM_ORCAN"]["shares"] == 479679
     assert next_holdings["SLIM_ORCAN"]["asset_type"] == "investment_trust"
     assert next_holdings["GS_MMF_USD"]["shares"] == 4018.77
