@@ -4407,6 +4407,17 @@ def _recommendation_entry_is_cancelled(entry: dict, cancelled_keys: set[tuple[st
 
 def _load_recommendation_execution_rows() -> tuple[list[dict], bool]:
     """Load the fill/order source of truth for RECENT_OWN_RECS labels."""
+    source = BASE_DIR / "action_executions.json"
+    try:
+        payload = json.loads(source.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        # An unreadable authority is not the same as an empty ledger.  Keep
+        # RECENT_OWN_RECS unknown instead of inferring lifecycle from the
+        # secondary action-state cache.
+        return [], False
+    raw_rows = payload.get("executions") if isinstance(payload, dict) else payload
+    if not isinstance(raw_rows, list):
+        return [], False
     try:
         from execution_reconciliation import load_effective_execution_records
         rows = load_effective_execution_records(base_dir=BASE_DIR)
