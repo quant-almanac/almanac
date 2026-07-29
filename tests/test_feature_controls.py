@@ -126,6 +126,90 @@ def test_feature_inventory_exposes_major_modes_and_only_shorts_are_mutable(
     assert statuses["privacy_mode"]["mode"] == "strict_local"
 
 
+def test_feature_inventory_isolates_one_status_resolution_failure(
+    tmp_path,
+    monkeypatch,
+):
+    original = fc.get_feature_status
+
+    def _failing_status(key, *, base_dir=None):
+        if key == "options_signals":
+            raise RuntimeError("fixture failure")
+        return original(key, base_dir=base_dir)
+
+    monkeypatch.setattr(fc, "get_feature_status", _failing_status)
+    payload = fc.list_feature_statuses(base_dir=tmp_path)
+    statuses = {row["key"]: row for row in payload["features"]}
+
+    assert len(statuses) == 15
+    assert statuses["options_signals"]["status_resolution_failed"] is True
+    assert statuses["options_signals"]["blockers"] == ["status_resolution_error"]
+    assert statuses["ginn"].get("status_resolution_failed") is not True
+
+
+def test_ginn_status_reuses_the_central_gate_for_five_minutes(
+    tmp_path,
+    monkeypatch,
+):
+    import ginn_model
+
+    model_path = tmp_path / "model.pt"
+    manifest_path = tmp_path / "manifest.json"
+    model_path.write_bytes(b"model")
+    manifest_path.write_text("{}", encoding="utf-8")
+    calls = {"resolve": 0}
+
+    def _resolve():
+        calls["resolve"] += 1
+        return model_path, manifest_path, "v1", None
+
+    monkeypatch.setattr(fc, "BASE_DIR", tmp_path)
+    monkeypatch.setattr(fc.time, "monotonic", lambda: 100.0)
+    monkeypatch.setattr(ginn_model, "_resolve_active_bundle", _resolve)
+    monkeypatch.setattr(
+        ginn_model,
+        "_load_ginn_meta",
+        lambda path: {"trained_at": datetime.now(timezone.utc).isoformat()},
+    )
+    monkeypatch.setattr(
+        ginn_model,
+        "_meets_promotion_criteria",
+        lambda meta: (True, None),
+    )
+    fc._GINN_GATE_CACHE.clear()
+
+    assert fc._ginn_status(tmp_path)["effective_enabled"] is True
+    assert fc._ginn_status(tmp_path)["effective_enabled"] is True
+    assert calls["resolve"] == 1
+
+
+def test_options_status_reuses_the_cache_summary_for_five_minutes(
+    tmp_path,
+    monkeypatch,
+):
+    path = tmp_path / "data" / "options_cache" / "AAPL.json"
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps({
+        "fetched_at": datetime.now(timezone.utc).isoformat(),
+    }), encoding="utf-8")
+    original = fc._load_json
+    calls = {"loads": 0}
+
+    def _counting_load(path, default):
+        if "options_cache" in str(path):
+            calls["loads"] += 1
+        return original(path, default)
+
+    monkeypatch.setattr(fc, "BASE_DIR", tmp_path)
+    monkeypatch.setattr(fc.time, "monotonic", lambda: 100.0)
+    monkeypatch.setattr(fc, "_load_json", _counting_load)
+    fc._OPTIONS_SUMMARY_CACHE.clear()
+
+    assert fc._options_status(tmp_path)["effective_enabled"] is True
+    assert fc._options_status(tmp_path)["effective_enabled"] is True
+    assert calls["loads"] == 1
+
+
 def test_disclosure_config_loader_applies_runtime_state(tmp_path, monkeypatch):
     from disclosure_shadow_book import load_config
 

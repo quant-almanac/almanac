@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -23,6 +24,9 @@ BASE_DIR = Path(__file__).parent
 DEFAULT_CONFIG_PATH = BASE_DIR / "disclosure_shadow_config.json"
 SCHEMA_VERSION = 1
 SYSTEM_LOCAL_TZ = ZoneInfo("Asia/Tokyo")
+_STATUS_CACHE_TTL_SECONDS = 300.0
+_GINN_GATE_CACHE: dict[str, Any] = {}
+_OPTIONS_SUMMARY_CACHE: dict[str, Any] = {}
 
 _SHORT_FEATURES = {
     "us_short": {
@@ -429,6 +433,7 @@ def _short_status(key: str, *, base_dir: Path | str | None = None) -> dict[str, 
         "warnings": readiness.get("warnings", []),
         "updated_at": state_entry.get("updated_at"),
         "updated_by": state_entry.get("updated_by"),
+        "control_hint": "この画面のスイッチがruntime設定の権威です",
         **{
             k: v for k, v in readiness.items()
             if k not in {"ready", "blockers", "warnings"}
@@ -456,6 +461,8 @@ def _margin_long_status(root: Path) -> dict[str, Any]:
     reason = (
         f"信用買い候補を{len(candidates)}件生成しています。注文は人間実行です"
         if effective else
+        "相場・VIX関門が停止中で、候補成果物も期限切れです"
+        if blocked and not fresh else
         "相場・VIXの安全関門が信用買い候補を停止しています"
         if blocked else
         "信用買い候補の最新成果物を確認できません"
@@ -481,20 +488,39 @@ def _margin_long_status(root: Path) -> dict[str, Any]:
 
 def _options_status(root: Path) -> dict[str, Any]:
     cache_dir = root / "data" / "options_cache"
-    timestamps: list[datetime] = []
-    total = 0
-    fresh_count = 0
-    for path in cache_dir.glob("*.json") if cache_dir.is_dir() else ():
-        total += 1
-        payload = _load_json(path, {})
-        fetched_at = payload.get("fetched_at") if isinstance(payload, dict) else None
-        parsed = _parse_time(fetched_at)
-        if parsed is None:
-            continue
-        timestamps.append(parsed)
-        if (datetime.now(timezone.utc) - parsed).total_seconds() <= 24 * 3600:
-            fresh_count += 1
-    latest = max(timestamps).isoformat() if timestamps else None
+    cache_key = str(root.resolve())
+    now_mono = time.monotonic()
+    cached = _OPTIONS_SUMMARY_CACHE.get(cache_key)
+    if (
+        root.resolve() == BASE_DIR.resolve()
+        and isinstance(cached, dict)
+        and now_mono < float(cached.get("expires_at", 0))
+    ):
+        total = int(cached["total"])
+        fresh_count = int(cached["fresh_count"])
+        latest = cached.get("latest")
+    else:
+        timestamps: list[datetime] = []
+        total = 0
+        fresh_count = 0
+        for path in cache_dir.glob("*.json") if cache_dir.is_dir() else ():
+            total += 1
+            payload = _load_json(path, {})
+            fetched_at = payload.get("fetched_at") if isinstance(payload, dict) else None
+            parsed = _parse_time(fetched_at)
+            if parsed is None:
+                continue
+            timestamps.append(parsed)
+            if (datetime.now(timezone.utc) - parsed).total_seconds() <= 24 * 3600:
+                fresh_count += 1
+        latest = max(timestamps).isoformat() if timestamps else None
+        if root.resolve() == BASE_DIR.resolve():
+            _OPTIONS_SUMMARY_CACHE[cache_key] = {
+                "expires_at": now_mono + _STATUS_CACHE_TTL_SECONDS,
+                "total": total,
+                "fresh_count": fresh_count,
+                "latest": latest,
+            }
     effective = fresh_count > 0
     return _read_only_status(
         key="options_signals",
@@ -838,25 +864,52 @@ def _ginn_status(root: Path) -> dict[str, Any]:
     promoted = False
     rejection_reason = "promoted_bundle_missing"
     if root.resolve() == BASE_DIR.resolve():
-        try:
-            from ginn_model import (
-                _load_ginn_meta,
-                _meets_promotion_criteria,
-                _resolve_active_bundle,
-            )
-            model_path, manifest_path, active_version, pointer_error = _resolve_active_bundle()
-            version = active_version
-            manifest_payload = _load_ginn_meta(manifest_path) or {}
-            if pointer_error:
-                rejection_reason = pointer_error
-            elif not model_path.exists():
-                rejection_reason = "model_file_missing"
-            elif not manifest_payload:
-                rejection_reason = "manifest_missing"
-            else:
-                promoted, rejection_reason = _meets_promotion_criteria(manifest_payload)
-        except Exception:
-            rejection_reason = "promotion_gate_unavailable"
+        cache_key = str(root.resolve())
+        pointer_path = root / "models" / "ginn" / "current.json"
+        legacy_manifest_path = root / "models" / "ginn_meta.json"
+        signature = tuple(
+            path.stat().st_mtime_ns if path.exists() else None
+            for path in (pointer_path, legacy_manifest_path)
+        )
+        now_mono = time.monotonic()
+        cached = _GINN_GATE_CACHE.get(cache_key)
+        if (
+            isinstance(cached, dict)
+            and cached.get("signature") == signature
+            and now_mono < float(cached.get("expires_at", 0))
+        ):
+            version = cached.get("version")
+            manifest_payload = dict(cached.get("manifest_payload") or {})
+            promoted = bool(cached.get("promoted"))
+            rejection_reason = cached.get("rejection_reason")
+        else:
+            try:
+                from ginn_model import (
+                    _load_ginn_meta,
+                    _meets_promotion_criteria,
+                    _resolve_active_bundle,
+                )
+                model_path, manifest_path, active_version, pointer_error = _resolve_active_bundle()
+                version = active_version
+                manifest_payload = _load_ginn_meta(manifest_path) or {}
+                if pointer_error:
+                    rejection_reason = pointer_error
+                elif not model_path.exists():
+                    rejection_reason = "model_file_missing"
+                elif not manifest_payload:
+                    rejection_reason = "manifest_missing"
+                else:
+                    promoted, rejection_reason = _meets_promotion_criteria(manifest_payload)
+            except Exception:
+                rejection_reason = "promotion_gate_unavailable"
+            _GINN_GATE_CACHE[cache_key] = {
+                "expires_at": now_mono + _STATUS_CACHE_TTL_SECONDS,
+                "signature": signature,
+                "version": version,
+                "manifest_payload": dict(manifest_payload),
+                "promoted": promoted,
+                "rejection_reason": rejection_reason,
+            }
     else:
         promoted = bool(version and manifest and manifest.exists())
     source_as_of = (
@@ -1057,8 +1110,35 @@ def list_feature_statuses(
         "execution_plan",
         "auto_tune",
     )
+    features = []
+    for key in keys:
+        try:
+            features.append(get_feature_status(key, base_dir=base_dir))
+        except Exception as exc:
+            features.append({
+                "key": key,
+                "label": key,
+                "category": "status_error",
+                "description": "運用状態の取得に失敗しました。",
+                "configured_enabled": False,
+                "effective_enabled": False,
+                "mutable": False,
+                "mode": "status_resolution_error",
+                "auto_order_enabled": False,
+                "reason": f"{key}の状態を安全に判定できません",
+                "blockers": ["status_resolution_error"],
+                "warnings": [],
+                "source": "feature_controls.get_feature_status",
+                "source_as_of": None,
+                "source_age_hours": None,
+                "freshness_status": "unknown",
+                "source_note": f"error_type={type(exc).__name__}",
+                "control_hint": "サーバーログと権威stateを確認してください",
+                "metrics": [],
+                "status_resolution_failed": True,
+            })
     return {
         "schema_version": SCHEMA_VERSION,
         "generated_at": _now_iso(),
-        "features": [get_feature_status(key, base_dir=base_dir) for key in keys],
+        "features": features,
     }

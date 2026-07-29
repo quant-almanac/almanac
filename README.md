@@ -490,7 +490,7 @@ Reading requires no API key. Authentication applies only to writes — recording
 
 ### Tests
 
-At this snapshot, pytest collects **3,069 tests across 229 `test_*.py` files**. The count basis is `pytest tests/ -q --collect-only` for cases and `find tests -type f -name 'test_*.py'` for files.
+At this snapshot, pytest collects **3,073 tests across 229 `test_*.py` files**. The count basis is `pytest tests/ -q --collect-only` for cases and `find tests -type f -name 'test_*.py'` for files.
 
 The composition matters more than the count: **16 files are named for the invariant they hold down** — specifically, filenames containing `safety`, `gating`, `policy`, `guard`, `integrity`, or `privacy`. A sample:
 

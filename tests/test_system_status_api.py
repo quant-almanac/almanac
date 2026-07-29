@@ -50,3 +50,19 @@ def test_heartbeat_rows_separates_monitored_freshness_and_raw_status():
     assert by_key["unmonitored_job"]["monitored"] is False
     assert by_key["unmonitored_job"]["freshness_status"] == "warning"
     assert by_key["unmonitored_job"]["error"] == "raw_status_warn"
+
+
+def test_heartbeat_rows_evaluates_the_supplied_snapshot(monkeypatch):
+    import watchdog
+
+    raw = {"portfolio_analyst": {"status": "ok", "last_run_ts": 1}}
+    seen = {}
+
+    def _evaluate(heartbeats):
+        seen["heartbeats"] = heartbeats
+        return {"ok": ["portfolio_analyst"], "stale": [], "errors": []}
+
+    monkeypatch.setattr(watchdog, "evaluate_heartbeats", _evaluate)
+    system_status._heartbeat_rows(raw)
+
+    assert seen["heartbeats"] is raw

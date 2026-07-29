@@ -51,6 +51,20 @@ const features = [
     freshness_status: 'missing',
     control_hint: 'モデル昇格ゲートが権威です',
   },
+  {
+    key: 'options_signals',
+    label: 'options_signals',
+    category: 'status_error',
+    description: '運用状態の取得に失敗しました。',
+    configured_enabled: false,
+    effective_enabled: false,
+    mutable: false,
+    mode: 'status_resolution_error',
+    auto_order_enabled: false,
+    reason: 'options_signalsの状態を安全に判定できません',
+    blockers: ['status_resolution_error'],
+    status_resolution_failed: true,
+  },
 ]
 
 function renderPanel() {
@@ -115,6 +129,10 @@ describe('FeatureControls', () => {
     expect(within(ginn).getByText('参照のみ')).toBeInTheDocument()
     expect(within(ginn).getByText(/モデル昇格ゲートが権威/)).toBeInTheDocument()
     expect(within(ginn).getByTestId('feature-ginn-authority')).toHaveTextContent('models/ginn/current.json')
+
+    const failed = screen.getByTestId('feature-options_signals')
+    expect(within(failed).getByText('状態取得失敗')).toBeInTheDocument()
+    expect(within(failed).getByText('ERROR')).toBeInTheDocument()
   })
 
   it('toggles a mutable feature through the authenticated write helper', async () => {

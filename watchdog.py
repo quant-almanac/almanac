@@ -631,30 +631,16 @@ def _is_monday_morning_grace() -> bool:
     return lt.tm_wday == 0 and lt.tm_hour < 9
 
 
-def evaluate_health() -> Dict:
-    """
-    heartbeats.json を評価して問題リストを返す。
-
-    Returns:
-        {
-            'stale': [{'script': str, 'age_hours': float, ...}, ...],
-            'errors': [{'script': str, 'error': str, ...}, ...],
-            'fx_stale': bool,
-            'fx_age_hours': float | None,
-            'ok': [script_name, ...],
-        }
-    """
-    hb = load_json(HEARTBEAT_PATH, default={})
+def evaluate_heartbeats(heartbeats: dict | None = None) -> Dict:
+    """Evaluate heartbeat freshness without running the other watchdog checks."""
+    hb = heartbeats if isinstance(heartbeats, dict) else load_json(HEARTBEAT_PATH, default={})
     now = time.time()
-
     stale = []
     errors = []
     ok = []
-
     for script, cfg in EXPECTED_INTERVALS.items():
         entry = hb.get(script)
         if entry is None:
-            # 一度も走っていない → weekend は猶予、平日は stale
             if _is_weekend() or _is_monday_morning_grace():
                 continue
             stale.append({
@@ -667,8 +653,6 @@ def evaluate_health() -> Dict:
         last = float(entry.get('last_run_ts', 0))
         age = now - last
         status = entry.get('status', 'ok')
-
-        # weekday_only は週末を猶予
         if cfg.get('weekday_only') and (_is_weekend() or _is_monday_morning_grace()):
             if status == 'error':
                 errors.append({
@@ -694,6 +678,28 @@ def evaluate_health() -> Dict:
             })
         else:
             ok.append(script)
+    return {'stale': stale, 'errors': errors, 'ok': ok}
+
+
+def evaluate_health() -> Dict:
+    """
+    heartbeats.json を評価して問題リストを返す。
+
+    Returns:
+        {
+            'stale': [{'script': str, 'age_hours': float, ...}, ...],
+            'errors': [{'script': str, 'error': str, ...}, ...],
+            'fx_stale': bool,
+            'fx_age_hours': float | None,
+            'ok': [script_name, ...],
+        }
+    """
+    hb = load_json(HEARTBEAT_PATH, default={})
+    now = time.time()
+    heartbeat_health = evaluate_heartbeats(hb)
+    stale = heartbeat_health['stale']
+    errors = heartbeat_health['errors']
+    ok = heartbeat_health['ok']
 
     # FX as-of チェック
     acc = load_json(ACCOUNT_JSON, default={})

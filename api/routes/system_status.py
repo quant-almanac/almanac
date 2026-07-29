@@ -18,9 +18,9 @@ def _heartbeat_rows(
     health: dict | None = None,
 ) -> list[dict]:
     """Normalize raw heartbeats and watchdog verdicts for the System UI."""
-    from watchdog import EXPECTED_INTERVALS, evaluate_health
+    from watchdog import EXPECTED_INTERVALS, evaluate_heartbeats
 
-    evaluation = health if health is not None else evaluate_health()
+    evaluation = health if health is not None else evaluate_heartbeats(heartbeats)
     stale_by_key = {
         str(row.get("script")): row
         for row in evaluation.get("stale", [])

@@ -42,6 +42,7 @@ export interface FeatureStatus {
   availability_label?: string
   availability_metric_kind?: string
   metrics?: Array<{ label: string; value: unknown }>
+  status_resolution_failed?: boolean
 }
 
 interface FeatureResponse {
@@ -58,6 +59,7 @@ const CATEGORY_LABEL: Record<string, string> = {
   candidate: '候補',
   signal: '分析シグナル',
   data: '入力・監査',
+  status_error: '状態取得エラー',
 }
 
 const FRESHNESS_LABEL: Record<string, string> = {
@@ -123,12 +125,16 @@ export default function FeatureControls() {
     {isLoading && <div style={{ color: OPS.dim, fontSize: 12 }}>機能状態を確認中…</div>}
     <div style={{ display: 'flex', flexDirection: 'column' }}>
       {data?.features.map(feature => {
-        const effectiveColor = feature.effective_enabled
+        const effectiveColor = feature.status_resolution_failed
+          ? OPS.redSoft
+          : feature.effective_enabled
           ? OPS.green
           : feature.configured_enabled
             ? OPS.amber
             : OPS.dim
-        const effectiveLabel = feature.effective_enabled
+        const effectiveLabel = feature.status_resolution_failed
+          ? '状態取得失敗'
+          : feature.effective_enabled
           ? '実効 ON'
           : feature.configured_enabled && feature.blockers.length > 0
             ? '設定ON・安全停止'
@@ -159,6 +165,7 @@ export default function FeatureControls() {
           <div style={{ flex: '1 1 300px' }}>
             <div style={{ display: 'flex', alignItems: 'center', gap: 7, flexWrap: 'wrap' }}>
               <Chip color={effectiveColor} mono>{effectiveLabel}</Chip>
+              {feature.status_resolution_failed && <Chip color={OPS.redSoft} mono>ERROR</Chip>}
               {feature.configured_enabled && !feature.effective_enabled && feature.blockers.length > 0 && <Chip color={OPS.amber} bg={OPS.amberBg} mono>FAIL-CLOSED</Chip>}
               {feature.auto_order_enabled === false && <Chip color={OPS.dim} mono>自動注文なし</Chip>}
             </div>

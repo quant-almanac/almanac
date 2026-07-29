@@ -101,7 +101,7 @@ function HeartbeatPanel({ rows }: { rows: SystemStatus['heartbeat_statuses'] }) 
         <tbody>{rows.map((row, index) => <tr key={row.key} style={{ borderTop: index ? `1px solid ${OPS.hairline}` : 'none' }}>
           <td style={{ ...cell, fontFamily: OPS.mono }}>{row.key}</td>
           <td style={cell}><Chip color={colorFor(row.freshness_status)} mono>{row.freshness_status}</Chip>{!row.monitored && <span style={{ color: OPS.dim, marginLeft: 7 }}>監視対象外</span>}</td>
-          <td style={{ ...cell, fontFamily: OPS.mono }}>{row.last_run_iso?.slice(0, 19).replace('T', ' ') ?? '未実行'}</td>
+          <td style={{ ...cell, fontFamily: OPS.mono }}>{row.last_run_iso?.replace('T', ' ') ?? '未実行'}</td>
           <td style={{ ...cell, fontFamily: OPS.mono }}>{row.age_hours != null ? `${row.age_hours}h` : '—'} / {row.max_age_hours != null ? `${row.max_age_hours}h` : '—'}</td>
           <td style={{ ...cell, color: row.error ? OPS.amber : OPS.dim }}>{row.error ?? row.status}</td>
         </tr>)}</tbody>
