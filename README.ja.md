@@ -527,9 +527,9 @@ MOM = MTUM − SPY   QMJ = QUAL − SPY      LVOL = SPLV − SPY  ほか
 
 ### テスト
 
-このスナップショットでは、pytest が **2,923件 / `test_*.py` 213ファイル**を収集します。数え方は、件数が`pytest tests/ -q --collect-only`、ファイル数が`find tests -type f -name 'test_*.py'`です。
+このスナップショットでは、pytest が **3,054件 / `test_*.py` 227ファイル**を収集します。数え方は、件数が`pytest tests/ -q --collect-only`、ファイル数が`find tests -type f -name 'test_*.py'`です。
 
-件数より中身のほうが重要で、**守るべき不変条件をファイル名に持つテストが14本**あります。数え方は、ファイル名に`safety` / `gating` / `policy` / `guard` / `integrity` / `privacy`のいずれかを含むものです。たとえば次のようなものです。
+件数より中身のほうが重要で、**守るべき不変条件をファイル名に持つテストが16本**あります。数え方は、ファイル名に`safety` / `gating` / `policy` / `guard` / `integrity` / `privacy`のいずれかを含むものです。たとえば次のようなものです。
 
 | ファイル | 何を守るか |
 |---|---|
