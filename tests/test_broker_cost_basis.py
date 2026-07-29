@@ -97,6 +97,40 @@ def test_fill_before_snapshot_is_safe_but_same_day_or_after_is_review(
     assert after["reason"] == "after_snapshot"
 
 
+def test_unknown_route_fill_before_snapshot_is_absorbed_but_same_day_is_review(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("ALMANAC_STATE_DIR", str(tmp_path))
+
+    def fill(saved_at):
+        return {
+            "id": f"unknown-{saved_at}",
+            "ticker": "DEMO",
+            "direction": "buy",
+            "quantity": 1,
+            "price": 10,
+            "status": "executed",
+            "saved_at": saved_at,
+        }
+
+    before = validate_broker_cost_basis(
+        position=POSITION,
+        quantity=-20,
+        holding=_holding(),
+        executions=[fill("2026-07-27T12:00:00")],
+    )
+    same_day = validate_broker_cost_basis(
+        position=POSITION,
+        quantity=-20,
+        holding=_holding(),
+        executions=[fill("2026-07-28T12:00:00")],
+    )
+
+    assert before["status"] == "ready"
+    assert same_day["status"] == "review"
+    assert same_day["reason"] == "execution_position_identity_unknown"
+
+
 def test_active_order_blocks_and_cancelled_does_not(tmp_path, monkeypatch):
     monkeypatch.setenv("ALMANAC_STATE_DIR", str(tmp_path))
     base = {

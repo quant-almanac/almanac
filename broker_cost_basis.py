@@ -73,6 +73,16 @@ def validate_broker_cost_basis(
         affects_position = is_fill_record(effective) or status in ACTIVE_ORDER_STATUSES
         if not affects_position:
             continue
+        # A complete broker snapshot already incorporates every fill strictly
+        # before its as-of date.  Route metadata on those historical rows is
+        # therefore irrelevant to the current quantity/basis and must not
+        # block readiness.  Same-day and later fills are deliberately handled
+        # below because the date-only snapshot cannot prove their ordering.
+        temporal_order = None
+        if is_fill_record(effective):
+            temporal_order = execution_temporal_order(effective, snapshot_as_of)
+            if temporal_order["temporal_order"] == "before_snapshot":
+                continue
         if execution_identity is None:
             return {
                 "status": "review",
@@ -87,13 +97,14 @@ def validate_broker_cost_basis(
                 "reason": "active_order_after_broker_snapshot_unknown",
                 "execution_id": raw.get("id"),
             }
-        order = execution_temporal_order(effective, snapshot_as_of)
-        if order["requires_review"]:
+        if temporal_order is None:
+            temporal_order = execution_temporal_order(effective, snapshot_as_of)
+        if temporal_order["requires_review"]:
             return {
                 "status": "review",
-                "reason": order["temporal_order"],
+                "reason": temporal_order["temporal_order"],
                 "execution_id": raw.get("id"),
-                "temporal_order": order,
+                "temporal_order": temporal_order,
             }
 
     if position.account.startswith("nisa"):
