@@ -100,10 +100,11 @@ def _current_month() -> str:
 
 
 def _executions() -> dict:
-    from utils import load_json
-
-    value = load_json(BASE_DIR / "action_executions.json", default={}) or {}
-    return value if isinstance(value, dict) else {"executions": []}
+    try:
+        from execution_reconciliation import load_effective_execution_records
+        return {"executions": load_effective_execution_records(base_dir=BASE_DIR)}
+    except Exception:
+        return {"executions": []}
 
 
 def _refresh_plan() -> str | None:

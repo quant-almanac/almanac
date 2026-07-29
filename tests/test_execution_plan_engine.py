@@ -1011,3 +1011,23 @@ def test_unpriced_open_execution_is_not_double_counted_with_its_lifecycle_state(
 
     assert summary["unattributed_monthly_unpriced_count"] == 1
     assert summary["unattributed_monthly_total_count"] == 1
+
+
+def test_reconciliation_review_cannot_consume_attributed_monthly_budget() -> None:
+    summary = epe.compute_monthly_consumption(
+        month_start=date(2026, 7, 1),
+        month_end=date(2026, 7, 31),
+        executions={"executions": [{
+            "id": "ambiguous",
+            "ticker": "V",
+            "direction": "buy",
+            "status": "executed",
+            "notional_jpy": 100_000,
+            "saved_at": "2026-07-02T10:00:00",
+            "monthly_objective_id": "2026-07-buy",
+            "execution_reconciliation_status": "review",
+        }]},
+    )
+
+    assert summary["monthly_consumed_jpy"] == 0
+    assert summary["unattributed_monthly_buy_total_notional_jpy"] == 100_000

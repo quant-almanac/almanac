@@ -154,15 +154,18 @@ def walk_forward_summary(months_lookback: int = 6) -> dict:
 # ============================================================
 
 def _load_executions() -> list[dict]:
-    if not EXEC_PATH.exists():
-        return []
     try:
-        data = json.loads(EXEC_PATH.read_text(encoding="utf-8"))
+        from execution_reconciliation import load_effective_execution_records
+        rows = load_effective_execution_records(
+            base_dir=EXEC_PATH.parent,
+            execution_path=EXEC_PATH,
+        )
     except Exception:
         return []
-    if isinstance(data, list):
-        return data
-    return data.get("executions", [])
+    return [
+        row for row in rows
+        if row.get("execution_reconciliation_status") != "review"
+    ]
 
 
 def _shortfall_lookup(execs: list[dict]) -> dict[str, float]:

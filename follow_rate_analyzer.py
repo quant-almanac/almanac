@@ -48,6 +48,17 @@ def _load_json(path: Path, default):
     return default
 
 
+def _load_effective_executions() -> list[dict]:
+    try:
+        from execution_reconciliation import load_effective_execution_records
+        return load_effective_execution_records(
+            base_dir=EXEC_LOG.parent,
+            execution_path=EXEC_LOG,
+        )
+    except Exception:
+        return []
+
+
 def _atomic_write_json(path: Path, data) -> None:
     tmp = path.with_suffix('.tmp')
     tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding='utf-8')
@@ -193,8 +204,12 @@ def match_recommendations(
     if recs is None:
         recs = load_recommendations()
     if execs is None:
-        execs_data = _load_json(EXEC_LOG, {'executions': []})
-        execs = execs_data.get('executions', []) if isinstance(execs_data, dict) else execs_data
+        execs = _load_effective_executions()
+    execs = [
+        ex for ex in execs
+        if isinstance(ex, dict)
+        and ex.get('execution_reconciliation_status') != 'review'
+    ]
 
     matched = []
     unmatched = []
@@ -398,8 +413,12 @@ def compute_actual_pnl_pct(
     単純化リターンを算出する。
     """
     if execs is None:
-        ed = _load_json(EXEC_LOG, {'executions': []})
-        execs = ed.get('executions', []) if isinstance(ed, dict) else ed
+        execs = _load_effective_executions()
+    execs = [
+        ex for ex in execs
+        if isinstance(ex, dict)
+        and ex.get('execution_reconciliation_status') != 'review'
+    ]
 
     cutoff = datetime.now() - timedelta(days=lookback_days)
     positions: dict = {}

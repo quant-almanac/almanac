@@ -144,3 +144,22 @@ def test_status_snapshot_reports_follow_rate_without_shadow_file(tmp_path):
     assert snapshot['follow_rate']['total_recs'] == 1
     assert snapshot['follow_rate']['total_matched'] == 1
     assert snapshot['follow_rate']['follow_rate'] == 1.0
+
+
+def test_reconciliation_review_is_not_counted_as_followed_execution():
+    now = datetime.now()
+    recs = [{'as_of': now.isoformat(), 'ticker': 'XLF', 'type': 'trim'}]
+    execs = [{
+        'id': 'ambiguous',
+        'ticker': 'XLF',
+        'direction': 'sell',
+        'price': 56.0,
+        'quantity': 20,
+        'saved_at': now.isoformat(),
+        'execution_reconciliation_status': 'review',
+    }]
+
+    result = fr.match_recommendations(recs, execs)
+
+    assert result['total_recs'] == 1
+    assert result['total_matched'] == 0

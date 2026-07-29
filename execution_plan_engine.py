@@ -892,6 +892,8 @@ def _item_exact_match_kind(item: dict[str, Any], record: dict[str, Any], record_
 
 
 def _item_matches_record(item: dict[str, Any], record: dict[str, Any], record_key: str) -> bool:
+    if record.get("execution_reconciliation_status") == "review":
+        return False
     return _item_exact_match_kind(item, record, record_key) is not None
 
 
@@ -1093,6 +1095,8 @@ def _monthly_attribution_id(
     plus the old plan-item id format during the migration month.  It never
     infers monthly spend from ticker, account, currency, or sector.
     """
+    if record.get("execution_reconciliation_status") == "review":
+        return None
     candidates = [record]
     action_state_id = str(record.get("action_state_id") or "")
     linked = state_actions.get(action_state_id) if action_state_id else None
@@ -1918,6 +1922,13 @@ def generate_execution_plan(*, base_dir: Path = BASE_DIR, now: datetime | None =
         base_dir=base_dir,
         now=now,
     )
+    try:
+        from execution_reconciliation import load_effective_execution_records
+        effective_executions = {
+            "executions": load_effective_execution_records(base_dir=base_dir),
+        }
+    except Exception:
+        effective_executions = {"executions": []}
     plan = build_execution_plan(
         account=load_json(base_dir / "account.json", {}),
         guard=load_json(base_dir / "guard_state.json", {}),
@@ -1925,7 +1936,7 @@ def generate_execution_plan(*, base_dir: Path = BASE_DIR, now: datetime | None =
         bottom_fishing=load_json(base_dir / "bottom_fishing_signals.json", {}),
         nisa=load_json(base_dir / "nisa_portfolio.json", {}),
         action_state=load_json(base_dir / "action_state.json", {"actions": {}}),
-        executions=load_json(base_dir / "action_executions.json", {"executions": []}),
+        executions=effective_executions,
         ai_analysis=load_json(base_dir / "ai_portfolio_analysis.json", {}),
         contribution_ledger=load_json(base_dir / "contribution_ledger.json", {"contributions": []}),
         now=now,

@@ -290,12 +290,16 @@ def _median(xs: list) -> Optional[float]:
 
 
 def _load_execs():
-    if EXEC_LOG.exists():
-        try:
-            return json.loads(EXEC_LOG.read_text(encoding='utf-8'))
-        except Exception:
-            return {'executions': []}
-    return {'executions': []}
+    try:
+        from execution_reconciliation import load_effective_execution_records
+        return {
+            'executions': load_effective_execution_records(
+                base_dir=EXEC_LOG.parent,
+                execution_path=EXEC_LOG,
+            ),
+        }
+    except Exception:
+        return {'executions': []}
 
 
 # ============================================================

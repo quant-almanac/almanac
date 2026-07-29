@@ -1,5 +1,6 @@
 """T20: execution_quality slippage + 100bps alert"""
 from datetime import datetime
+import json
 
 import execution_quality as eq
 
@@ -47,3 +48,30 @@ def test_incomplete_data_returns_none():
     # missing bid/ask
     ex = {'id': 'x', 'ticker': 'X', 'direction': 'buy', 'price': 100}
     assert eq._compute_slippage_bps(ex) is None
+
+
+def test_execution_quality_reads_corrected_route_without_mutating_ledger(tmp_path, monkeypatch):
+    from execution_reconciliation import record_route_correction
+
+    raw = _mk('XLF', 'sell', 56.0, 55.9, 56.1)
+    ledger = tmp_path / 'action_executions.json'
+    ledger.write_text(json.dumps({'executions': [raw]}), encoding='utf-8')
+    monkeypatch.setattr(eq, 'EXEC_LOG', ledger)
+    record_route_correction(
+        execution_record=raw,
+        corrected_route={
+            'execution_owner': 'husband',
+            'execution_broker': 'rakuten',
+            'execution_account': 'NISA成長投資枠',
+        },
+        evidence={'row_hash': 'fixture'},
+        reason='broker evidence',
+        approved_by='test',
+        state_path=tmp_path / 'execution_reconciliation_state.json',
+    )
+
+    loaded = eq._load_execs()['executions'][0]
+
+    assert loaded['execution_account'] == 'nisa_growth'
+    assert loaded['execution_reconciliation_status'] == 'corrected'
+    assert json.loads(ledger.read_text())['executions'][0] == raw
