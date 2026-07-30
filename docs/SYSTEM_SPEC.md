@@ -54,6 +54,7 @@ A ticker is not a position identity. The system uses three separate keys:
 |---|---|---|
 | `PositionIdentity` | owner + broker + account + canonical instrument | holdings, exits, action state, tax candidates |
 | `AccountResourceIdentity` | owner + broker + account + currency | cash and buying power |
+| `ExecutionCashWallet` | owner + broker + settlement pool + currency | executable budget reservation |
 | `NisaCapacityIdentity` | owner + broker + account + NISA type + tax year | annual/lifetime allowance |
 
 Aliases are normalized by `position_identity.py`; identity is propagated through tax candidates, conflict checks, recommendations, action IDs, action state, API rows, governance and broker reconciliation. Unknown ownership is not guessed. A zero holding requires a broker snapshot proving absence; “not found in a local dict” is not evidence of zero.
@@ -70,6 +71,8 @@ Freshness is evidence-specific, not file-wide:
 - `submitted`, `recommended` and local `portfolio_applied` events do not advance broker freshness;
 - a confirmed fill needs external execution ID, broker source, broker timestamp, quantity, price, reconciliation time and snapshot hash;
 - duplicate external execution IDs are rejected.
+- local account/holding ledgers without any complete broker snapshot are `legacy_unverified`, never `fresh`;
+- PATCH confirmation of a historical execution uses a broker-evidence schema separate from the POST idempotency key and never invents a key in the ledger.
 
 Analysis-source freshness is separately carried for holdings, cash, prices, FX, macro, news, screening and per-ticker options. `fresh`, `degraded`, `stale` and `unknown` are based on source time and each source's maximum-age policy. A hash proves immutability, not freshness.
 
@@ -164,6 +167,10 @@ fails the frozen validation/GARCH comparison, freshness, coverage or other
 manifest gates. VIX/regime history and leakage-free rolling GARCH features
 remain future research. Held-out data used for promotion is called validation;
 only observations arriving after promotion count as forward evidence.
+The current forward fields are reserved schema only: no forward-evaluation
+pipeline is implemented yet, and a stored zero must not be displayed as
+evidence. Runtime status therefore exposes the operating model separately from
+the latest audit candidate.
 
 The VaR path records forecasts and applies a Kupiec proportion-of-failures test. Passing that test validates breach frequency for that VaR series, not the whole risk stack.
 
@@ -182,6 +189,8 @@ The VaR path records forecasts and applies a Kupiec proportion-of-failures test.
 Inputs cover index distance from MA50/MA200, market breadth, VIX, HY OAS and rates. Rates distinguish a tightening shock, easing support, stress easing, restrictive real/nominal levels and curve inversion. Coverage, breadth observations, risk inputs and rate inputs must meet eligibility requirements. A two-evaluation confirmation prevents one noisy reading from flipping the committed level.
 
 A separate shock overlay can stop discretionary buying but does not sell after a crash merely to raise cash to the target. All confirmed cash inside the represented accounts is investable surplus capital; the protected lifestyle reserve is zero, while tactical cash, settlement, collateral, fees, tax and existing order reservations still apply. The execution plan deploys only the confirmed balance above the tactical target and derives its monthly allowance by dividing that surplus over 2 / 3 / 6 / 12 months for strong bull / mild bull / neutral / mild bear. Strong bear or an active shock creates no ordinary buying allowance. Filled buys consume the allowance without reducing its basis twice; confirmed cash flows recalculate it. Cash authority remains event-based rather than expiring solely because time elapsed.
+
+Household cash can be aggregated for allocation and tactical-reserve calculation, but it is not one executable wallet. Final candidate allocation also reserves confirmed buying power by owner, broker, settlement pool and currency. Cross-owner transfers and FX conversion require separate confirmed events; they are never inferred from the household total.
 
 ## 12. Policy, readiness and invalidation
 
@@ -236,6 +245,8 @@ Three quantities are kept separate:
 Listing currency is not economic currency. The instrument master stores underlying exposure, USD ratio, hedge ratio, leverage/inverse flags, replacement eligibility, source, as-of and validity date. Unknown or expired classifications fail closed; they are not treated as zero USD.
 
 Actual hedge notional is read only from complete broker position snapshots. Missing actual evidence is `unknown`, not zero. Shadow, target and actual notionals are separate states. The target ratio is limited to 0–70%, and the change is at most 10 percentage points per evaluation date. Same-date/same-snapshot reruns are idempotent.
+
+A later fill identified as an FX forward, spot FX or currency future invalidates the older actual-notional observation until complete broker snapshots replace it. An ordinary foreign-equity fill does not.
 
 Hedged ETFs are replacements, not overlays, and may replace only corresponding unhedged index exposure after tax, cash and lot checks. Futures/FX are overlays with different margin, tax and order adapters. Modes are `off`, `shadow` and `advisory`; none auto-submit.
 
@@ -382,7 +393,7 @@ of future capability.
 
 | Area | Current contract | Condition before a broader claim or activation |
 |---|---|---|
-| GINN | GJR-GARCH operates. GINN has a persisted scaler/inference contract but remains default-deny unless the frozen validation, comparative and manifest gates pass; forward observations are tracked separately. | Historical VIX/regime and leakage-safe rolling GARCH inputs, stable validation against the baseline and sufficient post-promotion forward evidence. |
+| GINN | GJR-GARCH operates. GINN has a persisted scaler/inference contract but remains default-deny unless the frozen validation, comparative and manifest gates pass. Forward fields are reserved; the evaluation pipeline is not implemented. | Historical VIX/regime and leakage-safe rolling GARCH inputs, stable validation against the baseline, an implemented forward evaluator and sufficient post-promotion evidence. |
 | Half-Kelly | Recommendation-performance sizing is shadow/counterfactual output, not trade-performance proof or an order. | A fixed evaluation population/horizon, sufficient observations and human review of the shadow record. |
 | FX | Classification, target and actual hedge evidence are separated; modes are off/shadow/advisory and do not auto-submit. | Complete economic-exposure classification, broker-confirmed actual notionals and vehicle-specific operational/tax controls. |
 | Tax | API schema v2 separates economic, taxable and NISA P&L. Broker-provided tax values remain authoritative. | A full reconciliation period and consumer confirmation before retiring legacy read paths. |

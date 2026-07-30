@@ -1005,6 +1005,13 @@ def _ginn_status(root: Path) -> dict[str, Any]:
             "disabled_by_env" if disabled else str(rejection_reason)
         ],
         "model_version": version,
+        "operating_model": "ginn" if effective else "gjr_garch",
+        "operating_model_source": (
+            "models/ginn/current.json" if effective else "central_fail_closed_fallback"
+        ),
+        "audit_candidate_version": (
+            version if source_kind == "latest_candidate" else None
+        ),
         "source": source_name,
         "source_as_of": source_as_of,
         "source_age_hours": round(source_age, 1) if source_age is not None else None,
@@ -1025,7 +1032,14 @@ def _ginn_status(root: Path) -> dict[str, Any]:
             {"label": "validation件数", "value": manifest_payload.get("n_validation")},
             {"label": "validation銘柄数", "value": manifest_payload.get("n_validation_tickers")},
             {"label": "GARCH比MSE", "value": garch_ratio},
-            {"label": "forward観測", "value": manifest_payload.get("forward_observations", 0)},
+            {
+                "label": "forward評価",
+                "value": (
+                    manifest_payload.get("forward_observations")
+                    if manifest_payload.get("forward_evaluation_implemented") is True
+                    else "未実装"
+                ),
+            },
         ],
         "detail_sections": [
             {
@@ -1033,7 +1047,8 @@ def _ginn_status(root: Path) -> dict[str, Any]:
                 "body": (
                     "GINNという考え方を否定した状態ではありません。現在候補の実測が"
                     "GJR-GARCH基準を満たさないため、投資判断にはGJR-GARCHだけを使います。"
-                    "上のvalidation値は最新manifestから動的に表示します。"
+                    "上のvalidation値は最新manifestから動的に表示します。forward評価の"
+                    "パイプラインは未実装で、予約フィールドの0件を実績とは数えません。"
                 ),
             },
             {

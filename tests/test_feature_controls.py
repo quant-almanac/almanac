@@ -215,9 +215,12 @@ def test_ginn_status_surfaces_latest_rejected_candidate_without_activating_it(
     assert status["effective_enabled"] is False
     assert status["source"] == "models/ginn/<latest candidate>/manifest.json"
     assert status["model_version"] == "candidate-v2"
+    assert status["operating_model"] == "gjr_garch"
+    assert status["operating_model_source"] == "central_fail_closed_fallback"
+    assert status["audit_candidate_version"] == "candidate-v2"
     assert status["blockers"][0].startswith("garch_ratio_degraded")
     assert {"label": "GARCH比MSE", "value": 8.15} in status["metrics"]
-    assert {"label": "forward観測", "value": 0} in status["metrics"]
+    assert {"label": "forward評価", "value": "未実装"} in status["metrics"]
     assert status["roadmap_status"] == "future_update"
     assert status["roadmap_label"] == "将来更新"
     assert [section["title"] for section in status["detail_sections"]] == [

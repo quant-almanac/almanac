@@ -54,6 +54,7 @@ tickerだけではpositionを特定できません。3種類のkeyを分けま�
 |---|---|---|
 | `PositionIdentity` | owner + broker + account + canonical instrument | 保有・売却・action state・税候補 |
 | `AccountResourceIdentity` | owner + broker + account + currency | 現金・買付余力 |
+| `ExecutionCashWallet` | owner + broker + settlement pool + currency | 実行可能予算の予約 |
 | `NisaCapacityIdentity` | owner + broker + account + NISA type + tax year | 年間/生涯枠 |
 
 `position_identity.py` がaliasを正規化し、税候補、conflict、推薦、action ID、action state、API、governance、broker reconciliationまで伝播します。owner不明を推測しません。保有ゼロも、ローカルdictに無いことではなくbroker snapshotによる不在証明が必要です。
@@ -70,6 +71,8 @@ household集中度はrisk計測のため同一instrumentを口座横断集約で
 - `submitted`、`recommended`、内部`portfolio_applied`はbroker鮮度を進めない
 - confirmed fillにはexternal execution ID、broker source/time、数量、価格、reconcile time、snapshot hashが必要
 - 同じexternal execution IDの二重適用を拒否
+- completeなbroker snapshotが1件もないlocal account/holding ledgerは`fresh`でなく`legacy_unverified`
+- 旧executionのPATCH確認はPOST idempotency keyと別のbroker evidence schemaを使い、ledgerへ合成keyを作らない
 
 分析入力の鮮度はholdings、cash、prices、FX、macro、news、screening、ticker別optionsに分離します。`fresh/degraded/stale/unknown`はsource timeと個別max-age policyから決まります。hashが証明するのは不変性で、鮮度ではありません。
 
@@ -159,6 +162,8 @@ GINNはversion bundleが固定promotion policy、model/manifest checksum、data 
 
 per-ticker scalerの永続化inference契約は実装済みです。candidateは契約completeとper-ticker scaler artifact/checksumを持ちます。ただしこれは昇格条件の一つです。固定validation/GARCH比較、freshness、coverage、その他manifest gateのどれかに失敗すればcandidateは拒否されます。VIX/regime履歴とleakage-free rolling GARCH featureは将来研究です。昇格に使ったheld-outはvalidationであり、昇格後に到着した観測だけがforward evidenceです。
 
+現在のforward fieldはschema予約だけで、forward評価pipelineは未実装です。保存値0を実績として表示しません。runtime statusは実際の稼働modelと最新の監査候補を別fieldで示します。
+
 VaR予測を保存してKupiec proportion-of-failures testを行います。合格しても検証されるのはそのVaR seriesのbreach頻度で、risk stack全体ではありません。
 
 ## 11. 5段階market regime・金利・現金
@@ -176,6 +181,8 @@ VaR予測を保存してKupiec proportion-of-failures testを行います。合�
 indexのMA50/MA200乖離、breadth、VIX、HY OAS、金利を使います。金利はtightening shock、easing support、stress easing、restrictive real/nominal level、curve inversionを分けます。coverage、breadth件数、risk/rate入力がeligibilityを満たす必要があります。2評価確認で単発noiseによるcommitted level変更を防ぎます。
 
 別のshock overlayは裁量buyを止められますが、crash後にcash targetへ戻すための売却はしません。確認済みcashは全て余剰投資資金、生活防衛reserveは0ですが、tactical cash、settlement、collateral、fee、tax、既存order予約は残ります。execution planはtactical targetを超える確認済み残高を、強い強気／弱い強気／中立／弱い弱気では2／3／6／12か月に分けて月次枠を作り、強い弱気またはshock中は通常買付枠を作りません。当月の約定は枠を消費しますがcash basisを二重に縮めず、確認済みcash flowは自動再計算します。cash authorityは時間経過だけで失効させず後続eventで判定します。
+
+household cashは配分・tactical reserve計算では集約できますが、実行可能walletは1つにまとめません。最終候補はowner・broker・settlement pool・currency別の確認済み買付余力も予約します。owner間transferやFX conversionは別の確認済みeventが必要で、household totalから暗黙推定しません。
 
 ## 12. Policy・readiness・invalidation
 
@@ -230,6 +237,8 @@ capはabsolute target positionで`max(0, Kelly target - current holding)`です�
 listing currencyはeconomic currencyではありません。instrument masterはunderlying exposure、USD ratio、hedge ratio、leverage/inverse、replacement eligibility、source、as-of、validityを持ちます。不明・期限切れは0 USDでなくfail-closedです。
 
 actual hedge notionalはcompleteなbroker position snapshotだけから読みます。証拠欠落は0でなく`unknown`です。shadow/target/actual stateは別です。target ratioは0–70%、1評価日の変化は±10 percentage points、同日同snapshot再実行は冪等です。
+
+FX forward・spot FX・currency futureと識別された後続fillは、completeなbroker snapshotで置換されるまで旧actual-notional観測を失効させます。通常の外国株fillは失効理由にしません。
 
 hedged ETFはoverlayでなく対応unhedged index exposureの置換で、tax/cash/lot check後だけです。future/FXはmargin・tax・order adapterが別のoverlayです。modeは`off/shadow/advisory`で、自動発注はありません。
 
@@ -346,7 +355,7 @@ sourceを読む前にこの仕様だけでclaimを検証可能にするための
 
 | 領域 | 現在の契約 | 拡張した主張/有効化の前提 |
 |---|---|---|
-| GINN | GJR-GARCHが稼働します。GINNは永続scaler/inference契約を持ちますが、固定validation・比較・manifest gateを通るまでdefault-denyです。forward観測は別管理です。 | historical VIX/regime、leakage-safe rolling GARCH input、baselineに対する安定validation、昇格後の十分なforward evidence。 |
+| GINN | GJR-GARCHが稼働します。GINNは永続scaler/inference契約を持ちますが、固定validation・比較・manifest gateを通るまでdefault-denyです。forward fieldは予約済みですが評価pipelineは未実装です。 | historical VIX/regime、leakage-safe rolling GARCH input、baselineに対する安定validation、forward evaluator実装、昇格後の十分なevidence。 |
 | Half-Kelly | recommendation performanceに基づくshadow/counterfactual outputで、trade performanceの証明でも注文でもありません。 | 固定evaluation population/horizon、十分な観測、shadow recordの人確認。 |
 | FX | classification、target、actual hedge evidenceを分離し、modeはoff/shadow/advisoryで自動注文しません。 | complete economic-exposure分類、broker-confirmed actual notional、vehicle別の運用/tax control。 |
 | Tax | API schema v2はeconomic/taxable/NISA P&Lを分離し、broker税務値が権威です。 | 完全な照合期間とconsumer確認後にlegacy read pathを廃止。 |
