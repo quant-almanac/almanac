@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 import subprocess
 from pathlib import Path
@@ -44,6 +45,20 @@ def tracked_files() -> list[Path]:
 
 def main() -> int:
     failures: list[str] = []
+    # Public clones must make an affirmative runtime choice before either
+    # short-candidate lane can run.  This complements the code fallbacks: a
+    # tracked config that silently flips either lane back on is a release bug.
+    short_config_path = ROOT / "disclosure_shadow_config.json"
+    try:
+        short_config = json.loads(short_config_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        failures.append(f"{short_config_path.name}: cannot validate short defaults ({exc})")
+    else:
+        for key in ("us_short_enabled", "jp_short_enabled"):
+            if short_config.get(key) is not False:
+                failures.append(
+                    f"{short_config_path.name}: {key} must be false in the public default"
+                )
     for path in tracked_files():
         rel = path.relative_to(ROOT)
         if path.name in PRIVATE_BASENAMES:

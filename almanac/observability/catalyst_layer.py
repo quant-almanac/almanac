@@ -1010,7 +1010,7 @@ def _short_execution_metadata(
             "notional_jpy": round(notional_jpy),
         })
         enabled_key = "jp_short_enabled" if market == "JP" else "us_short_enabled"
-        if not bool(cfg.get(enabled_key, market == "JP")):
+        if not bool(cfg.get(enabled_key, False)):
             tradeability.update({
                 "untradeable": True,
                 "reasons": [f"{market.lower()}_short_disabled_by_user"],
@@ -1057,7 +1057,12 @@ def _short_execution_metadata(
         cost_model["error"] = str(exc)[:160]
 
     try:
-        if market == "JP":
+        # A disabled product lane must not contact loanability sources or
+        # overwrite the explicit disabled-by-user reason below.
+        enabled_key = "jp_short_enabled" if market == "JP" else "us_short_enabled"
+        if not bool(cfg.get(enabled_key, False)):
+            pass
+        elif market == "JP":
             from jp_loanability import evaluate_short_tradeability
 
             checked = evaluate_short_tradeability(ticker)

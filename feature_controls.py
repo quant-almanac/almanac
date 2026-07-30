@@ -37,7 +37,10 @@ _SHORT_FEATURES = {
     },
     "jp_short": {
         "config_key": "jp_short_enabled",
-        "default": True,
+        # A missing or malformed tracked config must not silently enable a
+        # risk-increasing lane.  Production opts in through the ignored
+        # runtime overlay, while public clones start fail-closed.
+        "default": False,
         "label": "日本株の空売り",
         "market": "JP",
     },

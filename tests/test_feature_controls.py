@@ -25,9 +25,9 @@ def _write_us_source(root, *, tickers: dict | None = None) -> None:
     }), encoding="utf-8")
 
 
-def test_us_short_defaults_off_and_jp_short_defaults_on(tmp_path):
+def test_both_short_markets_default_off_without_a_tracked_or_runtime_opt_in(tmp_path):
     configured = fc.configured_short_features(base_dir=tmp_path)
-    assert configured == {"us_short": False, "jp_short": True}
+    assert configured == {"us_short": False, "jp_short": False}
 
 
 def test_us_short_toggle_is_single_runtime_authority(tmp_path):
@@ -266,7 +266,7 @@ def test_disclosure_config_loader_applies_runtime_state(tmp_path, monkeypatch):
 
     config = load_config()
     assert config["us_short_enabled"] is True
-    assert config["jp_short_enabled"] is True
+    assert config["jp_short_enabled"] is False
 
 
 def test_shortability_gate_reconciles_tradeability_metadata():

@@ -186,7 +186,7 @@ def simulate_shadow_book(
         if signal["direction"] < 0:
             market_key = market.upper()
             enabled_key = "jp_short_enabled" if market_key == "JP" else "us_short_enabled"
-            if not bool(cfg.get(enabled_key, market_key == "JP")):
+            if not bool(cfg.get(enabled_key, False)):
                 tradeability = {
                     "loanable": None,
                     "loan_ratio": None,

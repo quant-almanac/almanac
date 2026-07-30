@@ -299,17 +299,19 @@ def test_objective_05_concentration_overweight_reaches_rebalance_reduce_action()
 def test_objective_12_dilution_feature_should_reach_short_hypothesis_observe_only(monkeypatch):
     """#12 増資/希薄化: dilution feature should become an observe-only short hypothesis."""
 
+    # Do not inherit this machine's ignored runtime feature overlay.  This
+    # acceptance case verifies the checked-in fail-closed public default.
+    import disclosure_shadow_book
+    monkeypatch.setattr(
+        disclosure_shadow_book,
+        "load_config",
+        lambda: {"notional_jpy": 100_000, "jp_short_enabled": False},
+    )
+
     monkeypatch.setattr(
         jp_loanability,
         "evaluate_short_tradeability",
-        lambda ticker: {
-            "ticker": ticker,
-            "loanable": False,
-            "loan_ratio": None,
-            "reverse_daily_fee": False,
-            "untradeable": True,
-            "reasons": ["loanable_not_confirmed"],
-        },
+        lambda _ticker: pytest.fail("disabled JP short lane must not query loanability"),
     )
     hypotheses = synthesize_from_disclosure_features(
         [
@@ -336,11 +338,15 @@ def test_objective_12_dilution_feature_should_reach_short_hypothesis_observe_onl
     assert hypothesis.observe_only is True
     assert hypothesis.action_type == "short_sell"
     assert hypothesis.human_execution_only is True
-    assert hypothesis.execution_cost_model["standard_credit"]["round_trip_cost_pct"] > 0
-    assert hypothesis.execution_cost_model["general_credit"]["round_trip_cost_pct"] > 0
+    # Public/product defaults are fail-closed.  The analytical hypothesis still
+    # reaches the observe-only surface, but a user must explicitly enable the
+    # JP short lane before credit-cost details become actionable.
+    assert hypothesis.execution_cost_model["available"] is True
+    assert "standard_credit" not in hypothesis.execution_cost_model
+    assert "general_credit" not in hypothesis.execution_cost_model
     assert hypothesis.tradeability["untradeable"] is True
     assert hypothesis.tradeability["excluded_from_certify"] is True
-    assert "loanable_not_confirmed" in hypothesis.tradeability["reasons"]
+    assert "jp_short_disabled_by_user" in hypothesis.tradeability["reasons"]
 
 
 def test_objective_15_tax_loss_position_reaches_tax_harvest_candidate(tmp_path, monkeypatch):

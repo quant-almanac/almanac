@@ -365,7 +365,7 @@ def _short_execution_metadata(ticker: str, *, horizon_days: int = 10) -> tuple[d
 
     try:
         enabled_key = 'jp_short_enabled' if market == 'JP' else 'us_short_enabled'
-        if not bool(cfg.get(enabled_key, market == 'JP')):
+        if not bool(cfg.get(enabled_key, False)):
             tradeability.update({
                 'untradeable': True,
                 'reasons': [f'{market.lower()}_short_disabled_by_user'],
@@ -961,7 +961,7 @@ def screen_candidates(
         for candidate in candidates:
             market = 'JP' if str(candidate.get('ticker') or '').endswith('.T') else 'US'
             enabled_key = 'jp_short_enabled' if market == 'JP' else 'us_short_enabled'
-            if bool(short_cfg.get(enabled_key, market == 'JP')):
+            if bool(short_cfg.get(enabled_key, False)):
                 continue
             reason = f'{market.lower()}_short_disabled_by_user'
             candidate['shortable'] = False
