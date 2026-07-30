@@ -34,6 +34,23 @@ _README_RUNTIME_MARKERS = {
         "最終確認時刻、鮮度、ジョブのheartbeat",
     ),
 }
+_EXPECTED_SPEC_SECTIONS = [str(number) for number in range(1, 25)]
+_SPEC_REVIEW_MARKERS = {
+    "SYSTEM_SPEC.md": (
+        "The persisted-scaler inference contract is implemented",
+        "## 21. Review artifact map",
+        "## 22. Write authority and order boundary",
+        "## 23. Prose-first review protocol",
+        "## 24. Current limits and documentation maintenance",
+    ),
+    "SYSTEM_SPEC.ja.md": (
+        "per-ticker scalerの永続化inference契約は実装済みです",
+        "## 21. レビュー用artifact map",
+        "## 22. 書込み権威と注文境界",
+        "## 23. 文章から始めるreview手順",
+        "## 24. 現在の限界と文書保守",
+    ),
+}
 
 
 def numbered_sections(path: Path) -> list[str]:
@@ -84,6 +101,19 @@ def check() -> list[str]:
                 f"{label}: numbered H2 sections differ: "
                 f"English={en_sections}, Japanese={ja_sections}"
             )
+
+    spec_sections = numbered_sections(SPEC_EN)
+    if spec_sections != _EXPECTED_SPEC_SECTIONS:
+        failures.append(
+            "system specification: expected numbered H2 sections "
+            f"{_EXPECTED_SPEC_SECTIONS}, found {spec_sections}"
+        )
+
+    for name, markers in _SPEC_REVIEW_MARKERS.items():
+        text = (ROOT / "docs" / name).read_text(encoding="utf-8")
+        for marker in markers:
+            if marker not in text:
+                failures.append(f"docs/{name}: missing reviewer-guide marker: {marker}")
 
     expected = root_modules()
     for path in (CATALOG_EN, CATALOG_JA):

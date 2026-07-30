@@ -618,7 +618,7 @@ MOM = MTUM − SPY   QMJ = QUAL − SPY      LVOL = SPLV − SPY  ほか
 - **フロントエンド** — Next.js 16（App Router）/ React 19 / TypeScript。ポートフォリオ・スクリーニング・リスク・シナリオ・戦略・信用取引・NISA・AI判断支援・執行ログ・成績検証を1つの画面にまとめています。
 - **プライバシー層** — ALMANAC はローカルで動きますが、AI機能の一部は保有銘柄・数量・損益・配分といった情報を外部のAIへ送ります。開示情報の抽出、匿名化した審判役、外部の批判役、一部の分析通信は、`almanac/llm_safety.py` で公開・匿名化データかを検査します。公開情報だけを扱うスクリーナーはベンダーへ直接接続し、粗い呼び出し検査の許可リストに明示しているため、保有情報を渡さないことは個別レビューにも依存します。保有情報を含む経路は、分析本体・チャット・判断支援・ガードレール通知・Anthropic の批判役で、いずれもプライバシー関門により制御しています。
 
-この概要を支えるエンドツーエンドの契約は [システム仕様](docs/SYSTEM_SPEC.ja.md)、ルート直下の全 Python モジュールの責務と運用状態は [モジュール一覧](docs/MODULE_CATALOG.ja.md) に記載しています。`scripts/check_docs_consistency.py` は日英の節構成、README のリンク、モジュール網羅性を同期検査します。
+この概要を支えるエンドツーエンドの契約は [システム仕様](docs/SYSTEM_SPEC.ja.md) に記載しています。仕様書のレビューガイドでは、artifactごとの権威、local writeとbroker注文の境界、文章から始めるreview手順、現在の安全上の限界を明示しており、filename検索だけに頼らず実装reviewを始められます。ルート直下の全 Python モジュールの責務と運用状態は [モジュール一覧](docs/MODULE_CATALOG.ja.md) を参照してください。`scripts/check_docs_consistency.py` は日英の節構成、README のリンク、モジュール網羅性を同期検査します。
 
 ## 設定（Configuration）
 

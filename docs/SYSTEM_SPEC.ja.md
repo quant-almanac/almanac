@@ -157,7 +157,7 @@ optimization結果はtargetであってorderではありません。account elig
 
 GINNはversion bundleが固定promotion policy、model/manifest checksum、data age、feature coverage、validation件数/銘柄数、GARCH比較、inference schemaを通るまで研究用です。manifest/current pointer欠落はdefault-denyし、理由付きGJR-GARCH fallbackを返します。flat legacy modelは監査用に残しますが暗黙loadしません。
 
-現在のtrainingはper-ticker scalerのinference契約が未完成なので昇格不可です。VIX/regime履歴とleakage-free rolling GARCH featureも将来研究です。昇格に使ったheld-outはvalidationであり、昇格後に到着した観測だけがforward evidenceです。
+per-ticker scalerの永続化inference契約は実装済みです。candidateは契約completeとper-ticker scaler artifact/checksumを持ちます。ただしこれは昇格条件の一つです。固定validation/GARCH比較、freshness、coverage、その他manifest gateのどれかに失敗すればcandidateは拒否されます。VIX/regime履歴とleakage-free rolling GARCH featureは将来研究です。昇格に使ったheld-outはvalidationであり、昇格後に到着した観測だけがforward evidenceです。
 
 VaR予測を保存してKupiec proportion-of-failures testを行います。合格しても検証されるのはそのVaR seriesのbreach頻度で、risk stack全体ではありません。
 
@@ -289,3 +289,67 @@ git diff --check
 日次経路の変更ではlive `portfolio_analyst.py --force`、続けて`post_run_verify.py`を実行し、そのanalysis IDの新規logだけを監査します。model ID、tool stop reason、cost、snapshot hash、readiness reason、provenance、GINN fallback/promotion、FX/Kelly shadow、state mutation allowlistを確認します。
 
 公開repoへ入れるのはcode、fixture、example configだけです。broker export、household identity map、本番model bundle/manifest、FX actual/shadow state、tax比較、crontab backup、local path、state hash manifestを入れません。責務境界は完全な[モジュール台帳](MODULE_CATALOG.ja.md)を参照してください。
+
+## 21. レビュー用artifact map
+
+この表はfilename一覧ではなく権威の地図です。reviewでは結論を出す前に、producer契約、consumer、raw record/derived result/overlayの別を確認します。
+
+| Artifact | 権威と用途 | review時の規則 |
+|---|---|---|
+| `ai_portfolio_analysis.json` | 最新の統合分析結果 | 利便表示であって過去の証明ではありません。過去判断は`analysis_id`を固定し、stage logから再構成します。 |
+| `action_stage_log.jsonl` | candidate/action stageのappend-only監査 | `tier_generated`からsynthesis、policy、post-filter、readinessまで追います。candidate数をtradable action数と同一視しません。 |
+| `decision_snapshot_state.json` | frozen base/enriched inputとhash | hashは再現同一性でありfreshnessではありません。input別のsource/as-of/freshnessを別に確認します。 |
+| `action_state.json` | recommendation/intentの可変lifecycle | local recommendation stateでありbroker truthではありません。実行可否の前にinvalidation overlayを読みます。 |
+| `execution_invalidation_state.json` | 旧analysis/actionを無効化する不変overlay | 原文は残し、Today/API/backlog/notification consumerに優先します。 |
+| `action_executions.json`とreconciliation state | 人/ broker evidenceによるexecution記録と訂正overlay | API fill recordはbroker gatewayではありません。freshnessはbroker-confirmation evidence契約を通る場合だけ進みます。 |
+| broker position/cash snapshot | holdings/cash/capacityの外部根拠 | 適切なidentityでscopeします。別銘柄の更新で対象positionをfreshにしません。 |
+| `models/ginn/current.json`とbundle manifest | 昇格可能modelとvalidation契約へのpointer | 有効なcurrent pointerのないlegacy/candidate fileは監査用で、稼働modelではありません。 |
+| `tunable_params.json`と`tunable_params_history.jsonl` | 現在parameterとappend-only履歴 | active value、authorizing mode、historyを合わせて読みます。過去rowは必ずしもactiveではありません。 |
+| currency/FX shadow state | broker-confirmed actual hedgeとは分離したpolicy結果 | shadow proposalは実ヘッジやactual notionalを証明・更新しません。 |
+
+本番stateにはhousehold/broker情報があり公開artifactではありません。公開fixtureはschema例であり、実portfolioの根拠ではありません。
+
+## 22. 書込み権威と注文境界
+
+`POST`、`PUT`、`PATCH`、`DELETE`はlocal state mutationでありbroker注文ではありません。write routeは既定で`X-API-Key`を要求します。`ALLOW_UNAUTH=1`は意図的に危険なlocal-development overrideで、production controlと扱いません。
+
+| 書込み分類 | 変更し得るもの | 意味してはならないもの |
+|---|---|---|
+| analysis/screen/scenario refresh | derived analysis、snapshot、candidate artifact | broker order/fill/cash movement |
+| user-reported execution/fill/reconciliation | local ledger、execution record、条件を満たすfreshness evidence | credentialed broker routing。呼出元が既に得たevidenceを記録するだけです。 |
+| cash/holdings/capacity reconciliation | 必要evidence確認後のlocal accounting/reconciliation state | unknown balanceが0、または別owner/accountも更新されたこと |
+| feature/configuration control | 独立して認可されたlocal switch/parameter | policy bypass、execution approval、遡及的な証明 |
+| correction/rollback | 新しいcorrection、invalidation、read mode | 元監査eventの破壊的書換え |
+
+公開API routeに注文をsubmitする契約やbroker order routingはありません。implementation reviewではbutton表示やHTTP verbで推測せず、endpointとbroker-client境界から確認します。System UIはこれらcontrolのoperator viewであり、第二の権威ではありません。
+
+## 23. 文章から始めるreview手順
+
+sourceを読む前にこの仕様だけでclaimを検証可能にするための手順です。
+
+1. claimを明確化します。model選択、candidate、readiness、数量、tax、FX、UI表示、mutationのどれかを区別します。
+2. `analysis_id`を固定します。過去判断をlatest outputだけで説明しません。
+3. input authorityとidentity scopeを特定します。positionはowner/broker/account/instrument、cashはcurrency、NISAはtax year/typeまで見ます。
+4. freshnessとimmutabilityを分けます。frozen snapshotでもstale inputを正確に保存できます。無関係なholding更新は対象をfreshにしません。
+5. stage logでcandidate funnelを追います。screen済み銘柄を全てactionと呼びません。
+6. model/evidence lineageを確認します。derived claimにはinput claim IDとcalculation versionが必要で、同一tier出力由来viewは独立根拠ではありません。
+7. synthesis後の決定論的policy/readinessを確認します。後段は`blocked`を`ready`へ改善できません。
+8. 表示数量を実行可能と扱う前にsizingとopen-intentの冪等性を確認します。
+9. write境界と全consumer（Today/API/backlog/notification/state）を確認します。local recordをbroker executionと説明しません。
+10. 発見をcontract testにし、20節のrelease/public-safety checkを実行します。
+
+重要な不変条件は、unknownは0ではない、candidateはactionではない、snapshot hashはfreshnessではない、invalidationは履歴を消さずoverlayする、shadow/advisory outputはactual holdingを更新せず注文しない、です。
+
+## 24. 現在の限界と文書保守
+
+次は将来機能の主張ではなく、現在の契約を明示したものです。
+
+| 領域 | 現在の契約 | 拡張した主張/有効化の前提 |
+|---|---|---|
+| GINN | GJR-GARCHが稼働します。GINNは永続scaler/inference契約を持ちますが、固定validation・比較・manifest gateを通るまでdefault-denyです。forward観測は別管理です。 | historical VIX/regime、leakage-safe rolling GARCH input、baselineに対する安定validation、昇格後の十分なforward evidence。 |
+| Half-Kelly | recommendation performanceに基づくshadow/counterfactual outputで、trade performanceの証明でも注文でもありません。 | 固定evaluation population/horizon、十分な観測、shadow recordの人確認。 |
+| FX | classification、target、actual hedge evidenceを分離し、modeはoff/shadow/advisoryで自動注文しません。 | complete economic-exposure分類、broker-confirmed actual notional、vehicle別の運用/tax control。 |
+| Tax | API schema v2はeconomic/taxable/NISA P&Lを分離し、broker税務値が権威です。 | 完全な照合期間とconsumer確認後にlegacy read pathを廃止。 |
+| Execution plan | readiness/invalidationが権威で、UI recommendationはbroker instructionではありません。 | 必須position/cash/NISA evidence、決定論的sizing、人確認。 |
+
+source契約を変えるときは、この英語仕様、対応する日本語仕様、README要約、UI文言、documentation contract testを同じ変更で更新します。時間で変わる運用stateは永続README断言でなくSystem UI/APIまたはreview済みartifactに置きます。これにより文章だけのreviewでも設計不明点と実装/文書の不一致を発見できます。

@@ -78,6 +78,8 @@ const FRESHNESS_LABEL: Record<string, string> = {
   not_applicable: '時刻対象外',
 }
 
+const REVIEW_SPEC_URL = 'https://github.com/quant-almanac/almanac/blob/main/docs/SYSTEM_SPEC.ja.md'
+
 export default function FeatureControls() {
   const { data, error, isLoading, mutate } = useSWR<FeatureResponse>(
     '/api/features',
@@ -128,6 +130,9 @@ export default function FeatureControls() {
       設定ONと実効ONを分けて表示します。入力不足や期限切れでは設定がONでも安全側に停止します。
       「影実行」は計算と記録だけ、「将来更新」は理論を残しつつ現実装を判断から外した状態です。
       空売りを含め、この画面から自動注文は有効になりません。
+      {' '}<a href={REVIEW_SPEC_URL} target="_blank" rel="noreferrer" style={{ color: OPS.blue }}>
+        レビュー用の詳細仕様・確認手順
+      </a>
     </p>
     {message && <div role="status" style={{ color: message.includes('失敗') || message.startsWith('Error') ? OPS.redSoft : OPS.green, fontSize: 12, marginBottom: 10 }}>{message}</div>}
     {error && <div role="alert" style={{ color: OPS.redSoft, fontSize: 12 }}>/api/features を取得できません。</div>}

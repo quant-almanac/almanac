@@ -157,7 +157,13 @@ GJR-GARCH is the operating volatility model. GINN is a two-layer LSTM (hidden 64
 
 GINN is research-only unless a versioned bundle passes the frozen promotion policy, model/manifest checksums, data age, feature coverage, validation sample/ticker counts, GARCH comparison and inference schema. A missing manifest or current pointer is default-deny and returns a structured GJR-GARCH fallback with reason. The flat legacy model is retained for audit but cannot be silently loaded.
 
-Current training still has an incomplete inference contract for per-ticker scalers, so candidates are not promotable. VIX/regime history and leakage-free rolling GARCH features remain future research. Held-out data used for promotion is called validation; only observations arriving after promotion count as forward evidence.
+The persisted-scaler inference contract is implemented: a candidate declares the
+contract complete and carries a per-ticker scaler artifact with its checksum.
+That is only one promotion condition. A candidate is still rejected when it
+fails the frozen validation/GARCH comparison, freshness, coverage or other
+manifest gates. VIX/regime history and leakage-free rolling GARCH features
+remain future research. Held-out data used for promotion is called validation;
+only observations arriving after promotion count as forward evidence.
 
 The VaR path records forecasts and applies a Kupiec proportion-of-failures test. Passing that test validates breach frequency for that VaR series, not the whole risk stack.
 
@@ -289,3 +295,102 @@ git diff --check
 For changes to the daily path, additionally run a live `portfolio_analyst.py --force`, then `post_run_verify.py`, and inspect only log rows created by that analysis ID. Verify model IDs, tool stop reasons, cost accounting, snapshot hashes, readiness reasons, provenance, GINN fallback/promotion, FX/Kelly shadow output and state mutation allowlists.
 
 The public repository contains code, fixtures and example configuration only. Never copy broker exports, household identity maps, production model bundles/manifests, FX actual/shadow state, tax comparisons, crontab backups, local paths or state-hash manifests into it. See the exhaustive [module catalog](MODULE_CATALOG.md) for ownership boundaries.
+
+## 21. Review artifact map
+
+The following map is deliberately about authority, not merely filenames. A
+review must identify the producing contract, the consumers and whether an
+artifact is a raw record, a derived result or an overlay before drawing a
+conclusion from it.
+
+| Artifact | Authority and intended use | Review rule |
+|---|---|---|
+| `ai_portfolio_analysis.json` | Latest composite analysis result | It is a convenience view, not historical proof. Pin its `analysis_id` and reconstruct the run from the stage log before explaining a past decision. |
+| `action_stage_log.jsonl` | Append-only candidate/action-stage audit | Trace `tier_generated` through synthesis, policy, post-filter and readiness. Do not equate a candidate count with a tradable action count. |
+| `decision_snapshot_state.json` | Frozen base/enriched analysis inputs and hashes | A hash proves replay identity, not that the inputs were fresh. Inspect per-input source/as-of/freshness fields separately. |
+| `action_state.json` | Mutable lifecycle of a recommendation or intent | This is a local recommendation state, not broker truth. Read the invalidation overlay before treating a row as executable. |
+| `execution_invalidation_state.json` | Immutable overlay that invalidates old analyses/actions | It preserves the source record and takes precedence for Today, API, backlog and notification consumers. |
+| `action_executions.json` and reconciliation state | Human/broker-evidence execution records and corrective overlays | An API fill record is not a broker gateway. Freshness advances only under the broker-confirmation evidence contract. |
+| Broker position/cash snapshots | External evidence used for holdings, cash and capacity | Scope evidence by the appropriate identity; one security's update cannot refresh another position. |
+| `models/ginn/current.json` and a bundle manifest | Pointer to a promotable model and its validation contract | A legacy/candidate file without a valid current pointer is audit material, not an operating model. |
+| `tunable_params.json` and `tunable_params_history.jsonl` | Current parameters and their append-only history | Review the active value, authorizing mode and history together; a historical row is not necessarily active. |
+| Currency/FX shadow state | Derived policy state, separated from broker-confirmed actual hedge state | Shadow proposals never prove an executed hedge or advance actual notional. |
+
+Production state contains household and broker information and is never a
+public-release artifact. Public fixtures demonstrate schemas only; they are not
+evidence about a live household portfolio.
+
+## 22. Write authority and order boundary
+
+`POST`, `PUT`, `PATCH` or `DELETE` means a local state mutation, not an order
+to a broker. Write routes require `X-API-Key` by default; `ALLOW_UNAUTH=1` is a
+deliberately unsafe local-development override and must not be treated as a
+production control.
+
+| Write class | May change | Must not imply |
+|---|---|---|
+| Analysis, screen and scenario refresh | Derived analyses, snapshots and candidate artifacts | A broker order, fill or cash movement |
+| User-reported execution/fill and reconciliation | Local ledger, execution record and eligible freshness evidence | Credentialed broker routing; the caller records evidence already obtained elsewhere |
+| Cash, holdings and capacity reconciliation | Local accounting/reconciliation state after the required evidence checks | That an unknown balance is zero or that another account/owner is refreshed |
+| Feature/configuration control | Its own independently authorized local switch or parameter | A policy bypass, execution approval or retroactive proof |
+| Correction/rollback | A new correction, invalidation or read-mode selection | Destructive rewriting of the original audit event |
+
+No public API route submits an order or holds a broker-order-routing contract.
+An implementation review should prove this from the endpoint and broker-client
+boundaries rather than inferring it from a button label or from the HTTP verb.
+The System UI is an operator view of these controls; it is not a separate
+authority.
+
+## 23. Prose-first review protocol
+
+This sequence is intended for a reviewer who starts with this document rather
+than source code. It makes an implementation claim testable before proposing a
+change.
+
+1. State the claim precisely: model selection, candidate generation, readiness,
+   quantity, tax, FX, UI display or mutation.
+2. Pin an `analysis_id`; never use the latest-output file alone to explain a
+   historical decision.
+3. Identify the input authority and identity scope. Check owner/broker/account/
+   instrument for a position, currency for cash and tax year/type for NISA.
+4. Separate freshness from immutability. A frozen snapshot can faithfully
+   preserve stale input; a newer unrelated holding cannot refresh the target.
+5. Trace the candidate funnel in the stage log. Report each transition instead
+   of calling all screened names “actions.”
+6. Check model/evidence lineage. Derived claims require their input claim IDs
+   and calculation version; a view derived from the same tier output is not an
+   independent corroboration.
+7. Check deterministic policy/readiness after synthesis. A downstream step may
+   only preserve or worsen readiness, never upgrade `blocked` to `ready`.
+8. Check sizing and open-intent idempotency before interpreting a displayed
+   quantity as executable.
+9. Check the write boundary and all downstream consumers (Today, API, backlog,
+   notifications and state). A local record must not be described as a broker
+   execution.
+10. Turn the finding into a contract test, then run the release and public-safety
+    checks in section 20.
+
+Useful invariants are: unknown is not zero; a candidate is not an action; a
+snapshot hash is not freshness; an invalidation overlays rather than erases
+history; and shadow/advisory output does not mutate actual holdings or submit
+orders.
+
+## 24. Current limits and documentation maintenance
+
+The following limitations are deliberate current-state disclosures, not claims
+of future capability.
+
+| Area | Current contract | Condition before a broader claim or activation |
+|---|---|---|
+| GINN | GJR-GARCH operates. GINN has a persisted scaler/inference contract but remains default-deny unless the frozen validation, comparative and manifest gates pass; forward observations are tracked separately. | Historical VIX/regime and leakage-safe rolling GARCH inputs, stable validation against the baseline and sufficient post-promotion forward evidence. |
+| Half-Kelly | Recommendation-performance sizing is shadow/counterfactual output, not trade-performance proof or an order. | A fixed evaluation population/horizon, sufficient observations and human review of the shadow record. |
+| FX | Classification, target and actual hedge evidence are separated; modes are off/shadow/advisory and do not auto-submit. | Complete economic-exposure classification, broker-confirmed actual notionals and vehicle-specific operational/tax controls. |
+| Tax | API schema v2 separates economic, taxable and NISA P&L. Broker-provided tax values remain authoritative. | A full reconciliation period and consumer confirmation before retiring legacy read paths. |
+| Execution plans | Readiness and invalidation are authoritative; a UI recommendation is not a broker instruction. | Required position/cash/NISA evidence, deterministic sizing and human confirmation. |
+
+When a source contract changes, update this English specification, the matching
+Japanese specification, README summaries, UI wording and the documentation
+contract test in the same change. Keep time-varying operational state in the
+System UI/API or reviewed artifacts, not as a timeless README assertion. This
+is intentionally what lets a prose-only review discover both an unclear design
+and an implementation/documentation mismatch.

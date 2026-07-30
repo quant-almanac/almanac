@@ -136,6 +136,11 @@ describe('FeatureControls', () => {
   it('shows effective state, disabled reason, and read-only authority', async () => {
     renderPanel()
 
+    expect(await screen.findByRole('link', { name: 'レビュー用の詳細仕様・確認手順' })).toHaveAttribute(
+      'href',
+      'https://github.com/quant-almanac/almanac/blob/main/docs/SYSTEM_SPEC.ja.md',
+    )
+
     const us = await screen.findByTestId('feature-us_short')
     expect(within(us).getAllByText('OFF')).toHaveLength(2)
     expect(within(us).getByText('ユーザー設定でOFFです')).toBeInTheDocument()
