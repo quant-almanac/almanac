@@ -166,6 +166,7 @@ def derive_cash_info(
     del now, stale_hours
     warnings: list[str] = []
     resources: list[dict[str, Any]] = []
+    wallet_totals: dict[str, dict[str, Any]] = {}
     account = account if isinstance(account, dict) else {}
 
     def _number(value: Any) -> float | None:
@@ -194,17 +195,58 @@ def derive_cash_info(
 
     account_jpy = jpy_balance if account_confirmed else 0.0
     account_usd = usd_balance if account_confirmed and fx_rate and fx_rate > 0 else 0.0
+    def _append_resource(resource: dict[str, Any]) -> None:
+        owner = str(resource.get("owner") or "")
+        broker = str(resource.get("broker") or "")
+        settlement_pool = str(resource.get("settlement_pool") or "")
+        currency = str(resource.get("currency") or "").upper()
+        if not owner or not broker or not settlement_pool or not currency:
+            warnings.append(
+                f"cash_resource_wallet_identity_missing:{resource.get('resource') or '?'}"
+            )
+            return
+        wallet_key = f"{owner}|{broker}|{settlement_pool}|{currency}"
+        normalized = {
+            **resource,
+            "owner": owner,
+            "broker": broker,
+            "settlement_pool": settlement_pool,
+            "currency": currency,
+            "wallet_key": wallet_key,
+        }
+        resources.append(normalized)
+        wallet = wallet_totals.setdefault(wallet_key, {
+            "wallet_key": wallet_key,
+            "owner": owner,
+            "broker": broker,
+            "settlement_pool": settlement_pool,
+            "currency": currency,
+            "available_native": 0.0,
+            "available_jpy": 0,
+            "resources": [],
+        })
+        wallet["available_native"] += float(normalized.get("available_native") or 0)
+        wallet["available_jpy"] += _jpy(normalized.get("available_jpy"))
+        wallet["resources"].append(str(normalized.get("resource") or ""))
+
     if account_confirmed and jpy_balance:
-        resources.append({
+        _append_resource({
             "resource": "account.json:JPY",
+            "owner": "husband",
+            "broker": "rakuten",
+            "settlement_pool": "broker_cash",
             "currency": "JPY",
+            "available_native": account_jpy,
             "available_jpy": round(account_jpy),
             "source_as_of": account_as_of,
         })
     if account_confirmed and usd_balance:
         if fx_rate and fx_rate > 0:
-            resources.append({
+            _append_resource({
                 "resource": "account.json:USD",
+                "owner": "husband",
+                "broker": "rakuten",
+                "settlement_pool": "broker_cash",
                 "currency": "USD",
                 "available_native": usd_balance,
                 "available_jpy": round(account_usd * fx_rate),
@@ -244,6 +286,22 @@ def derive_cash_info(
             warnings.append(f"cash_resource_authority_missing:{ticker}")
             continue
         currency = "USD" if "_USD" in ticker else "JPY"
+        try:
+            from execution_safety import canonical_broker, canonical_owner
+            owner = canonical_owner(row.get("owner"))
+            broker = canonical_broker(row.get("broker"))
+        except Exception:
+            owner = broker = ""
+        # These synthetic cash rows are stable internal routes, not market
+        # instruments.  Older snapshots may predate explicit owner/broker
+        # fields, so recover only identities encoded by the exact route key.
+        if ticker == "CASH_JPY_SBI_WIFE":
+            owner, broker = "wife", "sbi"
+        elif ticker == "CASH_JPY_SBI":
+            owner, broker = "husband", "sbi"
+        if not owner or not broker:
+            warnings.append(f"cash_resource_wallet_identity_missing:{ticker}")
+            continue
         if currency == "JPY":
             native = _number(row.get("available_to_trade_jpy"))
             if native is None:
@@ -258,8 +316,11 @@ def derive_cash_info(
             warnings.append(f"cash_resource_amount_unresolved:{ticker}")
             continue
         additional_cash_jpy += available_jpy
-        resources.append({
+        _append_resource({
             "resource": ticker,
+            "owner": owner,
+            "broker": broker,
+            "settlement_pool": "broker_cash",
             "currency": currency,
             "available_native": native,
             "available_jpy": round(available_jpy),
@@ -285,6 +346,8 @@ def derive_cash_info(
         "validation_mode": "event_based",
         "assumption": "no_unreported_external_activity",
         "resources": resources,
+        "wallet_contract_version": 1,
+        "wallets": sorted(wallet_totals.values(), key=lambda row: row["wallet_key"]),
     }, warnings
 
 
@@ -1868,6 +1931,29 @@ def allocate_candidate_batch_against_plan(
     shared_normal_remaining = _jpy(shared_normal_raw)
     monthly_raw = summary.get("monthly_remaining_jpy")
     monthly_remaining: int | None = _jpy(monthly_raw) if monthly_raw is not None else None
+    cash_info = plan_state.get("cash_info") or {}
+    wallet_contract_active = cash_info.get("wallet_contract_version") == 1
+    wallet_remaining = {
+        str(row.get("wallet_key")): _jpy(row.get("available_jpy"))
+        for row in cash_info.get("wallets") or []
+        if isinstance(row, dict) and row.get("wallet_key")
+    }
+
+    def _wallet_key(action: dict[str, Any]) -> str | None:
+        try:
+            from execution_safety import canonical_broker, canonical_owner
+            owner = canonical_owner(action.get("execution_owner") or action.get("owner"))
+            broker = canonical_broker(action.get("execution_broker") or action.get("broker"))
+        except Exception:
+            owner = broker = ""
+        ticker = str(action.get("ticker") or "").upper()
+        currency = str(
+            action.get("currency") or ("JPY" if ticker.endswith(".T") else "USD")
+        ).upper()
+        settlement_pool = str(action.get("settlement_pool") or "broker_cash")
+        if not owner or not broker or currency not in {"JPY", "USD", "EUR"}:
+            return None
+        return f"{owner}|{broker}|{settlement_pool}|{currency}"
 
     def _number(value: Any) -> float:
         try:
@@ -1917,6 +2003,32 @@ def allocate_candidate_batch_against_plan(
                 "reason": "plan batch allocation requires a positive estimated notional",
             }
             continue
+        wallet_key = _wallet_key(action) if wallet_contract_active else None
+        if wallet_contract_active and (
+            wallet_key is None or wallet_key not in wallet_remaining
+        ):
+            results[index] = {
+                "applicable": True,
+                "executable": False,
+                "execution_plan_decision": "cash_wallet_unresolved",
+                "cash_wallet_key": wallet_key,
+                "reason": (
+                    "owner, broker, settlement pool and currency do not resolve "
+                    "to confirmed buying power"
+                ),
+            }
+            continue
+        wallet_before = wallet_remaining.get(wallet_key, 0) if wallet_key else None
+        if wallet_before is not None and estimated > wallet_before:
+            results[index] = {
+                "applicable": True,
+                "executable": False,
+                "execution_plan_decision": "cash_wallet_over_budget",
+                "cash_wallet_key": wallet_key,
+                "cash_wallet_remaining_jpy": wallet_before,
+                "reason": "candidate exceeds confirmed buying power in its routed wallet",
+            }
+            continue
 
         pool_before: int
         pool_after: int
@@ -1956,6 +2068,10 @@ def allocate_candidate_batch_against_plan(
             opportunity_remaining = pool_after
         if monthly_remaining is not None and not shared_normal_active:
             monthly_remaining -= estimated
+        wallet_after = None
+        if wallet_key is not None and wallet_before is not None:
+            wallet_after = wallet_before - estimated
+            wallet_remaining[wallet_key] = wallet_after
         results[index] = {
             "applicable": True,
             "executable": True,
@@ -1969,6 +2085,9 @@ def allocate_candidate_batch_against_plan(
                 monthly_remaining + estimated if monthly_remaining is not None and not shared_normal_active else None
             ),
             "monthly_remaining_after_jpy": monthly_remaining if not shared_normal_active else None,
+            "cash_wallet_key": wallet_key,
+            "cash_wallet_remaining_before_jpy": wallet_before,
+            "cash_wallet_remaining_after_jpy": wallet_after,
         }
     return results
 
@@ -2131,6 +2250,16 @@ def build_execution_plan(
     # an unbounded-budget gap.
     consumption_summary["unattributed_buy_budget_treatment"] = (
         "charged_to_monthly_base_budget"
+    )
+    consumption_summary["unattributed_sell_budget_treatment"] = (
+        "removed_from_deployment_basis"
+        if _jpy(consumption_summary.get("unattributed_monthly_sell_total_count")) > 0
+        else "not_applicable"
+    )
+    consumption_summary["unattributed_unpriced_budget_treatment"] = (
+        "excluded_fail_closed"
+        if _jpy(consumption_summary.get("unattributed_monthly_unpriced_count")) > 0
+        else "not_applicable"
     )
     consumption_summary["monthly_remaining_jpy"] = monthly_remaining
     # The shared pools are authoritative.  Item-level consumption remains an

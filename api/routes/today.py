@@ -732,6 +732,9 @@ def _build_execution_plan_view(plan: dict, board: list[dict], synthesis: dict, n
                 "normal_filled_matched_notional_jpy": None,
                 "opportunity_matched_notional_jpy": None,
                 "monthly_attribution_incomplete": False,
+                "buy_attribution_incomplete": False,
+                "sell_attribution_incomplete": False,
+                "unpriced_attribution_incomplete": False,
                 "unattributed_monthly_buy_total_notional_jpy": None,
                 "unattributed_monthly_sell_total_notional_jpy": None,
                 "unattributed_monthly_unpriced_count": 0,
@@ -882,14 +885,39 @@ def _build_execution_plan_view(plan: dict, board: list[dict], synthesis: dict, n
     unattributed_budget_treatment = str(
         consumption.get("unattributed_buy_budget_treatment") or ""
     )
-    monthly_attribution_incomplete = (
-        unattributed_budget_treatment != "charged_to_monthly_base_budget"
-        and _float_value(
-        consumption.get(
+    unattributed_buy_count = _float_value(
+        consumption.get("unattributed_monthly_buy_total_count")
+    )
+    unattributed_sell_count = _float_value(
+        consumption.get("unattributed_monthly_sell_total_count")
+    )
+    unattributed_unpriced_count = _float_value(
+        consumption.get("unattributed_monthly_unpriced_count")
+    )
+    typed_attribution_fields_present = any(
+        key in consumption
+        for key in (
             "unattributed_monthly_buy_total_count",
-            consumption.get("unattributed_monthly_total_count"),
+            "unattributed_monthly_sell_total_count",
+            "unattributed_monthly_unpriced_count",
         )
-        ) > 0
+    )
+    buy_attribution_incomplete = (
+        unattributed_budget_treatment != "charged_to_monthly_base_budget"
+        and (
+            unattributed_buy_count > 0
+            or (
+                not typed_attribution_fields_present
+                and _float_value(consumption.get("unattributed_monthly_total_count")) > 0
+            )
+        )
+    )
+    sell_attribution_incomplete = unattributed_sell_count > 0
+    unpriced_attribution_incomplete = unattributed_unpriced_count > 0
+    monthly_attribution_incomplete = (
+        buy_attribution_incomplete
+        or sell_attribution_incomplete
+        or unpriced_attribution_incomplete
     )
 
     if board:
@@ -998,6 +1026,8 @@ def _build_execution_plan_view(plan: dict, board: list[dict], synthesis: dict, n
             "monthly_consumed_jpy": consumption.get("monthly_consumed_jpy"),
             "monthly_remaining_jpy": consumption.get("monthly_remaining_jpy"),
             "unattributed_buy_budget_treatment": unattributed_budget_treatment,
+            "unattributed_sell_budget_treatment": consumption.get("unattributed_sell_budget_treatment"),
+            "unattributed_unpriced_budget_treatment": consumption.get("unattributed_unpriced_budget_treatment"),
             "unattributed_monthly_open_order_count": consumption.get("unattributed_monthly_open_order_count"),
             "unattributed_monthly_open_order_notional_jpy": consumption.get("unattributed_monthly_open_order_notional_jpy"),
             "unattributed_monthly_filled_count": consumption.get("unattributed_monthly_filled_count"),
@@ -1018,6 +1048,9 @@ def _build_execution_plan_view(plan: dict, board: list[dict], synthesis: dict, n
             "normal_filled_matched_notional_jpy": normal_filled_notional,
             "opportunity_matched_notional_jpy": opportunity_matched_notional,
             "monthly_attribution_incomplete": monthly_attribution_incomplete,
+            "buy_attribution_incomplete": buy_attribution_incomplete,
+            "sell_attribution_incomplete": sell_attribution_incomplete,
+            "unpriced_attribution_incomplete": unpriced_attribution_incomplete,
         },
         "summary": {
             "items_total": len([i for i in raw_items if isinstance(i, dict)]),

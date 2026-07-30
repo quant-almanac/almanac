@@ -708,6 +708,101 @@ def test_batch_allocation_applies_monthly_pool_to_playbook_actions() -> None:
     assert allocated[1]["opportunity_remaining_after_jpy"] == 30_000
 
 
+def test_batch_allocation_never_uses_another_wallets_cash() -> None:
+    item = _plan_item(budget=500_000, ticker="1489.T")
+    actions = [{
+        "ticker": "1489.T",
+        "type": "buy",
+        "rank": 1,
+        "confidence_pct": 90,
+        "estimated_notional_jpy": 70_000,
+        "execution_plan_decision": "plan_new_order",
+        "plan_item_id": item["plan_item_id"],
+        "execution_owner": "wife",
+        "execution_broker": "sbi",
+        "execution_account": "NISA成長投資枠",
+        "currency": "JPY",
+    }]
+    plan = {
+        "items": [item],
+        "budgets": {"normal_pool_available_jpy": 500_000},
+        "consumption_summary": {"monthly_remaining_jpy": 500_000},
+        "cash_info": {
+            "wallet_contract_version": 1,
+            "wallets": [
+                {
+                    "wallet_key": "husband|rakuten|broker_cash|JPY",
+                    "available_jpy": 1_000_000,
+                },
+                {
+                    "wallet_key": "wife|sbi|broker_cash|JPY",
+                    "available_jpy": 50_000,
+                },
+            ],
+        },
+    }
+
+    allocated = epe.allocate_candidate_batch_against_plan(actions, plan)
+
+    assert allocated[0]["executable"] is False
+    assert allocated[0]["execution_plan_decision"] == "cash_wallet_over_budget"
+    assert allocated[0]["cash_wallet_remaining_jpy"] == 50_000
+
+
+def test_batch_allocation_reserves_each_wallet_independently() -> None:
+    item = _plan_item(budget=500_000, ticker="1489.T")
+    actions = [
+        {
+            "ticker": "1489.T",
+            "type": "buy",
+            "rank": 1,
+            "confidence_pct": 90,
+            "estimated_notional_jpy": 70_000,
+            "execution_plan_decision": "plan_new_order",
+            "plan_item_id": item["plan_item_id"],
+            "execution_owner": "wife",
+            "execution_broker": "sbi",
+            "currency": "JPY",
+        },
+        {
+            "ticker": "7203.T",
+            "type": "buy",
+            "rank": 2,
+            "confidence_pct": 80,
+            "estimated_notional_jpy": 70_000,
+            "execution_plan_decision": "plan_new_order",
+            "plan_item_id": item["plan_item_id"],
+            "execution_owner": "husband",
+            "execution_broker": "rakuten",
+            "currency": "JPY",
+        },
+    ]
+    plan = {
+        "items": [item],
+        "budgets": {"normal_pool_available_jpy": 500_000},
+        "consumption_summary": {"monthly_remaining_jpy": 500_000},
+        "cash_info": {
+            "wallet_contract_version": 1,
+            "wallets": [
+                {
+                    "wallet_key": "husband|rakuten|broker_cash|JPY",
+                    "available_jpy": 100_000,
+                },
+                {
+                    "wallet_key": "wife|sbi|broker_cash|JPY",
+                    "available_jpy": 100_000,
+                },
+            ],
+        },
+    }
+
+    allocated = epe.allocate_candidate_batch_against_plan(actions, plan)
+
+    assert [row["executable"] for row in allocated] == [True, True]
+    assert allocated[0]["cash_wallet_remaining_after_jpy"] == 30_000
+    assert allocated[1]["cash_wallet_remaining_after_jpy"] == 30_000
+
+
 def test_account_hint_without_exact_key_is_advisory_and_does_not_consume() -> None:
     item = {
         **_plan_item(budget=100_000, ticker="DUMMY"),

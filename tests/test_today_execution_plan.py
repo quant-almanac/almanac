@@ -459,6 +459,9 @@ def test_build_execution_plan_view_explains_open_order_consumption():
     assert view["consumption"]["normal_filled_matched_notional_jpy"] == 0
     assert view["consumption"]["opportunity_matched_notional_jpy"] == 0
     assert view["consumption"]["monthly_attribution_incomplete"] is False
+    assert view["consumption"]["buy_attribution_incomplete"] is False
+    assert view["consumption"]["sell_attribution_incomplete"] is False
+    assert view["consumption"]["unpriced_attribution_incomplete"] is False
     assert view["filtered_summary"] == {"plan_consumed_by_open_order": 1}
     assert view["filtered_examples"] == [{
         "ticker": "META",
@@ -587,6 +590,9 @@ def test_build_execution_plan_view_reports_missing_state():
         "normal_filled_matched_notional_jpy": None,
         "opportunity_matched_notional_jpy": None,
         "monthly_attribution_incomplete": False,
+        "buy_attribution_incomplete": False,
+        "sell_attribution_incomplete": False,
+        "unpriced_attribution_incomplete": False,
         "unattributed_monthly_buy_total_notional_jpy": None,
         "unattributed_monthly_sell_total_notional_jpy": None,
         "unattributed_monthly_unpriced_count": 0,
@@ -663,6 +669,33 @@ def test_build_execution_plan_view_handles_missing_weekly_budget_and_unattribute
     consumption = view["consumption"]
     assert consumption["normal_plan_budget_consumed_jpy"] == 500
     assert consumption["normal_plan_budget_consumed_pct"] is None
+    assert consumption["monthly_attribution_incomplete"] is True
+    assert consumption["buy_attribution_incomplete"] is True
+
+
+def test_execution_plan_view_splits_sell_and_unpriced_attribution_gaps() -> None:
+    plan = {
+        "status": "active",
+        "consumption_summary": {
+            "unattributed_buy_budget_treatment": "charged_to_monthly_base_budget",
+            "unattributed_monthly_buy_total_count": 1,
+            "unattributed_monthly_sell_total_count": 2,
+            "unattributed_monthly_unpriced_count": 1,
+        },
+        "items": [],
+    }
+
+    view = today._build_execution_plan_view(
+        plan,
+        board=[],
+        synthesis={},
+        now=datetime(2026, 7, 10, 7, 0, 0),
+    )
+
+    consumption = view["consumption"]
+    assert consumption["buy_attribution_incomplete"] is False
+    assert consumption["sell_attribution_incomplete"] is True
+    assert consumption["unpriced_attribution_incomplete"] is True
     assert consumption["monthly_attribution_incomplete"] is True
 
 
