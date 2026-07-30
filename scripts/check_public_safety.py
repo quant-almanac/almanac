@@ -17,6 +17,7 @@ PRIVATE_BASENAMES = {
     "credit_card_plans.json",
     "action_executions.json",
     "ai_portfolio_analysis.json",
+    "macro_event_state.json",
 }
 FORBIDDEN_TEXT = {
     "former employer name": "ク" + "ボタ",

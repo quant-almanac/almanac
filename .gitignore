@@ -97,6 +97,7 @@ fx_actual_hedge_state.json
 fx_instrument_master.json
 broker_position_snapshot_*.json
 macro_state.json
+macro_event_state.json
 currency_policy_state.json
 market_*.json
 backtest*_results.json
