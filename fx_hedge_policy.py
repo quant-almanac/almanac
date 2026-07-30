@@ -66,6 +66,7 @@ def _actual_notional_contract(
     state: dict,
     *,
     now: datetime,
+    base_dir: Path,
 ) -> tuple[Optional[float], list[str], Optional[str]]:
     issues = []
     for key in (
@@ -93,8 +94,47 @@ def _actual_notional_contract(
         if state.get("source_as_of") not in (None, ""):
             issues.append("actual_hedge_source_as_of_invalid")
     # Broker-confirmed hedge inventory is event-based.  Elapsed time alone
-    # cannot change notional; a later overlay execution must invalidate or
-    # replace this state through the reconciliation path.
+    # cannot change notional, but a later overlay fill makes this observation
+    # stale until a new complete broker snapshot replaces it.
+    if source_as_of is not None:
+        try:
+            from execution_reconciliation import (
+                execution_temporal_order,
+                load_effective_execution_records,
+            )
+            from execution_safety import canonical_broker, is_fill_record
+            from fx_actual_hedge_state import OVERLAY_VEHICLE_TYPES
+
+            broker_as_of = {
+                canonical_broker(row.get("broker")): row.get("source_as_of")
+                for row in state.get("broker_evidence") or []
+                if isinstance(row, dict) and canonical_broker(row.get("broker"))
+            }
+            for row in load_effective_execution_records(base_dir=base_dir):
+                if not isinstance(row, dict) or not is_fill_record(row):
+                    continue
+                vehicle = str(
+                    row.get("vehicle_type") or row.get("instrument_type") or ""
+                ).lower()
+                is_overlay = (
+                    vehicle in OVERLAY_VEHICLE_TYPES
+                    or row.get("fx_hedge_overlay") is True
+                    or str(row.get("source") or "").startswith("fx_hedge")
+                )
+                if not is_overlay:
+                    continue
+                broker = canonical_broker(
+                    row.get("execution_broker") or row.get("broker")
+                )
+                authority_time = broker_as_of.get(broker) or state.get("source_as_of")
+                temporal = execution_temporal_order(row, authority_time)
+                if temporal.get("temporal_order") != "before_snapshot":
+                    issues.append(
+                        "actual_hedge_state_invalidated_by_execution:"
+                        + str(row.get("id") or row.get("external_execution_id") or "unknown")
+                    )
+        except Exception:
+            issues.append("actual_hedge_execution_ledger_unreadable")
     return amount, sorted(set(issues)), (
         _as_jst(source_as_of).isoformat() if source_as_of is not None else None
     )
@@ -111,6 +151,7 @@ def evaluate_portfolio_hedge_shadow(
     now: Optional[datetime] = None,
     decision_snapshot_hash: Optional[str] = None,
     usdjpy_iv_1m: float = 0.10,
+    base_dir: Optional[Path] = None,
 ) -> dict:
     """Evaluate and, only when fully evidenced, persist the shadow target."""
     if mode not in VALID_HEDGE_MODES:
@@ -154,6 +195,7 @@ def evaluate_portfolio_hedge_shadow(
     observed_actual, actual_issues, actual_as_of = _actual_notional_contract(
         actual_state if actual_state is not None else _load_actual_state(),
         now=now,
+        base_dir=Path(base_dir) if base_dir is not None else BASE_DIR,
     )
     issues.extend(actual_issues)
     result = {

@@ -9886,6 +9886,7 @@ def run_analysis(force: bool = False) -> dict:
             usdjpy_iv_1m=float(_fx_market.get("usdjpy_iv_1m") or 0.10),
             mode=str(os.environ.get("ALMANAC_FX_HEDGE_MODE", "shadow")).lower(),
             decision_snapshot_hash=_decision_snapshot_hash,
+            base_dir=BASE_DIR,
         )
     except Exception as _fx_shadow_error:
         _fx_hedge_shadow_observation = {
