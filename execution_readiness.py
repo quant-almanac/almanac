@@ -65,10 +65,10 @@ def portfolio_snapshot_health(base_dir: Path, *, now: datetime) -> dict:
     if not ledgers_present:
         status = "unknown"
     elif not snapshot_paths:
-        # Backward-compatible local/public deployments may still keep the
-        # verified baseline only in account.json + holdings.json.  Treat that
-        # baseline as event-based rather than reintroducing a time TTL.
-        status = "fresh"
+        # Local ledgers alone cannot prove that the broker inventory is
+        # complete.  Preserve compatibility as a distinct review state instead
+        # of calling an unverified baseline fresh.
+        status = "legacy_unverified"
     elif invalid_count or complete_count != len(snapshot_paths):
         status = "invalidated"
     else:
@@ -186,13 +186,17 @@ def _cash_snapshot_execution_authority(
     base_dir: Path,
     owner: str,
     broker: str,
+    settlement_pool: str,
+    currency: str,
     snapshot_as_of: datetime,
 ) -> dict:
     """Resolve fills after a cash snapshot into an authority chain.
 
     Cash does not expire with wall-clock time, but a later trade can change it.
     SBI and other brokers may share buying power across tax-account labels, so
-    matching is deliberately owner+broker scoped rather than account scoped.
+    matching is deliberately settlement-pool scoped rather than account scoped.
+    A fill in a different settlement currency must not advance or invalidate
+    this wallet's authority.
     A complete broker-confirmed Web fill that was applied locally advances the
     authority timestamp; an unattributed or incomplete fill invalidates it.
     """
@@ -244,6 +248,16 @@ def _cash_snapshot_execution_authority(
         if row_owner and row_owner != owner:
             continue
         if row_broker and row_broker != broker:
+            continue
+        row_currency = str(
+            row.get("cash_currency")
+            or row.get("currency")
+            or ("JPY" if str(row.get("ticker") or "").upper().endswith(".T") else "")
+        ).upper()
+        if row_currency and row_currency != currency:
+            continue
+        row_pool = str(row.get("settlement_pool") or "broker_cash")
+        if row_pool != settlement_pool:
             continue
         event_time = None
         for field in (
@@ -506,6 +520,8 @@ def evaluate_cash_buying_power(
         base_dir=base_dir,
         owner=owner,
         broker=broker,
+        settlement_pool="broker_cash",
+        currency=currency,
         snapshot_as_of=resource_as_of,
     )
     effective_resource_as_of = authority["authority_as_of"]
@@ -816,7 +832,7 @@ def classify_execution_readiness(
         )
     if risk_increasing and not action.get("scheduled_contribution"):
         snapshot = portfolio_snapshot_health(base_dir, now=now)
-        if snapshot["status"] in {"invalidated", "unknown"}:
+        if snapshot["status"] in {"invalidated", "unknown", "legacy_unverified"}:
             add(
                 "blocked",
                 "portfolio_snapshot_invalid",

@@ -19,6 +19,11 @@ def _write_base(tmp_path, now, *, snapshot_hours=1, ticker="XLF", tech_status="f
     stamp = (now - timedelta(hours=snapshot_hours)).isoformat()
     (tmp_path / "account.json").write_text(json.dumps({"last_updated": stamp}), encoding="utf-8")
     (tmp_path / "holdings.json").write_text(json.dumps({"last_updated": stamp}), encoding="utf-8")
+    (tmp_path / "broker_position_snapshot_fixture.json").write_text(json.dumps({
+        "complete": True,
+        "source_as_of": stamp,
+        "positions": [],
+    }), encoding="utf-8")
     (tmp_path / "technical_state.json").write_text(json.dumps({
         "tickers": {ticker: {"freshness_status": tech_status, "data_as_of": "2026-07-13"}}
     }), encoding="utf-8")
@@ -316,6 +321,56 @@ def test_complete_web_fill_advances_cash_authority_without_new_snapshot(tmp_path
     assert result["readiness"] == "ready"
     assert result["cash_resource_authority_source"] == "broker_confirmed_web_fill"
     assert result["cash_resource_as_of"] == "2026-07-27T12:05:00+09:00"
+
+
+def test_usd_fill_does_not_advance_jpy_cash_authority(tmp_path):
+    now = datetime(2026, 7, 28, 9, 0, tzinfo=JST)
+    (tmp_path / "holdings.json").write_text(json.dumps({
+        "CASH_JPY_SBI_WIFE": {
+            "ticker": "CASH_JPY_SBI_WIFE",
+            "shares": 47_000,
+            "available_to_trade_jpy": 47_000,
+            "currency": "JPY",
+            "balance_status": "confirmed",
+            "reconciliation_required": False,
+            "source_as_of": "2026-07-27T09:00:00+09:00",
+        },
+    }), encoding="utf-8")
+    (tmp_path / "action_executions.json").write_text(json.dumps({
+        "executions": [{
+            "id": "usd-web-fill",
+            "ticker": "XLF",
+            "status": "executed",
+            "direction": "buy",
+            "currency": "USD",
+            "account": "NISA成長投資枠",
+            "execution_owner": "wife",
+            "execution_broker": "sbi",
+            "broker_confirmed_filled": True,
+            "external_execution_id": "sbi-usd-123",
+            "broker_source": "web_manual_confirmation",
+            "broker_reported_at": "2026-07-27T12:00:00+09:00",
+            "filled_quantity": 1,
+            "filled_price": 20,
+            "reconciled_at": "2026-07-27T12:05:00+09:00",
+            "reconciliation_snapshot_hash": "sha256:web-usd",
+            "portfolio_applied": True,
+        }],
+    }), encoding="utf-8")
+
+    result = evaluate_cash_buying_power({
+        "ticker": "1489.T",
+        "type": "buy",
+        "quantity": 1,
+        "limit_price": 3_000,
+        "execution_owner": "wife",
+        "execution_broker": "sbi",
+        "execution_account": "NISA成長投資枠",
+    }, base_dir=tmp_path, now=now)
+
+    assert result["readiness"] == "ready"
+    assert result["cash_resource_authority_source"] == "cash_snapshot"
+    assert result["cash_resource_as_of"] == "2026-07-27T09:00:00+09:00"
 
 
 def test_exit_quantity_over_requested_account_inventory_is_blocked(tmp_path):
@@ -692,10 +747,11 @@ def test_old_portfolio_snapshot_does_not_expire_by_time_alone(tmp_path):
     )
 
 
-def test_legacy_ledgers_do_not_degrade_after_24_hours(tmp_path):
+def test_legacy_ledgers_without_broker_snapshot_are_not_called_fresh(tmp_path):
     now = datetime(2026, 7, 17, 6, 0, tzinfo=JST)
     holdings_at = now - timedelta(hours=30)
     _write_base(tmp_path, now, snapshot_hours=30)
+    (tmp_path / "broker_position_snapshot_fixture.json").unlink()
     (tmp_path / "account.json").write_text(
         json.dumps({"last_updated": (now - timedelta(hours=1)).isoformat()}),
         encoding="utf-8",
@@ -711,7 +767,7 @@ def test_legacy_ledgers_do_not_degrade_after_24_hours(tmp_path):
 
     health = portfolio_snapshot_health(tmp_path, now=now)
 
-    assert health["status"] == "fresh"
+    assert health["status"] == "legacy_unverified"
     assert health["validation_mode"] == "event_based"
     assert health["legacy_ledgers_only"] is True
 
@@ -719,6 +775,7 @@ def test_legacy_ledgers_do_not_degrade_after_24_hours(tmp_path):
 def test_aggregate_health_does_not_use_unscoped_execution_timestamp(tmp_path):
     now = datetime(2026, 7, 17, 6, 0, tzinfo=JST)
     _write_base(tmp_path, now, snapshot_hours=30)
+    (tmp_path / "broker_position_snapshot_fixture.json").unlink()
     (tmp_path / "account.json").write_text(
         json.dumps({"last_updated": (now - timedelta(hours=1)).isoformat()}),
         encoding="utf-8",
@@ -734,7 +791,7 @@ def test_aggregate_health_does_not_use_unscoped_execution_timestamp(tmp_path):
 
     health = portfolio_snapshot_health(tmp_path, now=now)
 
-    assert health["status"] == "fresh"
+    assert health["status"] == "legacy_unverified"
     assert health["validation_mode"] == "event_based"
 
 
@@ -746,6 +803,11 @@ def test_date_only_snapshot_timestamp_uses_file_mtime(tmp_path):
     holdings = tmp_path / "holdings.json"
     account.write_text(json.dumps({"last_updated": "2026-07-14"}), encoding="utf-8")
     holdings.write_text(json.dumps({"last_updated": "2026-07-14"}), encoding="utf-8")
+    (tmp_path / "broker_position_snapshot_fixture.json").write_text(json.dumps({
+        "complete": True,
+        "source_as_of": "2026-07-14",
+        "positions": [],
+    }), encoding="utf-8")
     imported_at = (now - timedelta(hours=7)).timestamp()
     os.utime(account, (imported_at, imported_at))
     os.utime(holdings, (imported_at, imported_at))

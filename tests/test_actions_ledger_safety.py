@@ -291,6 +291,58 @@ def test_ordered_to_web_confirmed_fill_persists_complete_evidence(isolated_actio
     assert record["reconciliation_snapshot_hash"].startswith("sha256:")
 
 
+def test_legacy_execution_without_post_idempotency_key_accepts_broker_confirmation(
+    isolated_actions,
+):
+    files = isolated_actions
+    _write_json(files["holdings"], {
+        "7203.T": {
+            "ticker": "7203.T",
+            "entry_price": 100.0,
+            "shares": 1.0,
+            "currency": "JPY",
+            "account": "特定",
+        }
+    })
+    _write_json(files["executions"], {
+        "executions": [{
+            "id": "legacy_order_without_post_key",
+            "ticker": "7203.T",
+            "direction": "buy",
+            "status": "ordered",
+            "price": 100.0,
+            "quantity": 1.0,
+            "currency": "JPY",
+            "account": "特定",
+            "investment_type": "medium",
+            "execution_owner": "husband",
+            "execution_broker": "rakuten",
+            "execution_position_keys": ["7203.T"],
+        }]
+    })
+
+    asyncio.run(actions.patch_execution(
+        "legacy_order_without_post_key",
+        actions.ExecutionPatchRequest(
+            status=actions.Status.executed,
+            broker_confirmed_filled=True,
+            external_execution_id="rakuten-legacy-web-1",
+            broker_source="web_manual_confirmation",
+            broker_reported_at="2026-07-30T09:15:00+09:00",
+            filled_quantity=1,
+            filled_price=100,
+            executed_at_time="2026-07-30T09:15:00+09:00",
+            reconciled_at="2026-07-30T09:16:00+09:00",
+        ),
+    ))
+
+    record = _read(files["executions"])["executions"][0]
+    assert "idempotency_key" not in record
+    assert record["portfolio_applied"] is True
+    assert record["broker_confirmed_filled"] is True
+    assert record["reconciliation_snapshot_hash"].startswith("sha256:")
+
+
 def test_ordered_to_executed_preserves_analysis_id_in_stage_log(isolated_actions, monkeypatch):
     files = isolated_actions
     logged = []

@@ -255,6 +255,32 @@ class ExecutionRequest(BaseModel):
         return value
 
 
+class BrokerConfirmationEvidence(BaseModel):
+    """Broker fill evidence independent of the POST idempotency contract.
+
+    Historical execution rows predate ``ExecutionRequest.idempotency_key``.
+    PATCH must be able to attest those rows without inventing a POST key or
+    admitting quantity/price/trade-date corrections into the route overlay.
+    """
+
+    ticker: str
+    direction: Direction
+    quantity: Optional[float] = None
+    price: Optional[float] = None
+    account: Optional[Account] = None
+    status: Status
+    execution_owner: Optional[str] = None
+    execution_broker: Optional[str] = None
+    broker_confirmed_filled: bool = False
+    external_execution_id: Optional[str] = None
+    broker_source: Optional[str] = None
+    broker_reported_at: Optional[str] = None
+    filled_quantity: Optional[float] = None
+    filled_price: Optional[float] = None
+    reconciled_at: Optional[str] = None
+    reconciliation_snapshot_hash: Optional[str] = None
+
+
 class StatusPatchRequest(BaseModel):
     status: str
     note:   str = ""
@@ -500,7 +526,9 @@ def _load_effective_execution_log() -> dict:
     return {**data, "executions": effective}
 
 
-def _validate_broker_confirmation(req: ExecutionRequest) -> None:
+def _validate_broker_confirmation(
+    req: ExecutionRequest | BrokerConfirmationEvidence,
+) -> None:
     # Web confirmation is an attested event, not an uploaded broker snapshot.
     # Hash its immutable evidence server-side so recurring full CSV snapshots
     # are not required merely to preserve freshness.
@@ -583,7 +611,7 @@ def _validate_broker_confirmation(req: ExecutionRequest) -> None:
 
 
 def _reject_duplicate_external_execution(
-    req: ExecutionRequest,
+    req: ExecutionRequest | BrokerConfirmationEvidence,
     *,
     exclude_execution_id: Optional[str] = None,
 ) -> None:
@@ -2736,7 +2764,7 @@ async def patch_execution(exec_id: str, req: ExecutionPatchRequest):
             rec["edited_at"] = datetime.now().isoformat(timespec="seconds")
             if rec.get("broker_confirmed_filled"):
                 try:
-                    confirmation_req = ExecutionRequest(**rec)
+                    confirmation_req = BrokerConfirmationEvidence(**rec)
                 except Exception as exc:
                     raise HTTPException(
                         status_code=422,
