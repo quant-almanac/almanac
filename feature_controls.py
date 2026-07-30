@@ -986,12 +986,17 @@ def _ginn_status(root: Path) -> dict[str, Any]:
         "key": "ginn",
         "label": "GINNボラティリティ",
         "category": "model",
-        "description": "検証済みbundleだけを使用し、条件を満たさなければGJR-GARCHへ縮退します。",
+        "description": (
+            "論文上の着想は将来候補として維持しますが、現在の実装候補は"
+            "検証ゲートを通ったbundleだけを使用し、不合格ならGJR-GARCHへ縮退します。"
+        ),
         "configured_enabled": not disabled,
         "effective_enabled": effective,
         "mutable": False,
         "mode": "promoted_bundle_only",
         "auto_order_enabled": False,
+        "roadmap_status": "future_update",
+        "roadmap_label": "将来更新",
         "reason": reason,
         "blockers": [] if effective else [
             "disabled_by_env" if disabled else str(rejection_reason)
@@ -1017,6 +1022,40 @@ def _ginn_status(root: Path) -> dict[str, Any]:
             {"label": "validation件数", "value": manifest_payload.get("n_validation")},
             {"label": "validation銘柄数", "value": manifest_payload.get("n_validation_tickers")},
             {"label": "GARCH比MSE", "value": garch_ratio},
+            {"label": "forward観測", "value": manifest_payload.get("forward_observations", 0)},
+        ],
+        "detail_sections": [
+            {
+                "title": "現在の判断",
+                "body": (
+                    "GINNという考え方を否定した状態ではありません。現在候補の実測が"
+                    "GJR-GARCH基準を満たさないため、投資判断にはGJR-GARCHだけを使います。"
+                    "上のvalidation値は最新manifestから動的に表示します。"
+                ),
+            },
+            {
+                "title": "原論文との差",
+                "items": [
+                    "現実装は60日窓・2層×64・50 epoch・絶対リターン目標・GARCH項λ=0.3です。",
+                    "原論文は90日窓・3層×256・300 epoch・分散を対象にした結合損失を報告しています。",
+                    "現実装のVIX/レジームは定数、GARCH σはfold内の単一値で、時系列特徴として未完成です。",
+                ],
+            },
+            {
+                "title": "将来の更新条件",
+                "items": [
+                    "paper-aligned版、または差を明示したGINN-inspired版として学習契約を作り直します。",
+                    "look-aheadのないVIX・レジーム履歴とrolling GARCH σ、保存済みscalerを学習・推論で一致させます。",
+                    "walk-forward後も未観測期間をshadowで評価し、MSE/QLIKE・tail・peak・3倍clamp頻度をGJR-GARCHと比較します。",
+                    "合格後も影響上限付きcanaryから始め、自動注文権限は与えません。",
+                ],
+            },
+        ],
+        "references": [
+            {
+                "label": "GINN原論文（ICAIF 2024 / arXiv）",
+                "url": "https://arxiv.org/abs/2410.00288",
+            },
         ],
     }
 

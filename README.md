@@ -14,7 +14,7 @@ This repository is a **public, sanitized snapshot** of that system. Runtime data
 
 The objective function is explicit and version-controlled ([`objective.md`](objective.md)): maximize **after-tax, after-fee, JPY-denominated time-weighted return**, benchmarked against a 60% global equity / 40% global bond blend, subject to hard risk limits (VaR, drawdown, VIX-based circuit breakers) enforced by a deterministic policy engine — not by an LLM's judgment call.
 
-The checked-in default is not “every product is off.” It separates **always-on measurement** from **authority to change an action**: cash securities and non-leveraged funds are active; margin and short candidates are conditional on the safety gates; options are analysis signals only; half-Kelly sizing and FX hedging run in shadow; tax basis runs in comparison mode; and GINN is rejected unless a validated model has been promoted, falling back to GJR-GARCH. The execution-plan gate starts in observe mode, and none of these modes can place a broker order. The complete activation contract is in [`objective.md`](objective.md#8-機能商品の有効化契約).
+The checked-in default is not “every product is off.” It separates **always-on measurement** from **authority to change an action**: cash securities and non-leveraged funds are active; margin and short candidates are conditional on the safety gates; options are analysis signals only; half-Kelly sizing and FX hedging run in shadow; tax basis runs in comparison mode; and GINN remains a future research update—the current candidate is excluded from decisions and GJR-GARCH is authoritative unless a validated bundle is promoted. The execution-plan gate starts in observe mode, and none of these modes can place a broker order. The complete activation contract is in [`objective.md`](objective.md#8-機能商品の有効化契約).
 
 The dashboard's **System** page is a live operating inventory, not a static feature list. It shows configured and effective state, stop reasons, authority source, last confirmation time, freshness, and job heartbeats for short and margin candidates, options signals, market regime, GINN, frozen analysis inputs, broker reconciliation, tax basis, privacy, Kelly and FX shadows, currency policy, the execution plan, and Auto Tune. **Only the two short-candidate switches are mutable** there; every other row is read-only and names the state, environment variable, or validation gate that has authority and where it must be changed.
 
@@ -338,6 +338,7 @@ Where the numbers come from. **Each item carries its status**, because having an
 | **Live** | Wired into the daily decision path |
 | **Optional** | Runs only when explicitly enabled |
 | **Unwired** | Implemented but not used for decisions (CLI/diagnostic) |
+| **Future update** | The idea stays on the roadmap, but the present implementation is excluded from decisions until a new validation contract passes |
 | **Retired** | Not used in normal operation |
 
 ### Choosing weights
@@ -366,7 +367,7 @@ The same lineage is never counted twice. When `independent_count=0`, no Black-Li
 
 Volatility is forecast with **GJR-GARCH**, which lets downside moves raise expected volatility more than upside ones.
 
-**GINN (Research)** — `ginn_model.py` implements the GARCH-Informed Neural Network (ICAIF 2024).
+**GINN (Research / future update)** — `ginn_model.py` contains an experimental GINN-inspired model. It is **not a paper-faithful reproduction** of the [ICAIF 2024 GINN paper](https://arxiv.org/abs/2410.00288).
 
 ```
 model: 2-layer LSTM (hidden=64, dropout=0.1) + linear + Softplus
@@ -375,9 +376,13 @@ loss:  MSE(σ_pred, |ε_t|) + 0.3 · MSE(σ_pred, σ_GARCH)
 
 The second term penalises divergence from the GARCH estimate. **It cannot be claimed to prevent overfitting**: during training VIX and regime are passed as constants (0.2 / 1.0) rather than real series, and the GARCH σ is a single per-ticker forecast broadcast across the window.
 
-Runtime use is fail-closed. A legacy model without validation metadata, or a candidate that fails the predeclared validation thresholds, is rejected and the forecast falls back to GJR-GARCH. The model name carried into tier artifacts, the Today API and the dashboard is the model actually used—not an unconditional “GINN” label. This safety gate does not make the research model validated; it prevents an unvalidated model from entering decisions.
+The distinction matters. The paper reports a 90-day input window, three 256-unit LSTM layers, 300 epochs and a variance-based joint loss whose GARCH weight was tuned on a separate dataset. The present code uses a 60-day window, two 64-unit layers, 50 epochs, absolute next-day return as its target and a differently parameterised `0.3` GARCH penalty. The paper reports promising index-level results; that evidence does not validate this smaller, differently trained implementation on an individual portfolio universe.
+
+Runtime use is fail-closed. A legacy model without validation metadata, or a candidate that fails the predeclared validation thresholds, is rejected and the forecast falls back to GJR-GARCH. The model name carried into tier artifacts, the Today API and the dashboard is the model actually used—not an unconditional “GINN” label. The dashboard reads the latest manifest and shows its validation sample count, ticker count, MSE relative to GJR-GARCH and subsequent forward-observation count; these values are deliberately not copied into this README, where they would become stale. This safety gate does not make the research model validated; it prevents an unvalidated model from entering decisions.
 
 Training uses three expanding rolling-origin folds. Each fold fits its normalisation statistics and GARCH baseline only on its training window, then evaluates the following validation window; after validation, a fresh candidate is refit on the available history. The versioned bundle stores `model.pt`, a manifest and the per-ticker scaler artifact used by inference, each protected by checksums. Promotion requires the predeclared sample, ticker-coverage, feature-coverage, data-age and GARCH-relative-error thresholds; inference also requires an explicit ticker route and the matching persisted scaler. Post-promotion performance is still measured only on subsequently observed data: `forward_observations` and `forward_metrics` remain empty until such observations exist, and the walk-forward validation must not be described as a final untouched test set.
+
+This is therefore a postponement, not a deletion. A future update must either reproduce the paper's contract or explicitly call itself **GINN-inspired**; replace constant VIX/regime and scalar GARCH inputs with look-ahead-safe histories and rolling GARCH σ; keep training and inference transformations identical; and collect genuinely unseen shadow-forward observations. Before any decision-path promotion, the planned evidence gate is at least a 5% improvement over GJR-GARCH on both MSE and QLIKE, no degradation in tail/peak behaviour, no frequent three-times-volatility clamps, and at least 60 trading days of forward evidence. A passing model would enter through a bounded canary first, never by receiving broker-order authority.
 
 **Risk is computed on current holdings, not the NAV series.** That series is short and older accounting bugs contaminated part of it, so `portfolio_risk_returns.py` reconstructs daily returns by applying today's weights to historical prices.
 
@@ -538,7 +543,7 @@ Terms used above, for readers who don't work in finance or haven't seen the hous
 | **VIX** | The market's expectation of near-term US equity volatility. Higher means a more unstable market |
 | **Black-Litterman** | A way to combine the market's implied view with additional return views. ALMANAC consumes only rows marked as independent; tier-LLM-derived rows are audit-only |
 | **GJR-GARCH** | A volatility model that allows downside moves to raise expected volatility more than upside moves — the asymmetry real markets show |
-| **GINN** | A research neural network whose volatility forecast is trained both on realised moves and on a GARCH estimate; a candidate enters decisions only after the walk-forward validation, persisted-scaler and promotion contracts all pass |
+| **GINN** | A research neural network combining realised moves with a GARCH estimate. ALMANAC's present model is a smaller GINN-inspired variant and is excluded from decisions; a future paper-aligned or explicitly redefined version must pass walk-forward, persisted-scaler and shadow-forward promotion contracts |
 | **LSTM** | A neural-network layer designed for sequences, so earlier observations can influence a later forecast |
 | **Softplus** | A smooth output transformation that keeps a predicted volatility above zero |
 | **Regime** | Which state the market is in (bull / neutral / bear / crash). The same action can be reasonable in one and reckless in another |

@@ -216,7 +216,19 @@ def test_ginn_status_surfaces_latest_rejected_candidate_without_activating_it(
     assert status["source"] == "models/ginn/<latest candidate>/manifest.json"
     assert status["model_version"] == "candidate-v2"
     assert status["blockers"][0].startswith("garch_ratio_degraded")
-    assert status["metrics"][-1] == {"label": "GARCH比MSE", "value": 8.15}
+    assert {"label": "GARCH比MSE", "value": 8.15} in status["metrics"]
+    assert {"label": "forward観測", "value": 0} in status["metrics"]
+    assert status["roadmap_status"] == "future_update"
+    assert status["roadmap_label"] == "将来更新"
+    assert [section["title"] for section in status["detail_sections"]] == [
+        "現在の判断",
+        "原論文との差",
+        "将来の更新条件",
+    ]
+    assert status["references"] == [{
+        "label": "GINN原論文（ICAIF 2024 / arXiv）",
+        "url": "https://arxiv.org/abs/2410.00288",
+    }]
 
 
 def test_options_status_reuses_the_cache_summary_for_five_minutes(

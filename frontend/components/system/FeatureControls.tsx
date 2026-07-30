@@ -42,6 +42,14 @@ export interface FeatureStatus {
   availability_label?: string
   availability_metric_kind?: string
   metrics?: Array<{ label: string; value: unknown }>
+  roadmap_status?: string
+  roadmap_label?: string
+  detail_sections?: Array<{
+    title: string
+    body?: string
+    items?: string[]
+  }>
+  references?: Array<{ label: string; url: string }>
   status_resolution_failed?: boolean
 }
 
@@ -118,7 +126,8 @@ export default function FeatureControls() {
     </div>
     <p style={{ color: OPS.sub, fontSize: 12, lineHeight: 1.7, margin: '7px 0 13px' }}>
       設定ONと実効ONを分けて表示します。入力不足や期限切れでは設定がONでも安全側に停止します。
-      空売りはすべて人間実行専用で、この画面から自動注文は有効になりません。
+      「影実行」は計算と記録だけ、「将来更新」は理論を残しつつ現実装を判断から外した状態です。
+      空売りを含め、この画面から自動注文は有効になりません。
     </p>
     {message && <div role="status" style={{ color: message.includes('失敗') || message.startsWith('Error') ? OPS.redSoft : OPS.green, fontSize: 12, marginBottom: 10 }}>{message}</div>}
     {error && <div role="alert" style={{ color: OPS.redSoft, fontSize: 12 }}>/api/features を取得できません。</div>}
@@ -167,6 +176,7 @@ export default function FeatureControls() {
               <Chip color={effectiveColor} mono>{effectiveLabel}</Chip>
               {feature.status_resolution_failed && <Chip color={OPS.redSoft} mono>ERROR</Chip>}
               {feature.configured_enabled && !feature.effective_enabled && feature.blockers.length > 0 && <Chip color={OPS.amber} bg={OPS.amberBg} mono>FAIL-CLOSED</Chip>}
+              {feature.roadmap_label && <Chip color={OPS.blue} mono>{feature.roadmap_label}</Chip>}
               {feature.auto_order_enabled === false && <Chip color={OPS.dim} mono>自動注文なし</Chip>}
             </div>
             <div style={{ color: OPS.sub, fontSize: 11.5, lineHeight: 1.6, marginTop: 6 }}>{feature.reason}</div>
@@ -217,6 +227,41 @@ export default function FeatureControls() {
             }}>
               {feature.metrics?.map(metric => <span key={metric.label}>{metric.label} {String(metric.value ?? '—')}</span>)}
             </div>}
+            {((feature.detail_sections?.length ?? 0) > 0 || (feature.references?.length ?? 0) > 0) && <details
+              data-testid={`feature-${feature.key}-details`}
+              open={feature.key === 'ginn'}
+              style={{
+                background: OPS.panelAlt,
+                border: `1px solid ${OPS.hairline}`,
+                borderRadius: 8,
+                marginTop: 8,
+                padding: '7px 9px',
+              }}
+            >
+              <summary style={{ color: OPS.blue, cursor: 'pointer', fontSize: 10.5, fontWeight: 650 }}>
+                詳しい判定と将来計画
+              </summary>
+              <div style={{ display: 'grid', gap: 8, marginTop: 8 }}>
+                {feature.detail_sections?.map(section => <section key={section.title}>
+                  <div style={{ color: OPS.text, fontSize: 10.5, fontWeight: 650 }}>{section.title}</div>
+                  {section.body && <div style={{ color: OPS.sub, fontSize: 10.5, lineHeight: 1.6, marginTop: 2 }}>{section.body}</div>}
+                  {(section.items?.length ?? 0) > 0 && <ul style={{ color: OPS.sub, fontSize: 10.5, lineHeight: 1.6, margin: '3px 0 0', paddingLeft: 18 }}>
+                    {section.items?.map(item => <li key={item}>{item}</li>)}
+                  </ul>}
+                </section>)}
+                {(feature.references?.length ?? 0) > 0 && <div style={{ display: 'flex', flexWrap: 'wrap', gap: 10 }}>
+                  {feature.references?.map(reference => <a
+                    key={reference.url}
+                    href={reference.url}
+                    target="_blank"
+                    rel="noreferrer"
+                    style={{ color: OPS.blue, fontSize: 10.5 }}
+                  >
+                    {reference.label}
+                  </a>)}
+                </div>}
+              </div>
+            </details>}
             {(feature.source || feature.source_as_of || feature.updated_at) && <div
               data-testid={`feature-${feature.key}-authority`}
               style={{ color: OPS.dim, fontSize: 10, marginTop: 4 }}

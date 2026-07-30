@@ -50,6 +50,32 @@ const features = [
     source: 'models/ginn/current.json + promoted manifest',
     freshness_status: 'missing',
     control_hint: 'モデル昇格ゲートが権威です',
+    roadmap_status: 'future_update',
+    roadmap_label: '将来更新',
+    metrics: [
+      { label: 'GARCH比MSE', value: 8.15 },
+      { label: 'forward観測', value: 0 },
+    ],
+    detail_sections: [
+      {
+        title: '現在の判断',
+        body: 'GINNという考え方を否定した状態ではありません。',
+      },
+      {
+        title: '原論文との差',
+        items: ['現実装は60日窓・2層×64です。'],
+      },
+      {
+        title: '将来の更新条件',
+        items: ['未観測期間をshadowで評価します。'],
+      },
+    ],
+    references: [
+      {
+        label: 'GINN原論文（ICAIF 2024 / arXiv）',
+        url: 'https://arxiv.org/abs/2410.00288',
+      },
+    ],
   },
   {
     key: 'options_signals',
@@ -126,7 +152,16 @@ describe('FeatureControls', () => {
     const ginn = screen.getByTestId('feature-ginn')
     expect(within(ginn).getByText('設定ON・安全停止')).toBeInTheDocument()
     expect(within(ginn).getByText('FAIL-CLOSED')).toBeInTheDocument()
+    expect(within(ginn).getByText('将来更新')).toBeInTheDocument()
     expect(within(ginn).getByText('参照のみ')).toBeInTheDocument()
+    expect(within(ginn).getByText('現在の判断')).toBeInTheDocument()
+    expect(within(ginn).getByText(/GINNという考え方を否定/)).toBeInTheDocument()
+    expect(within(ginn).getByText('原論文との差')).toBeInTheDocument()
+    expect(within(ginn).getByText('将来の更新条件')).toBeInTheDocument()
+    expect(within(ginn).getByRole('link', { name: 'GINN原論文（ICAIF 2024 / arXiv）' })).toHaveAttribute(
+      'href',
+      'https://arxiv.org/abs/2410.00288',
+    )
     expect(within(ginn).getByText(/モデル昇格ゲートが権威/)).toBeInTheDocument()
     expect(within(ginn).getByTestId('feature-ginn-authority')).toHaveTextContent('models/ginn/current.json')
 
