@@ -1142,9 +1142,8 @@ def _build_today() -> dict:
         notional = a.get("estimated_notional_jpy")
         amount_view = render_action_amount(a)
         deterministic_sizing = bool(
-            a.get("position_size_corrected")
-            or a.get("exit_sizing_status")
-            or a.get("exit_sizing_steps")
+            a.get("exit_sizing_status") == "actionable"
+            and a.get("exit_sizing_steps")
         )
         confidence_scope = (
             a.get("confidence_scope")
@@ -1223,6 +1222,9 @@ def _build_today() -> dict:
             "amount_hint": amount_view["quantity"] or a.get("amount_hint"),
             "estimated_notional_jpy": notional,
             "amount_display": amount_view["display"],
+            "notional_authority": (
+                "structured" if amount_view["notional_jpy"] is not None else "missing"
+            ),
             "confidence_scope": confidence_scope,
             "sizing_confidence_source": sizing_confidence_source,
             "impact_nav_pct": impact,
@@ -1254,7 +1256,7 @@ def _build_today() -> dict:
         if v.get("status") != "pending":
             continue
         rec_dt = _parse_dt(v.get("recommended_at"))
-        if not rec_dt or rec_dt > stale_cutoff:
+        if not rec_dt:
             continue
         try:
             key = dedup_key_for_action(v)
@@ -1269,6 +1271,12 @@ def _build_today() -> dict:
             expiry_at is not None
             and expiry_at <= datetime.now(expiry_at.tzinfo)
         )
+        from action_amounts import render_action_amount
+        amount_view = render_action_amount({
+            "amount_hint": v.get("amount_hint"),
+            "estimated_notional_jpy": v.get("estimated_notional_jpy"),
+        })
+        is_historical = rec_dt <= stale_cutoff
         backlog_row = {
             "rank": None,
             "tier": None,
@@ -1277,8 +1285,16 @@ def _build_today() -> dict:
             "urgency": v.get("urgency"),
             "action": v.get("action_detail"),
             "reason": v.get("reason"),
-            "amount_hint": v.get("amount_hint"),
-            "confidence_pct": None,
+            "amount_hint": amount_view["quantity"],
+            "amount_hint_original": v.get("amount_hint"),
+            "estimated_notional_jpy": amount_view["notional_jpy"],
+            "amount_display": amount_view["display"],
+            "notional_authority": (
+                "structured" if amount_view["notional_jpy"] is not None else "missing"
+            ),
+            "confidence_pct": v.get("confidence_pct"),
+            "confidence_scope": v.get("confidence_scope"),
+            "sizing_confidence_source": v.get("sizing_confidence_source"),
             "order_type": v.get("order_type"),
             "limit_price": v.get("limit_price"),
             "decision_price": v.get("decision_price"),
@@ -1296,7 +1312,7 @@ def _build_today() -> dict:
             "execution_account": v.get("execution_account"),
             "execution_investment_type": v.get("execution_investment_type"),
             "execution_position_keys": v.get("execution_position_keys") or [],
-            "historical_backlog": True,
+            "historical_backlog": is_historical,
             "days_pending": (now.date() - rec_dt.date()).days,
             "lifecycle": {
                 "id": v.get("id"),
@@ -1311,13 +1327,21 @@ def _build_today() -> dict:
             },
         }
         if not backlog_row["execution_block_reasons"]:
+            if is_expired:
+                fallback_code = "historical_backlog_expired"
+                fallback_message = "提案期限を過ぎた履歴です。新規注文には使えません"
+            elif is_historical:
+                fallback_code = "historical_readiness_unknown"
+                fallback_message = "期限情報のない旧候補です。新規注文には使えません"
+            else:
+                fallback_code = "pending_not_in_latest_analysis"
+                fallback_message = (
+                    "未処理の候補ですが最新分析には含まれていません。"
+                    "再分析または明示的な確認が必要です"
+                )
             backlog_row["execution_block_reasons"] = [{
-                "code": "historical_backlog_expired" if is_expired else "historical_readiness_unknown",
-                "message": (
-                    "提案期限を過ぎた履歴です。新規注文には使えません"
-                    if is_expired else
-                    "期限情報のない旧候補です。新規注文には使えません"
-                ),
+                "code": fallback_code,
+                "message": fallback_message,
             }]
         backlog.append(backlog_row)
     backlog.sort(key=lambda b: b["lifecycle"]["recommended_at"] or "")

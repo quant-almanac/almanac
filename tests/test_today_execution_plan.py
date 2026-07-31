@@ -195,6 +195,8 @@ def test_build_today_separates_ready_orders_from_review_candidates(monkeypatch):
                     "execution_readiness": "ready", "estimated_notional_jpy": 120_000,
                     "amount_hint": "22口（約¥104,600）",
                     "position_size_corrected": True,
+                    "exit_sizing_status": "actionable",
+                    "exit_sizing_steps": {"final_quantity": 22},
                 },
                 {
                     "rank": 2, "ticker": "ROBO", "type": "buy",
@@ -304,6 +306,68 @@ def test_historical_non_ready_candidate_never_returns_as_executable_backlog(monk
     assert result["backlog"][0]["execution_readiness"] == "review"
     assert result["backlog"][0]["historical_backlog"] is True
     assert result["review_board"] == []
+
+
+def test_non_deterministic_wording_fix_does_not_claim_sizing_confidence(monkeypatch):
+    analysis = {
+        "as_of": datetime.now().isoformat(),
+        "synthesis": {
+            "analysis_id": "wording-only",
+            "priority_actions": [{
+                "ticker": "AVGO",
+                "type": "add",
+                "execution_readiness": "review",
+                "position_size_corrected": True,
+                "exit_sizing_status": "review",
+                "exit_sizing_steps": {"reason": "missing basis"},
+            }],
+        },
+    }
+    monkeypatch.setattr(
+        today,
+        "_load",
+        lambda name: analysis if name == "ai_portfolio_analysis.json" else {},
+    )
+    monkeypatch.setattr(
+        portfolio_manager,
+        "build_portfolio_snapshot",
+        lambda: {"positions": [], "total_jpy": 0},
+    )
+    monkeypatch.setattr(today, "_ticker_closes", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(today, "_build_benchmark", lambda _guard: {})
+    row = today._build_today()["review_board"][0]
+    assert row["confidence_scope"] is None
+    assert row["sizing_confidence_source"] is None
+
+
+def test_recent_unmatched_pending_is_visible_and_money_requires_authority(monkeypatch):
+    state = {"actions": {"recent": {
+        "id": "recent",
+        "ticker": "1489.T",
+        "action_type": "buy",
+        "status": "pending",
+        "recommended_at": datetime.now().isoformat(),
+        "amount_hint": "¥200,000",
+    }}}
+    monkeypatch.setattr(
+        today,
+        "_load",
+        lambda name: state if name == "action_state.json" else {},
+    )
+    monkeypatch.setattr(
+        portfolio_manager,
+        "build_portfolio_snapshot",
+        lambda: {"positions": [], "total_jpy": 0},
+    )
+    monkeypatch.setattr(today, "_ticker_closes", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(today, "_build_benchmark", lambda _guard: {})
+    row = today._build_today()["backlog"][0]
+    assert row["ticker"] == "1489.T"
+    assert row["historical_backlog"] is False
+    assert row["amount_hint"] is None
+    assert row["amount_display"] is None
+    assert row["notional_authority"] == "missing"
+    assert row["execution_block_reasons"][0]["code"] == "pending_not_in_latest_analysis"
 
 
 def test_ticker_closes_reuses_only_unchanged_parquet_mtime(monkeypatch, tmp_path):

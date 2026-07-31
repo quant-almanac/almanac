@@ -300,6 +300,33 @@ def test_decision_input_health_surfaces_macro_fallback_and_stale_options(tmp_pat
     assert health["options_inputs"]["extra"]["nonfresh_tickers"] == ["AVGO"]
 
 
+def test_decision_input_health_fails_when_all_required_options_are_missing(tmp_path):
+    now = datetime(2026, 7, 27, 12, 0, 0)
+    base = snap.build_base_snapshot(base_dir=tmp_path, now=now)
+    enriched = snap.build_enriched_snapshot(
+        base,
+        options_by_ticker_raw={},
+        option_coverage_raw={
+            "SPY": {"status": "error", "error": "rate_limited"},
+            "1489.T": {"status": "not_applicable", "error": "no_options"},
+        },
+        now=now,
+    )
+    health = snap.decision_input_health(enriched)
+    issues = snap.decision_freshness_issues(enriched)
+    assert health["options_inputs"]["status"] == "error"
+    assert health["options_inputs"]["extra"]["requested_count"] == 2
+    assert health["options_inputs"]["extra"]["required_count"] == 1
+    assert health["options_inputs"]["extra"]["available_count"] == 0
+    assert health["options_inputs"]["extra"]["nonfresh_tickers"] == ["SPY"]
+    assert any(
+        row.get("category") == "options"
+        and row.get("ticker") == "SPY"
+        and row.get("status") == "error"
+        for row in issues
+    )
+
+
 def test_old_options_timestamp_is_stale_not_fresh():
     now = datetime(2026, 7, 27, 12, 0, 0)
     base = snap.build_base_snapshot(base_dir=Path("/nonexistent"), now=now)

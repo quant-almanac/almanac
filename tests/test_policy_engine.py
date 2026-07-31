@@ -709,6 +709,46 @@ def test_size_adj_rewrites_exact_order_quantity_in_action_text():
     assert d.accepted[0]["amount_hint"] == "22口"
     assert d.accepted[0]["action"] == "妻NISAで1489.Tを22口追加"
     assert d.accepted[0]["estimated_notional_jpy"] == 76_164
+    assert d.accepted[0]["action_quantity_sync_status"] == "rewritten"
+
+
+def test_size_adj_does_not_rewrite_ambiguous_holding_quantity():
+    a = _action("trim")
+    a.update({
+        "amount_hint": "30口",
+        "action": "保有30口のうち30口を売却",
+        "policy_size_adj": 0.5,
+    })
+    accepted, collapsed = pe._apply_size_adj(a)
+    assert collapsed is None
+    assert accepted["amount_hint"] == "15口"
+    assert accepted["action"] == "保有30口のうち30口を売却"
+    assert accepted["action_quantity_sync_status"] == "ambiguous"
+    assert accepted["action_quantity_sync_failed"] is True
+
+
+def test_size_adj_matches_comma_and_english_share_tokens():
+    comma = _action("trim")
+    comma.update({
+        "amount_hint": "1000株",
+        "action": "1,000 株を売却",
+        "policy_size_adj": 0.5,
+    })
+    english = _action("trim")
+    english.update({
+        "ticker": "XLF",
+        "amount_hint": "20 shares",
+        "action": "Sell 20 shares",
+        "policy_size_adj": 0.5,
+    })
+    comma_result, comma_collapsed = pe._apply_size_adj(comma)
+    english_result, english_collapsed = pe._apply_size_adj(english)
+    assert comma_collapsed is None
+    assert english_collapsed is None
+    assert comma_result["action"] == "500株を売却"
+    assert comma_result["action_quantity_sync_status"] == "rewritten"
+    assert english_result["amount_hint"] == "10 shares"
+    assert english_result["action"] == "Sell 10 shares"
 
 
 def test_size_adj_collapse_rejects_sub_share():

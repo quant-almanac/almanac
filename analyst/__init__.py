@@ -82,6 +82,27 @@ def _env_bool(name: str, default: bool = False) -> bool:
     return str(raw).strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _validate_decision_refresh_configuration() -> dict[str, float]:
+    """Fail the run when refresh overrides cross their stale boundaries."""
+    env_by_source = {
+        "macro": "ALMANAC_MACRO_EVENT_REFRESH_HOURS",
+        "technical": "ALMANAC_TECHNICAL_REFRESH_HOURS",
+        "news": "ALMANAC_NEWS_CANDIDATE_REFRESH_HOURS",
+    }
+    validated: dict[str, float] = {}
+    for source, name in env_by_source.items():
+        raw = get_env(name)
+        if raw is None or str(raw).strip() == "":
+            threshold = refresh_after_hours(source)
+        else:
+            try:
+                threshold = float(raw)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"{source}: invalid refresh override {raw!r}") from exc
+        validated[source] = refresh_after_hours(source, threshold)
+    return validated
+
+
 def _currency_policy_synthesis_verdict(
     ingest_result: dict,
     *,
@@ -195,10 +216,12 @@ except Exception:
 # v5.1 Phase 3: オプション市場由来センチメント
 try:
     from options_fetcher import (
+        get_option_signal_coverage as _get_option_signal_coverage,
         get_option_signals as _get_option_signals,
         format_for_prompt as _format_options_for_prompt,
     )
 except Exception:
+    _get_option_signal_coverage = None
     _get_option_signals = None
     _format_options_for_prompt = None
 
@@ -6861,6 +6884,28 @@ def _apply_stance_guard(synthesis: dict, data: dict, regime_bull_confirmed: bool
     return synthesis
 
 
+def _downgrade_quantity_sync_failures(actions: list[dict]) -> list[dict]:
+    """Fail closed when policy resizing could not synchronize action prose."""
+    for action in actions:
+        if not action.get("action_quantity_sync_failed"):
+            continue
+        action["execution_readiness"] = "review"
+        reasons = action.setdefault("execution_block_reasons", [])
+        if not any(
+            isinstance(reason, dict)
+            and reason.get("code") == "action_quantity_sync_failed"
+            for reason in reasons
+        ):
+            reasons.append({
+                "code": "action_quantity_sync_failed",
+                "message": (
+                    "数量縮小後の説明文を安全に同期できませんでした。"
+                    "構造化数量を確認してから実行してください"
+                ),
+            })
+    return actions
+
+
 def _phase1_post_filter(
     synthesis: dict,
     portfolio_total: float,
@@ -8599,6 +8644,7 @@ def _phase1_post_filter(
                 "code": "execution_readiness_error",
                 "message": f"実行可否判定に失敗: {type(exc).__name__}: {str(exc)[:160]}",
             })
+    _downgrade_quantity_sync_failures(kept)
 
     # The model's original rank is audit data.  The actionable/review board
     # needs contiguous ranks after all deterministic filters have run.
@@ -9619,6 +9665,8 @@ def run_analysis(force: bool = False) -> dict:
     except Exception as _secret_e:
         print(f"  ⚠️ secrets 読み込みスキップ: {_secret_e}")
 
+    _validate_decision_refresh_configuration()
+
     if not force and is_cache_valid():
         print("✅ キャッシュが有効です（スキップ）")
         write_progress(8, 8, "✅ 分析完了（キャッシュ利用）", "有効な既存分析結果を読み込みました")
@@ -9825,16 +9873,30 @@ def run_analysis(force: bool = False) -> dict:
     _decision_tickers = _collect_snapshot_tickers(data, max_tickers=30)
     _decision_chart_map: dict[str, dict] = {}
     _decision_opt_map: dict[str, dict] = {}
+    _option_targets = ["SPY"] + [
+        ticker for ticker in _decision_tickers if ticker != "SPY"
+    ][:14]
+    _decision_option_coverage: dict[str, dict] = {}
     try:
         if _decision_tickers and _gather_chart_context:
             _decision_chart_map = _gather_chart_context(
                 _decision_tickers, intraday=True, max_tickers=30
             )
         if _get_option_signals:
-            _option_targets = ["SPY"] + [
-                ticker for ticker in _decision_tickers if ticker != "SPY"
-            ][:14]
             _decision_opt_map = _get_option_signals(_option_targets, max_n=15)
+        if _get_option_signal_coverage:
+            _decision_option_coverage = _get_option_signal_coverage(
+                _option_targets,
+                _decision_opt_map,
+            )
+        else:
+            _decision_option_coverage = {
+                ticker: {
+                    "status": "error",
+                    "error": "options_fetcher_unavailable",
+                }
+                for ticker in _option_targets
+            }
     except Exception as _market_snapshot_error:
         raise RuntimeError(
             f"decision market-data snapshot failed: {_market_snapshot_error}"
@@ -9886,6 +9948,7 @@ def run_analysis(force: bool = False) -> dict:
     _tier_enriched_snapshot = build_enriched_snapshot(
         _tier_base_snapshot,
         options_by_ticker_raw=_decision_opt_map,
+        option_coverage_raw=_decision_option_coverage,
     )
     _decision_snapshot_issues = decision_freshness_issues(_tier_enriched_snapshot)
     _decision_snapshot_hash = decision_snapshot_content_hash(_tier_enriched_snapshot)

@@ -3563,3 +3563,15 @@ def test_operational_stance_ready_buy_remains_actionable():
     )
 
     assert synthesis["operational_stance"]["code"] == "actionable"
+def test_quantity_sync_failure_can_only_leave_post_filter_as_review():
+    action = {
+        "execution_readiness": "ready",
+        "execution_block_reasons": [],
+        "action_quantity_sync_failed": True,
+    }
+    analyst._downgrade_quantity_sync_failures([action])
+    assert action["execution_readiness"] == "review"
+    assert any(
+        row.get("code") == "action_quantity_sync_failed"
+        for row in action["execution_block_reasons"]
+    )

@@ -80,9 +80,15 @@ Refresh and rejection boundaries are separate values in one registry. Every
 periodically refreshed decision source must satisfy
 `refresh_after_hours < stale_after_hours`; the checked-in defaults are
 technical 4/8h, macro 12/24h, news 6/12h and options 12/24h. A contract test
-iterates the registry, so adding a source with an equal or reversed boundary
-fails CI. Macro fallback/degradation and non-fresh option inputs also emit
-snapshot-derived heartbeats rather than remaining silent.
+iterates the registry and snapshot construction rejects literal age policies,
+so adding a registered source with an equal/reversed boundary or bypassing the
+registry fails CI. VIX, earnings proximity and scenario state use separate
+entry checks and are not part of this periodic registry. Invalid environment
+overrides fail the analysis before cache reuse. Macro fallback/degradation and
+non-fresh option inputs emit snapshot-derived heartbeats; requested option
+coverage is retained even when every fetch fails. A time-fresh degraded macro
+fallback is an operational warning, not by itself an execution-readiness
+blocker. Missing or stale macro data is a blocker.
 
 ## 5. Decision and execution snapshots
 

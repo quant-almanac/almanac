@@ -32,6 +32,8 @@ import re
 from dataclasses import dataclass, field
 from typing import Callable, Optional, Tuple, List, Set
 
+from action_amounts import rewrite_action_quantity
+
 
 # ============================================================
 # Context — Policy 評価に必要な集約済み市場・ポートフォリオ状態
@@ -592,22 +594,36 @@ def _apply_size_adj(action: dict) -> Tuple[dict, Optional[str]]:
             if ratio is not None:
                 actual_ratios.append(ratio)
             if fld == "amount_hint":
-                old_match = re.search(r"[\d,]+(?:\.\d+)?\s*(?:株|口)", str(old_val))
-                new_match = re.search(r"[\d,]+(?:\.\d+)?\s*(?:株|口)", str(new_val))
+                old_match = re.search(
+                    r"[\d,]+(?:\.\d+)?\s*(?:株|口|shares?)",
+                    str(old_val),
+                    re.IGNORECASE,
+                )
+                new_match = re.search(
+                    r"[\d,]+(?:\.\d+)?\s*(?:株|口|shares?)",
+                    str(new_val),
+                    re.IGNORECASE,
+                )
                 if old_match and new_match:
                     quantity_rewrite = (old_match.group(0), new_match.group(0))
         if collapsed:
             collapsed_fields.append(fld)
-    # Keep the human action sentence aligned at the same policy boundary.
-    # Replace the exact order quantity from amount_hint, not the first quantity
-    # in the sentence (which may describe current holdings).
-    if quantity_rewrite and out.get("action"):
+    # Rewrite only when the order token is unambiguous. A plain str.replace()
+    # can corrupt the holding quantity in "保有30口のうち30口を売却".
+    if quantity_rewrite:
         old_quantity, new_quantity = quantity_rewrite
-        old_action = str(out["action"])
-        new_action = old_action.replace(old_quantity, new_quantity, 1)
-        if new_action != old_action:
+        old_action = str(out.get("action") or "")
+        new_action, rewrite_status = rewrite_action_quantity(
+            old_action,
+            old_hint=old_quantity,
+            new_hint=new_quantity,
+        )
+        out["action_quantity_sync_status"] = rewrite_status
+        if rewrite_status == "rewritten":
             applied["action"] = {"from": old_action, "to": new_action}
             out["action"] = new_action
+        else:
+            out["action_quantity_sync_failed"] = True
     # Keep audit/funding notionals consistent with the final rounded quantity.
     # The smallest observed ratio is conservative when multiple size fields
     # have different lot-rounding effects.

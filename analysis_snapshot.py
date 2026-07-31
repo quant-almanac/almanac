@@ -32,7 +32,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -78,6 +78,7 @@ class BaseSnapshot:
 class EnrichedSnapshot:
     base: BaseSnapshot
     options_by_ticker: dict  # ticker -> SourceProvenance
+    option_coverage: dict = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -384,6 +385,21 @@ def decision_freshness_issues(enriched: EnrichedSnapshot) -> list[dict]:
                 "source_as_of": provenance.source_as_of,
                 "max_age_policy_hours": provenance.max_age_policy_hours,
             })
+    for ticker, coverage in enriched.option_coverage.items():
+        if not isinstance(coverage, dict):
+            continue
+        status = str(coverage.get("status") or "unknown")
+        if status not in {"error", "missing"}:
+            continue
+        issues.append({
+            "category": "options",
+            "ticker": ticker,
+            "status": status,
+            "source": f"options_fetcher:{ticker}",
+            "source_as_of": coverage.get("fetched_at"),
+            "max_age_policy_hours": stale_after_hours("options"),
+            "error": coverage.get("error"),
+        })
     return issues
 
 
@@ -407,10 +423,23 @@ def decision_input_health(
         macro_error = None
 
     option_rows = list(enriched.options_by_ticker.values())
-    option_bad = [
-        row for row in option_rows
+    nonfresh_tickers = {
+        ticker for ticker, row in enriched.options_by_ticker.items()
         if row.freshness_status in {"stale", "unknown"}
-    ]
+    }
+    coverage_required = {
+        ticker for ticker, row in enriched.option_coverage.items()
+        if isinstance(row, dict)
+        and str(row.get("status") or "unknown") != "not_applicable"
+    }
+    coverage_bad = {
+        ticker for ticker in coverage_required
+        if str((enriched.option_coverage.get(ticker) or {}).get("status") or "unknown")
+        in {"error", "missing", "unknown"}
+    }
+    option_bad_tickers = nonfresh_tickers | coverage_bad
+    requested_count = len(enriched.option_coverage) or len(option_rows)
+    required_count = len(coverage_required) if enriched.option_coverage else len(option_rows)
     return {
         "macro_event_calendar": {
             "status": macro_status,
@@ -423,18 +452,21 @@ def decision_input_health(
             },
         },
         "options_inputs": {
-            "status": "error" if option_bad else "ok",
+            "status": "error" if option_bad_tickers else "ok",
             "error": (
-                f"{len(option_bad)}_of_{len(option_rows)}_snapshot_inputs_nonfresh"
-                if option_bad else None
+                f"{len(option_bad_tickers)}_of_{required_count}_required_inputs_unavailable"
+                if option_bad_tickers else None
             ),
             "extra": {
-                "required_count": len(option_rows),
-                "nonfresh_count": len(option_bad),
-                "nonfresh_tickers": sorted(
-                    ticker for ticker, row in enriched.options_by_ticker.items()
-                    if row.freshness_status in {"stale", "unknown"}
+                "requested_count": requested_count,
+                "required_count": required_count,
+                "available_count": len(enriched.options_by_ticker),
+                "not_applicable_count": sum(
+                    1 for row in enriched.option_coverage.values()
+                    if isinstance(row, dict) and row.get("status") == "not_applicable"
                 ),
+                "nonfresh_count": len(option_bad_tickers),
+                "nonfresh_tickers": sorted(option_bad_tickers),
             },
         },
     }
@@ -449,6 +481,7 @@ def build_enriched_snapshot(
     base: BaseSnapshot,
     *,
     options_by_ticker_raw: Optional[dict] = None,
+    option_coverage_raw: Optional[dict] = None,
     now: Optional[datetime] = None,
 ) -> EnrichedSnapshot:
     """enriched_snapshot: base + 保有/候補/open order 銘柄のオプション市場データ。
@@ -477,7 +510,15 @@ def build_enriched_snapshot(
             max_age_policy_hours=stale_after_hours("options"),
             artifact_hash=hashlib.sha256(serialized).hexdigest(),
         )
-    return EnrichedSnapshot(base=base, options_by_ticker=options_by_ticker)
+    return EnrichedSnapshot(
+        base=base,
+        options_by_ticker=options_by_ticker,
+        option_coverage={
+            str(ticker): dict(row)
+            for ticker, row in (option_coverage_raw or {}).items()
+            if isinstance(row, dict)
+        },
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -503,6 +544,10 @@ def _enriched_snapshot_from_dict(d: dict) -> EnrichedSnapshot:
         base=_base_snapshot_from_dict(d["base"]),
         options_by_ticker={
             k: _source_provenance_from_dict(v) for k, v in (d.get("options_by_ticker") or {}).items()
+        },
+        option_coverage={
+            k: dict(v) for k, v in (d.get("option_coverage") or {}).items()
+            if isinstance(v, dict)
         },
     )
 

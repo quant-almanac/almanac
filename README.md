@@ -74,7 +74,19 @@ flowchart TD
 
 Each stage exists for a reason:
 
-**Freshness first.** Every input the gate depends on — the macro-event calendar, technical state, VIX, earnings proximity, scenario snapshot — is checked *before* analysis starts and refreshed before its rejection boundary. Refresh and stale thresholds share one registry and CI requires `refresh < stale` (technical 4/8h, macro 12/24h, news 6/12h, options 12/24h), preventing a daily producer from skipping an update at the exact instant its consumer rejects the old value. A stale calendar would otherwise be silently read as "no important events coming up." Refresh failures are printed rather than swallowed, macro fallback and option-input health reach the watchdog, and the readiness gate treats a missing calendar as `review`, not as "clear."
+**Freshness first.** Periodically refreshed decision inputs — technical state,
+the macro-event calendar, news and options — share one threshold registry, and
+CI requires `refresh < stale` (technical 4/8h, macro 12/24h, news 6/12h,
+options 12/24h). Holdings, cash, FX and screening also use registry stale
+limits but are refreshed by their own evidence/event paths. VIX, earnings
+proximity and scenario state have dedicated entry checks; they are not covered
+by the periodic-registry guarantee. Invalid refresh overrides fail the analysis
+before cache reuse rather than being printed and ignored. Missing or stale
+calendar/options inputs make actions `review`, and option health keeps the
+requested-ticker denominator so a provider-wide failure cannot become
+`0 of 0 = ok`. A time-fresh macro fallback marked `degraded` is surfaced to
+the watchdog but does not alone block every action; missing or stale macro data
+does.
 
 The analysis then freezes a two-stage **decision snapshot**. The base snapshot contains holdings, cash, prices, FX, macro, news and screening data; after the held and candidate tickers are known, an enriched snapshot adds their chart and options payloads. A single run-wide `analysis_id` is issued before catalyst or tier work begins and follows the catalyst, every tier result, final synthesis, action, stage log and both snapshot stages. Every tier and the final synthesis receive the same content hash, source timestamps and payload hashes, and external re-fetches are forbidden after the enriched snapshot is sealed. A separate execution-quote snapshot may refresh price, spread and market status just before an order, but it may only reprice or downgrade an action—not rewrite the investment thesis or confidence.
 
@@ -203,8 +215,10 @@ This is the part that makes the system something other than "an LLM that suggest
 
 Quantity and money remain separate through that chain. A share/unit
 `amount_hint` contains quantity only, while `estimated_notional_jpy` is the
-numeric money authority; the dashboard renders the combined text at response
-time. If deterministic exit sizing replaces an LLM draft quantity, the
+numeric money authority. The API constructs the combined display from those
+structured fields; clients must not revive embedded money from legacy prose
+when the numeric authority is missing. If deterministic exit sizing replaces
+an LLM draft quantity, the
 original model confidence is explicitly direction-only rather than confidence
 in the machine-calculated size.
 

@@ -36,7 +36,7 @@ IV_HISTORY_DIR = BASE_DIR / "data" / "options_iv"
 CACHE_TTL_HOURS = refresh_after_hours("options")
 
 # 日本株や投信などオプション無しと判明したらキャッシュに negative エントリーを残す
-NEGATIVE_TTL_HOURS = 24
+NEGATIVE_TTL_HOURS = refresh_after_hours("options")
 
 SKIP_TICKERS = frozenset({
     "SLIM_SP500", "SLIM_ORCAN", "MNXACT", "IFREE_FANGPLUS",
@@ -302,6 +302,43 @@ def get_option_signals(tickers: list[str], *, force: bool = False, max_n: int = 
         # rate limit ガード
         time.sleep(0.2)
     return out
+
+
+def get_option_signal_coverage(
+    tickers: list[str],
+    signals: Optional[dict[str, dict]] = None,
+) -> dict[str, dict]:
+    """Describe every requested ticker, including rows omitted after failure."""
+    signals = signals or {}
+    coverage: dict[str, dict] = {}
+    for ticker in dict.fromkeys(t for t in tickers if t):
+        if ticker in signals:
+            coverage[ticker] = {"status": "available", "error": None}
+            continue
+        if (
+            ticker in SKIP_TICKERS
+            or is_pseudo_market_ticker(ticker)
+            or not _is_safe_ticker(ticker)
+        ):
+            coverage[ticker] = {"status": "not_applicable", "error": "unsupported_ticker"}
+            continue
+        cache_row: dict = {}
+        try:
+            cache_row = json.loads(_cache_path(ticker).read_text(encoding="utf-8"))
+        except Exception:
+            cache_row = {}
+        error = str(cache_row.get("error") or "missing_option_result")
+        status = (
+            "not_applicable"
+            if error == "no_options" and ticker != "SPY"
+            else "error"
+        )
+        coverage[ticker] = {
+            "status": status,
+            "error": error,
+            "fetched_at": cache_row.get("fetched_at"),
+        }
+    return coverage
 
 
 def format_for_prompt(sigs: dict[str, dict]) -> str:
