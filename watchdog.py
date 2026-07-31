@@ -90,6 +90,18 @@ EXPECTED_INTERVALS = {
     'margin_manager':    {'max_stale_sec': 26 * 3600, 'weekday_only': True},
     'long_term_screener':{'max_stale_sec': 8 * 24 * 3600, 'weekday_only': False},
     'behavioral_guard_snapshot': {'max_stale_sec': 26 * 3600, 'weekday_only': True},
+    # Written from the immutable decision snapshot. A primary-source fallback
+    # must be visible rather than silently remaining degraded.
+    'macro_event_calendar': {
+        'max_stale_sec': 26 * 3600,
+        'weekday_only': True,
+        'warn_is_error': True,
+    },
+    'options_inputs': {
+        'max_stale_sec': 26 * 3600,
+        'weekday_only': True,
+        'warn_is_error': True,
+    },
     # Auto Tune runs four times on weekdays; use a daily threshold so a single
     # missed slot is visible without generating intraday false positives.
     'auto_tune':        {'max_stale_sec': 26 * 3600, 'weekday_only': True},
@@ -673,7 +685,7 @@ def evaluate_heartbeats(heartbeats: dict | None = None) -> Dict:
                 'age_hours': round(age / 3600, 1),
                 'reason': f'older_than_{cfg["max_stale_sec"] // 3600}h',
             })
-        elif status == 'error':
+        elif status == 'error' or (status == 'warn' and cfg.get('warn_is_error')):
             errors.append({
                 'script': script,
                 'error': entry.get('error'),

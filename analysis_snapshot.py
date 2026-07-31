@@ -37,6 +37,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
+from freshness_policy import stale_after_hours
+
 BASE_DIR = Path(__file__).parent
 SNAPSHOT_STATE_PATH = BASE_DIR / "decision_snapshot_state.json"
 
@@ -254,15 +256,18 @@ def build_base_snapshot(*, base_dir: Path = BASE_DIR, now: Optional[datetime] = 
     now = now or datetime.now()
 
     holdings = _provenance_for_file(
-        base_dir / "holdings.json", ts_keys=("__mtime__",), max_age_hours=96.0,
+        base_dir / "holdings.json", ts_keys=("__mtime__",),
+        max_age_hours=stale_after_hours("holdings"),
         now=now, source_label="holdings.json",
     )
     cash = _provenance_for_file(
-        base_dir / "account.json", ts_keys=("last_updated",), max_age_hours=96.0,
+        base_dir / "account.json", ts_keys=("last_updated",),
+        max_age_hours=stale_after_hours("cash"),
         now=now, source_label="account.json",
     )
     prices = _provenance_for_file(
-        base_dir / "technical_state.json", ts_keys=("cached_at",), max_age_hours=8.0,
+        base_dir / "technical_state.json", ts_keys=("cached_at",),
+        max_age_hours=stale_after_hours("technical"),
         now=now, source_label="technical_state.json",
     )
     # FX レートは account.json 経由 (utils.get_fx_rate_cached) で解決される。
@@ -272,15 +277,17 @@ def build_base_snapshot(*, base_dir: Path = BASE_DIR, now: Optional[datetime] = 
     fx = _provenance_for_file(
         base_dir / "account.json",
         ts_keys=("fx_rate_usdjpy_as_of", "last_updated"),
-        max_age_hours=24.0,
+        max_age_hours=stale_after_hours("fx"),
         now=now, source_label="account.json(fx_rate_usdjpy)",
     )
     macro = _provenance_for_file(
-        base_dir / "macro_event_state.json", ts_keys=("refreshed_at",), max_age_hours=24.0,
+        base_dir / "macro_event_state.json", ts_keys=("refreshed_at",),
+        max_age_hours=stale_after_hours("macro"),
         now=now, source_label="macro_event_state.json",
     )
     news = _provenance_for_file(
-        base_dir / "news_signal_candidates.json", ts_keys=("generated_at", "scan_time"), max_age_hours=12.0,
+        base_dir / "news_signal_candidates.json", ts_keys=("generated_at", "scan_time"),
+        max_age_hours=stale_after_hours("news"),
         now=now, source_label="news_signal_candidates.json",
     )
 
@@ -298,8 +305,10 @@ def build_base_snapshot(*, base_dir: Path = BASE_DIR, now: Optional[datetime] = 
         source="+".join(p.name for p, _ in screening_files),
         source_as_of=screening_as_of.isoformat() if screening_as_of else None,
         retrieved_at=now.isoformat(),
-        freshness_status=_freshness_status(screening_as_of, now=now, max_age_hours=72.0),
-        max_age_policy_hours=72.0,
+        freshness_status=_freshness_status(
+            screening_as_of, now=now, max_age_hours=stale_after_hours("screening"),
+        ),
+        max_age_policy_hours=stale_after_hours("screening"),
         artifact_hash=_combined_hash([p for p, _ in screening_files]),
     )
 
@@ -378,6 +387,59 @@ def decision_freshness_issues(enriched: EnrichedSnapshot) -> list[dict]:
     return issues
 
 
+def decision_input_health(
+    enriched: EnrichedSnapshot,
+    *,
+    macro_state: Optional[dict] = None,
+) -> dict[str, dict]:
+    """Summarize monitored macro/options inputs from the frozen snapshot."""
+    macro = enriched.base.macro
+    macro_runtime_status = str((macro_state or {}).get("status") or "unknown")
+    macro_errors = list((macro_state or {}).get("errors") or [])
+    if macro.freshness_status in {"stale", "unknown"}:
+        macro_status = "error"
+        macro_error = f"snapshot_{macro.freshness_status}"
+    elif macro_runtime_status not in {"ok", "healthy"}:
+        macro_status = "warn"
+        macro_error = f"source_status_{macro_runtime_status}"
+    else:
+        macro_status = "ok"
+        macro_error = None
+
+    option_rows = list(enriched.options_by_ticker.values())
+    option_bad = [
+        row for row in option_rows
+        if row.freshness_status in {"stale", "unknown"}
+    ]
+    return {
+        "macro_event_calendar": {
+            "status": macro_status,
+            "error": macro_error,
+            "extra": {
+                "snapshot_status": macro.freshness_status,
+                "source_as_of": macro.source_as_of,
+                "runtime_status": macro_runtime_status,
+                "source_errors": macro_errors[:5],
+            },
+        },
+        "options_inputs": {
+            "status": "error" if option_bad else "ok",
+            "error": (
+                f"{len(option_bad)}_of_{len(option_rows)}_snapshot_inputs_nonfresh"
+                if option_bad else None
+            ),
+            "extra": {
+                "required_count": len(option_rows),
+                "nonfresh_count": len(option_bad),
+                "nonfresh_tickers": sorted(
+                    ticker for ticker, row in enriched.options_by_ticker.items()
+                    if row.freshness_status in {"stale", "unknown"}
+                ),
+            },
+        },
+    }
+
+
 def decision_snapshot_content_hash(enriched: EnrichedSnapshot) -> str:
     """Hash the complete frozen decision payload for deterministic keys."""
     return _payload_hash(asdict(enriched))
@@ -410,9 +472,9 @@ def build_enriched_snapshot(
             source_as_of=as_of.isoformat() if as_of else None,
             retrieved_at=now.isoformat(),
             freshness_status=_freshness_status(
-                as_of, now=now, max_age_hours=24.0,
+                as_of, now=now, max_age_hours=stale_after_hours("options"),
             ),
-            max_age_policy_hours=24.0,
+            max_age_policy_hours=stale_after_hours("options"),
             artifact_hash=hashlib.sha256(serialized).hexdigest(),
         )
     return EnrichedSnapshot(base=base, options_by_ticker=options_by_ticker)

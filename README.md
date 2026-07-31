@@ -74,7 +74,7 @@ flowchart TD
 
 Each stage exists for a reason:
 
-**Freshness first.** Every input the gate depends on — the macro-event calendar, technical state, VIX, earnings proximity, scenario snapshot — is checked *before* analysis starts and refreshed when its own staleness rule requires it. A stale calendar would otherwise be silently read as "no important events coming up," which is the difference between an earnings blackout firing and not firing. Refresh failures are printed rather than swallowed, and the readiness gate treats a missing calendar as `review`, not as "clear."
+**Freshness first.** Every input the gate depends on — the macro-event calendar, technical state, VIX, earnings proximity, scenario snapshot — is checked *before* analysis starts and refreshed before its rejection boundary. Refresh and stale thresholds share one registry and CI requires `refresh < stale` (technical 4/8h, macro 12/24h, news 6/12h, options 12/24h), preventing a daily producer from skipping an update at the exact instant its consumer rejects the old value. A stale calendar would otherwise be silently read as "no important events coming up." Refresh failures are printed rather than swallowed, macro fallback and option-input health reach the watchdog, and the readiness gate treats a missing calendar as `review`, not as "clear."
 
 The analysis then freezes a two-stage **decision snapshot**. The base snapshot contains holdings, cash, prices, FX, macro, news and screening data; after the held and candidate tickers are known, an enriched snapshot adds their chart and options payloads. A single run-wide `analysis_id` is issued before catalyst or tier work begins and follows the catalyst, every tier result, final synthesis, action, stage log and both snapshot stages. Every tier and the final synthesis receive the same content hash, source timestamps and payload hashes, and external re-fetches are forbidden after the enriched snapshot is sealed. A separate execution-quote snapshot may refresh price, spread and market status just before an order, but it may only reprice or downgrade an action—not rewrite the investment thesis or confidence.
 
@@ -195,11 +195,18 @@ Primary role-based model choice is centralized in `model_router.py`. `ALMANAC_BU
 
 The economic shape is a funnel: cheap models see everything, expensive models see only what survived.
 
-Spend is measurable rather than assumed, because the main analysis, screening, disclosure, and monitoring transports all write token usage and estimated cost to a shared LLM-call log. The caveat is that this covers the instrumented paths, not every call in the tree.
+Spend is measurable rather than assumed, because the main analysis, screening, disclosure, and monitoring transports all write token usage and estimated cost to a shared LLM-call log. The daily analysis issues its `analysis_id` before gathering data and propagates it into parallel workers, so per-run spend is joined by ID rather than guessed from a time range. The caveat is that this covers the instrumented paths, not every call in the tree.
 
 ### 6. The gate
 
 This is the part that makes the system something other than "an LLM that suggests trades." Every proposed action passes through an ordered chain of **deterministic rules** — plain Python, no model in the loop. A rule can reject an action or modify it (downgrade urgency, halve the size).
+
+Quantity and money remain separate through that chain. A share/unit
+`amount_hint` contains quantity only, while `estimated_notional_jpy` is the
+numeric money authority; the dashboard renders the combined text at response
+time. If deterministic exit sizing replaces an LLM draft quantity, the
+original model confidence is explicitly direction-only rather than confidence
+in the machine-calculated size.
 
 | Rule | What it does |
 |---|---|

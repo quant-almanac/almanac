@@ -503,6 +503,11 @@ def _scale_size_field(raw, factor: float, *, unit: int = 1) -> Tuple[object, boo
         new_num = int(round(scaled))
         return f"{prefix}{new_num}{suffix}", False
     new_num = int(math.floor(scaled / unit) * unit)
+    if _has_qty_unit:
+        qty_label = "口" if "口" in raw else ("株" if "株" in raw else " shares")
+        # Embedded money/prose is discarded. The structured notional is scaled
+        # separately and rendered only at API/UI boundaries.
+        return f"{new_num}{qty_label}", (num > 0 and new_num < unit)
     return f"{prefix}{new_num}{suffix}", (num > 0 and new_num < unit)
 
 
@@ -574,6 +579,7 @@ def _apply_size_adj(action: dict) -> Tuple[dict, Optional[str]]:
     applied = {}
     collapsed_fields: List[str] = []
     actual_ratios: List[float] = []
+    quantity_rewrite: Optional[Tuple[str, str]] = None
     for fld in _SIZE_FIELDS:
         if fld not in out:
             continue
@@ -585,8 +591,23 @@ def _apply_size_adj(action: dict) -> Tuple[dict, Optional[str]]:
             ratio = _numeric_ratio(old_val, new_val)
             if ratio is not None:
                 actual_ratios.append(ratio)
+            if fld == "amount_hint":
+                old_match = re.search(r"[\d,]+(?:\.\d+)?\s*(?:株|口)", str(old_val))
+                new_match = re.search(r"[\d,]+(?:\.\d+)?\s*(?:株|口)", str(new_val))
+                if old_match and new_match:
+                    quantity_rewrite = (old_match.group(0), new_match.group(0))
         if collapsed:
             collapsed_fields.append(fld)
+    # Keep the human action sentence aligned at the same policy boundary.
+    # Replace the exact order quantity from amount_hint, not the first quantity
+    # in the sentence (which may describe current holdings).
+    if quantity_rewrite and out.get("action"):
+        old_quantity, new_quantity = quantity_rewrite
+        old_action = str(out["action"])
+        new_action = old_action.replace(old_quantity, new_quantity, 1)
+        if new_action != old_action:
+            applied["action"] = {"from": old_action, "to": new_action}
+            out["action"] = new_action
     # Keep audit/funding notionals consistent with the final rounded quantity.
     # The smallest observed ratio is conservative when multiple size fields
     # have different lot-rounding effects.

@@ -76,6 +76,14 @@ Freshness is evidence-specific, not file-wide:
 
 Analysis-source freshness is separately carried for holdings, cash, prices, FX, macro, news, screening and per-ticker options. `fresh`, `degraded`, `stale` and `unknown` are based on source time and each source's maximum-age policy. A hash proves immutability, not freshness.
 
+Refresh and rejection boundaries are separate values in one registry. Every
+periodically refreshed decision source must satisfy
+`refresh_after_hours < stale_after_hours`; the checked-in defaults are
+technical 4/8h, macro 12/24h, news 6/12h and options 12/24h. A contract test
+iterates the registry, so adding a source with an equal or reversed boundary
+fails CI. Macro fallback/degradation and non-fresh option inputs also emit
+snapshot-derived heartbeats rather than remaining silent.
+
 ## 5. Decision and execution snapshots
 
 The decision lane is two-stage:
@@ -98,6 +106,19 @@ The enriched snapshot is frozen before the first tier LLM. It records source tim
 - optional pseudonymized judge: DeepSeek reasoner.
 
 Anthropic calls that reject sampling parameters never receive `temperature`, `top_p` or `top_k`. Opus 5 and Sonnet 5 receive `output_config.effort=low`; forced tools are used with adaptive thinking. `max_tokens` truncation is an error and selected paths retry with a larger limit.
+
+The analysis ID is issued before refresh, data gathering and any model call.
+The run context is copied into tier and Red-Team worker threads, and every
+instrumented LLM usage row inherits that ID unless the caller supplied a
+different explicit job ID. Cost for one analysis is therefore joined by
+`analysis_id`, never inferred from a clock window.
+
+Action quantity and money are stored separately. For share/unit actions,
+`amount_hint` is canonical quantity only; `estimated_notional_jpy` is the
+numeric money authority. API/UI text such as `22 units / about JPY 76,164` is
+rendered from those structured values. Deterministic exit sizing also labels
+the model confidence as direction-only, because the final quantity comes from
+the rule engine rather than the LLM.
 
 `ALMANAC_PRIVACY_MODE` controls book-aware egress:
 

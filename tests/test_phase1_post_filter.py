@@ -617,7 +617,8 @@ def test_structured_equity_notional_wins_over_mistyped_prose():
     normalized = analyst._normalize_amount_hint_notional(action, estimated)
 
     assert estimated == 67_640
-    assert normalized["amount_hint"] == "20口（約¥67,640相当）"
+    assert normalized["amount_hint"] == "20口"
+    assert normalized["notional_claim_corrected_jpy"] == 67_640
     assert normalized["notional_claim_original_jpy"] == 680_000
 
 

@@ -689,6 +689,28 @@ def test_size_adj_keeps_estimated_notional_consistent_with_rounded_quantity():
     }
 
 
+def test_size_adj_rewrites_exact_order_quantity_in_action_text():
+    ctx = pe.PolicyContext(
+        current_dd=-0.01,
+        market_regime_mode="advisory",
+        market_regime_levels={"JP": 1},
+        market_regime_buy_multipliers={"JP": 0.75},
+    )
+    a = _action("buy")
+    a.update({
+        "ticker": "1489.T",
+        "amount_hint": "30口（約¥104,600）",
+        "action": "妻NISAで1489.Tを30口追加",
+        "estimated_notional_jpy": 103_860,
+    })
+
+    d = pe.apply_policy_gate([a], ctx)
+
+    assert d.accepted[0]["amount_hint"] == "22口"
+    assert d.accepted[0]["action"] == "妻NISAで1489.Tを22口追加"
+    assert d.accepted[0]["estimated_notional_jpy"] == 76_164
+
+
 def test_size_adj_collapse_rejects_sub_share():
     ctx = pe.PolicyContext(current_dd=-0.06)
     a = _action("buy")
@@ -706,6 +728,16 @@ def test_size_adj_yen_amount_rounds_no_collapse():
     d = pe.apply_policy_gate([a], ctx)
     assert len(d.accepted) == 1
     assert d.accepted[0]["amount_hint"] == "¥75000"
+
+
+def test_policy_resize_drops_stale_embedded_notional_from_quantity_hint():
+    scaled, collapsed = pe._scale_size_field(
+        "30口（約¥104,600）",
+        0.75,
+        unit=1,
+    )
+    assert scaled == "22口"
+    assert collapsed is False
 
 
 def test_size_adj_noop_when_no_reduction():

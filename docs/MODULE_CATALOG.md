@@ -19,7 +19,7 @@ This is an ownership map, not a claim that every file is live. The lifecycle col
 
 | Lifecycle | Modules | Boundary |
 |---|---|---|
-| live | `analyzer.py`, `llm_adapters.py`, `model_router.py`, `llm_cost_accounting.py` | Provider transport, role routing and spend attribution |
+| live | `analyzer.py`, `llm_adapters.py`, `model_router.py`, `llm_cost_accounting.py`, `llm_run_context.py` | Provider transport, role routing, run identity and spend attribution |
 | live/observe | `red_team_ledger.py`, `compare_harness.py`, `human_feedback_log.py` | Adversarial evidence, harness comparison and human labels |
 
 The large orchestration implementation lives in the `analyst/` package; see §15.
@@ -42,7 +42,7 @@ The large orchestration implementation lives in the `analyst/` package; see §15
 | live | `action_stage_log.py`, `action_state_tracker.py`, `execution_invalidation.py` | Stage audit, action lifecycle and invalidation overlay |
 | live | `execution_readiness.py`, `execution_safety.py`, `policy_engine.py` | Deterministic admission, freshness and safety gates |
 | live | `feature_controls.py` | Runtime feature switches, effective-state reasons and fail-closed UI contract |
-| live | `order_intent_resolver.py`, `exit_sizing.py`, `execution_explanation.py` | Idempotent intent, deterministic quantity and display text |
+| live | `order_intent_resolver.py`, `exit_sizing.py`, `execution_explanation.py`, `action_amounts.py` | Idempotent intent, deterministic quantity and structured amount display |
 | observe | `execution_plan_engine.py`, `execution_plan_observer.py`, `execution_quality.py` | Plan budgets, enforce-readiness evidence and implementation shortfall |
 | live | `behavioral_guard.py`, `margin_manager.py` | Drawdown behavior guard and margin-position controls |
 
@@ -69,7 +69,7 @@ The large orchestration implementation lives in the `analyst/` package; see §15
 | live | `sector_rotation.py`, `sector_strength_updater.py` | Sector state |
 | shared | `instrument_metadata.py`, `pseudo_tickers.py`, `download_tickers.py`, `expand_tickers.py` | Instrument identity, synthetic IDs and universe files |
 | maintenance | `parquet_rebuilder.py`, `sync_jp_universe_prices.py` | Local price-store repair and JP-universe synchronization |
-| live | `analysis_snapshot.py`, `claim_provenance.py` | Frozen decision inputs and claim lineage |
+| live | `analysis_snapshot.py`, `freshness_policy.py`, `claim_provenance.py` | Frozen decision inputs, refresh/staleness invariants and claim lineage |
 
 ## 7. Screeners and candidate measurement
 

@@ -21,7 +21,7 @@
 
 | Lifecycle | Modules | 境界 |
 |---|---|---|
-| live | `analyzer.py`, `llm_adapters.py`, `model_router.py`, `llm_cost_accounting.py` | provider transport、role routing、cost |
+| live | `analyzer.py`, `llm_adapters.py`, `model_router.py`, `llm_cost_accounting.py`, `llm_run_context.py` | provider transport、role routing、実行ID、cost |
 | live/observe | `red_team_ledger.py`, `compare_harness.py`, `human_feedback_log.py` | 反証証拠、harness比較、人のlabel |
 
 ## 3. Portfolio・口座・household policy
@@ -42,7 +42,7 @@
 | live | `action_stage_log.py`, `action_state_tracker.py`, `execution_invalidation.py` | stage監査、action lifecycle、invalidation |
 | live | `execution_readiness.py`, `execution_safety.py`, `policy_engine.py` | 決定論的採用、freshness、安全gate |
 | live | `feature_controls.py` | runtime機能switch、実効状態の理由、fail-closed UI contract |
-| live | `order_intent_resolver.py`, `exit_sizing.py`, `execution_explanation.py` | 冪等intent、数量、表示文 |
+| live | `order_intent_resolver.py`, `exit_sizing.py`, `execution_explanation.py`, `action_amounts.py` | 冪等intent、決定論的数量、構造化金額表示 |
 | observe | `execution_plan_engine.py`, `execution_plan_observer.py`, `execution_quality.py` | plan budget、enforce readiness、shortfall |
 | live | `behavioral_guard.py`, `margin_manager.py` | drawdown行動guardと信用管理 |
 
@@ -69,7 +69,7 @@
 | live | `sector_rotation.py`, `sector_strength_updater.py` | sector state |
 | shared | `instrument_metadata.py`, `pseudo_tickers.py`, `download_tickers.py`, `expand_tickers.py` | instrument identity、synthetic ID、universe |
 | maintenance | `parquet_rebuilder.py`, `sync_jp_universe_prices.py` | local price store修復、JP同期 |
-| live | `analysis_snapshot.py`, `claim_provenance.py` | decision input凍結とclaim lineage |
+| live | `analysis_snapshot.py`, `freshness_policy.py`, `claim_provenance.py` | decision input凍結、refresh/stale不変条件、claim lineage |
 
 ## 7. Screener とcandidate計測
 

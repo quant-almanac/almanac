@@ -66,3 +66,28 @@ def test_heartbeat_rows_evaluates_the_supplied_snapshot(monkeypatch):
     system_status._heartbeat_rows(raw)
 
     assert seen["heartbeats"] is raw
+
+
+def test_watchdog_escalates_monitored_decision_input_warning(monkeypatch):
+    import time
+    import watchdog
+
+    monkeypatch.setattr(watchdog, "_is_weekend", lambda: False)
+    monkeypatch.setattr(watchdog, "_is_monday_morning_grace", lambda: False)
+    now = time.time()
+    health = watchdog.evaluate_heartbeats({
+        "macro_event_calendar": {
+            "status": "warn",
+            "error": "source_status_degraded",
+            "last_run_ts": now,
+        },
+        "options_inputs": {
+            "status": "ok",
+            "last_run_ts": now,
+        },
+    })
+    assert any(
+        row["script"] == "macro_event_calendar"
+        and row["error"] == "source_status_degraded"
+        for row in health["errors"]
+    )

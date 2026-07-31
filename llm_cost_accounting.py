@@ -96,6 +96,14 @@ def _is_batch_api_usage(row: dict[str, Any]) -> bool:
 
 def normalize_usage_row(row: dict[str, Any]) -> dict[str, Any]:
     normalized = dict(row)
+    if not normalized.get("analysis_id"):
+        try:
+            from llm_run_context import current_analysis_id
+            analysis_id = current_analysis_id()
+            if analysis_id:
+                normalized["analysis_id"] = analysis_id
+        except Exception:
+            pass
     normalized.setdefault("provider", "anthropic" if "claude" in str(row.get("model", "")).lower() else "external")
     normalized.setdefault("lane", row.get("role") or "unknown")
     normalized.setdefault("input_tokens", row.get("prompt_tokens"))

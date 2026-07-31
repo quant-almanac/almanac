@@ -35,7 +35,9 @@ from analyst.llm_client import (
 from analyst.data_gatherer import (
     gather_data, fmt_news_section, fmt_earnings_section,
 )
+from action_amounts import canonicalize_action_amount_hint
 from almanac.runtime_config import get_env
+from freshness_policy import refresh_after_hours
 from instrument_metadata import (
     jp_trading_unit_prompt,
     quantity_label_for_ticker,
@@ -1077,7 +1079,11 @@ def _ensure_news_candidates_fresh(
         return False
     local_tz = ZoneInfo(get_env("ALMANAC_LOCAL_TIMEZONE", "Asia/Tokyo") or "Asia/Tokyo")
     now = datetime.now(local_tz).replace(tzinfo=None)
-    max_age = _env_float("ALMANAC_NEWS_CANDIDATE_REFRESH_HOURS", 6.0) if max_age_hours is None else float(max_age_hours)
+    configured = (
+        _env_float("ALMANAC_NEWS_CANDIDATE_REFRESH_HOURS", refresh_after_hours("news"))
+        if max_age_hours is None else float(max_age_hours)
+    )
+    max_age = refresh_after_hours("news", configured)
     age_h = _data_source_age_hours(
         base_dir,
         "news_signal_candidates.json",
@@ -1103,7 +1109,11 @@ def _ensure_technical_state_fresh(
 ) -> bool:
     local_tz = ZoneInfo(get_env("ALMANAC_LOCAL_TIMEZONE", "Asia/Tokyo") or "Asia/Tokyo")
     now = datetime.now(local_tz).replace(tzinfo=None)
-    max_age = _env_float("ALMANAC_TECHNICAL_REFRESH_HOURS", 4.0) if max_age_hours is None else float(max_age_hours)
+    configured = (
+        _env_float("ALMANAC_TECHNICAL_REFRESH_HOURS", refresh_after_hours("technical"))
+        if max_age_hours is None else float(max_age_hours)
+    )
+    max_age = refresh_after_hours("technical", configured)
     age_h = _data_source_age_hours(
         base_dir,
         "technical_state.json",
@@ -1154,10 +1164,15 @@ def _ensure_technical_state_fresh(
 def _ensure_macro_event_state_fresh(
     *,
     base_dir: Path = BASE_DIR,
-    max_age_hours: float = 24.0,
+    max_age_hours: float | None = None,
     refresher=None,
 ) -> bool:
     """Refresh official CPI/employment/FOMC calendar when missing or stale."""
+    configured = (
+        _env_float("ALMANAC_MACRO_EVENT_REFRESH_HOURS", refresh_after_hours("macro"))
+        if max_age_hours is None else float(max_age_hours)
+    )
+    max_age = refresh_after_hours("macro", configured)
     path = base_dir / "macro_event_state.json"
     age_h = None
     if path.exists():
@@ -1169,7 +1184,7 @@ def _ensure_macro_event_state_fresh(
             age_h = (datetime.now(timezone.utc) - ts.astimezone(timezone.utc)).total_seconds() / 3600
         except Exception:
             age_h = None
-    if age_h is not None and age_h <= max_age_hours:
+    if age_h is not None and age_h <= max_age:
         return False
     if refresher is None:
         from macro_event_calendar import refresh_macro_event_state
@@ -1845,8 +1860,9 @@ def _self_consistent_long(data: dict, shared_ctx: str = "") -> dict:
     timeout = _tier_llm_timeout_seconds() + 10.0
     ex = _SCPool(max_workers=2)
     try:
-        f1 = ex.submit(_analyze_long, data, shared_ctx)
-        f2 = ex.submit(_analyze_long, data, shared_ctx)
+        from llm_run_context import submit_with_current_context
+        f1 = submit_with_current_context(ex, _analyze_long, data, shared_ctx)
+        f2 = submit_with_current_context(ex, _analyze_long, data, shared_ctx)
         done, not_done = _cf_wait([f1, f2], timeout=timeout)
         if f1 not in done:
             print(f"  ⚠️ Long自己一致性 run1 タイムアウト: {timeout:.0f}s")
@@ -2891,7 +2907,11 @@ def _analyze_redteam_multi(data: dict, shared_ctx: str = "",
     results: dict[str, dict] = {}
     _RT_TIMEOUT = 120  # Red Team 全体で最大 2 分
     _ex_rt = _TPE(max_workers=len(providers))
-    futs = {_ex_rt.submit(fn): name for name, fn in providers.items()}
+    from llm_run_context import submit_with_current_context
+    futs = {
+        submit_with_current_context(_ex_rt, fn): name
+        for name, fn in providers.items()
+    }
     _done_rt, _not_done_rt = _cf_wait(futs, timeout=_RT_TIMEOUT)
     for fut in _done_rt:
         name = futs[fut]
@@ -4952,6 +4972,25 @@ _APPROX_NOTIONAL_RE = re.compile(
 
 def _normalize_amount_hint_notional(action: dict, estimated_jpy: float) -> dict:
     """Align a prose amount claim with the deterministic structured notional."""
+    canonical = canonicalize_action_amount_hint(action)
+    if canonical.get("amount_hint") != action.get("amount_hint"):
+        canonical["notional_claim_corrected"] = True
+        canonical.setdefault("notional_claim_original", action.get("amount_hint"))
+        original_match = _APPROX_NOTIONAL_RE.search(
+            str(action.get("amount_hint") or "")
+        )
+        if original_match:
+            original_claim = float(
+                original_match.group("number").replace(",", "")
+            )
+            if original_match.group("suffix") in {"万円", "万"}:
+                original_claim *= 10_000
+            else:
+                original_claim *= 1_000
+            canonical["notional_claim_original_jpy"] = round(original_claim)
+        if estimated_jpy >= 0 and math.isfinite(estimated_jpy):
+            canonical["notional_claim_corrected_jpy"] = round(estimated_jpy)
+        return canonical
     hint = str(action.get("amount_hint") or "")
     match = _APPROX_NOTIONAL_RE.search(hint)
     if not match or estimated_jpy < 0 or not math.isfinite(estimated_jpy):
@@ -7365,6 +7404,11 @@ def _phase1_post_filter(
         action["exit_sizing_steps"] = [dict(step) for step in result.steps]
         action["exit_sizing_is_revision"] = result.is_revision_of_pending
         action["exit_sizing_quantity_basis"] = "medium_sleeve_quantity"
+        # The LLM confidence still describes the direction/thesis. The final
+        # quantity is produced by a deterministic drift rule and must not be
+        # presented as though the model assigned confidence to that size.
+        action["confidence_scope"] = "direction_only"
+        action["sizing_confidence_source"] = "deterministic_exit_rule"
         action["exit_sizing_sleeve_quantity"] = sleeve_current_qty
         action["exit_sizing_physical_quantity"] = physical_current_qty
         action["exit_sizing_max_step_basis"] = (
@@ -9545,6 +9589,25 @@ def _inject_playbook_actions(synthesis: dict, data: dict) -> dict:
 
 # ── メインエントリー ─────────────────────────────────────
 
+def _with_analysis_run_context(function):
+    """Issue one run ID and expose it to all nested LLM usage writers."""
+    from functools import wraps
+
+    @wraps(function)
+    def wrapper(*args, **kwargs):
+        try:
+            from almanac.observability.ids import new_analysis_id
+        except Exception:
+            from action_stage_log import new_analysis_id
+        from llm_run_context import analysis_run_context
+
+        with analysis_run_context(new_analysis_id()):
+            return function(*args, **kwargs)
+
+    return wrapper
+
+
+@_with_analysis_run_context
 def run_analysis(force: bool = False) -> dict:
     """
     フル AI 分析を実行してキャッシュに保存。
@@ -9689,14 +9752,12 @@ def run_analysis(force: bool = False) -> dict:
     print("📊 データ収集中…")
     data = gather_data()
 
-    # One run-wide ID is issued before any catalyst/tier/synthesis work.  It is
-    # distinct from decision_snapshot_id (the immutable input artifact key)
-    # but is available to every downstream record from the start of analysis.
-    try:
-        from almanac.observability.ids import new_analysis_id as _new_analysis_id
-    except Exception:
-        from action_stage_log import new_analysis_id as _new_analysis_id
-    _asl_analysis_id = _new_analysis_id()
+    # The decorator issues one run-wide ID before refresh/gather/LLM work.
+    # It remains distinct from decision_snapshot_id (the immutable input key).
+    from llm_run_context import current_analysis_id
+    _asl_analysis_id = current_analysis_id()
+    if not _asl_analysis_id:
+        raise RuntimeError("analysis run context missing analysis_id")
     data["analysis_id"] = _asl_analysis_id
     _analysis_now = datetime.now(ZoneInfo("Asia/Tokyo"))
 
@@ -9815,6 +9876,7 @@ def run_analysis(force: bool = False) -> dict:
         build_base_snapshot_from_data,
         build_enriched_snapshot,
         decision_freshness_issues,
+        decision_input_health,
         decision_snapshot_content_hash,
         freeze_decision_snapshot,
     )
@@ -9827,6 +9889,23 @@ def run_analysis(force: bool = False) -> dict:
     )
     _decision_snapshot_issues = decision_freshness_issues(_tier_enriched_snapshot)
     _decision_snapshot_hash = decision_snapshot_content_hash(_tier_enriched_snapshot)
+    try:
+        _macro_runtime_state = load_json(
+            BASE_DIR / "macro_event_state.json", default={},
+        )
+        from utils import heartbeat as _snapshot_heartbeat
+        for _source_name, _health in decision_input_health(
+            _tier_enriched_snapshot,
+            macro_state=_macro_runtime_state,
+        ).items():
+            _snapshot_heartbeat(
+                _source_name,
+                _health["status"],
+                _health.get("error"),
+                extra=_health.get("extra"),
+            )
+    except Exception as _snapshot_health_error:
+        print(f"  ⚠️ decision input heartbeat 生成失敗: {_snapshot_health_error}")
     _code_revision = None
     try:
         import subprocess as _snap_sp
@@ -9934,12 +10013,23 @@ def run_analysis(force: bool = False) -> dict:
 
     _executor = ThreadPoolExecutor(max_workers=_TIER_WORKERS)
     try:
+        from llm_run_context import submit_with_current_context
         futures = {
-            "Long分析":       _executor.submit(_self_consistent_long,     data, shared_ctx),
-            "Medium分析":     _executor.submit(_analyze_medium,           data, shared_ctx),
-            "Swing分析":      _executor.submit(_analyze_short_positions,  data, shared_ctx),
-            "MarginLong分析": _executor.submit(_analyze_margin_long,      data, shared_ctx),
-            "ShortSell分析":  _executor.submit(_analyze_short_selling,    data, shared_ctx),
+            "Long分析": submit_with_current_context(
+                _executor, _self_consistent_long, data, shared_ctx,
+            ),
+            "Medium分析": submit_with_current_context(
+                _executor, _analyze_medium, data, shared_ctx,
+            ),
+            "Swing分析": submit_with_current_context(
+                _executor, _analyze_short_positions, data, shared_ctx,
+            ),
+            "MarginLong分析": submit_with_current_context(
+                _executor, _analyze_margin_long, data, shared_ctx,
+            ),
+            "ShortSell分析": submit_with_current_context(
+                _executor, _analyze_short_selling, data, shared_ctx,
+            ),
         }
         from concurrent.futures import wait as _cf_wait
         done, not_done = _cf_wait(futures.values(), timeout=_TIER_TIMEOUT)
@@ -10651,6 +10741,9 @@ def run_analysis(force: bool = False) -> dict:
             ) from _synth_err
 
     if isinstance(synthesis, dict):
+        for _amount_action in synthesis.get("priority_actions") or []:
+            if isinstance(_amount_action, dict):
+                canonicalize_action_amount_hint(_amount_action, in_place=True)
         _apply_degraded_mode(synthesis, _degraded_info)
         synthesis["fx_hedge_shadow_decision"] = _fx_hedge_shadow_observation
         synthesis["investment_policy_observation"] = (

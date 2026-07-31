@@ -6,7 +6,7 @@ yfinance options chain から IV Rank / 25Δ Skew / Put-Call Ratio を取得。
 責務:
 - 指定 ticker のオプション最近接月次 expiration を取得
 - ATM IV / 25Δ Skew / Put-Call Ratio を計算
-- 24h TTL で data/options_cache/{ticker}.json にキャッシュ
+- 12h TTL で data/options_cache/{ticker}.json にキャッシュ
 - 252 日 ATM IV 履歴を data/options_iv/{ticker}.parquet に append し IV Rank を percentile で計算
 - 取得不可 ticker（投信、日本株のオプション無し銘柄等）は None で継続
 
@@ -27,12 +27,13 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
 
+from freshness_policy import refresh_after_hours
 from pseudo_tickers import is_pseudo_market_ticker
 
 BASE_DIR = Path(__file__).parent
 CACHE_DIR = BASE_DIR / "data" / "options_cache"
 IV_HISTORY_DIR = BASE_DIR / "data" / "options_iv"
-CACHE_TTL_HOURS = 24
+CACHE_TTL_HOURS = refresh_after_hours("options")
 
 # 日本株や投信などオプション無しと判明したらキャッシュに negative エントリーを残す
 NEGATIVE_TTL_HOURS = 24

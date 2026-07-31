@@ -275,6 +275,31 @@ def test_decision_freshness_issues_include_unknown_option_inputs(tmp_path):
     )
 
 
+def test_decision_input_health_surfaces_macro_fallback_and_stale_options(tmp_path):
+    now = datetime(2026, 7, 27, 12, 0, 0)
+    _write(
+        tmp_path,
+        "macro_event_state.json",
+        {"refreshed_at": "2026-07-27T11:00:00"},
+    )
+    base = snap.build_base_snapshot(base_dir=tmp_path, now=now)
+    enriched = snap.build_enriched_snapshot(
+        base,
+        options_by_ticker_raw={
+            "AVGO": {"as_of": "2026-07-26T11:00:00", "iv_rank": 50},
+        },
+        now=now,
+    )
+    health = snap.decision_input_health(
+        enriched,
+        macro_state={"status": "degraded", "errors": ["bls:403"]},
+    )
+    assert health["macro_event_calendar"]["status"] == "warn"
+    assert health["macro_event_calendar"]["extra"]["source_errors"] == ["bls:403"]
+    assert health["options_inputs"]["status"] == "error"
+    assert health["options_inputs"]["extra"]["nonfresh_tickers"] == ["AVGO"]
+
+
 def test_old_options_timestamp_is_stale_not_fresh():
     now = datetime(2026, 7, 27, 12, 0, 0)
     base = snap.build_base_snapshot(base_dir=Path("/nonexistent"), now=now)

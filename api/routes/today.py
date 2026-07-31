@@ -1136,8 +1136,11 @@ def _build_today() -> dict:
     )
 
     def _board_row(a: dict, *, force_review: bool = False) -> dict:
+        from action_amounts import render_action_amount
+
         entry = _match_lifecycle(a, action_state, as_of_dt)
         notional = a.get("estimated_notional_jpy")
+        amount_view = render_action_amount(a)
         impact = (
             round(notional / portfolio_total * 100, 2)
             if notional and portfolio_total else None
@@ -1198,12 +1201,14 @@ def _build_today() -> dict:
                 "execution_advisories", "market_quote_confirmation_required",
                 "market_order_window", "expiry_starts_at", "expiry_ends_at",
                 "market_reprice_required", "market_reprice_after",
+                "confidence_scope", "sizing_confidence_source",
             )},
             "analysis_id": a.get("analysis_id") or synthesis.get("analysis_id"),
             "action_state_id": lifecycle.get("id"),
             "execution_readiness": readiness,
             "execution_block_reasons": block_reasons,
             "estimated_notional_jpy": notional,
+            "amount_display": amount_view["display"],
             "impact_nav_pct": impact,
             "lifecycle": lifecycle,
         }

@@ -76,6 +76,8 @@ household集中度はrisk計測のため同一instrumentを口座横断集約で
 
 分析入力の鮮度はholdings、cash、prices、FX、macro、news、screening、ticker別optionsに分離します。`fresh/degraded/stale/unknown`はsource timeと個別max-age policyから決まります。hashが証明するのは不変性で、鮮度ではありません。
 
+更新境界と拒否境界は、1つのregistry内の別の値です。定期更新する判断入力は必ず`refresh_after_hours < stale_after_hours`を満たします。既定値はtechnical 4/8時間、macro 12/24時間、news 6/12時間、options 12/24時間です。契約testがregistry全体を走査するため、同値または逆転したsourceを追加するとCIで失敗します。macroのfallback/degradedとfreshでないoptions入力は、黙って残さずfrozen snapshot由来のheartbeatにも記録します。
+
 ## 5. Decision snapshot と execution snapshot
 
 decision laneは2段階です。
@@ -98,6 +100,10 @@ decision laneは2段階です。
 - 任意のpseudonymized judge: DeepSeek reasoner
 
 sampling paramを拒否するAnthropic modelへ`temperature/top_p/top_k`を送りません。Opus 5/Sonnet 5は`output_config.effort=low`、adaptive thinkingとforced toolを使います。`max_tokens` truncateはerrorで、対象経路は上限を増やしてretryします。
+
+analysis IDはrefresh、data gather、最初のmodel callより前に発行します。run contextはtierとRed Teamのworker threadへ複製し、計測済みLLM usage行はcallerが別の明示job IDを持たない限り同じIDを継承します。1分析のcostは時刻窓で推測せず`analysis_id`でjoinします。
+
+actionの数量と金額は別々に保存します。株・口数actionの`amount_hint`は正規化した数量だけ、`estimated_notional_jpy`が金額の数値権威です。`22口 / 約¥76,164`のようなAPI/UI文字列はその構造化値から描画時に作ります。決定論的exit sizingではmodel confidenceを方向だけのconfidenceと明記します。最終数量はLLMでなくrule engineが決めるためです。
 
 `ALMANAC_PRIVACY_MODE`がbook-aware送信を制御します。
 
