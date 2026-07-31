@@ -1141,6 +1141,19 @@ def _build_today() -> dict:
         entry = _match_lifecycle(a, action_state, as_of_dt)
         notional = a.get("estimated_notional_jpy")
         amount_view = render_action_amount(a)
+        deterministic_sizing = bool(
+            a.get("position_size_corrected")
+            or a.get("exit_sizing_status")
+            or a.get("exit_sizing_steps")
+        )
+        confidence_scope = (
+            a.get("confidence_scope")
+            or ("direction_only" if deterministic_sizing else None)
+        )
+        sizing_confidence_source = (
+            a.get("sizing_confidence_source")
+            or ("deterministic_exit_rule" if deterministic_sizing else None)
+        )
         impact = (
             round(notional / portfolio_total * 100, 2)
             if notional and portfolio_total else None
@@ -1210,6 +1223,8 @@ def _build_today() -> dict:
             "amount_hint": amount_view["quantity"] or a.get("amount_hint"),
             "estimated_notional_jpy": notional,
             "amount_display": amount_view["display"],
+            "confidence_scope": confidence_scope,
+            "sizing_confidence_source": sizing_confidence_source,
             "impact_nav_pct": impact,
             "lifecycle": lifecycle,
         }
