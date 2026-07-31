@@ -193,6 +193,7 @@ def test_build_today_separates_ready_orders_from_review_candidates(monkeypatch):
                 {
                     "rank": 1, "ticker": "1489.T", "type": "buy",
                     "execution_readiness": "ready", "estimated_notional_jpy": 120_000,
+                    "amount_hint": "22口（約¥104,600）",
                 },
                 {
                     "rank": 2, "ticker": "ROBO", "type": "buy",
@@ -237,6 +238,8 @@ def test_build_today_separates_ready_orders_from_review_candidates(monkeypatch):
     assert [row["ticker"] for row in result["review_board"]] == ["ROBO", "4063.T"]
     assert result["board"][0]["analysis_id"] == "analysis-0714"
     assert result["board"][0]["action_state_id"] == "ready-id"
+    assert result["board"][0]["amount_hint"] == "22口"
+    assert result["board"][0]["amount_display"] == "22口 / 約¥120,000"
     assert result["review_board"][0]["execution_block_reasons"][0]["code"] == "market_spread_too_wide"
     assert result["review_board"][1]["execution_block_reasons"][0]["code"] == "near_minimum_notional"
     assert result["execution_plan"]["summary"]["board_count"] == 1

@@ -122,7 +122,7 @@ JPY残高: ¥{account.get('balance', 0):,} / USD残高: ${account.get('usd_balan
 方向       : {action_ctx.get('direction', '')}（{action_ctx.get('type', '')}）
 アクション : {action_ctx.get('action', '')}
 理由       : {action_ctx.get('reason', '')}
-数量       : {action_ctx.get('amount_hint', 'なし')}
+数量       : {_amount_view['quantity'] or 'なし'}
 想定金額   : {f"¥{_amount_view['notional_jpy']:,}" if _amount_view['notional_jpy'] is not None else '不明'}
 緊急度     : {action_ctx.get('urgency', '')}
 ティア     : {action_ctx.get('tier', '')}

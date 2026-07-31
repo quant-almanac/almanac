@@ -1207,6 +1207,7 @@ def _build_today() -> dict:
             "action_state_id": lifecycle.get("id"),
             "execution_readiness": readiness,
             "execution_block_reasons": block_reasons,
+            "amount_hint": amount_view["quantity"] or a.get("amount_hint"),
             "estimated_notional_jpy": notional,
             "amount_display": amount_view["display"],
             "impact_nav_pct": impact,
