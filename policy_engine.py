@@ -32,7 +32,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Callable, Optional, Tuple, List, Set
 
-from action_amounts import rewrite_action_quantity
+from action_amounts import synchronize_resized_action_prose
 from risk_policy import POLICY, classify_drawdown, var_threshold_decimal
 
 
@@ -544,6 +544,15 @@ def _apply_size_adj(action: dict) -> Tuple[dict, Optional[str]]:
     collapsed_fields: List[str] = []
     actual_ratios: List[float] = []
     quantity_rewrite: Optional[Tuple[str, str]] = None
+    old_notional_authority: Optional[float] = None
+    for fld in _NOTIONAL_FIELDS:
+        try:
+            candidate = float(out.get(fld))
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(candidate):
+            old_notional_authority = candidate
+            break
     for fld in _SIZE_FIELDS:
         if fld not in out:
             continue
@@ -570,22 +579,6 @@ def _apply_size_adj(action: dict) -> Tuple[dict, Optional[str]]:
                     quantity_rewrite = (old_match.group(0), new_match.group(0))
         if collapsed:
             collapsed_fields.append(fld)
-    # Rewrite only when the order token is unambiguous. A plain str.replace()
-    # can corrupt the holding quantity in "保有30口のうち30口を売却".
-    if quantity_rewrite:
-        old_quantity, new_quantity = quantity_rewrite
-        old_action = str(out.get("action") or "")
-        new_action, rewrite_status = rewrite_action_quantity(
-            old_action,
-            old_hint=old_quantity,
-            new_hint=new_quantity,
-        )
-        out["action_quantity_sync_status"] = rewrite_status
-        if rewrite_status == "rewritten":
-            applied["action"] = {"from": old_action, "to": new_action}
-            out["action"] = new_action
-        else:
-            out["action_quantity_sync_failed"] = True
     # Keep audit/funding notionals consistent with the final rounded quantity.
     # The smallest observed ratio is conservative when multiple size fields
     # have different lot-rounding effects.
@@ -601,6 +594,25 @@ def _apply_size_adj(action: dict) -> Tuple[dict, Optional[str]]:
         if new_notional != out[fld]:
             applied[fld] = {"from": out[fld], "to": new_notional}
             out[fld] = new_notional
+    if quantity_rewrite:
+        old_quantity, new_quantity = quantity_rewrite
+        new_notional_authority: Optional[float] = None
+        for fld in _NOTIONAL_FIELDS:
+            try:
+                candidate = float(out.get(fld))
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(candidate):
+                new_notional_authority = candidate
+                break
+        out, prose_applied = synchronize_resized_action_prose(
+            out,
+            old_hint=old_quantity,
+            new_hint=new_quantity,
+            old_notional_jpy=old_notional_authority,
+            new_notional_jpy=new_notional_authority,
+        )
+        applied.update(prose_applied)
     if applied:
         out["policy_size_applied"] = applied
         out["policy_size_final"] = True  # 後段の単元丸めで増額しない印

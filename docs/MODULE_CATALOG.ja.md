@@ -21,7 +21,7 @@
 
 | Lifecycle | Modules | 境界 |
 |---|---|---|
-| live | `analyzer.py`, `llm_adapters.py`, `model_router.py`, `llm_cost_accounting.py`, `llm_run_context.py` | provider transport、role routing、実行ID、cost |
+| live | `analyzer.py`, `llm_adapters.py`, `model_router.py`, `llm_cost_accounting.py`, `llm_run_context.py`, `analysis_output_validation.py` | provider transport、role routing、実行ID、cost、金融説明の決定論的検証 |
 | live/observe | `red_team_ledger.py`, `compare_harness.py`, `human_feedback_log.py` | 反証証拠、harness比較、人のlabel |
 
 ## 3. Portfolio・口座・household policy

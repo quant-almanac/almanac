@@ -257,7 +257,9 @@ def test_final_synthesis_prompt_exposes_cash_amounts():
 def test_final_synthesis_drawdown_rule_has_correct_sign():
     source = inspect.getsource(analyst._synthesize)
 
-    assert "current_dd<=-8%" in source
+    assert "canonical flow-adjusted DD<=-8%" in source
+    assert "risk_context_for_prompt(risk)" in source
+    assert "VIX>30 または current_dd<=-8%" not in source
     assert "drawdown>-4%" not in source
 
 

@@ -647,6 +647,30 @@ def test_execution_plan_would_filter_is_review_not_ready(tmp_path):
     assert any(row["code"] == "execution_plan_observe_conflict" for row in result["execution_block_reasons"])
 
 
+def test_exit_with_opposite_active_plan_is_review_not_blocked(tmp_path):
+    now = datetime(2026, 7, 14, 6, 0, tzinfo=JST)
+    _write_base(tmp_path, now, ticker="XLF")
+    result = classify_execution_readiness({
+        "ticker": "XLF",
+        "type": "trim",
+        "amount_hint": "1株",
+        "holding_shares_before": 80,
+        "requested_sell_quantity": 1,
+        "order_type": "limit",
+        "limit_price": 55,
+        "execution_plan_direction_conflict": True,
+        "execution_plan_conflict_item_ids": ["2026-08-w32-add-financials-003"],
+        "execution_plan_conflict_reason": "XLFの買付計画と売却候補が併存",
+    }, base_dir=tmp_path, now=now)
+
+    assert result["execution_readiness"] == "review"
+    reason = next(
+        row for row in result["execution_block_reasons"]
+        if row["code"] == "execution_plan_direction_conflict"
+    )
+    assert reason["plan_item_ids"] == ["2026-08-w32-add-financials-003"]
+
+
 def test_same_session_opposite_execution_is_blocked(tmp_path):
     now = datetime(2026, 7, 16, 6, 9, tzinfo=JST)
     _write_base(tmp_path, now)

@@ -509,6 +509,32 @@ def test_short_is_not_a_defensive_plan_override() -> None:
     }
 
 
+def test_exit_named_by_active_buy_plan_requires_review_but_remains_executable() -> None:
+    item = _plan_item(
+        plan_item_id="2026-08-w32-add-financials-003",
+        budget=2_302_672,
+        ticker="XLF",
+    )
+
+    decision = epe.classify_candidate_against_plan(
+        {
+            "ticker": "XLF",
+            "type": "trim",
+            "estimated_notional_jpy": 493_299,
+            "confidence_pct": 50,
+            "rank": 1,
+            "urgency": "medium",
+        },
+        {"items": [item], "consumption_summary": {"remaining_opportunity_jpy": 0}},
+    )
+
+    assert decision["execution_plan_decision"] == "defensive_exit_with_opposite_plan"
+    assert decision["execution_plan_direction_conflict"] is True
+    assert decision["execution_plan_requires_review"] is True
+    assert decision["execution_plan_conflict_item_ids"] == [item["plan_item_id"]]
+    assert decision["executable"] is True
+
+
 def test_monthly_cap_blocks_exact_candidate_even_when_weekly_item_has_room() -> None:
     item = _plan_item(budget=100_000, ticker="META")
     decision = epe.classify_candidate_against_plan(

@@ -36,6 +36,11 @@ from analyst.data_gatherer import (
     gather_data, fmt_news_section, fmt_earnings_section,
 )
 from action_amounts import canonicalize_action_amount_hint
+from analysis_output_validation import (
+    normalize_risk_warning_claims,
+    normalize_stance_drawdown_language,
+    risk_context_for_prompt,
+)
 from almanac.runtime_config import get_env
 from freshness_policy import refresh_after_hours
 from instrument_metadata import (
@@ -3987,7 +3992,10 @@ def _synthesize(long_a: dict, medium_a: dict, short_positions_a: dict,
 {_integrity_ctx + chr(10) if _integrity_ctx else ""}
 ## 現在のシナリオ: {scenario.get('key')} — {scenario.get('name','')}
 ## バックテスト実績: {json.dumps(backtest_summary or [], ensure_ascii=False)}
-## リスク指標: {json.dumps(risk, ensure_ascii=False)}
+## リスク指標（metric contract付き）: {json.dumps(risk_context_for_prompt(risk), ensure_ascii=False)}
+※ actual/current DD と呼べるのは drawdown_metrics.canonical_flow_adjusted の
+  authority=enforced の値だけ。clean NAV / flow-adjusted shadow / synthetic ex-ante は
+  必ずそのラベルを保持し、DDゲートやstanceの根拠に使わないこと。
 ## 市場環境（リアルタイム）:
 VIX={market_meta.get('vix','不明')} {market_meta.get('vix_level','')} / 米10Y={market_meta.get('us10y_yield',{}).get('value','不明')}% / 米2Y={market_meta.get('us2y_yield',{}).get('value','不明')}% / イールド:{market_meta.get('yield_curve_status','')}
 
@@ -4080,13 +4088,13 @@ VIX={market_meta.get('vix','不明')} {market_meta.get('vix_level','')} / 米10Y
 - **試験エントリー「1〜3株の小ロット」ルール**: 米国株は従来どおり1〜3株可。日本株 WATCH+BULLISH 候補も、かぶミニ現物または公式売買単位が1口のETFなら小口で提案可。それ以外は銘柄別売買単位に従うこと。
 - 新規購入クーリング期間: Sonnet出力は既にクーリングフィルタ適用済み（直近14日以内に買い執行記録のある銘柄の trim/sell/stop_loss は除去済み）。Opusで追加のクーリング判断は不要。priority_actions に残っている銘柄はそのまま採用してよい。holding_days だけでは判断しないこと。
 - overall_stance の判定基準（**aggressive 自動昇格 + override 禁止ルール**）:
-  * **defensive**: VIX>30 または current_dd<=-8% または margin_health danger/emergency。これは強制で override 不可
+  * **defensive**: VIX>30 または canonical flow-adjusted DD<=-8% または margin_health danger/emergency。これは強制で override 不可
   * **neutral**: 基本状態
   * **moderately_aggressive**: regime_bull_confirmed かつ VIX<25
   * **aggressive**: regime_bull_confirmed かつ VIX<20 かつ 現金比率>3%（target_cash 0% への余地ある場合）
   * 🛑 **stance override 禁止ルール**: aggressive 昇格条件を満たしている場合、短期警戒（決算1週間以内・データ鮮度<0.5・原油急騰・地政学リスク等）を理由に `moderately_aggressive` や `neutral` に **格下げしてはならない**。短期警戒は urgency 1段下げで対応せよ。
   * 🛑 **excess α / TWR 実績 / CVaR / cvar_unstable を stance 格下げの根拠にしてはならない**。これらは測定指標であり、クリーン履歴不足時は「未確定」で提示される（TWRセクション参照）。実績αが負・cvar_unstable=true 等を理由に aggressive を見送ることは override 規則違反。これらは候補の sizing / urgency にのみ反映し、stance には反映しない。
-  * 有効な override 条件は **実データの VIX>30 / current_dd<=-8% / margin_health danger・emergency / regime 急変** のみ。違反時は `aggressive_override_block` フィールドに該当する**実データ条件**を記録すること（測定指標や短期警戒は不可。該当が無ければ aggressive を維持し block しない）。
+  * 有効な override 条件は **実データの VIX>30 / canonical flow-adjusted DD<=-8% / margin_health danger・emergency / regime 急変** のみ。違反時は `aggressive_override_block` フィールドに該当する**実データ条件**を記録すること（測定指標や短期警戒は不可。該当が無ければ aggressive を維持し block しない）。
   * 短期警戒や測定指標で stance 全体を保守化することは「攻めモード言葉だけ実装ゼロ」の元凶なので明示的に禁止する。
 - **FinBERT センチメント反映**: shared_ctx の「FinBERTニュース感情集計」が「強気優勢」のとき、aggressive 昇格を後押しする方向に解釈すること（urgency 上げ・新規候補増）。「弱気優勢」のときは urgency 1段下げで対応（stance 全体の格下げは不可）。
 - **FRED マクロ stance 補正**:
@@ -7652,6 +7660,10 @@ def _phase1_post_filter(
                 "execution_plan_match_kind",
                 "execution_plan_advisory_item_ids",
                 "execution_plan_override",
+                "execution_plan_direction_conflict",
+                "execution_plan_requires_review",
+                "execution_plan_conflict_item_ids",
+                "execution_plan_conflict_reason",
                 "override_reason",
                 "budget_impact_jpy",
                 "ai_bounded_gate",
@@ -7674,6 +7686,10 @@ def _phase1_post_filter(
             "monthly_objective_id",
             "execution_plan_match_kind",
             "execution_plan_advisory_item_ids",
+            "execution_plan_direction_conflict",
+            "execution_plan_requires_review",
+            "execution_plan_conflict_item_ids",
+            "execution_plan_conflict_reason",
             "plan_remaining_before_jpy",
             "plan_remaining_after_jpy",
             "monthly_remaining_before_jpy",
@@ -11369,6 +11385,16 @@ def run_analysis(force: bool = False) -> dict:
         _apply_stance_guard(synthesis, data, _regime_bull_confirmed)
     except Exception as _sg_e:
         print(f"  ⚠️ stance guard エラー（スキップ）: {_sg_e}")
+
+    # User-facing financial prose is not an authority. Recalculate monetary
+    # risk claims from structured positions and make DD metric semantics match
+    # the same canonical source used by the deterministic stance guard.
+    if isinstance(synthesis, dict):
+        normalize_stance_drawdown_language(synthesis, data.get("risk"))
+        normalize_risk_warning_claims(
+            synthesis,
+            data.get("investment_policy_observation"),
+        )
 
     # Phase 1 (2026-04-28): post-filter — 細切れ抑制 / cooldown / earnings blackout / flip 警告
     try:

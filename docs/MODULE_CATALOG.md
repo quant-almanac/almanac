@@ -19,7 +19,7 @@ This is an ownership map, not a claim that every file is live. The lifecycle col
 
 | Lifecycle | Modules | Boundary |
 |---|---|---|
-| live | `analyzer.py`, `llm_adapters.py`, `model_router.py`, `llm_cost_accounting.py`, `llm_run_context.py` | Provider transport, role routing, run identity and spend attribution |
+| live | `analyzer.py`, `llm_adapters.py`, `model_router.py`, `llm_cost_accounting.py`, `llm_run_context.py`, `analysis_output_validation.py` | Provider transport, role routing, run identity, spend attribution and deterministic validation of financial prose |
 | live/observe | `red_team_ledger.py`, `compare_harness.py`, `human_feedback_log.py` | Adversarial evidence, harness comparison and human labels |
 
 The large orchestration implementation lives in the `analyst/` package; see §15.

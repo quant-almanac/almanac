@@ -1103,7 +1103,15 @@ def _build_today() -> dict:
     except Exception:
         data_health = {"ok": False, "sources": {}, "stale_sources": [], "missing_sources": []}
 
-    synthesis = analysis.get("synthesis") or {}
+    # Render a corrected deep-copy. The persisted analysis remains immutable
+    # audit evidence while legacy numeric prose is reconciled to structured
+    # policy/risk fields for the current Today response.
+    from analysis_output_validation import (
+        apply_execution_plan_display_conflicts,
+        synthesis_for_display,
+    )
+    synthesis = synthesis_for_display(analysis)
+    apply_execution_plan_display_conflicts(synthesis, execution_plan_state)
     long_a = analysis.get("long_analysis") or {}
     medium_a = analysis.get("medium_analysis") or {}
     margin_a = analysis.get("margin_long_analysis") or {}

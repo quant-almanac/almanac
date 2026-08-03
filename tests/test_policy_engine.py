@@ -709,6 +709,34 @@ def test_size_adj_rewrites_exact_order_quantity_in_action_text():
     assert d.accepted[0]["action_quantity_sync_status"] == "rewritten"
 
 
+def test_size_adj_synchronizes_action_reason_and_embedded_notional():
+    action = _action("buy", ticker="GOOGL")
+    action.update({
+        "amount_hint": "5株",
+        "shares": 5,
+        "action": "特定口座でGOOGLを5株新規購入（約¥28万相当）",
+        "reason": "最低ロット規則に沿い5株。データ鮮度低下のためurgencyはlow。",
+        "estimated_notional_jpy": 277_232,
+        "policy_size_adj": 0.75,
+    })
+
+    resized, collapsed = pe._apply_size_adj(action)
+
+    assert collapsed is None
+    assert resized["amount_hint"] == "3株"
+    assert resized["shares"] == 3
+    assert resized["estimated_notional_jpy"] == 166_339
+    assert "3株" in resized["action"]
+    assert "約¥166,339" in resized["action"]
+    assert "5株" not in resized["action"]
+    assert "5株" not in resized["reason"]
+    assert "3株" in resized["reason"]
+    assert "policy縮小後の権威値: 3株 / 約¥166,339" in resized["reason"]
+    assert resized["policy_resize_action_original"].endswith("約¥28万相当）")
+    assert resized["policy_resize_reason_original"].startswith("最低ロット規則")
+    assert resized["prose_numeric_sync_status"] == "rewritten"
+
+
 def test_size_adj_does_not_rewrite_ambiguous_holding_quantity():
     a = _action("trim")
     a.update({

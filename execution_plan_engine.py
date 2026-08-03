@@ -1866,6 +1866,43 @@ def classify_candidate_against_plan(
     opportunity = _opportunity()
     if opportunity:
         return opportunity
+    if direction == "sell":
+        # Risk-reducing exits must remain available, but an active plan that
+        # explicitly names the same ticker for accumulation is a policy
+        # conflict. Keep the exit executable and require human review.
+        opposite_plan_items: list[str] = []
+        for item in plan_state.get("items") or []:
+            if not isinstance(item, dict):
+                continue
+            if str(item.get("status") or "active").lower() not in {"active", "open"}:
+                continue
+            if _jpy(item.get("remaining_jpy")) <= 0:
+                continue
+            allowed = {
+                str(value or "").lower()
+                for value in (item.get("allowed_action_types") or [])
+            }
+            preferred = {
+                canonical_ticker(value)
+                for value in (item.get("preferred_tickers") or [])
+            }
+            if allowed.intersection({"buy", "add", "dca", "margin_buy"}) and ticker in preferred:
+                item_id = str(item.get("plan_item_id") or "")
+                if item_id:
+                    opposite_plan_items.append(item_id)
+        if opposite_plan_items:
+            return {
+                "execution_plan_decision": "defensive_exit_with_opposite_plan",
+                "execution_plan_override": "defensive",
+                "execution_plan_direction_conflict": True,
+                "execution_plan_requires_review": True,
+                "execution_plan_conflict_item_ids": opposite_plan_items[:3],
+                "execution_plan_conflict_reason": (
+                    f"{ticker} の売却候補と、同銘柄を明示した active buy/add plan が併存。"
+                    "スリーブ目標と全体配分目標の優先順位を人間が確認してください"
+                ),
+                "executable": True,
+            }
     if direction in {"sell", "cover"}:
         return {
             "execution_plan_decision": "defensive_or_exit_outside_plan",

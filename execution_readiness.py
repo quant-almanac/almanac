@@ -582,6 +582,16 @@ def classify_execution_readiness(
         add("review", "non_executable_candidate", str(action.get("non_executable_reason") or "非実行候補"))
     if action.get("execution_plan_would_filter"):
         add("review", "execution_plan_observe_conflict", "execution planのobserve判定では非実行")
+    if action.get("execution_plan_direction_conflict"):
+        add(
+            "review",
+            "execution_plan_direction_conflict",
+            str(
+                action.get("execution_plan_conflict_reason")
+                or "同じ銘柄に売却候補とactive買付計画が併存しています"
+            ),
+            plan_item_ids=action.get("execution_plan_conflict_item_ids") or [],
+        )
     recent_opposite = action.get("recent_opposite_execution_guard")
     if isinstance(recent_opposite, dict):
         level = str(recent_opposite.get("level") or "review")

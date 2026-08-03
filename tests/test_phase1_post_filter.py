@@ -3583,3 +3583,83 @@ def test_quantity_sync_failure_can_only_leave_post_filter_as_review():
         row.get("code") == "action_quantity_sync_failed"
         for row in action["execution_block_reasons"]
     )
+
+
+def test_exit_opposite_active_buy_plan_is_propagated_for_readiness(monkeypatch):
+    _silence_external_filters(monkeypatch)
+    monkeypatch.setattr(tunable_params, "get", _tp_get)
+    plan_item_id = "2026-08-w32-add-financials-003"
+    plan = {
+        "items": [{
+            "plan_item_id": plan_item_id,
+            "objective": "add_sector_financial-services",
+            "status": "active",
+            "remaining_jpy": 2_302_672,
+            "normal_budget_jpy": 2_302_672,
+            "allowed_action_types": ["buy", "add"],
+            "preferred_tickers": ["XLF"],
+            "dedup_keys": ["XLF|buy|default"],
+            "constraints": {"min_confidence_pct": 70},
+        }],
+        "consumption_summary": {
+            "remaining_opportunity_jpy": 0,
+            "monthly_consumed_jpy": 0,
+            "unattributed_monthly_total_count": 0,
+            "unattributed_monthly_total_notional_jpy": 0,
+            "unattributed_monthly_buy_total_count": 0,
+            "unattributed_monthly_buy_total_notional_jpy": 0,
+        },
+    }
+    synthesis = {
+        "analysis_id": "analysis-xlf-conflict",
+        "decision_snapshot_hash": "snapshot-xlf-conflict",
+        "overall_stance": "neutral",
+        "priority_actions": [{
+            "ticker": "XLF",
+            "tier": "Medium",
+            "type": "sell",
+            "amount_hint": "80株",
+            "action": "特定口座のXLF 80株を全数売却",
+            "reason": "Mediumスリーブの超過を解消",
+            "execution_account": "特定",
+            "execution_owner": "husband",
+            "execution_broker": "rakuten",
+            "decision_price": 56.93,
+            "currency": "USD",
+            "confidence_pct": 60,
+            "rank": 1,
+            "urgency": "medium",
+        }],
+    }
+    positions = [{
+        "key": "XLF",
+        "ticker": "XLF",
+        "current_price": 56.93,
+        "currency": "USD",
+        "shares": 80,
+        "value_jpy": 740_000,
+        "investment_type": "medium",
+        "account": "特定",
+        "owner": "husband",
+        "broker": "rakuten",
+        "broker_quantity": 80,
+        "broker_total_cost_basis_jpy": 640_000,
+        "broker_cost_basis_source": "broker_report",
+        "broker_cost_basis_as_of": "2026-07-28",
+    }]
+
+    result = analyst._phase1_post_filter(
+        synthesis,
+        30_000_000,
+        fx_rate=162.0,
+        positions=positions,
+        execution_plan=plan,
+    )
+
+    assert len(result["priority_actions"]) == 1
+    action = result["priority_actions"][0]
+    assert action["execution_plan_observed_decision"] == "defensive_exit_with_opposite_plan"
+    assert action["execution_plan_direction_conflict"] is True
+    assert action["execution_plan_requires_review"] is True
+    assert action["execution_plan_conflict_item_ids"] == [plan_item_id]
+    assert "active buy/add plan" in action["execution_plan_conflict_reason"]
