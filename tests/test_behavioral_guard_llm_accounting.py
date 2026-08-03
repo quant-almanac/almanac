@@ -18,9 +18,11 @@ def _blocked_state() -> dict:
 def test_guardrail_suggestion_logs_haiku_usage_without_telegram(monkeypatch):
     monkeypatch.setenv("ALMANAC_PRIVACY_MODE", "anthropic_book_aware")
     rows: list[dict] = []
+    requests: list[dict] = []
 
     class FakeMessages:
         def create(self, **kwargs):
+            requests.append(kwargs)
             return types.SimpleNamespace(
                 content=[types.SimpleNamespace(text="1. 新規停止\n2. 損失確認\n3. サイズ縮小")],
                 stop_reason="end_turn",
@@ -46,6 +48,8 @@ def test_guardrail_suggestion_logs_haiku_usage_without_telegram(monkeypatch):
     assert row["trading_stopped"] is True
     assert row["input_tokens"] == 210
     assert row["output_tokens"] == 35
+    assert "リスク増加凍結＋人間レビュー" in requests[-1]["messages"][0]["content"]
+    assert "全取引停止" not in requests[-1]["messages"][0]["content"]
 
 
 def test_leverage_health_uses_tunable_vix_margin_buy_block(monkeypatch):

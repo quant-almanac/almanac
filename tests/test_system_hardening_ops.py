@@ -69,6 +69,7 @@ def test_backup_is_restorable_and_bundle_cloneable(tmp_path, monkeypatch):
     result = bm.snapshot(date(2026, 6, 12))
     restored = backup_dir / "20260612"
 
+    assert result["portfolio_lock_acquired"] is True
     assert result["repo_bundle"]["status"] == "created"
     assert result["nested_repo_bundles"]["frontend"]["status"] == "created"
     assert result["worktree_archives"]["frontend"]["status"] == "created"
@@ -79,6 +80,9 @@ def test_backup_is_restorable_and_bundle_cloneable(tmp_path, monkeypatch):
     assert json.loads(
         (restored / "broker_position_snapshot_sbi.json").read_text(encoding="utf-8")
     )["complete"] is True
+    assert json.loads((restored / "manifest.json").read_text(encoding="utf-8"))[
+        "portfolio_lock_acquired"
+    ] is True
     restored_db = sqlite3.connect(restored / "nexustrader.db")
     try:
         assert restored_db.execute("SELECT COUNT(*) FROM ledger_events").fetchone()[0] == 1

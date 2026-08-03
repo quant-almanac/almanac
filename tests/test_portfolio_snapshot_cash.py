@@ -96,6 +96,42 @@ def test_build_snapshot_allocates_usd_cash_to_usd_currency(monkeypatch):
     assert snap["currency_breakdown"]["JPY"]["ratio"] == 0.1517
 
 
+def test_build_snapshot_values_jpy_investment_trust_per_10000_but_not_usd_fund(monkeypatch):
+    """Keep the useful valuation contract formerly covered only by Streamlit."""
+    monkeypatch.setattr(pm, "get_fx_rate", lambda: 150.0)
+    monkeypatch.setattr(pm, "get_current_price", lambda ticker, currency, current_nav=None: current_nav or 1.0)
+    monkeypatch.setattr(pm, "load_espp_data", lambda: {})
+    monkeypatch.setattr(pm, "load_account", lambda: {"total_cash": 0})
+    monkeypatch.setattr(pm, "load_holdings", lambda: {
+        "SLIM_SP500": {
+            "ticker": "SLIM_SP500",
+            "shares": 10_000,
+            "entry_price": 20_000,
+            "current_nav": 25_000,
+            "currency": "JPY",
+            "unit": "口",
+            "asset_type": "investment_trust",
+        },
+        "USD_FUND": {
+            "ticker": "USD_FUND",
+            "shares": 2,
+            "entry_price": 90,
+            "current_nav": 100,
+            "currency": "USD",
+            "asset_type": "etf",
+        },
+    })
+
+    snap = pm.build_portfolio_snapshot(include_espp=False, fetch_missing_sectors=False)
+    positions = {row["ticker"]: row for row in snap["positions"]}
+
+    assert positions["SLIM_SP500"]["value_jpy"] == 25_000
+    assert positions["SLIM_SP500"]["cost_jpy"] == 20_000
+    assert positions["USD_FUND"]["value_jpy"] == 30_000
+    assert positions["USD_FUND"]["cost_jpy"] == 27_000
+    assert snap["total_jpy"] == 55_000
+
+
 def test_cash_holdings_do_not_fetch_market_price(monkeypatch):
     called = []
     monkeypatch.setattr(pm, "get_fx_rate", lambda: 150.0)

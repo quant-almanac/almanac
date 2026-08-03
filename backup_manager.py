@@ -46,6 +46,7 @@ from pathlib import Path
 from typing import Callable, List
 
 from almanac.runtime_config import get_env
+from utils import process_lock
 
 BASE_DIR = Path(__file__).parent
 BACKUP_DIR = BASE_DIR / 'backups'
@@ -266,32 +267,39 @@ def snapshot(
         'sqlite_backups': [],
         'nested_repo_bundles': {},
         'worktree_archives': {},
+        'portfolio_lock_acquired': False,
     }
 
-    for rel in TARGETS:
-        src = BASE_DIR / rel
-        if not src.exists():
-            results['missing'].append(rel)
-            continue
-        dst = target_dir / rel
-        dst.parent.mkdir(exist_ok=True, parents=True)
-        shutil.copy2(src, dst)
-        results['copied'].append(rel)
-        try:
-            results['hashes'][rel] = _sha256(dst)
-        except Exception:
-            results['hashes'][rel] = None
+    # Keep cross-file portfolio facts and the transactionally consistent
+    # SQLite image in the same write-free capture window.  Git/archive work is
+    # intentionally outside this lock because it can take much longer and is
+    # unrelated to financial-state consistency.
+    with process_lock('portfolio_ledger', timeout=30.0):
+        results['portfolio_lock_acquired'] = True
+        for rel in TARGETS:
+            src = BASE_DIR / rel
+            if not src.exists():
+                results['missing'].append(rel)
+                continue
+            dst = target_dir / rel
+            dst.parent.mkdir(exist_ok=True, parents=True)
+            shutil.copy2(src, dst)
+            results['copied'].append(rel)
+            try:
+                results['hashes'][rel] = _sha256(dst)
+            except Exception:
+                results['hashes'][rel] = None
 
-    for rel in SQLITE_TARGETS:
-        src = BASE_DIR / rel
-        if not src.exists():
-            results['missing'].append(rel)
-            continue
-        dst = target_dir / rel
-        _backup_sqlite(src, dst)
-        results['copied'].append(rel)
-        results['sqlite_backups'].append(rel)
-        results['hashes'][rel] = _sha256(dst)
+        for rel in SQLITE_TARGETS:
+            src = BASE_DIR / rel
+            if not src.exists():
+                results['missing'].append(rel)
+                continue
+            dst = target_dir / rel
+            _backup_sqlite(src, dst)
+            results['copied'].append(rel)
+            results['sqlite_backups'].append(rel)
+            results['hashes'][rel] = _sha256(dst)
 
     results['repo_bundle'] = _create_repo_bundle(
         target_dir,
@@ -313,6 +321,7 @@ def snapshot(
             'repo_bundle': results['repo_bundle'],
             'nested_repo_bundles': results['nested_repo_bundles'],
             'worktree_archives': results['worktree_archives'],
+            'portfolio_lock_acquired': results['portfolio_lock_acquired'],
         }, f, indent=2, ensure_ascii=False)
 
     return results

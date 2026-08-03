@@ -417,7 +417,7 @@ def _send_guardrail_suggestion(state: dict, trading_stopped: bool):
     """ガードレール発動時に Haiku で対応提案を生成して Telegram 送信"""
     import anthropic
 
-    level = "全取引停止" if trading_stopped else "新規エントリー禁止"
+    level = "リスク増加凍結＋人間レビュー" if trading_stopped else "新規エントリー禁止"
     icon  = "🚨" if trading_stopped else "⛔"
 
     # Haiku で対応提案生成
@@ -851,7 +851,10 @@ def _print_status():
     warn = '⚠️'
 
     print(f'\n=== 行動ガードレール状況 {datetime.now().strftime("%Y-%m-%d %H:%M")} ===')
-    print(f'取引ステータス:     {ok if state["trading_allowed"]   else ng} {"正常" if state["trading_allowed"]   else "停止"}')
+    print(
+        f'取引ステータス:     {ok if state["trading_allowed"] else ng} '
+        f'{"正常" if state["trading_allowed"] else "リスク増加凍結＋人間レビュー"}'
+    )
     print(f'新規エントリー:     {ok if state["new_entry_allowed"] else ng} {"可能" if state["new_entry_allowed"] else "禁止"}')
     print(f'本日P&L:           ¥{state["daily_pnl_jpy"]:+,.0f}  ({state["daily_pnl_pct"]*100:+.2f}%)')
     print(f'直近30日P&L:       ¥{state["monthly_pnl_jpy"]:+,.0f}  ({state["monthly_pnl_pct"]*100:+.2f}%)')
