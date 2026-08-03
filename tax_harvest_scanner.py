@@ -73,7 +73,12 @@ def compute_tax_harvest(
     provider = price_provider or _default_price_provider
     substitutes = _load_substitutes()
     candidates: list[dict] = []
-    data_quality_issues: list[str] = []
+    data_quality_issues: list[str] = [
+        f"{row.get('ticker', '(unknown)')}: {row.get('kind', 'tax_lot_error')}: {row.get('message', '')}"
+        for row in (snapshot.get("errors") or [])
+        if isinstance(row, dict)
+    ]
+    snapshot_authoritative = bool(snapshot.get("authoritative", not data_quality_issues))
 
     for ticker, lots in (snapshot.get("lots") or {}).items():
         if not lots:
@@ -99,7 +104,8 @@ def compute_tax_harvest(
                 if lot.get("owner") and lot.get("broker")
             }
             authoritative_basis = bool(
-                estimate is not None and not estimate.data_quality_issues
+                snapshot_authoritative
+                and estimate is not None and not estimate.data_quality_issues
                 and len(identity_pairs) == 1
             )
             if authoritative_basis:
@@ -163,6 +169,8 @@ def compute_tax_harvest(
         "warning": REPURCHASE_WARNING,
         "execution": "display_and_notify_only",
         "data_quality_issues": sorted(set(data_quality_issues)),
+        "authoritative": snapshot_authoritative and not data_quality_issues,
+        "observation_only": bool(data_quality_issues),
     }
 
 
@@ -235,6 +243,11 @@ def send_notification(report: dict, *, send: Optional[Callable[[str], None]] = N
 
 
 def format_telegram(report: dict) -> str:
+    if report.get("status") == "error":
+        issues = report.get("data_quality_issues") or ["unknown failure"]
+        return "損出し定期スキャン: エラー（候補は利用禁止）\n" + "\n".join(
+            f"- {issue}" for issue in issues[:3]
+        )
     if not report.get("candidates"):
         return "損出し定期スキャン: 対象候補はありません。"
     lines = [
@@ -261,8 +274,35 @@ def run_scan(
     """既存の cron 呼び出し (main() 経由、--notify 付き) を変えない
     thin wrapper。実体は compute→register→publish→notify の4ステップに
     分離済み (Stage 5A)。"""
-    report = scan_tax_harvest(**scan_kwargs)
+    try:
+        report = scan_tax_harvest(**scan_kwargs)
+    except Exception as exc:
+        # Scheduled failures must remain visible.  In particular, do not turn
+        # a tax-lot exception into a deceptive empty recommendation report.
+        report = {
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "status": "error",
+            "authoritative": False,
+            "observation_only": True,
+            "candidate_count": 0,
+            "candidates": [],
+            "data_quality_issues": [f"top_level_failure: {type(exc).__name__}: {exc}"],
+            "execution": "display_and_notify_only",
+        }
     publish_report(report, report_path=report_path)
+    try:
+        from utils import heartbeat
+        heartbeat(
+            "tax_harvest_scanner",
+            "ok" if report.get("authoritative") else "warn",
+            extra={
+                "status": report.get("status", "ok"),
+                "candidate_count": report.get("candidate_count", 0),
+                "data_quality_issue_count": len(report.get("data_quality_issues") or []),
+            },
+        )
+    except Exception:
+        pass
     if notify:
         send_notification(report, send=send)
     return report

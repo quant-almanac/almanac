@@ -263,3 +263,20 @@ def test_run_scan_still_composes_all_four_steps(tmp_path, monkeypatch):
     assert len(sent) == 1                                   # notify
     state = ast._load()
     assert report["candidates"][0]["recommendation_id"] in state["actions"]  # register 確認
+
+
+def test_run_scan_publishes_and_notifies_top_level_failure(tmp_path, monkeypatch):
+    """A scheduled failure is visible rather than a deceptive empty report."""
+    def fail(**_kwargs):
+        raise RuntimeError("broken lot")
+
+    monkeypatch.setattr(ths, "scan_tax_harvest", fail)
+    sent = []
+    report_path = tmp_path / "reports.jsonl"
+    report = ths.run_scan(report_path=report_path, notify=True, send=sent.append)
+
+    assert report["status"] == "error"
+    assert report["authoritative"] is False
+    assert "broken lot" in report["data_quality_issues"][0]
+    assert sent and "エラー" in sent[0]
+    assert "broken lot" in report_path.read_text(encoding="utf-8")

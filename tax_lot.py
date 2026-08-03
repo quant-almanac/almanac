@@ -73,6 +73,20 @@ class TaxLotState:
     realized_trades:  List[RealizedTrade] = field(default_factory=list)
 
 
+def _tax_lot_error_kind(error: Exception) -> str:
+    """Classify a fail-loud lot error for partial aggregate consumers."""
+    message = str(error)
+    if "owner/broker" in message or "identity" in message:
+        return "identity_missing_or_mismatch"
+    if "account=" in message and "賄えません" in message:
+        return "lot_quantity_shortage_or_account_mismatch"
+    if "fx_rate_usdjpy" in message or "USD FX" in message:
+        return "missing_fx"
+    if "split_ratio" in message or "split ratio" in message:
+        return "corporate_action_data_missing"
+    return "tax_lot_build_failed"
+
+
 # ============================================================
 # Build lots from event_ledger
 # ============================================================
@@ -437,8 +451,17 @@ def realized_pnl_in_year(
     year_from = f"{year}-01-01"
     year_to   = f"{year}-12-31"
 
+    errors: list[dict] = []
     for ticker in tickers:
-        state = build_lots(ticker, db_path=db_path, until=year_to)
+        try:
+            state = build_lots(ticker, db_path=db_path, until=year_to)
+        except Exception as exc:
+            errors.append({
+                "ticker": ticker,
+                "kind": _tax_lot_error_kind(exc),
+                "message": str(exc),
+            })
+            continue
         for rt in state.realized_trades:
             if rt.sell_date < year_from or rt.sell_date > year_to:
                 continue
@@ -454,6 +477,8 @@ def realized_pnl_in_year(
         "by_account":   {k: round(v, 2) for k, v in by_account.items()},
         "by_ticker":    {k: round(v, 2) for k, v in by_ticker.items()},
         "trade_count":  trade_count,
+        "errors":       errors,
+        "authoritative": not errors,
     }
 
 
@@ -476,9 +501,9 @@ def realized_pnl_in_year_v2(
     account 名に "NISA" を含むかどうかで taxable/nisa を分ける
     (tax_harvest_scanner.py の NISA 除外判定と同じ規約)。
     """
-    mode = str(mode or os.environ.get("ALMANAC_TAX_BASIS_MODE", "compare")).lower()
+    mode = str(mode or os.environ.get("ALMANAC_TAX_BASIS_MODE", "total_average")).lower()
     if mode not in {"legacy", "compare", "total_average"}:
-        mode = "compare"
+        mode = "total_average"
     legacy = realized_pnl_in_year(year, tickers=tickers, db_path=db_path)
     total_average = realized_pnl_in_year_total_average(
         year, tickers=tickers, db_path=db_path
@@ -492,8 +517,7 @@ def realized_pnl_in_year_v2(
         else:
             taxable_total += amount
 
-    use_total_average = mode == "total_average" and total_average["complete"]
-    authoritative = total_average if use_total_average else {
+    legacy_comparison = {
         "economic_realized_pnl_jpy": legacy["realized_jpy"],
         "taxable_realized_pnl_jpy": round(taxable_total, 2),
         "nisa_realized_pnl_jpy": round(nisa_total, 2),
@@ -501,31 +525,44 @@ def realized_pnl_in_year_v2(
         "by_ticker": legacy["by_ticker"],
         "trade_count": legacy["trade_count"],
     }
+    # FIFO is retained for audit comparison, but it can never silently become
+    # the tax authority when identity, FX, route, or inventory evidence is
+    # incomplete.  In that state tax-facing numbers are explicitly unavailable.
+    use_total_average = mode == "total_average" and total_average["complete"]
+    authoritative = total_average if use_total_average else None
+    quality_issues = list(total_average["data_quality_issues"])
+    quality_issues.extend(
+        f"{row['ticker']}: {row['kind']}: {row['message']}"
+        for row in legacy.get("errors", [])
+    )
     return {
         "schema_version": 2,
         "year": year,
         "basis_mode": mode,
-        "authoritative_basis": (
-            "total_average_like" if use_total_average else "legacy_fifo"
-        ),
+        "authoritative_basis": "total_average_like" if use_total_average else "unavailable",
+        "authoritative": bool(use_total_average),
         "total_average_complete": total_average["complete"],
-        "data_quality_issues": total_average["data_quality_issues"],
+        "data_quality_issues": sorted(set(quality_issues)),
+        "ticker_errors": legacy.get("errors", []),
         # 旧フィールドは互換のため残すが、課税対象額と誤解されないよう
         # semantics を明示する。新規コードは economic/taxable/nisa の
         # 3フィールドを権威として使うこと。
         "realized_jpy": legacy["realized_jpy"],
         "realized_jpy_semantics": "legacy_mixed_accounts_deprecated",
-        "economic_realized_pnl_jpy": authoritative["economic_realized_pnl_jpy"],
-        "taxable_realized_pnl_jpy": authoritative["taxable_realized_pnl_jpy"],
-        "nisa_realized_pnl_jpy": authoritative["nisa_realized_pnl_jpy"],
-        "by_account": authoritative["by_account"],
-        "by_ticker": authoritative["by_ticker"],
-        "trade_count": authoritative["trade_count"],
+        "economic_realized_pnl_jpy": authoritative["economic_realized_pnl_jpy"] if authoritative else None,
+        "taxable_realized_pnl_jpy": authoritative["taxable_realized_pnl_jpy"] if authoritative else None,
+        "nisa_realized_pnl_jpy": authoritative["nisa_realized_pnl_jpy"] if authoritative else None,
+        "by_account": authoritative["by_account"] if authoritative else {},
+        "by_ticker": authoritative["by_ticker"] if authoritative else {},
+        "trade_count": authoritative["trade_count"] if authoritative else 0,
         "comparison": {
             "legacy_fifo": {
-                "economic_realized_pnl_jpy": legacy["realized_jpy"],
-                "taxable_realized_pnl_jpy": round(taxable_total, 2),
-                "nisa_realized_pnl_jpy": round(nisa_total, 2),
+                key: legacy_comparison[key]
+                for key in (
+                    "economic_realized_pnl_jpy",
+                    "taxable_realized_pnl_jpy",
+                    "nisa_realized_pnl_jpy",
+                )
             },
             "total_average_like": {
                 key: total_average[key]
@@ -685,8 +722,17 @@ def portfolio_lot_snapshot(
         tickers = sorted({(ev.get("ticker") or "") for ev in all_events if ev.get("ticker")})
 
     lots_by_ticker: Dict[str, List[dict]] = {}
+    errors: list[dict] = []
     for t in tickers:
-        state = build_lots(t, db_path=db_path)
+        try:
+            state = build_lots(t, db_path=db_path)
+        except Exception as exc:
+            errors.append({
+                "ticker": t,
+                "kind": _tax_lot_error_kind(exc),
+                "message": str(exc),
+            })
+            continue
         opens = [l for l in state.open_lots if l.is_open]
         lots_by_ticker[t] = [
             {
@@ -703,7 +749,11 @@ def portfolio_lot_snapshot(
             }
             for l in opens
         ]
-    return {"lots": lots_by_ticker}
+    return {
+        "lots": lots_by_ticker,
+        "errors": errors,
+        "authoritative": not errors,
+    }
 
 
 # ============================================================

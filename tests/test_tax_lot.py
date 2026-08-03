@@ -209,21 +209,23 @@ def test_realized_pnl_year_v2_separates_nisa_from_taxable(tmp_db):
     assert r["schema_version"] == 2
     assert r["realized_jpy"] == pytest.approx(400)
     assert r["realized_jpy_semantics"] == "legacy_mixed_accounts_deprecated"
-    assert r["economic_realized_pnl_jpy"] == pytest.approx(400)
-    assert r["taxable_realized_pnl_jpy"] == pytest.approx(500)
-    assert r["nisa_realized_pnl_jpy"] == pytest.approx(-100)
-    # economic = taxable + nisa (恒等式)
-    assert r["taxable_realized_pnl_jpy"] + r["nisa_realized_pnl_jpy"] == pytest.approx(
-        r["economic_realized_pnl_jpy"]
-    )
+    # No owner/broker evidence means FIFO must not be promoted silently.  The
+    # values remain visible only as a comparison for remediation/audit.
+    assert r["authoritative_basis"] == "unavailable"
+    assert r["authoritative"] is False
+    assert r["economic_realized_pnl_jpy"] is None
+    assert r["comparison"]["legacy_fifo"]["economic_realized_pnl_jpy"] == pytest.approx(400)
+    assert r["comparison"]["legacy_fifo"]["taxable_realized_pnl_jpy"] == pytest.approx(500)
+    assert r["comparison"]["legacy_fifo"]["nisa_realized_pnl_jpy"] == pytest.approx(-100)
 
 
 def test_realized_pnl_year_v2_all_taxable_has_zero_nisa(tmp_db):
     _add_buy(tmp_db,  ticker="A", qty=10, price=100, date="2026-01-10")
     _add_sell(tmp_db, ticker="A", qty=10, price=150, date="2026-04-10")
     r = tl.realized_pnl_in_year_v2(2026, db_path=tmp_db)
-    assert r["nisa_realized_pnl_jpy"] == 0.0
-    assert r["taxable_realized_pnl_jpy"] == pytest.approx(500)
+    assert r["authoritative_basis"] == "unavailable"
+    assert r["nisa_realized_pnl_jpy"] is None
+    assert r["comparison"]["legacy_fifo"]["taxable_realized_pnl_jpy"] == pytest.approx(500)
 
 
 def test_realized_pnl_year_v2_does_not_change_legacy_function(tmp_db):
@@ -233,7 +235,9 @@ def test_realized_pnl_year_v2_does_not_change_legacy_function(tmp_db):
     _add_sell(tmp_db, ticker="A", qty=10, price=150, date="2026-04-10")
     legacy = tl.realized_pnl_in_year(2026, db_path=tmp_db)
     assert "schema_version" not in legacy
-    assert set(legacy.keys()) == {"year", "realized_jpy", "by_account", "by_ticker", "trade_count"}
+    assert set(legacy.keys()) == {
+        "year", "realized_jpy", "by_account", "by_ticker", "trade_count", "errors", "authoritative"
+    }
 
 
 # ────────────────────────────────────────────────────────
@@ -254,6 +258,24 @@ def test_portfolio_lot_snapshot(tmp_db):
     # B は無 SELL なので 5 株残
     b_lots = snap["lots"]["B"]
     assert b_lots[0]["remaining_qty"] == pytest.approx(5)
+    assert snap["errors"] == []
+    assert snap["authoritative"] is True
+
+
+def test_aggregate_tax_lot_failures_are_partial_and_categorized(tmp_db):
+    _add_buy(tmp_db, ticker="GOOD", qty=1, price=100, date="2026-01-10")
+    _add_buy(tmp_db, ticker="BROKEN", qty=1, price=100, date="2026-01-10")
+    _add_sell(tmp_db, ticker="BROKEN", qty=2, price=120, date="2026-02-10")
+
+    snapshot = tl.portfolio_lot_snapshot(db_path=tmp_db)
+    assert "GOOD" in snapshot["lots"]
+    assert "BROKEN" not in snapshot["lots"]
+    assert snapshot["authoritative"] is False
+    assert snapshot["errors"][0]["ticker"] == "BROKEN"
+    assert snapshot["errors"][0]["kind"] == "lot_quantity_shortage_or_account_mismatch"
+
+    realized = tl.realized_pnl_in_year(2026, db_path=tmp_db)
+    assert realized["errors"][0]["ticker"] == "BROKEN"
 
 
 # ────────────────────────────────────────────────────────
