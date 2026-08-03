@@ -135,6 +135,19 @@ def _guard_metrics(base_dir: Path) -> tuple[float | None, float | None]:
     return _as_decimal(raw.get("daily_pnl_pct")), _as_decimal(raw.get("monthly_pnl_pct"))
 
 
+def _current_short_positions(base_dir: Path) -> int | None:
+    """Read the EOD canonical short count used by the behavioral guard."""
+    try:
+        raw = json.loads((base_dir / "guard_state.json").read_text(encoding="utf-8"))
+        value = raw.get("short_positions") if isinstance(raw, dict) else None
+        if value is None:
+            return None
+        count = int(value)
+        return count if count >= 0 else None
+    except (FileNotFoundError, TypeError, ValueError, json.JSONDecodeError):
+        return None
+
+
 def _analysis_risk_metrics(base_dir: Path) -> tuple[float | None, str | None, str | None]:
     """Read explicitly named decimal metrics from the latest analysis snapshot."""
     try:
@@ -270,6 +283,7 @@ def evaluate_preflight(payload: dict[str, Any], *, base_dir: Path) -> dict[str, 
     concentration = _prospective_concentration(payload, base_dir)
     direction = str(payload.get("direction") or "").lower()
     risk_increasing = direction in {"buy", "margin_buy", "short"}
+    short_positions = _current_short_positions(base_dir)
     decision = classify_execution_risk(
         daily_pnl_decimal=daily,
         rolling_30_pnl_decimal=rolling,
@@ -279,6 +293,8 @@ def evaluate_preflight(payload: dict[str, Any], *, base_dir: Path) -> dict[str, 
         canonical_drawdown_stage=drawdown_stage,
         var_policy_threshold_decimal=var_threshold,
         risk_increasing=risk_increasing,
+        action_direction=direction,
+        current_short_positions=short_positions,
     )
     digest = action_digest(payload)
     metrics = {
@@ -291,6 +307,7 @@ def evaluate_preflight(payload: dict[str, Any], *, base_dir: Path) -> dict[str, 
         "prospective_concentration_decimal": concentration,
         "canonical_drawdown_decimal": drawdown,
         "canonical_drawdown_stage": drawdown_stage,
+        "current_short_positions": short_positions,
     }
     review_context = {
         "policy_version": RISK_POLICY_VERSION,

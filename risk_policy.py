@@ -168,6 +168,8 @@ def classify_execution_risk(
     canonical_drawdown_stage: str | None = None,
     var_policy_threshold_decimal: float | None = None,
     risk_increasing: bool,
+    action_direction: str | None = None,
+    current_short_positions: int | None = None,
 ) -> dict[str, Any]:
     """Return the deterministic preflight disposition.
 
@@ -202,6 +204,19 @@ def classify_execution_risk(
             "loss_guard": loss,
             "drawdown": dd,
         }
+
+    if str(action_direction or "").lower() == "short":
+        if current_short_positions is None:
+            add(
+                "short_position_count_unavailable",
+                "現在の空売りポジション数を確認できません。人間の明示確認が必要です",
+            )
+        elif int(current_short_positions) >= POLICY.max_short_positions:
+            add(
+                "max_short_positions",
+                f"空売りポジションが{int(current_short_positions)}/{POLICY.max_short_positions}上限に達しています",
+                hard=True,
+            )
 
     var_threshold = (
         float(var_policy_threshold_decimal)

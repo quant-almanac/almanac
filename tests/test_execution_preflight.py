@@ -104,6 +104,33 @@ def test_absolute_caps_are_hard_rejections(var, concentration, code):
     assert {r["code"] for r in decision["hard_reasons"]} == {code}
 
 
+def test_short_position_cap_is_hard_and_cover_is_never_blocked():
+    short = classify_execution_risk(
+        daily_pnl_decimal=0.0,
+        rolling_30_pnl_decimal=0.0,
+        var_1d_95_decimal=0.01,
+        concentration_decimal=0.02,
+        canonical_drawdown_decimal=-0.01,
+        risk_increasing=True,
+        action_direction="short",
+        current_short_positions=POLICY.max_short_positions,
+    )
+    cover = classify_execution_risk(
+        daily_pnl_decimal=-0.20,
+        rolling_30_pnl_decimal=-0.20,
+        var_1d_95_decimal=0.10,
+        concentration_decimal=0.50,
+        canonical_drawdown_decimal=-0.20,
+        risk_increasing=False,
+        action_direction="cover",
+        current_short_positions=POLICY.max_short_positions,
+    )
+
+    assert short["disposition"] == "hard_reject"
+    assert "max_short_positions" in {row["code"] for row in short["hard_reasons"]}
+    assert cover["disposition"] == "ready"
+
+
 def test_sells_are_always_ready_even_in_a_freeze():
     decision = classify_execution_risk(
         daily_pnl_decimal=-0.2, rolling_30_pnl_decimal=-0.2,

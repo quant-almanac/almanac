@@ -60,6 +60,7 @@ class PolicyContext:
 
     # Leverage
     leverage_status: Optional[str] = None   # 'safe' | 'warning' | 'deleverage' | 'emergency'
+    current_short_positions: Optional[int] = None
 
     # Data quality
     data_freshness: Optional[float] = None  # 0..1 (1=完全に新鮮)
@@ -123,6 +124,12 @@ class PolicyDecision:
 
 # Action type categories
 _BUY_TYPES = {"buy", "add", "dca", "margin_buy"}
+# ``short`` is an opening risk position in ALMANAC.  It is not a hedge action:
+# the risk-reducing inverse is ``cover``.  Keep this set aligned with
+# execution_readiness.RISK_INCREASING and api.routes.actions._is_risk_increasing
+# so the morning candidate gate cannot admit an action that the execution-time
+# preflight classifies as new risk.
+_RISK_INCREASING_TYPES = _BUY_TYPES | {"short"}
 _SPECULATIVE_TYPES = {"margin_buy", "short"}
 _EXECUTABLE_TYPES = _BUY_TYPES | {"sell", "trim", "reduce", "rebalance", "stop_loss", "take_profit", "short", "cover"}
 # Every action type the synthesis layer is allowed to emit (see analyst priority_actions
@@ -172,12 +179,37 @@ def _rule_ledger_integrity(action: dict, ctx: PolicyContext):
     )
 
 
+def _rule_short_capacity(action: dict, ctx: PolicyContext):
+    """Enforce the fixed cap on *new* short positions.
+
+    ``cover`` and other exits never consume a short slot. Missing position
+    count is not proof of spare capacity, so a new short is rejected until the
+    canonical guard snapshot is available.
+    """
+    if str(action.get("type") or "").lower() != "short":
+        return None
+    if ctx.current_short_positions is None:
+        return (
+            "reject",
+            "現在の空売りポジション数を確認できないため、新規shortを安全に判定できない。",
+        )
+    if int(ctx.current_short_positions) >= POLICY.max_short_positions:
+        return (
+            "reject",
+            f"空売りポジション {int(ctx.current_short_positions)}/{POLICY.max_short_positions} "
+            "で上限到達。新規shortは禁止し、coverは継続可能。",
+        )
+    return None
+
+
 def _rule_var_budget(action: dict, ctx: PolicyContext):
     """
-    ex-ante VaR が threshold を超えた状態で新規 buy/add/dca/margin_buy をすると
+    ex-ante VaR が threshold を超えた状態で新規リスクを追加すると
     リスクバジェットを更に圧迫する → 全て reject。
+
+    ``short`` も新規建てであり、既存空売りを閉じる ``cover`` とは区別する。
     """
-    if action.get("type", "").lower() not in _BUY_TYPES:
+    if action.get("type", "").lower() not in _RISK_INCREASING_TYPES:
         return None
     if ctx.var_1d_95 is None or ctx.var_1d_95 < ctx.var_threshold:
         return None
@@ -193,7 +225,7 @@ def _rule_dd_stage(action: dict, ctx: PolicyContext):
       - DD ≤ -5%  → 警戒 (urgency 降格 + policy_size_adj=0.5)
       - それ以外  → pass
     """
-    if action.get("type", "").lower() not in _BUY_TYPES:
+    if action.get("type", "").lower() not in _RISK_INCREASING_TYPES:
         return None
     if ctx.loss_guard_stage and ctx.loss_guard_stage != "ok":
         return ("reject", f"loss_guard_stage={ctx.loss_guard_stage}（日次/30日P&Lショック制御）により新規リスク停止。")
@@ -274,13 +306,15 @@ def _rule_market_regime_size(action: dict, ctx: PolicyContext):
 
 def _rule_leverage_block(action: dict, ctx: PolicyContext):
     """
-    leverage_status が warning/deleverage/emergency のときに新規信用建てを全 reject。
+    leverage_status が warn/warning/deleverage/emergency のときに新規信用建てを全 reject。
     behavioral_guard.evaluate_leverage_health の出力を直接利用する想定。
     """
     atype = action.get("type", "").lower()
     if atype not in {"margin_buy", "short"}:
         return None
-    if ctx.leverage_status not in ("warning", "deleverage", "emergency"):
+    # evaluate_leverage_health() の実値は ``warn``。``warning`` は過去の
+    # persisted/test fixture との互換表記として残す。
+    if str(ctx.leverage_status or "").lower() not in ("warn", "warning", "deleverage", "emergency"):
         return None
     return ("reject",
             f"leverage_status = '{ctx.leverage_status}' で type={atype} の新規信用建ては禁止。"
@@ -395,6 +429,7 @@ Rule = Callable[[dict, PolicyContext], Optional[Tuple]]
 
 RULES: List[Rule] = [
     _rule_ledger_integrity,
+    _rule_short_capacity,
     _rule_var_budget,
     _rule_dd_stage,
     _rule_market_regime_size,
@@ -762,6 +797,14 @@ def build_context_from_synthesis_inputs(
         except (TypeError, ValueError):
             return None
 
+    def _nonnegative_int_field(name: str) -> int | None:
+        try:
+            value = risk.get(name)
+            parsed = int(value) if value is not None else None
+            return parsed if parsed is not None and parsed >= 0 else None
+        except (TypeError, ValueError):
+            return None
+
     var_decimal = _decimal_field("var_95_decimal")
     cvar_decimal = _decimal_field("cvar_95_decimal")
     dd_decimal = _decimal_field("enforced_flow_adjusted_dd_decimal")
@@ -824,6 +867,7 @@ def build_context_from_synthesis_inputs(
             (regime_v2.get("shock") or {}).get("active")
         ),
         leverage_status   = (leverage_health.get("status") if isinstance(leverage_health, dict) else None),
+        current_short_positions = _nonnegative_int_field("short_positions"),
         data_freshness    = freshness_score,
         cvar_unstable     = bool(risk.get("cvar_unstable", False)),
         cvar_reason       = risk.get("cvar_reason"),

@@ -11169,7 +11169,10 @@ def run_analysis(force: bool = False) -> dict:
             _policy_risk = dict(data.get("risk") or {}) if isinstance(data, dict) else {}
             _guard_state = data.get("guard_state") if isinstance(data, dict) else None
             if isinstance(_guard_state, dict):
-                for _key in ("allow_dca_tranche", "dca_active_tranche", "trading_allowed"):
+                for _key in (
+                    "allow_dca_tranche", "dca_active_tranche", "trading_allowed",
+                    "short_positions",
+                ):
                     if _key in _guard_state:
                         _policy_risk[_key] = _guard_state.get(_key)
 

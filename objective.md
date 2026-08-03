@@ -57,7 +57,8 @@ env で上書き可:
 | 制約 | 閾値 | env override | 違反時の挙動 |
 |---|---|---|---|
 | portfolio ledger integrity | `ok is not False` | — | 不整合が明示された場合、実行可能な提案を reject |
-| ex-ante VaR_1d_95% | 弱気・ストレス時 `< 1.2%` / 通常時 `< 1.4%` / 強気かつ VIX<25 時 `< 1.6%` / 絶対上限 `< 1.8%` | — | 朝のpolicy gateはregime閾値以上の新規buy系をreject。発注前はregime閾値以上を明示確認へ送り、絶対上限以上をhard reject |
+| ex-ante VaR_1d_95% | 弱気・ストレス時 `< 1.2%` / 通常時 `< 1.4%` / 強気かつ VIX<25 時 `< 1.6%` / 絶対上限 `< 1.8%` | — | 朝のpolicy gateはregime閾値以上の新規risk（buy/add/dca/margin_buy/short）をreject。発注前はregime閾値以上を明示確認へ送り、絶対上限以上をhard reject |
+| open short positions | `< 3` | — | 3建玉到達後の新規shortを朝のpolicy gateと発注前checkでhard reject。coverは常に継続可能 |
 | daily P&L shock | `> -3%` | — | -3%以下では新規riskを停止し、人間確認へ送る |
 | rolling 30-day P&L shock | `> -6% / -9% / -12%` | — | stage 1/2/3で新規riskを停止。stage 3もsell/cover/hedge/stopを止める「全取引停止」ではない |
 | flow-adjusted current drawdown | ≤ -5% | — | caution。urgency降格 + size半減 |

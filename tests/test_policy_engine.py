@@ -34,6 +34,17 @@ def test_var_budget_ignores_sell():
     assert len(d.accepted) == 1  # sell は対象外
 
 
+def test_var_budget_rejects_new_short_but_allows_cover():
+    ctx = pe.PolicyContext(var_1d_95=0.020, current_short_positions=0)
+
+    d = pe.apply_policy_gate([_action("short"), _action("cover")], ctx)
+
+    assert len(d.rejected) == 1
+    assert d.rejected[0]["action"]["type"] == "short"
+    assert d.rejected[0]["rule"] == "_rule_var_budget"
+    assert [action["type"] for action in d.accepted] == ["cover"]
+
+
 def test_ledger_integrity_failure_rejects_executable_actions():
     ctx = pe.PolicyContext(
         ledger_integrity_ok=False,
@@ -86,6 +97,25 @@ def test_loss_guard_stage_blocks_buy_when_canonical_dd_is_unavailable():
     d = pe.apply_policy_gate([_action("buy")], ctx)
     assert len(d.rejected) == 1
     assert d.rejected[0]["rule"] == "_rule_dd_stage"
+
+
+def test_loss_guard_and_drawdown_block_new_short_but_allow_cover():
+    scenarios = [
+        pe.PolicyContext(current_dd=None, loss_guard_stage="stage_3", current_short_positions=0),
+        pe.PolicyContext(
+            current_dd=-0.081,
+            loss_guard_stage="ok",
+            canonical_drawdown_stage="block",
+            current_short_positions=0,
+        ),
+    ]
+
+    for ctx in scenarios:
+        d = pe.apply_policy_gate([_action("short"), _action("cover")], ctx)
+        assert len(d.rejected) == 1
+        assert d.rejected[0]["action"]["type"] == "short"
+        assert d.rejected[0]["rule"] == "_rule_dd_stage"
+        assert [action["type"] for action in d.accepted] == ["cover"]
 
 
 def test_market_regime_mild_bull_caps_us_buy_to_075():
@@ -295,11 +325,54 @@ def test_leverage_warning_blocks_margin_buy():
 
 
 def test_leverage_warning_blocks_new_short_but_not_cover():
-    ctx = pe.PolicyContext(leverage_status="warning")
+    ctx = pe.PolicyContext(leverage_status="warning", current_short_positions=0)
     d = pe.apply_policy_gate([_action("short"), _action("cover")], ctx)
     assert len(d.rejected) == 1
     assert d.rejected[0]["action"]["type"] == "short"
     assert d.accepted[0]["type"] == "cover"
+
+
+def test_actual_leverage_warn_status_blocks_new_credit_positions():
+    leverage_health = {
+        "status": "warn",
+        "new_buy_allowed": False,
+        "margin_buy_allowed": False,
+    }
+    ctx = pe.build_context_from_synthesis_inputs(
+        risk={"short_positions": 0},
+        leverage_health=leverage_health,
+    )
+
+    d = pe.apply_policy_gate([_action("margin_buy"), _action("short"), _action("cover")], ctx)
+
+    assert ctx.leverage_status == "warn"
+    assert [row["action"]["type"] for row in d.rejected] == ["margin_buy", "short"]
+    assert {row["rule"] for row in d.rejected} == {"_rule_leverage_block"}
+    assert [action["type"] for action in d.accepted] == ["cover"]
+
+
+def test_short_capacity_uses_canonical_guard_count_and_never_blocks_cover():
+    ctx = pe.PolicyContext(current_short_positions=pe.POLICY.max_short_positions)
+
+    d = pe.apply_policy_gate([_action("short"), _action("cover")], ctx)
+
+    assert len(d.rejected) == 1
+    assert d.rejected[0]["action"]["type"] == "short"
+    assert d.rejected[0]["rule"] == "_rule_short_capacity"
+    assert [action["type"] for action in d.accepted] == ["cover"]
+
+
+def test_short_capacity_fails_closed_when_count_is_missing():
+    d = pe.apply_policy_gate([_action("short")], pe.PolicyContext())
+
+    assert len(d.rejected) == 1
+    assert d.rejected[0]["rule"] == "_rule_short_capacity"
+
+
+def test_context_builder_wires_short_position_count():
+    ctx = pe.build_context_from_synthesis_inputs(risk={"short_positions": 2})
+
+    assert ctx.current_short_positions == 2
 
 
 def test_leverage_safe_passes_margin_buy():
