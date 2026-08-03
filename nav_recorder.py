@@ -41,6 +41,7 @@ from almanac.runtime_config import resolve_db_path
 
 BASE_DIR = Path(__file__).parent
 DB_PATH  = resolve_db_path(BASE_DIR)
+FLOW_ADJUSTED_DD_SHADOW_FILE = BASE_DIR / "flow_adjusted_dd_shadow.json"
 
 
 # ============================================================
@@ -107,6 +108,18 @@ def snapshot_today(*, db_path: Optional[Path] = None) -> dict:
         record_date=today,
     )
 
+    # v7: calculate and persist a shadow-only, flow-adjusted DD series.  This
+    # does not alter daily_performance.drawdown_pct and cannot gate trading
+    # until the separate Slice 3 promotion conditions are satisfied.
+    shadow = update_flow_adjusted_dd_shadow(db_path=db_path)
+    try:
+        from drawdown_enforcement import advance_enforced_state
+        dd_enforcement = advance_enforced_state(base_dir=BASE_DIR)
+    except Exception as exc:
+        # The shadow measurement is still valid; surface state-machine failure
+        # to the caller rather than silently claiming the gate advanced.
+        dd_enforcement = {"error": f"{type(exc).__name__}: {exc}"}
+
     return {
         "date":            today,
         "portfolio_value": float(total),
@@ -115,6 +128,8 @@ def snapshot_today(*, db_path: Optional[Path] = None) -> dict:
         "monthly_pnl_jpy": monthly_pnl_jpy,
         "monthly_pnl_pct": monthly_pnl_pct,
         "fx_rate":         fx,
+        "flow_adjusted_dd_shadow": shadow,
+        "drawdown_enforcement": dd_enforcement,
     }
 
 
@@ -586,6 +601,152 @@ def compute_max_drawdown(
         "clean_ok": clean_ok,
         "error": None,
     }
+
+
+# ============================================================
+# Flow-adjusted DD shadow (v7)
+# ============================================================
+
+def _effective_clean_nav_rows(
+    *,
+    db_path: Optional[Path] = None,
+    clean_since: Optional[str] = None,
+) -> list[tuple[str, float]]:
+    """Return observed weekday NAVs only; estimates and weekend rows are out."""
+    if clean_since is None:
+        from config_clean_baseline import clean_nav_since_iso
+        clean_since = clean_nav_since_iso()
+    with _conn(db_path) as c:
+        estimated_clause = "AND COALESCE(estimated, 0) = 0" if _has_estimated_col(c) else ""
+        rows = c.execute(
+            "SELECT date, portfolio_value FROM daily_performance "
+            f"WHERE date >= ? {estimated_clause} ORDER BY date ASC",
+            (clean_since,),
+        ).fetchall()
+    effective: list[tuple[str, float]] = []
+    for row in rows:
+        try:
+            day = str(row["date"])
+            nav = float(row["portfolio_value"])
+            if date.fromisoformat(day).weekday() >= 5 or nav <= 0:
+                continue
+        except (TypeError, ValueError):
+            continue
+        effective.append((day, nav))
+    return effective
+
+
+def compute_flow_adjusted_drawdown_shadow(
+    *,
+    db_path: Optional[Path] = None,
+    clean_since: Optional[str] = None,
+) -> dict:
+    """Calculate a canonical external-flow-adjusted NAV return index.
+
+    The end-of-day cash-flow convention matches the documented limitation of
+    ``snapshot_today``: for a day t, return_t = (NAV_t - external_flow_t) /
+    NAV_(t-1) - 1.  This is a shadow series until broker timing reconciliation
+    and the promotion gates have been met.
+    """
+    try:
+        from event_ledger import query_events
+        from config_clean_baseline import clean_nav_since_iso
+        since = clean_since or clean_nav_since_iso()
+        rows = _effective_clean_nav_rows(db_path=db_path, clean_since=since)
+        if len(rows) < 2:
+            return {
+                "source": "flow_adjusted_nav_shadow",
+                "flow_adjusted_current_dd_decimal": None,
+                "flow_adjusted_max_dd_decimal": None,
+                "effective_nav_days": len(rows),
+                "clean_since": since,
+                "reason": "insufficient_effective_nav_rows",
+                "estimated_rows_excluded": True,
+                "weekend_rows_excluded": True,
+            }
+        events = query_events(
+            date_from=rows[0][0], date_to=rows[-1][0] + "T23:59:59",
+            types=["cash_flow"], db_path=db_path,
+        )
+        flows_by_day: dict[str, float] = {}
+        for event in events:
+            try:
+                day = str(event.get("occurred_at") or "")[:10]
+                flows_by_day[day] = flows_by_day.get(day, 0.0) + float(event.get("amount_jpy") or 0.0)
+            except (TypeError, ValueError):
+                continue
+        index = 1.0
+        peak = 1.0
+        current_dd = 0.0
+        max_dd = 0.0
+        invalid_days: list[str] = []
+        for (prev_day, prev_nav), (day, nav) in zip(rows, rows[1:]):
+            adjusted_end = nav - flows_by_day.get(day, 0.0)
+            if prev_nav <= 0 or adjusted_end <= 0:
+                invalid_days.append(day)
+                continue
+            index *= adjusted_end / prev_nav
+            peak = max(peak, index)
+            current_dd = index / peak - 1.0
+            max_dd = min(max_dd, current_dd)
+        coverage = cash_flow_ledger_status(
+            date_from=rows[0][0], date_to=rows[-1][0], db_path=db_path,
+        )
+        expected = coverage.get("expected_count")
+        matched = coverage.get("matched_count")
+        flow_coverage = (
+            float(matched) / float(expected)
+            if isinstance(expected, int) and expected > 0 and isinstance(matched, int)
+            else (1.0 if expected == 0 else 0.0)
+        )
+        return {
+            "source": "flow_adjusted_nav_shadow",
+            "flow_adjusted_current_dd_decimal": round(current_dd, 8),
+            "flow_adjusted_max_dd_decimal": round(max_dd, 8),
+            "return_index": round(index, 8),
+            "effective_nav_days": len(rows),
+            "start_date": rows[0][0],
+            "end_date": rows[-1][0],
+            "clean_since": since,
+            "cash_flow_count": len(events),
+            "flow_coverage": round(flow_coverage, 4),
+            "flow_coverage_detail": coverage,
+            "invalid_days": invalid_days,
+            "estimated_rows_excluded": True,
+            "weekend_rows_excluded": True,
+            "flow_timing_convention": "end_of_day",
+            "manual_reconciliation_required": True,
+        }
+    except Exception as exc:
+        return {
+            "source": "flow_adjusted_nav_shadow",
+            "flow_adjusted_current_dd_decimal": None,
+            "flow_adjusted_max_dd_decimal": None,
+            "reason": f"unavailable:{type(exc).__name__}",
+            "error": str(exc),
+        }
+
+
+def update_flow_adjusted_dd_shadow(*, db_path: Optional[Path] = None) -> dict:
+    """Persist one forward-shadow observation per effective NAV date."""
+    result = compute_flow_adjusted_drawdown_shadow(db_path=db_path)
+    end_date = result.get("end_date")
+    try:
+        previous = json.loads(FLOW_ADJUSTED_DD_SHADOW_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        previous = {}
+    valid = int(previous.get("forward_shadow_effective_days") or 0)
+    if end_date and previous.get("last_effective_nav_date") != end_date:
+        valid += 1
+    result.update({
+        "shadow_started_at": previous.get("shadow_started_at") or datetime.now().isoformat(),
+        "forward_shadow_effective_days": valid,
+        "last_effective_nav_date": end_date,
+        "updated_at": datetime.now().isoformat(),
+    })
+    from utils import atomic_write_json
+    atomic_write_json(FLOW_ADJUSTED_DD_SHADOW_FILE, result)
+    return result
 
 
 # ============================================================

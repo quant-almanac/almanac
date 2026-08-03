@@ -485,9 +485,15 @@ def run(dry_run: bool = False, force: bool = False) -> dict:
             params = tp.list_all()
             allowlist = list(policy.get("auto_apply_allowlist") or [])
             denylist = set(policy.get("auto_apply_denylist") or [])
+            from risk_policy import RETIRED_TUNABLE_RISK_KEYS
             invalid_policy = [
                 key for key in allowlist
-                if key in denylist or key not in params or not params[key].get("auto_apply", False)
+                if (
+                    key in denylist
+                    or key in RETIRED_TUNABLE_RISK_KEYS
+                    or key not in params
+                    or not params[key].get("auto_apply", False)
+                )
             ]
             if invalid_policy:
                 raise ValueError(f"invalid allowlist policy: {','.join(invalid_policy)}")

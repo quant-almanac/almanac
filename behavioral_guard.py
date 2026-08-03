@@ -11,6 +11,7 @@ from datetime import datetime, date, timedelta
 from pathlib import Path
 
 from utils import atomic_write_json
+from risk_policy import POLICY, RISK_POLICY_VERSION, loss_guard_state
 
 BASE_DIR = Path(__file__).parent
 STATE_FILE = BASE_DIR / 'guard_state.json'
@@ -167,50 +168,9 @@ def is_rebalance_in_cooldown(vix: float | None = None) -> tuple[bool, str]:
 # ============================================================
 
 GUARDRAILS = {
-    'daily_loss_limit':    -0.04,   # 日次-4%: 新規エントリー禁止（fallback default）
-    'monthly_loss_limit':  -0.08,   # 月間-8%: 現金積み増し推奨（fallback default）
-    'max_short_positions':  3,
-    # ポジション数上限は廃止 — 日次/月次損失制限と未発注SLブロックで管理
-}
-
-
-def _get_guardrail(key: str, default_pct: float) -> float:
-    """tunable_params から最新値を取得（fallback 必須）。
-    値はパーセント（例: -4.0）で保存されているので 100 で割って小数化。
-    """
-    try:
-        from tunable_params import get as _tp_get
-        # daily_loss_limit ↔ daily_loss_limit_pct のマッピング
-        tp_key = {
-            'daily_loss_limit':   'daily_loss_limit_pct',
-            'monthly_loss_limit': 'monthly_stage1_pct',
-            'max_short_positions': 'max_short_positions',
-        }.get(key)
-        if tp_key:
-            v = _tp_get(tp_key)
-            if v is not None:
-                # max_short_positions は整数のまま、損失系は % → 小数
-                return float(v) if 'positions' in tp_key else float(v) / 100.0
-    except Exception:
-        pass
-    return default_pct
-
-STAGED_GUARDRAILS = {
-    # 統計的整合性: 日次VaR 1% × √20 ≈ 4.5%/月 → 正常ノイズで誤発動しない水準に設定
-    'stage_1': {'threshold': -0.08, 'risk_factor': 0.50, 'label': 'リスク50%縮小'},
-    'stage_2': {'threshold': -0.12, 'risk_factor': 0.25, 'label': 'リスク75%縮小'},
-    'stage_3': {'threshold': -0.16, 'risk_factor': 0.00, 'label': '全取引停止'},
-}
-
-RECOVERY_MODE = {
-    'enabled_after_stage': 1,        # stage_1 or stage_2 からの回復を許可
-    'recovery_window_days': 5,       # 回復判定期間（5営業日連続改善で緩和）
-    'max_risk_in_recovery': 0.50,    # 回復中の最大リスク係数
-}
-
-DRAWDOWN_RULES = {
-    'warning':  -0.25,   # -25%: ポジション50%縮小アラート
-    'critical': -0.35,   # -35%: 全現金化推奨
+    # Compatibility display only.  The values are fixed in RiskPolicy, not
+    # read from tunable_params or an AI recommendation.
+    'max_short_positions': POLICY.max_short_positions,
 }
 
 
@@ -531,214 +491,78 @@ def _send_guardrail_suggestion(state: dict, trading_stopped: bool):
 # ガードレール評価
 # ============================================================
 
-def _evaluate_recovery(state: dict, daily_pct: float, monthly_pct: float,
-                       current_stage: int, alerts: list) -> None:
-    """リカバリーモードの判定と状態更新"""
-    today_str = date.today().isoformat()
-
-    # 日次プラスなら連続カウント
-    if daily_pct > 0:
-        state['consecutive_positive_days'] = state.get('consecutive_positive_days', 0) + 1
-    else:
-        state['consecutive_positive_days'] = 0
-
-    # リカバリーモード開始判定: 連続プラス日数が回復期間に達した場合
-    _recovery_window = int(_tp_bg("recovery_window_days", RECOVERY_MODE['recovery_window_days']))
-    # _evaluate_recovery 内でも stage 閾値を動的上書き
-    _stages_r = {k: dict(v) for k, v in STAGED_GUARDRAILS.items()}
-    _s1r = _tp_bg("monthly_stage1_pct", None)
-    if _s1r is not None:
-        _stages_r['stage_1']['threshold'] = float(_s1r) / 100.0
-    _s2r = _tp_bg("monthly_stage2_pct", None)
-    if _s2r is not None:
-        _stages_r['stage_2']['threshold'] = float(_s2r) / 100.0
-    _s3r = _tp_bg("monthly_stage3_pct", None)
-    if _s3r is not None:
-        _stages_r['stage_3']['threshold'] = float(_s3r) / 100.0
-    if (not state.get('recovery_mode') and
-            state['consecutive_positive_days'] >= _recovery_window):
-        state['recovery_mode'] = True
-        state['recovery_start_date'] = today_str
-        # リスク係数を少し緩和（ただし最大制限あり）
-        max_recovery_risk = RECOVERY_MODE['max_risk_in_recovery']
-        state['risk_factor'] = min(max_recovery_risk, state.get('risk_factor', 0) + 0.25)
-        alerts.append({
-            'level':   'info',
-            'message': f'リカバリーモード発動: {_recovery_window}営業日連続プラス達成。リスク係数を{state["risk_factor"]:.0%}に緩和',
-            'time':    datetime.now().isoformat(),
-        })
-    elif state.get('recovery_mode'):
-        # リカバリー中に日次マイナスが続いたら回復モード解除
-        if state['consecutive_positive_days'] == 0 and daily_pct <= _get_guardrail('daily_loss_limit', GUARDRAILS['daily_loss_limit']):
-            state['recovery_mode'] = False
-            state['recovery_start_date'] = None
-            stage_info = _stages_r[f'stage_{current_stage}']
-            state['risk_factor'] = stage_info['risk_factor']
-            alerts.append({
-                'level':   'warning',
-                'message': f'リカバリーモード解除: 日次損失-3%到達。リスク係数を{state["risk_factor"]:.0%}に戻す',
-                'time':    datetime.now().isoformat(),
-            })
+def _legacy_evaluate(state: dict) -> dict:
+    """Compatibility alias for callers that still import the old name."""
+    return evaluate(state)
 
 
 def evaluate(state: dict) -> dict:
-    """
-    現在の状態に基づきガードレールを評価し、state を更新して返す。
-    段階的ガードレール（STAGED_GUARDRAILS）とリカバリーモードを適用する。
-    """
-    alerts            = []
-    new_entry_allowed = True
-    trading_allowed   = True
+    """Evaluate the fixed v7 loss guard without regime or DCA exceptions.
 
-    daily_pct   = state['daily_pnl_pct']
-    monthly_pct = state['monthly_pnl_pct']
-    active      = state['active_trades']
-    shorts      = state['short_positions']
-
-    # 日次損失制限
-    if daily_pct <= _get_guardrail('daily_loss_limit', GUARDRAILS['daily_loss_limit']):
-        new_entry_allowed = False
+    Daily and rolling 30-day P&L are shock controls, not drawdown.  Stage 3
+    freezes *risk increases* only; sells, covers, hedges and stops remain
+    available.  ``risk_factor`` is retained at 1.0 for compatibility but is
+    no longer an automatic sizing instruction.
+    """
+    daily = float(state.get("daily_pnl_pct") or 0.0)
+    rolling = float(state.get("monthly_pnl_pct") or 0.0)
+    decision = loss_guard_state(
+        daily_pnl_decimal=daily,
+        rolling_30_pnl_decimal=rolling,
+    )
+    stage_by_name = {"ok": 0, "daily_block": 0, "stage_1": 1, "stage_2": 2, "stage_3": 3}
+    loss_stage = str(decision["loss_guard_stage"])
+    stage = stage_by_name[loss_stage]
+    now = datetime.now().isoformat()
+    alerts: list[dict] = []
+    if loss_stage != "ok":
+        labels = {
+            "daily_block": f"日次P&L {daily * 100:.2f}% が -3% 日次ショック制御に到達",
+            "stage_1": f"30日P&L {rolling * 100:.2f}% が -6% に到達",
+            "stage_2": f"30日P&L {rolling * 100:.2f}% が -9% に到達",
+            "stage_3": f"30日P&L {rolling * 100:.2f}% が -12% に到達：リスク増加を凍結し人間レビュー",
+        }
         alerts.append({
-            'level':   'warning',
-            'message': f'本日P&L {daily_pct*100:.2f}%（閾値-4%）→ 新規エントリー禁止',
-            'time':    datetime.now().isoformat(),
+            "level": "critical" if stage >= 2 else "warning",
+            "message": labels[loss_stage] + "。売却・カバー・ヘッジ・ストップは継続可能",
+            "time": now,
         })
-
-    # 未発注ストップ/売却チェック（3営業日超で新規ブロック）
     try:
-        from action_state_tracker import check_new_position_block as _chk_block, send_telegram_alerts as _send_alerts
-        _block_info = _chk_block()
-        if _block_info.get("blocked"):
-            new_entry_allowed = False
+        from action_state_tracker import check_new_position_block as _check_block, send_telegram_alerts as _send_alerts
+        pending = _check_block()
+        if pending.get("blocked"):
+            decision["new_risk_allowed"] = False
             alerts.append({
-                'level':   'critical',
-                'message': f'⛔ 未発注アクション3日超 → 新規ポジション禁止｜{_block_info["reason"][:80]}',
-                'time':    datetime.now().isoformat(),
+                "level": "critical",
+                "message": f"未発注アクションにより新規リスク停止：{str(pending.get('reason') or '')[:80]}",
+                "time": now,
             })
-            _send_alerts()  # Telegram通知（重複防止は送信側で管理）
+            _send_alerts()
     except Exception:
         pass
+    max_short = POLICY.max_short_positions
+    if int(state.get("short_positions") or 0) >= max_short:
+        alerts.append({"level": "info", "message": f"空売りポジション {state.get('short_positions', 0)}/{max_short} → 上限到達", "time": now})
 
-    # 月次-4%: 現金確保リマインダー（緩和: 旧-3%）
-    MONTHLY_CASH_WARNING = -0.04
-    _monthly_limit = _get_guardrail('monthly_loss_limit', GUARDRAILS['monthly_loss_limit'])
-    if _monthly_limit < monthly_pct <= MONTHLY_CASH_WARNING:
-        alerts.append({
-            'level':   'warning',
-            'message': f'月間P&L {monthly_pct*100:.2f}%（-3%ライン）→ 防衛キャッシュ積み増し推奨',
-            'time':    datetime.now().isoformat(),
-        })
-
-    # === 段階的ガードレール ===
-    prev_stage = state.get('guardrail_stage', 0)
-    new_stage  = 0
-    risk_factor = 1.0
-
-    # tunable_params で stage1/2/3 の閾値を動的上書き
-    _stages = {k: dict(v) for k, v in STAGED_GUARDRAILS.items()}
-    _s1 = _tp_bg("monthly_stage1_pct", None)
-    if _s1 is not None:
-        _stages['stage_1']['threshold'] = float(_s1) / 100.0
-    _s2 = _tp_bg("monthly_stage2_pct", None)
-    if _s2 is not None:
-        _stages['stage_2']['threshold'] = float(_s2) / 100.0
-    _s3 = _tp_bg("monthly_stage3_pct", None)
-    if _s3 is not None:
-        _stages['stage_3']['threshold'] = float(_s3) / 100.0
-
-    for stage_num in [3, 2, 1]:  # 最も厳しいステージから判定
-        stage = _stages[f'stage_{stage_num}']
-        if monthly_pct <= stage['threshold']:
-            new_stage   = stage_num
-            risk_factor = stage['risk_factor']
-            break
-
-    state['guardrail_stage'] = new_stage
-    state['risk_factor']     = risk_factor
-
-    if new_stage >= 3:
-        trading_allowed   = False
-        new_entry_allowed = False
-        state['recovery_mode'] = False
-        alerts.append({
-            'level':   'critical',
-            'message': f'月間P&L {monthly_pct*100:.2f}%（閾値-10%）→ 全取引停止（Stage 3）',
-            'time':    datetime.now().isoformat(),
-        })
-    elif new_stage >= 1:
-        stage_info = _stages[f'stage_{new_stage}']
-        # Stage 1-2: 新規エントリー禁止だが既存ポジション管理は可能
-        new_entry_allowed = False
-        alerts.append({
-            'level':   'critical' if new_stage == 2 else 'warning',
-            'message': f'月間P&L {monthly_pct*100:.2f}%（{stage_info["threshold"]*100:.0f}%ライン）→ {stage_info["label"]}（Stage {new_stage}）',
-            'time':    datetime.now().isoformat(),
-        })
-        # ステージ悪化時はリカバリーモードをリセット
-        if new_stage > prev_stage:
-            state['recovery_mode']              = False
-            state['recovery_start_date']        = None
-            state['consecutive_positive_days']  = 0
-
-    # === リカバリーモード判定 ===
-    if new_stage > 0 and new_stage <= RECOVERY_MODE['enabled_after_stage'] + 1:
-        _evaluate_recovery(state, daily_pct, monthly_pct, new_stage, alerts)
-    elif new_stage == 0:
-        # 正常復帰
-        state['recovery_mode']             = False
-        state['recovery_start_date']       = None
-        state['consecutive_positive_days'] = 0
-
-    # レジームフリップ例外: BULL レジーム時はNISA積立・既存ポジション追加を許可
-    if not trading_allowed and _get_regime_bull():
-        state['nisa_exception_allowed'] = True
-        alerts.append({
-            'level':   'info',
-            'message': 'レジームフリップ例外: BULL転換中。NISA積立・既存ポジション追加は継続可能',
-            'time':    datetime.now().isoformat(),
-        })
-    else:
-        state['nisa_exception_allowed'] = False
-
-    # DCA ラダー限定フラグ: Active tranche がある場合だけ、policy_engine が
-    # type="dca" source="dca_ladder" を DD stage 下でも半量通過させる余地を持つ。
-    # stage_3 / daily_block、または trading_allowed が True と確認できない場合は
-    # policy 側が fail-closed する。
-    state['allow_dca_tranche'] = False
-    try:
-        from pathlib import Path as _P
-        _dca_f = _P(__file__).parent / "bottom_fishing_signals.json"
-        if _dca_f.exists():
-            import json as _json
-            _sig = _json.loads(_dca_f.read_text(encoding="utf-8"))
-            _active = _sig.get("active_tranche")
-            if _active:
-                state['allow_dca_tranche'] = True
-                state['dca_active_tranche'] = _active
-                alerts.append({
-                    'level':   'info',
-                    'message': f'🩸 DCA ラダー {_active} 観測中: source="dca_ladder" 候補はDD policy限定例外の対象',
-                    'time':    datetime.now().isoformat(),
-                })
-    except Exception:
-        pass
-
-    # ポジション数制限は廃止（長期・中期・スウィング混在ポートフォリオには不適切）
-    # 実質的なリスク管理は日次/月次損失制限と未発注アクションブロックで行う
-
-    # 空売りポジション上限（tunable_params: max_short_positions）
-    _max_short = int(_get_guardrail('max_short_positions', GUARDRAILS['max_short_positions']))
-    if shorts >= _max_short:
-        alerts.append({
-            'level':   'info',
-            'message': f'空売りポジション {shorts}/{_max_short} → 上限到達',
-            'time':    datetime.now().isoformat(),
-        })
-
-    state['new_entry_allowed'] = new_entry_allowed
-    state['trading_allowed']   = trading_allowed
-    state['alerts']            = alerts
-
+    state.update({
+        "risk_policy_version": RISK_POLICY_VERSION,
+        "loss_guard_stage": loss_stage,
+        "loss_guard_reason_code": decision["reason_code"],
+        # Legacy consumers still use this string.  It is a loss-guard stage,
+        # never a drawdown value; data_gatherer publishes the renamed fields.
+        "actual_dd_stage": decision["actual_dd_stage"],
+        "guardrail_stage": stage,
+        "new_entry_allowed": bool(decision["new_risk_allowed"]),
+        "trading_allowed": True,
+        "risk_factor": 1.0,
+        "nisa_exception_allowed": False,
+        "allow_dca_tranche": False,
+        "dca_active_tranche": None,
+        "recovery_mode": False,
+        "recovery_start_date": None,
+        "consecutive_positive_days": 0,
+        "alerts": alerts,
+    })
     return state
 
 
@@ -849,29 +673,38 @@ def check_drawdown(current_value: float, peak_value: float) -> dict:
 
     dd = (current_value - peak_value) / peak_value
 
-    # tunable_params で閾値を動的上書き（dd_full_liquidate / dd_50pct_reduce）
-    _dd_critical = DRAWDOWN_RULES['critical']
-    _dd_warning  = DRAWDOWN_RULES['warning']
-    _v = _tp_bg("dd_full_liquidate", None)
-    if _v is not None:
-        _dd_critical = float(_v) / 100.0
-    _v = _tp_bg("dd_50pct_reduce", None)
-    if _v is not None:
-        _dd_warning = float(_v) / 100.0
-
-    if dd <= _dd_critical:
+    # This helper is descriptive only.  The authoritative enforcement path is
+    # the flow-adjusted DD state machine; neither a 50% reduction nor a full
+    # liquidation is ever automatic.
+    if dd <= POLICY.dd_objective_breach_decimal:
         return {
             'drawdown_pct': round(dd, 4),
-            'level':        'critical',
-            'action':       '全現金化を推奨。直ちにポジションを解消してください。',
+            'level':        'objective_breach',
+            'action':       '12ヶ月DD目標逸脱。緊急の人間レビューが必要です。',
             'should_alert': True,
         }
-    elif dd <= _dd_warning:
+    if dd <= POLICY.dd_freeze_decimal:
         return {
             'drawdown_pct': round(dd, 4),
-            'level':        'warning',
-            'action':       '全ポジション50%縮小を推奨。',
+            'level':        'freeze',
+            'action':       'リスク増加を凍結し、緊急の人間レビューを要請。売却・ヘッジは継続可能。',
             'should_alert': True,
+        }
+    if dd <= POLICY.dd_derisk_decimal:
+        return {
+            'drawdown_pct': round(dd, 4), 'level': 'derisk_review',
+            'action': '戦術・投機リスク予算50%のデリスク計画を人間レビューへ送る。自動売却はしない。',
+            'should_alert': True,
+        }
+    if dd <= POLICY.dd_block_decimal:
+        return {
+            'drawdown_pct': round(dd, 4), 'level': 'block',
+            'action': '通常の新規リスク経路を停止し、人間承認へ送る。', 'should_alert': True,
+        }
+    if dd <= POLICY.dd_caution_decimal:
+        return {
+            'drawdown_pct': round(dd, 4), 'level': 'caution',
+            'action': '注意状態。新規リスクは人間確認のうえで判断する。', 'should_alert': True,
         }
     else:
         return {
@@ -1023,7 +856,7 @@ def _print_status():
     print(f'本日P&L:           ¥{state["daily_pnl_jpy"]:+,.0f}  ({state["daily_pnl_pct"]*100:+.2f}%)')
     print(f'直近30日P&L:       ¥{state["monthly_pnl_jpy"]:+,.0f}  ({state["monthly_pnl_pct"]*100:+.2f}%)')
     print(f'アクティブトレード: {state["active_trades"]}件（上限なし）')
-    _display_max_short = int(_get_guardrail('max_short_positions', GUARDRAILS['max_short_positions']))
+    _display_max_short = POLICY.max_short_positions
     print(f'空売りポジション:   {state["short_positions"]}/{_display_max_short}')
     stage = state.get('guardrail_stage', 0)
     rf = state.get('risk_factor', 1.0)

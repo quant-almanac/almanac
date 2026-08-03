@@ -59,6 +59,32 @@ def _safe_status_label(value: object, default: str = "未判定") -> str:
     return default if not label or label.lower() in {"nan", "none", "null"} else label
 
 
+def _build_execution_risk_snapshot(data: dict, *, snapshot_as_of: str) -> dict:
+    """Return the small, unit-explicit risk envelope persisted for preflight."""
+    raw = data.get("risk") if isinstance(data, dict) else None
+    raw = raw if isinstance(raw, dict) else {}
+    keys = (
+        "source",
+        "observations",
+        "var_95_decimal",
+        "cvar_95_decimal",
+        "loss_guard_stage",
+        "daily_pnl_decimal",
+        "rolling_30_pnl_decimal",
+        "flow_adjusted_current_dd_decimal",
+        "enforced_flow_adjusted_dd_decimal",
+        "enforced_drawdown_stage",
+    )
+    snapshot = {key: raw.get(key) for key in keys}
+    snapshot["snapshot_as_of"] = snapshot_as_of
+    try:
+        from risk_policy import RISK_POLICY_VERSION
+        snapshot["risk_policy_version"] = RISK_POLICY_VERSION
+    except Exception:
+        snapshot["risk_policy_version"] = None
+    return snapshot
+
+
 def _env_float(name: str, default: float) -> float:
     raw = get_env(name, str(default))
     try:
@@ -3673,9 +3699,9 @@ def _load_catalyst_context_for_opus(
 ) -> str:
     """Run the catalyst layer and return a compact text block for Opus injection.
 
-    AI autonomy v2: the pipeline runs, writes to ``catalyst_hypothesis_log.jsonl``
-    for observability, and returns a capped review block for Opus by default.
-    Set ``ALMANAC_DISABLE_CATALYST_CONTEXT=1`` to keep log-only shadow behavior.
+    The pipeline always writes its hypothesis log. Context injection is
+    explicitly controlled by ``ALMANAC_CATALYST_CONTEXT_MODE=on|off`` and is
+    on by default. The old disable flag is read for one compatibility period.
 
     Fail-open: any exception returns ``""`` with a console warning so the
     daily analysis is never blocked by a catalyst pipeline failure.
@@ -3721,8 +3747,17 @@ def _load_catalyst_context_for_opus(
         n = output.n_hypotheses_total
         print(f"  🔬 触媒レイヤー: {n} 件の仮説を生成")
 
-        # Explicit opt-out: log only, do not inject.
-        if get_env("ALMANAC_DISABLE_CATALYST_CONTEXT"):
+        mode_raw = os.environ.get("ALMANAC_CATALYST_CONTEXT_MODE")
+        mode = str(mode_raw or "on").strip().lower()
+        if mode not in {"on", "off"}:
+            print(f"  ⚠️ invalid ALMANAC_CATALYST_CONTEXT_MODE={mode!r}; defaulting to on")
+            mode = "on"
+        legacy_disabled = get_env("ALMANAC_DISABLE_CATALYST_CONTEXT")
+        if mode_raw in (None, "") and legacy_disabled:
+            print("  ⚠️ ALMANAC_DISABLE_CATALYST_CONTEXT is deprecated; use ALMANAC_CATALYST_CONTEXT_MODE=off")
+            mode = "off"
+        if mode == "off":
+            print("  🔬 catalyst context: log-only (ALMANAC_CATALYST_CONTEXT_MODE=off)")
             return ""
 
         return _compact(output, scenario_readiness=scenario_readiness)
@@ -6784,12 +6819,15 @@ def _apply_stance_guard(synthesis: dict, data: dict, regime_bull_confirmed: bool
         vix = None
 
     risk = data.get("risk", {}) or {}
-    actual_dd = risk.get("actual_current_dd")  # percent, actual guard/NAV only; never synthetic parquet DD
+    # Only the promoted flow-adjusted decimal DD may affect the stance. The
+    # retired ``actual_current_dd`` field was a P&L proxy, not drawdown.
+    canonical_dd = risk.get("enforced_flow_adjusted_dd_decimal")
     try:
-        actual_dd = float(actual_dd) if actual_dd is not None else None
+        canonical_dd = float(canonical_dd) if canonical_dd is not None else None
     except (TypeError, ValueError):
-        actual_dd = None
-    actual_dd_stage = risk.get("actual_dd_stage")
+        canonical_dd = None
+    canonical_dd_stage = str(risk.get("enforced_drawdown_stage") or "").lower() or None
+    loss_guard_stage = str(risk.get("loss_guard_stage") or "").lower() or None
 
     leverage_health = synthesis.get("leverage_health") if isinstance(synthesis.get("leverage_health"), dict) else {}
     leverage_status = str(leverage_health.get("status") or "").lower() or None
@@ -6807,7 +6845,7 @@ def _apply_stance_guard(synthesis: dict, data: dict, regime_bull_confirmed: bool
     inputs_complete = (
         vix is not None
         and cash_pct is not None
-        and actual_dd is not None
+        and canonical_dd is not None
         and leverage_status is not None
     )
 
@@ -6821,8 +6859,9 @@ def _apply_stance_guard(synthesis: dict, data: dict, regime_bull_confirmed: bool
     # 実データで判定する hard override (rule 3040 の defensive 強制条件のみ)
     hard_override = (
         (vix is not None and vix > 30)
-        or (actual_dd is not None and actual_dd <= -8.0)
-        or (actual_dd_stage in {"block", "daily_block", "monthly_block", "stage_1", "stage_2", "stage_3"})
+        or (canonical_dd is not None and canonical_dd <= -0.08)
+        or (canonical_dd_stage in {"block", "derisk_review", "freeze", "objective_breach"})
+        or (loss_guard_stage not in (None, "ok"))
         or (leverage_status in ("deleverage", "emergency"))
     )
 
@@ -6833,8 +6872,9 @@ def _apply_stance_guard(synthesis: dict, data: dict, regime_bull_confirmed: bool
             "promoted_to": "aggressive",
             "reason": "aggressive 昇格条件を実データで充足し有効な override 無し（excess α/CVaR は override 根拠に不可）",
             "vix": vix,
-            "actual_dd_pct": actual_dd,
-            "actual_dd_stage": actual_dd_stage,
+            "canonical_drawdown_pct": canonical_dd * 100 if canonical_dd is not None else None,
+            "canonical_drawdown_stage": canonical_dd_stage,
+            "loss_guard_stage": loss_guard_stage,
             "cash_pct": (round(cash_pct, 1) if cash_pct is not None else None),
             "leverage_status": leverage_status,
             "regime_bull_confirmed": bool(regime_bull_confirmed),
@@ -6865,8 +6905,9 @@ def _apply_stance_guard(synthesis: dict, data: dict, regime_bull_confirmed: bool
             "downgraded_to": corrected_stance,
             "reason": correction_reason,
             "vix": vix,
-            "actual_dd_pct": actual_dd,
-            "actual_dd_stage": actual_dd_stage,
+            "canonical_drawdown_pct": canonical_dd * 100 if canonical_dd is not None else None,
+            "canonical_drawdown_stage": canonical_dd_stage,
+            "loss_guard_stage": loss_guard_stage,
             "cash_pct": (round(cash_pct, 1) if cash_pct is not None else None),
             "leverage_status": leverage_status,
             "regime_bull_confirmed": bool(regime_bull_confirmed),
@@ -10937,7 +10978,7 @@ def run_analysis(force: bool = False) -> dict:
     # action_stage_log: run-wide ID was issued before catalyst/tier work.
     _asl_scenario_key = (data.get("scenario") or {}).get("key", "") if isinstance(data, dict) else ""
     _asl_regime = ((data.get("regime") or {}).get("regime", "") if isinstance(data, dict) else "")
-    _asl_dd_stage = ((data.get("risk") or {}).get("actual_dd_stage", "") if isinstance(data, dict) else "")
+    _asl_dd_stage = ((data.get("risk") or {}).get("loss_guard_stage", "") if isinstance(data, dict) else "")
     _asl_leverage = ((synthesis.get("leverage_health") or {}).get("status", "") if isinstance(synthesis, dict) else "")
     _asl_as_of = datetime.now().isoformat()
     try:
@@ -11433,8 +11474,13 @@ def run_analysis(force: bool = False) -> dict:
         except Exception:
             pass
 
+    _result_as_of = datetime.now().strftime("%Y-%m-%d %H:%M")
+    # Persist only unit-labelled metrics needed by deterministic preflight;
+    # never copy position-level gather_data into the analysis cache.
+    _risk_snapshot = _build_execution_risk_snapshot(data, snapshot_as_of=_result_as_of)
+
     result = {
-        "as_of":             datetime.now().strftime("%Y-%m-%d %H:%M"),
+        "as_of":             _result_as_of,
         "scenario_key":      data["scenario"].get("key", "NEUTRAL"),
         "market_regime_v2":  data.get("market_regime_v2", {}),
         "portfolio_total":   data["portfolio_total"],
@@ -11444,6 +11490,7 @@ def run_analysis(force: bool = False) -> dict:
             "long_tier": data.get("currency_breakdown_long", {}),
         },
         "signals_age_hours": data.get("signals_age_hours"),
+        "risk_snapshot":              _risk_snapshot,
         "long_analysis":               long_analysis,
         "medium_analysis":             medium_analysis,
         "short_positions_analysis":    short_positions_analysis,

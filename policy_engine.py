@@ -33,6 +33,7 @@ from dataclasses import dataclass, field
 from typing import Callable, Optional, Tuple, List, Set
 
 from action_amounts import rewrite_action_quantity
+from risk_policy import POLICY, classify_drawdown, var_threshold_decimal
 
 
 # ============================================================
@@ -69,6 +70,9 @@ class PolicyContext:
     cvar_reason: Optional[str] = None
     # Actual DD/P&L guard state, separate from synthetic ex-ante parquet DD.
     actual_dd_stage: Optional[str] = None
+    # v7 names: P&L shock control and canonical DD are separate metrics.
+    loss_guard_stage: Optional[str] = None
+    canonical_drawdown_stage: Optional[str] = None
     actual_trading_allowed: Optional[bool] = None
     allow_dca_tranche: bool = False
     dca_active_tranche: Optional[str] = None
@@ -82,10 +86,10 @@ class PolicyContext:
     earnings_blackout: Set[str] = field(default_factory=set)
 
     # 閾値 (環境変数で上書き可、通常時デフォルトは objective.md 想定値)
-    var_threshold: float = 0.016        # 通常時: ex-ante VaR_1d_95% ≤ 1.6%
-    var_max_threshold: float = 0.023    # 絶対上限: ex-ante VaR_1d_95% ≤ 2.3%
-    dd_block_threshold: float = -0.08    # DD ≤ -8% で新規 buy 全停止
-    dd_caution_threshold: float = -0.05  # DD ≤ -5% で警戒 (サイズ半減)
+    var_threshold: float = POLICY.var_normal_decimal
+    var_max_threshold: float = POLICY.var_absolute_max_decimal
+    dd_block_threshold: float = POLICY.dd_block_decimal
+    dd_caution_threshold: float = POLICY.dd_caution_decimal
     vix_block_threshold: float = 40.0    # VIX > 40 で全 buy 抑制
     vix_caution_threshold: float = 30.0
     freshness_threshold: float = 0.7
@@ -191,64 +195,22 @@ def _rule_dd_stage(action: dict, ctx: PolicyContext):
     """
     if action.get("type", "").lower() not in _BUY_TYPES:
         return None
-    if ctx.actual_dd_stage in {"block", "daily_block", "monthly_block", "stage_1", "stage_2", "stage_3"}:
-        if _is_dca_ladder_action(action) and ctx.allow_dca_tranche:
-            # trading_allowed は True と確認できた場合のみ例外を許す (None=欠落は fail-closed)。
-            if ctx.actual_trading_allowed is not True or ctx.actual_dd_stage in {"stage_3", "daily_block"}:
-                return ("reject",
-                        f"actual_dd_stage={ctx.actual_dd_stage} かつ trading_allowed="
-                        f"{ctx.actual_trading_allowed} のため DCA 例外も停止。")
-            modified = dict(action)
-            if modified.get("urgency") == "high":
-                modified["urgency"] = "medium"
-            modified["policy_size_adj"] = min(_current_size_adj(modified), 0.5)
-            modified["policy_dca_dd_exception"] = True
-            if ctx.dca_active_tranche:
-                modified["policy_dca_active_tranche"] = ctx.dca_active_tranche
-            return ("modify", modified,
-                    f"actual_dd_stage={ctx.actual_dd_stage} だが DCA ラダー "
-                    "deterministic 例外によりサイズ半減で通過。")
-        return ("reject",
-                f"actual_dd_stage={ctx.actual_dd_stage}（実損益ガード）により新規 buy 停止。")
-    if ctx.actual_dd_stage == "caution":
-        # 実損益ガードが警戒 → deterministic にサイズ半減。数値 current_dd での再判定はしない。
+    if ctx.loss_guard_stage and ctx.loss_guard_stage != "ok":
+        return ("reject", f"loss_guard_stage={ctx.loss_guard_stage}（日次/30日P&Lショック制御）により新規リスク停止。")
+    dd_stage = ctx.canonical_drawdown_stage or classify_drawdown(ctx.current_dd).get("dd_stage")
+    if dd_stage in {"objective_breach", "freeze", "derisk_review", "block"}:
+        return ("reject", f"canonical_drawdown_stage={dd_stage} により新規リスクは人間レビュー待ち。")
+    # Before Slice 3 promotion a missing canonical DD is a visible data-quality
+    # caution at execution preflight, not a morning-analysis hard block.
+    if dd_stage == "data_confidence_caution":
+        return None
+    if dd_stage == "caution":
         modified = dict(action)
         if modified.get("urgency") == "high":
             modified["urgency"] = "medium"
         modified["policy_size_adj"] = min(_current_size_adj(modified), 0.5)
         return ("modify", modified,
-                "actual_dd_stage=caution（実損益ガード警戒）→ サイズ半減 + urgency 降格")
-    if ctx.actual_dd_stage == "ok":
-        # 実損益ガードが健全と評価済みなら stage が権威。数値 current_dd による再判定は行わない
-        # (単位誤読や合成系列 DD が stage=ok を上書きし、高値圏の凪の日に buy を全停止した事故の再発防止)。
-        return None
-    if ctx.current_dd is None:
-        return None
-
-    if ctx.current_dd <= ctx.dd_block_threshold:
-        if _is_dca_ladder_action(action) and ctx.allow_dca_tranche and ctx.actual_trading_allowed is True:
-            modified = dict(action)
-            if modified.get("urgency") == "high":
-                modified["urgency"] = "medium"
-            modified["policy_size_adj"] = min(_current_size_adj(modified), 0.5)
-            modified["policy_dca_dd_exception"] = True
-            if ctx.dca_active_tranche:
-                modified["policy_dca_active_tranche"] = ctx.dca_active_tranche
-            return ("modify", modified,
-                    f"current_dd = {ctx.current_dd * 100:.1f}% だが DCA ラダー "
-                    "deterministic 例外によりサイズ半減で通過。")
-        return ("reject",
-                f"current_dd = {ctx.current_dd * 100:.1f}% ≤ "
-                f"{ctx.dd_block_threshold * 100:.0f}%（危険ステージ）。新規 buy 停止。")
-
-    if ctx.current_dd <= ctx.dd_caution_threshold:
-        modified = dict(action)
-        if modified.get("urgency") == "high":
-            modified["urgency"] = "medium"
-        modified["policy_size_adj"] = min(_current_size_adj(modified), 0.5)
-        return ("modify", modified,
-                f"current_dd = {ctx.current_dd * 100:.1f}% ≤ "
-                f"{ctx.dd_caution_threshold * 100:.0f}%（警戒）→ サイズ半減 + urgency 降格")
+                "canonical_drawdown_stage=caution → サイズ半減 + urgency 降格")
 
     return None
 
@@ -764,14 +726,6 @@ def build_context_from_synthesis_inputs(
     analyst/synthesis から渡される dict / float を PolicyContext に詰める helper。
     各入力は欠落可（None / 空）— 該当 rule は自動的に no-op。
     """
-    import os
-
-    def _env_float(name: str, default: float) -> float:
-        try:
-            return float(os.environ.get(name, str(default)))
-        except (TypeError, ValueError):
-            return default
-
     risk = risk or {}
     macro = macro or {}
     leverage_health = leverage_health or {}
@@ -787,39 +741,18 @@ def build_context_from_synthesis_inputs(
         else {}
     )
 
-    # VaR / DD の単位検出:
-    #   コードベースの慣習として risk[*] は % 表示で保存される (例 0.8 = 0.8%)。
-    #   ただし呼び出し元によっては既に小数 (0.008) で渡るケースもある。
-    #   閾値判定: 絶対値 > 0.1 (= 10%) なら "% 表示" と判定して /100、それ以下は小数。
-    #   日次 VaR_95 が 10% を超える状況はそもそも危険水準で、小数 0.10 = 10% でも
-    #   threshold 比較は同じく機能する (どちらに転んでも誤判定にならない安全圏)。
-    def _to_decimal(raw):
-        if raw is None:
-            return None
+    # v7 contract: policy consumes only explicitly named decimal fields.
+    # Never infer whether an arbitrary magnitude is a percent or a decimal.
+    def _decimal_field(name: str) -> float | None:
         try:
-            v = float(raw)
+            value = risk.get(name)
+            return float(value) if value is not None else None
         except (TypeError, ValueError):
             return None
-        return v / 100.0 if abs(v) > 0.1 else v
 
-    var_decimal = _to_decimal(risk.get("var_95"))
-    if var_decimal is not None:
-        var_decimal = abs(var_decimal)
-    cvar_decimal = _to_decimal(risk.get("cvar_95") or risk.get("cvar_pct"))
-    if cvar_decimal is not None:
-        cvar_decimal = abs(cvar_decimal)
-    # actual_current_dd は data_gatherer が常に percent 表記 (round(x*100, 2)) で書く契約。
-    # _to_decimal のヒューリスティック (|v| > 0.1 なら %) は |v| ≤ 0.1 の percent 値
-    # (例: -0.1 = -0.1%) を小数表記 (-10%) と誤読し、ほぼ高値圏の凪の日に dd_block を
-    # 誤発動させた (2026-07-07) — 実ガード値は推測せず無条件に /100 する。
-    dd_actual = risk.get("actual_current_dd")
-    if dd_actual is not None:
-        try:
-            dd_decimal = float(dd_actual) / 100.0
-        except (TypeError, ValueError):
-            dd_decimal = _to_decimal(risk.get("current_dd"))
-    else:
-        dd_decimal = _to_decimal(risk.get("current_dd"))
+    var_decimal = _decimal_field("var_95_decimal")
+    cvar_decimal = _decimal_field("cvar_95_decimal")
+    dd_decimal = _decimal_field("enforced_flow_adjusted_dd_decimal")
     try:
         ledger_blocking = int(portfolio_integrity.get("blocking_issue_count") or 0)
     except (TypeError, ValueError):
@@ -831,7 +764,6 @@ def build_context_from_synthesis_inputs(
         unapplied = 0
 
     def _default_var_threshold() -> float:
-        """Use normal/stress/bull tiers while DD rules still size entries down."""
         try:
             vix = float(macro.get("vix")) if macro.get("vix") is not None else None
         except (TypeError, ValueError):
@@ -839,29 +771,27 @@ def build_context_from_synthesis_inputs(
         scenario_key = str(macro.get("scenario_key") or macro.get("scenario") or "").upper()
         regime_label = str(macro.get("regime") or macro.get("hmm_regime") or "")
         regime_upper = regime_label.upper()
-        actual_stage = str(risk.get("actual_dd_stage") or "").lower()
+        loss_stage = str(risk.get("loss_guard_stage") or "").lower()
         bull = (
             scenario_key == "BULL"
             or "強気" in regime_label
             or bool(macro.get("regime_bull_confirmed"))
         )
-        if bull and vix is not None and vix < 25:
-            return 0.020
         stress = (
             scenario_key in {"BEAR", "DEFENSIVE", "STRESS"}
             or "BEAR" in regime_upper
             or "DEFENSIVE" in regime_upper
             or "弱気" in regime_label
-            or actual_stage in {"block", "daily_block", "monthly_block", "stage_1", "stage_2", "stage_3"}
+            or loss_stage in {"daily_block", "stage_1", "stage_2", "stage_3"}
             or (vix is not None and vix >= 30)
         )
-        return 0.012 if stress else 0.016
+        if stress:
+            return POLICY.var_bear_decimal
+        if bull and vix is not None and vix < 25:
+            return POLICY.var_bull_decimal
+        return POLICY.var_normal_decimal
 
-    _var_max_threshold = _env_float("POLICY_VAR_MAX_THRESHOLD", 0.023)
-    _var_threshold = min(
-        _env_float("POLICY_VAR_THRESHOLD", _default_var_threshold()),
-        _var_max_threshold,
-    )
+    _var_threshold = _default_var_threshold()
 
     return PolicyContext(
         var_1d_95         = var_decimal,
@@ -885,7 +815,9 @@ def build_context_from_synthesis_inputs(
         data_freshness    = freshness_score,
         cvar_unstable     = bool(risk.get("cvar_unstable", False)),
         cvar_reason       = risk.get("cvar_reason"),
-        actual_dd_stage   = risk.get("actual_dd_stage"),
+        actual_dd_stage   = None,  # legacy name intentionally no longer sourced
+        loss_guard_stage  = risk.get("loss_guard_stage"),
+        canonical_drawdown_stage = risk.get("enforced_drawdown_stage") or classify_drawdown(dd_decimal).get("dd_stage"),
         actual_trading_allowed = risk.get("trading_allowed"),
         allow_dca_tranche = bool(risk.get("allow_dca_tranche", False)),
         dca_active_tranche = risk.get("dca_active_tranche"),
@@ -897,10 +829,7 @@ def build_context_from_synthesis_inputs(
         ledger_unapplied_executed_count = unapplied,
         earnings_blackout = set(earnings_blackout_tickers or []),
         var_threshold       = _var_threshold,
-        var_max_threshold   = _var_max_threshold,
-        dd_block_threshold  = _env_float("POLICY_DD_BLOCK_THRESHOLD", -0.08),
-        dd_caution_threshold= _env_float("POLICY_DD_CAUTION_THRESHOLD",-0.05),
-        vix_block_threshold = _env_float("POLICY_VIX_BLOCK_THRESHOLD", 40.0),
-        vix_caution_threshold=_env_float("POLICY_VIX_CAUTION_THRESHOLD",30.0),
-        freshness_threshold = _env_float("POLICY_FRESHNESS_THRESHOLD", 0.7),
+        var_max_threshold   = POLICY.var_absolute_max_decimal,
+        dd_block_threshold  = POLICY.dd_block_decimal,
+        dd_caution_threshold= POLICY.dd_caution_decimal,
     )

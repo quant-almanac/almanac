@@ -305,6 +305,8 @@ def reset(key: str, source: str = "user") -> dict:
 
 
 def set_ai_recommendations(recommendations: Iterable[dict]) -> None:
+    from risk_policy import RETIRED_TUNABLE_RISK_KEYS
+
     definitions = _read_definitions()
     now = datetime.now().isoformat()
     with _state_lock():
@@ -314,6 +316,11 @@ def set_ai_recommendations(recommendations: Iterable[dict]) -> None:
         for recommendation in recommendations:
             key = recommendation.get("key")
             if key not in definitions:
+                continue
+            # The old risk guardrail keys are retained only to preserve their
+            # historical audit trail.  Do not let a new advisory output make
+            # their stale values look current again.
+            if key in RETIRED_TUNABLE_RISK_KEYS:
                 continue
             value = _validate(definitions[key], recommendation.get("recommended"))
             row = dict(state["params"].get(key) or {})

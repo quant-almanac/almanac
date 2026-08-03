@@ -87,7 +87,7 @@ async def get_system_status():
     from api.routes.dashboard import _build_data_health
     from auto_tune import get_status as get_auto_tune_status
     from model_router import get_model, resolve_adapter
-    from tunable_params import get as tunable
+    from risk_policy import POLICY
     from feature_controls import list_feature_statuses
 
     roles = (
@@ -117,13 +117,23 @@ async def get_system_status():
         "auto_tune": auto_tune,
         "model_routes": model_routes,
         "guards": {
-            "daily_loss_limit_pct": tunable("daily_loss_limit_pct", -5),
-            "monthly_stage1_pct": tunable("monthly_stage1_pct", -10),
-            "monthly_stage2_pct": tunable("monthly_stage2_pct", -15),
-            "monthly_stage3_pct": tunable("monthly_stage3_pct", -20),
-            "max_short_positions": tunable("max_short_positions", 3),
-            "sector_rebalance_threshold_pct": tunable("sector_rebalance_threshold_pct", 35),
-            "sector_max_pct": tunable("sector_max_pct", 40),
+            "risk_policy_version": POLICY.version,
+            "daily_loss_limit_pct_points": POLICY.daily_loss_block_decimal * 100,
+            "rolling_30_stage_pct_points": [
+                POLICY.rolling_30_stage1_decimal * 100,
+                POLICY.rolling_30_stage2_decimal * 100,
+                POLICY.rolling_30_stage3_decimal * 100,
+            ],
+            "var_1d_95_pct_points": [
+                POLICY.var_bear_decimal * 100,
+                POLICY.var_normal_decimal * 100,
+                POLICY.var_bull_decimal * 100,
+                POLICY.var_absolute_max_decimal * 100,
+            ],
+            "concentration_pct_points": [
+                POLICY.concentration_caution_decimal * 100,
+                POLICY.concentration_cap_decimal * 100,
+            ],
         },
         "feature_modes": {
             "execution_plan": execution_plan.get("mode") or execution_plan.get("gate_mode") or "observe",

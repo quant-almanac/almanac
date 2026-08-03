@@ -9,6 +9,7 @@ from scipy import stats
 from scipy.special import comb
 from typing import Optional
 import warnings
+from risk_policy import POLICY, classify_drawdown, loss_guard_state
 warnings.filterwarnings('ignore')
 
 # ============================================================
@@ -16,9 +17,11 @@ warnings.filterwarnings('ignore')
 # ============================================================
 
 CONCENTRATION_LIMITS = {
-    'single_stock_long_term':  0.20,   # 15%→20%: 高確信銘柄の集中投資余地を拡大
-    'single_stock_short_term': 0.08,   # 5%→8%: 戦術枠の柔軟性向上
-    'espp_plan_max':         0.10,   # 人的資本リスク考慮（変更なし）
+    # Fixed RiskPolicy limits. Tier labels may explain exposure but cannot
+    # relax the whole-portfolio concentration mandate.
+    'single_stock_long_term':  POLICY.concentration_cap_decimal,
+    'single_stock_short_term': POLICY.concentration_cap_decimal,
+    'espp_plan_max':           POLICY.concentration_cap_decimal,
     'correlated_group':        0.30,
     'single_sector':           0.30,
     'single_theme':            0.25,   # テーマ集中上限（半導体/欧州など）
@@ -45,16 +48,12 @@ THEME_GROUPS = {
 }
 
 BEHAVIORAL_GUARDRAILS = {
-    'daily_loss_limit':    -0.04,   # 1日-4%: 新規エントリー禁止（2026-04改訂）
-    'monthly_loss_limit':  -0.08,   # 月間-8%: トレード停止（2026-04改訂）
-    'max_short_positions':  3,
-    # max_active_trades は廃止 — ポジション数制限なし（2026-04改訂）
-    'override_logging':    True,
-}
-
-DRAWDOWN_ALERTS = {
-    'warning':  -0.25,   # -25%: 全ポジション50%縮小アラート
-    'critical': -0.35,   # -35%: 全現金化推奨
+    'daily_loss_limit': POLICY.daily_loss_block_decimal,
+    'monthly_stage1': POLICY.rolling_30_stage1_decimal,
+    'monthly_stage2': POLICY.rolling_30_stage2_decimal,
+    'monthly_stage3': POLICY.rolling_30_stage3_decimal,
+    'max_short_positions': POLICY.max_short_positions,
+    'override_logging': True,
 }
 
 STRESS_SCENARIOS = {
@@ -245,12 +244,17 @@ def calculate_drawdown(returns: pd.Series) -> dict:
     current_dd = drawdown.iloc[-1] if len(drawdown) > 0 else 0.0
     max_dd     = drawdown.min()
 
-    if current_dd <= DRAWDOWN_ALERTS['critical']:
+    dd = classify_drawdown(float(current_dd))
+    stage = str(dd['dd_stage'])
+    if stage in {'objective_breach', 'freeze'}:
         alert_level = 'critical'
-        action      = '全現金化を推奨。損失拡大リスクが高い。'
-    elif current_dd <= DRAWDOWN_ALERTS['warning']:
+        action = 'リスク増加を凍結し、緊急の人間レビューへ送る。自動全清算はしない。'
+    elif stage in {'derisk_review', 'block'}:
         alert_level = 'warning'
-        action      = '全ポジション50%縮小を推奨。'
+        action = '新規リスクを人間レビューへ送り、デリスク計画を提示する。自動売却はしない。'
+    elif stage == 'caution':
+        alert_level = 'warning'
+        action = '注意水準。新規リスクは集中度・VaRとともに確認する。'
     else:
         alert_level = 'normal'
         action      = '通常運用継続。'
@@ -955,31 +959,27 @@ def evaluate_behavioral_guardrails(
         }
     """
     alerts = []
-    new_entry_allowed = True
-    trading_allowed   = True
+    decision = loss_guard_state(
+        daily_pnl_decimal=daily_pnl_pct,
+        rolling_30_pnl_decimal=monthly_pnl_pct,
+    )
+    new_entry_allowed = bool(decision['new_risk_allowed'])
+    trading_allowed = True
+    max_short_positions = POLICY.max_short_positions
 
-    # Keep this legacy risk evaluator aligned with behavioral_guard.py.  The
-    # previous fixed value (3) made Auto Tune appear effective in one path but
-    # not in this one.
-    max_short_positions = BEHAVIORAL_GUARDRAILS['max_short_positions']
-    try:
-        from tunable_params import get as _tp_get
-        max_short_positions = int(_tp_get('max_short_positions', max_short_positions))
-    except Exception:
-        pass
-
-    if daily_pnl_pct <= BEHAVIORAL_GUARDRAILS['daily_loss_limit']:
-        new_entry_allowed = False
+    if decision['loss_guard_stage'] == 'daily_block':
         alerts.append({
             'level':   'warning',
-            'message': f'本日P&L {daily_pnl_pct*100:.1f}%（-4%閾値）: 新規エントリー禁止',
+            'message': f'本日P&L {daily_pnl_pct*100:.1f}%（-3%閾値）: 新規リスク停止',
         })
-
-    if monthly_pnl_pct <= BEHAVIORAL_GUARDRAILS['monthly_loss_limit']:
-        trading_allowed = False
+    elif decision['loss_guard_stage'] in {'stage_1', 'stage_2', 'stage_3'}:
         alerts.append({
-            'level':   'critical',
-            'message': f'月間P&L {monthly_pnl_pct*100:.1f}%（-8%閾値）: トレード停止',
+            'level': 'critical' if decision['loss_guard_stage'] in {'stage_2', 'stage_3'} else 'warning',
+            'message': (
+                f'30日P&L {monthly_pnl_pct*100:.1f}% '
+                f'({decision["loss_guard_stage"]}): リスク増加停止。'
+                '売却・カバー・ヘッジ・ストップは継続可能'
+            ),
         })
 
     if short_positions >= max_short_positions:

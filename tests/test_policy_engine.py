@@ -81,8 +81,8 @@ def test_dd_block_threshold_rejects_buy():
     assert d.rejected[0]["rule"] == "_rule_dd_stage"
 
 
-def test_actual_dd_stage_blocks_buy_when_synthetic_dd_missing():
-    ctx = pe.PolicyContext(current_dd=None, actual_dd_stage="stage_1")
+def test_loss_guard_stage_blocks_buy_when_canonical_dd_is_unavailable():
+    ctx = pe.PolicyContext(current_dd=None, loss_guard_stage="stage_1")
     d = pe.apply_policy_gate([_action("buy")], ctx)
     assert len(d.rejected) == 1
     assert d.rejected[0]["rule"] == "_rule_dd_stage"
@@ -174,10 +174,10 @@ def test_context_builder_wires_eligible_market_regime_contract():
     assert ctx.market_regime_buy_multipliers["JP"] == 0.25
 
 
-def test_actual_dd_stage_allows_dca_ladder_exception_half_size():
+def test_loss_guard_stops_dca_ladder_together_with_other_risk_increases():
     ctx = pe.PolicyContext(
         current_dd=None,
-        actual_dd_stage="stage_2",
+        loss_guard_stage="stage_2",
         allow_dca_tranche=True,
         actual_trading_allowed=True,
         dca_active_tranche="T2",
@@ -192,19 +192,14 @@ def test_actual_dd_stage_allows_dca_ladder_exception_half_size():
 
     d = pe.apply_policy_gate([action], ctx)
 
-    assert len(d.rejected) == 0
-    assert len(d.accepted) == 1
-    accepted = d.accepted[0]
-    assert accepted["urgency"] == "medium"
-    assert accepted["policy_dca_dd_exception"] is True
-    assert accepted["policy_dca_active_tranche"] == "T2"
-    assert accepted["policy_size_adj"] == 0.5
-    assert accepted["amount_hint"] == "2株"
+    assert len(d.rejected) == 1
+    assert d.rejected[0]["rule"] == "_rule_dd_stage"
+    assert len(d.accepted) == 0
 
 
 def test_dca_ladder_exception_does_not_apply_when_trading_stopped():
     ctx = pe.PolicyContext(
-        actual_dd_stage="stage_3",
+        loss_guard_stage="stage_3",
         allow_dca_tranche=True,
         actual_trading_allowed=False,
     )
@@ -214,13 +209,13 @@ def test_dca_ladder_exception_does_not_apply_when_trading_stopped():
 
     assert len(d.rejected) == 1
     assert d.rejected[0]["rule"] == "_rule_dd_stage"
-    assert "DCA 例外も停止" in d.rejected[0]["reason"]
+    assert "loss_guard_stage=stage_3" in d.rejected[0]["reason"]
 
 
 def test_dca_ladder_exception_requires_confirmed_trading_allowed():
     """trading_allowed が欠落 (None) の場合は fail-closed で DCA 例外を許さない。"""
     ctx = pe.PolicyContext(
-        actual_dd_stage="monthly_block",
+        loss_guard_stage="stage_2",
         allow_dca_tranche=True,
         actual_trading_allowed=None,
     )
@@ -230,11 +225,11 @@ def test_dca_ladder_exception_requires_confirmed_trading_allowed():
 
     assert len(d.rejected) == 1
     assert d.rejected[0]["rule"] == "_rule_dd_stage"
-    assert "DCA 例外も停止" in d.rejected[0]["reason"]
+    assert "loss_guard_stage=stage_2" in d.rejected[0]["reason"]
 
 
-def test_dca_without_ladder_source_still_blocked_by_actual_dd_stage():
-    ctx = pe.PolicyContext(actual_dd_stage="stage_1", allow_dca_tranche=True)
+def test_dca_without_ladder_source_is_blocked_by_loss_guard():
+    ctx = pe.PolicyContext(loss_guard_stage="stage_1", allow_dca_tranche=True)
     d = pe.apply_policy_gate([_action("dca")], ctx)
     assert len(d.rejected) == 1
     assert d.rejected[0]["rule"] == "_rule_dd_stage"
@@ -256,44 +251,36 @@ def test_dd_no_change_when_safe():
     assert d.accepted[0]["urgency"] == "high"
 
 
-def test_actual_dd_stage_ok_overrides_numeric_current_dd():
-    """実損益ガードが ok なら、数値 current_dd（単位誤読/合成系列）で buy を止めない。
-
-    2026-07-07 事故の回帰テスト: guard は daily -0.1% / stage=ok なのに、
-    percent 表記 -0.1 が小数 (-10%) と誤読され buy 全滅した。stage=ok が権威。
-    """
-    ctx = pe.PolicyContext(current_dd=-0.10, actual_dd_stage="ok")
+def test_canonical_decimal_dd_is_not_overridden_by_a_pnl_guard_label():
+    """A promoted DD is decimal and cannot be masked by an unrelated P&L label."""
+    ctx = pe.PolicyContext(current_dd=-0.10, loss_guard_stage="ok")
     d = pe.apply_policy_gate([_action("buy")], ctx)
-    assert len(d.rejected) == 0
-    assert len(d.accepted) == 1
-    assert d.accepted[0]["urgency"] == "high"  # caution 降格もされない
+    assert len(d.rejected) == 1
+    assert len(d.accepted) == 0
 
 
-def test_actual_dd_stage_caution_halves_size_deterministically():
-    """実損益ガード caution → 数値再判定なしでサイズ半減 + urgency 降格。"""
-    ctx = pe.PolicyContext(current_dd=None, actual_dd_stage="caution")
+def test_canonical_drawdown_caution_halves_size_deterministically():
+    ctx = pe.PolicyContext(current_dd=-0.06, canonical_drawdown_stage="caution")
     d = pe.apply_policy_gate([_action("buy", urgency="high")], ctx)
     assert len(d.rejected) == 0
     assert d.accepted[0]["urgency"] == "medium"
     assert d.accepted[0]["policy_size_adj"] == 0.5
 
 
-def test_build_context_actual_dd_small_percent_not_misread_as_decimal():
-    """actual_current_dd は常に percent 表記契約 — -0.1 は -0.1% (= -0.001) であり -10% ではない。"""
+def test_build_context_accepts_only_explicit_canonical_dd_decimal():
     ctx = pe.build_context_from_synthesis_inputs(
-        risk={"actual_current_dd": -0.1, "actual_dd_stage": "ok"},
+        risk={"enforced_flow_adjusted_dd_decimal": -0.001, "loss_guard_stage": "ok"},
     )
     assert abs(ctx.current_dd - (-0.001)) < 1e-12
     d = pe.apply_policy_gate([_action("buy")], ctx)
     assert len(d.rejected) == 0
 
 
-def test_build_context_actual_dd_caution_band_percent():
-    """-6.0 (percent) は -6% として caution 帯に入る (従来動作の維持)。"""
+def test_build_context_does_not_infer_percent_units_from_a_legacy_field():
     ctx = pe.build_context_from_synthesis_inputs(
         risk={"actual_current_dd": -6.0},
     )
-    assert abs(ctx.current_dd - (-0.06)) < 1e-9
+    assert ctx.current_dd is None
 
 
 # ────────────────────────────────────────────────────────
@@ -496,10 +483,12 @@ def test_non_dict_actions_are_skipped():
 # Context builder
 # ────────────────────────────────────────────────────────
 
-def test_build_context_from_pct_format():
-    """risk["var_95"] が % 単位 (0.8 = 0.8%) のとき小数化される。"""
+def test_build_context_uses_explicit_decimal_fields_without_unit_inference():
     ctx = pe.build_context_from_synthesis_inputs(
-        risk={"var_95": 0.8, "current_dd": -5.0},
+        risk={
+            "var_95_decimal": 0.008,
+            "enforced_flow_adjusted_dd_decimal": -0.05,
+        },
         macro={"vix": 25.0},
         leverage_health={"status": "safe"},
         freshness_score=0.85,
@@ -511,13 +500,12 @@ def test_build_context_from_pct_format():
     assert ctx.data_freshness == 0.85
 
 
-def test_build_context_accepts_decimal_format():
-    """risk["var_95"] が小数 (0.008) のときそのまま使う。"""
+def test_build_context_ignores_ambiguous_legacy_metrics():
     ctx = pe.build_context_from_synthesis_inputs(
         risk={"var_95": 0.008, "current_dd": -0.05},
     )
-    assert abs(ctx.var_1d_95 - 0.008) < 1e-9
-    assert abs(ctx.current_dd - (-0.05)) < 1e-9
+    assert ctx.var_1d_95 is None
+    assert ctx.current_dd is None
 
 
 def test_build_context_handles_missing_fields():
@@ -530,7 +518,7 @@ def test_build_context_handles_missing_fields():
 
 def test_build_context_includes_portfolio_integrity_and_cvar_unstable():
     ctx = pe.build_context_from_synthesis_inputs(
-        risk={"cvar_unstable": True, "cvar_95": 2.5},
+        risk={"cvar_unstable": True, "cvar_95_decimal": 0.025},
         portfolio_integrity={
             "ok": False,
             "blocking_issue_count": 3,
@@ -544,22 +532,25 @@ def test_build_context_includes_portfolio_integrity_and_cvar_unstable():
     assert ctx.ledger_unapplied_executed_count == 2
 
 
-def test_build_context_prefers_actual_dd_over_synthetic_current_dd():
+def test_build_context_uses_only_promoted_flow_adjusted_dd():
     ctx = pe.build_context_from_synthesis_inputs(
-        risk={"current_dd": None, "actual_current_dd": -8.5, "actual_dd_stage": "stage_1"}
+        risk={
+            "current_dd": None,
+            "actual_current_dd": -8.5,
+            "enforced_flow_adjusted_dd_decimal": -0.085,
+            "enforced_drawdown_stage": "block",
+        }
     )
     assert ctx.current_dd == -0.085
-    assert ctx.actual_dd_stage == "stage_1"
+    assert ctx.canonical_drawdown_stage == "block"
 
 
-def test_build_context_relaxes_var_threshold_in_bull_regime(monkeypatch):
-    """BULL/A_強気 + calm VIX should allow buys through VaR, then DD caution sizes down."""
-    monkeypatch.delenv("POLICY_VAR_THRESHOLD", raising=False)
+def test_build_context_uses_fixed_bull_var_threshold_and_canonical_dd():
     ctx = pe.build_context_from_synthesis_inputs(
-        risk={"var_95": 1.82, "current_dd": -5.88},
+        risk={"var_95_decimal": 0.015, "enforced_flow_adjusted_dd_decimal": -0.058},
         macro={"vix": 18.0, "scenario_key": "BULL", "regime": "A_強気"},
     )
-    assert abs(ctx.var_threshold - 0.020) < 1e-9
+    assert abs(ctx.var_threshold - 0.016) < 1e-9
 
     d = pe.apply_policy_gate([_action("buy", urgency="high")], ctx)
     assert len(d.rejected) == 0
@@ -568,38 +559,44 @@ def test_build_context_relaxes_var_threshold_in_bull_regime(monkeypatch):
     assert d.accepted[0]["policy_size_adj"] == 0.5
 
 
-def test_build_context_uses_normal_var_threshold(monkeypatch):
-    monkeypatch.delenv("POLICY_VAR_THRESHOLD", raising=False)
+def test_build_context_uses_fixed_normal_var_threshold():
     ctx = pe.build_context_from_synthesis_inputs(
-        risk={"var_95": 1.50},
+        risk={"var_95_decimal": 0.015},
         macro={"vix": 22.0, "scenario_key": "BASE", "regime": "B_通常"},
     )
-    assert abs(ctx.var_threshold - 0.016) < 1e-9
+    assert abs(ctx.var_threshold - 0.014) < 1e-9
 
 
-def test_build_context_uses_stress_var_threshold(monkeypatch):
-    monkeypatch.delenv("POLICY_VAR_THRESHOLD", raising=False)
+def test_build_context_uses_fixed_stress_var_threshold():
     ctx = pe.build_context_from_synthesis_inputs(
-        risk={"var_95": 1.50, "actual_dd_stage": "stage_1"},
+        risk={"var_95_decimal": 0.015, "loss_guard_stage": "stage_1"},
         macro={"vix": 31.0, "scenario_key": "BASE", "regime": "B_通常"},
     )
     assert abs(ctx.var_threshold - 0.012) < 1e-9
 
 
-def test_var_threshold_env_override_is_capped_by_absolute_max(monkeypatch):
-    monkeypatch.setenv("POLICY_VAR_THRESHOLD", "0.050")
-    monkeypatch.delenv("POLICY_VAR_MAX_THRESHOLD", raising=False)
-    ctx = pe.build_context_from_synthesis_inputs(risk={"var_95": 1.0})
-    assert abs(ctx.var_threshold - 0.023) < 1e-9
-
-
-def test_env_var_threshold_override_wins(monkeypatch):
-    monkeypatch.setenv("POLICY_VAR_THRESHOLD", "0.012")
+def test_loss_guard_stress_overrides_a_stale_bull_regime_var_budget():
     ctx = pe.build_context_from_synthesis_inputs(
-        risk={"var_95": 1.82},
+        risk={"var_95_decimal": 0.015, "loss_guard_stage": "daily_block"},
         macro={"vix": 18.0, "scenario_key": "BULL", "regime": "A_強気"},
     )
     assert abs(ctx.var_threshold - 0.012) < 1e-9
+
+
+def test_var_threshold_environment_override_is_ignored(monkeypatch):
+    monkeypatch.setenv("POLICY_VAR_THRESHOLD", "0.050")
+    monkeypatch.delenv("POLICY_VAR_MAX_THRESHOLD", raising=False)
+    ctx = pe.build_context_from_synthesis_inputs(risk={"var_95_decimal": 0.01})
+    assert abs(ctx.var_threshold - 0.014) < 1e-9
+
+
+def test_var_threshold_environment_override_does_not_win(monkeypatch):
+    monkeypatch.setenv("POLICY_VAR_THRESHOLD", "0.012")
+    ctx = pe.build_context_from_synthesis_inputs(
+        risk={"var_95_decimal": 0.015},
+        macro={"vix": 18.0, "scenario_key": "BULL", "regime": "A_強気"},
+    )
+    assert abs(ctx.var_threshold - 0.016) < 1e-9
 
 
 # ────────────────────────────────────────────────────────

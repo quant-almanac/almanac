@@ -13,6 +13,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 import tunable_params as tp
+from risk_policy import RETIRED_TUNABLE_RISK_KEYS
 
 BASE_DIR = Path(__file__).parent
 
@@ -155,7 +156,8 @@ def _build_prompt(market_ctx: dict, params: dict) -> tuple[str, str]:
 - 攻撃局面（VIX<20 / レジームA_強気 / DD 健全 / 連勝中）→ 閾値を緩めて機会を取りに行く
   例: already_executed/deferred が多い時は DONE_LIST/ordered 仕様をレビューし、too_small が多い時だけ min_action_jpy や min_action_pct_of_portfolio の引き下げを検討する
 - 守備局面（VIX>30 / レジームC_弱気 / DD 大 / 連敗中）→ 閾値を厳しくして防御
-  例: daily_loss_limit_pct を緩める（早期発動を抑える）/ rebalance_cooldown_days を伸ばす
+  例: rebalance_cooldown_days を伸ばす。RiskPolicy の損失/DD/VaR閾値は
+  固定の運用マンデートであり、提案・変更の対象外。
 - 各値はパラメータの min/max レンジ内に必ず収めること
 - 不明・確信のないパラメータは現在値をそのまま recommended に入れ rationale に「変更不要」と記述すること
 - **全パラメータを必ず返すこと**（省略禁止）。変更不要でも recommended に現在値をセットして返す
@@ -204,7 +206,18 @@ def generate_recommendations(
     all_params = tp.list_all()
     if keys is not None:
         requested = list(dict.fromkeys(keys))
+        retired_requested = sorted(set(requested) & RETIRED_TUNABLE_RISK_KEYS)
+        if retired_requested:
+            return {
+                "error": "retired_risk_policy_keys:" + ",".join(retired_requested),
+                "recommendations": [],
+            }
         all_params = {key: all_params[key] for key in requested if key in all_params}
+    else:
+        all_params = {
+            key: value for key, value in all_params.items()
+            if key not in RETIRED_TUNABLE_RISK_KEYS
+        }
     if not all_params:
         return {"error": "no tunable params loaded", "recommendations": []}
 

@@ -424,22 +424,14 @@ def _guard_blocks_new_deployment(guard: dict[str, Any] | None) -> bool:
             return True
     except (TypeError, ValueError):
         pass
-    stage = str(guard.get("actual_dd_stage") or "").lower()
+    stage = str(guard.get("loss_guard_stage") or "").lower()
     return stage in {"block", "daily_block", "monthly_block", "stage_3"}
 
 
 def _guard_caution_multiplier(guard: dict[str, Any] | None) -> float:
-    if not isinstance(guard, dict):
-        return 1.0
-    try:
-        stage_num = int(guard.get("guardrail_stage") or 0)
-    except (TypeError, ValueError):
-        stage_num = 0
-    stage = str(guard.get("actual_dd_stage") or "").lower()
-    if stage_num >= 2 or stage == "stage_2":
-        return 0.25
-    if stage_num == 1 or stage in {"stage_1", "caution"}:
-        return 0.5
+    # v7 has no implicit risk-factor sizing.  Loss/DD controls either block a
+    # new deployment or send an explicit human-review plan; they never turn
+    # into automatic 50%/25% cash deployment.
     return 1.0
 
 

@@ -525,7 +525,11 @@ def _stance_guard_data(**overrides):
         "market_meta": {"vix": 16.0},
         "cash_info": {"total_cash_jpy": 1_000_000},
         "portfolio_total": 10_000_000,
-        "risk": {"actual_current_dd": -2.0, "actual_dd_stage": "ok"},
+        "risk": {
+            "enforced_flow_adjusted_dd_decimal": -0.02,
+            "enforced_drawdown_stage": "ok",
+            "loss_guard_stage": "ok",
+        },
     }
     data.update(overrides)
     return data
@@ -561,7 +565,11 @@ def test_stance_guard_does_not_promote_on_actual_dd_block():
         "overall_stance": "moderately_aggressive",
         "leverage_health": {"status": "ok"},
     }
-    data = _stance_guard_data(risk={"actual_current_dd": -8.1, "actual_dd_stage": "block"})
+    data = _stance_guard_data(risk={
+        "enforced_flow_adjusted_dd_decimal": -0.081,
+        "enforced_drawdown_stage": "block",
+        "loss_guard_stage": "ok",
+    })
     result = analyst._apply_stance_guard(synthesis, data, True)
     assert result["overall_stance"] == "moderately_aggressive"
     assert "stance_guard_applied" not in result

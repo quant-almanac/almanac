@@ -146,7 +146,7 @@ class TestActionStageLog:
             rejected=[{"action": {"type": "buy", "ticker": "NVDA"}, "rule": "_rule_dd_stage",
                        "reason": "DD block"}],
             scenario_key="BULL",
-            actual_dd_stage="block",
+            actual_dd_stage="loss_guard_stage:block",
         )
         entries = read_entries(path=log_path)
         accepted = [e for e in entries if e["stage"] == "policy_accepted"]
@@ -542,7 +542,7 @@ class TestTakeProfitDirection:
     def test_policy_engine_does_not_block_take_profit(self):
         """take_profit は sell 系なので buy 系 policy block の対象外。"""
         import policy_engine as pe
-        ctx = pe.PolicyContext(current_dd=-0.10, actual_dd_stage="block")
+        ctx = pe.PolicyContext(current_dd=-0.10, canonical_drawdown_stage="block")
         action = {"type": "take_profit", "ticker": "NVDA", "urgency": "high"}
         d = pe.apply_policy_gate([action], ctx)
         # DD block は buy 系のみ → take_profit は通過するはず

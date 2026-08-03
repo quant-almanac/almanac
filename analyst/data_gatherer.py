@@ -1416,6 +1416,7 @@ def gather_data() -> dict:
                 "var_95_cf": round(cf_var * 100, 2),
                 "var_95_hist": round(hist_var * 100, 2),
                 "cvar_95": round(float(cvar.get("cvar_pct", 0) or 0) * 100, 2),
+                "cvar_95_decimal": round(float(cvar.get("cvar_pct", 0) or 0), 6),
                 "cvar_unstable": _unstable,
                 # tail サンプル不足由来 (実データあり) は tail_small_sample。
                 "cvar_reason": ("tail_small_sample" if _unstable else None),
@@ -1431,12 +1432,8 @@ def gather_data() -> dict:
                 out.update(extra)
             return out
 
-        def _actual_dd_from_guard_state() -> dict | None:
-            """実損益ガード状態から actual DD/P&L stage を返す。
-
-            guard_state は behavioral_guard の評価額 snapshot P&L 由来で、parquet 合成系列や
-            daily_performance の汚染 NAV には依存しない運用ガードとして扱う。
-            """
+        def _loss_guard_from_guard_state() -> dict | None:
+            """Return P&L shock controls without calling them drawdown."""
             if not isinstance(guard, dict) or not guard:
                 return None
             try:
@@ -1444,35 +1441,20 @@ def gather_data() -> dict:
                 monthly_pct = float(guard.get("monthly_pnl_pct"))
             except (TypeError, ValueError):
                 return None
-            try:
-                guard_stage = int(guard.get("guardrail_stage") or 0)
-            except (TypeError, ValueError):
-                guard_stage = 0
-            trading_allowed = guard.get("trading_allowed")
-            new_entry_allowed = guard.get("new_entry_allowed")
-            actual_pct = round(min(daily_pct, monthly_pct) * 100, 2)
-            if trading_allowed is False or guard_stage >= 3:
-                stage = "stage_3"
-            elif guard_stage == 2:
-                stage = "stage_2"
-            elif guard_stage == 1:
-                stage = "stage_1"
-            elif new_entry_allowed is False or daily_pct <= -0.04 or monthly_pct <= -0.08:
-                stage = "block"
-            elif daily_pct <= -0.03 or monthly_pct <= -0.05:
-                stage = "caution"
-            else:
-                stage = "ok"
+            from risk_policy import loss_guard_state
+            decision = loss_guard_state(
+                daily_pnl_decimal=daily_pct, rolling_30_pnl_decimal=monthly_pct,
+            )
             return {
-                "actual_current_dd": actual_pct,
-                "actual_dd_stage": stage,
-                "actual_dd_source": "guard_state_snapshot_pnl",
-                "actual_daily_pnl_pct": round(daily_pct * 100, 2),
-                "actual_rolling30_pnl_pct": round(monthly_pct * 100, 2),
+                "loss_guard_source": "guard_state_snapshot_pnl",
+                "loss_guard_stage": decision["loss_guard_stage"],
+                "loss_guard_reason_code": decision["reason_code"],
+                "daily_pnl_decimal": daily_pct,
+                "rolling_30_pnl_decimal": monthly_pct,
             }
 
-        def _actual_dd_from_clean_nav() -> dict | None:
-            """clean NAV 履歴が十分ある場合だけ actual DD を daily_performance から算出する。"""
+        def _clean_nav_drawdown_shadow() -> dict | None:
+            """Return unadjusted clean-NAV DD as a shadow metric only."""
             db = resolve_db_path(BASE_DIR)
             if not db.exists():
                 return None
@@ -1503,16 +1485,10 @@ def gather_data() -> dict:
                 return None
             dd = calculate_drawdown(clean_returns)
             current_dd_pct = round(float(dd.get("current_dd", 0) or 0) * 100, 2)
-            if current_dd_pct <= -8.0:
-                stage = "block"
-            elif current_dd_pct <= -5.0:
-                stage = "caution"
-            else:
-                stage = "ok"
             return {
-                "actual_current_dd": current_dd_pct,
-                "actual_dd_stage": stage,
-                "actual_dd_source": "daily_performance_clean",
+                "clean_nav_current_dd_decimal": round(current_dd_pct / 100.0, 6),
+                "clean_nav_current_dd_pct": current_dd_pct,
+                "clean_nav_drawdown_source": "daily_performance_clean_unadjusted_shadow",
             }
 
         # P1-1: 主経路 = parquet 再構成（現ウェイト × 過去市場リターン, ex-ante）。
@@ -1586,13 +1562,45 @@ def gather_data() -> dict:
                 "current_dd": None,
                 "max_dd": None,
             }
-        actual_dd = _actual_dd_from_guard_state() or _actual_dd_from_clean_nav()
-        if actual_dd:
-            risk.update(actual_dd)
+        loss_guard = _loss_guard_from_guard_state()
+        clean_nav_shadow = _clean_nav_drawdown_shadow()
+        if loss_guard:
+            risk.update(loss_guard)
         else:
-            risk.setdefault("actual_current_dd", None)
-            risk.setdefault("actual_dd_stage", None)
-            risk.setdefault("actual_dd_source", None)
+            risk.setdefault("loss_guard_stage", None)
+            risk.setdefault("daily_pnl_decimal", None)
+            risk.setdefault("rolling_30_pnl_decimal", None)
+        if clean_nav_shadow:
+            risk.update(clean_nav_shadow)
+        # v7 shadow DD is produced by nav_recorder after each EOD snapshot.
+        # It is deliberately a separate source from the P&L loss guard and is
+        # not authoritative until Slice 3 records an explicit promotion.
+        try:
+            shadow_path = BASE_DIR / "flow_adjusted_dd_shadow.json"
+            shadow = load_json(shadow_path) if shadow_path.exists() else {}
+            if isinstance(shadow, dict):
+                risk["flow_adjusted_current_dd_decimal"] = shadow.get("flow_adjusted_current_dd_decimal")
+                risk["flow_adjusted_max_dd_decimal"] = shadow.get("flow_adjusted_max_dd_decimal")
+                risk["flow_adjusted_dd_shadow"] = {
+                    key: shadow.get(key) for key in (
+                        "source", "effective_nav_days", "forward_shadow_effective_days",
+                        "flow_coverage", "flow_timing_convention",
+                        "manual_reconciliation_required", "updated_at",
+                    )
+                }
+                enforcement_path = BASE_DIR / "drawdown_state.json"
+                enforcement = load_json(enforcement_path) if enforcement_path.exists() else {}
+                if isinstance(enforcement, dict) and enforcement.get("enforcement_enabled") is True:
+                    risk["enforced_flow_adjusted_dd_decimal"] = enforcement.get("last_drawdown_decimal")
+                    risk["enforced_drawdown_stage"] = enforcement.get("dd_state")
+                else:
+                    risk["enforced_flow_adjusted_dd_decimal"] = None
+                    risk["enforced_drawdown_stage"] = None
+            else:
+                risk.setdefault("flow_adjusted_current_dd_decimal", None)
+        except Exception:
+            risk.setdefault("flow_adjusted_current_dd_decimal", None)
+            risk.setdefault("enforced_flow_adjusted_dd_decimal", None)
     except Exception as e:
         risk = {"source": "unavailable", "error": str(e)}
 
