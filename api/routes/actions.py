@@ -166,6 +166,9 @@ class ExecutionRequest(BaseModel):
     # fills remain recordable without it; only future plan accounting consumes
     # an approved contribution.
     contribution_id:            Optional[str]   = None
+    # v7: signed, 60 minute, action-bound execution-time risk preflight.
+    # Required only to record a risk-increasing ``ordered`` status.
+    preflight_token:            Optional[str]   = None
     idempotency_key:           str
 
     @field_validator("ticker")
@@ -214,6 +217,7 @@ class ExecutionRequest(BaseModel):
         "execution_owner", "execution_broker", "contribution_id",
         "external_execution_id", "broker_source", "broker_reported_at",
         "reconciled_at", "reconciliation_snapshot_hash",
+        "preflight_token",
     )
     @classmethod
     def normalize_optional_text(cls, v: Optional[str]) -> Optional[str]:
@@ -253,6 +257,72 @@ class ExecutionRequest(BaseModel):
         if not (8 <= len(value) <= 128) or not re.fullmatch(r"[A-Za-z0-9._:-]+", value):
             raise ValueError("idempotency_key は8〜128文字の英数字・._:-で指定してください")
         return value
+
+
+class PreflightRequest(BaseModel):
+    """Read-only request run immediately before a manually placed order."""
+    ticker: str
+    direction: Direction = Direction.hold
+    order_type: Optional[str] = None
+    quantity: Optional[float] = None
+    price: Optional[float] = None
+    limit_price: Optional[float] = None
+    currency: Optional[Currency] = None
+    account: Optional[Account] = None
+    analysis_id: Optional[str] = None
+    action_state_id: Optional[str] = None
+    execution_owner: Optional[str] = None
+    execution_broker: Optional[str] = None
+    execution_position_keys: Optional[list[str]] = None
+
+    @field_validator("ticker")
+    @classmethod
+    def preflight_ticker_non_empty(cls, v: str) -> str:
+        v = (v or "").strip()
+        if not v:
+            raise ValueError("ticker は必須です")
+        from instrument_metadata import canonical_execution_ticker
+        return canonical_execution_ticker(v)
+
+    @field_validator("quantity", "price", "limit_price")
+    @classmethod
+    def preflight_nonnegative(cls, v: Optional[float]) -> Optional[float]:
+        if v is not None and v < 0:
+            raise ValueError("数量・価格は0以上です")
+        return v
+
+    @field_validator("order_type")
+    @classmethod
+    def preflight_order_type(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return None
+        normalized = str(v).strip().lower()
+        if normalized not in {"market", "limit", "stop", "stop_limit"}:
+            raise ValueError("order_type は 'market'/'limit'/'stop'/'stop_limit' のいずれか")
+        return normalized
+
+    def execution_payload(self) -> dict:
+        return {
+            "ticker": self.ticker,
+            "direction": self.direction.value,
+            "order_type": self.order_type,
+            "quantity": self.quantity,
+            "price": self.price,
+            "limit_price": self.limit_price,
+            "currency": self.currency.value if self.currency else None,
+            "account": self.account.value if self.account else None,
+            "analysis_id": self.analysis_id,
+            "action_state_id": self.action_state_id,
+            "execution_owner": self.execution_owner,
+            "execution_broker": self.execution_broker,
+            "execution_position_keys": self.execution_position_keys,
+        }
+
+
+class PreflightAcknowledgement(BaseModel):
+    preflight_token: str
+    action_digest: str
+    acknowledgement_reason: str
 
 
 class BrokerConfirmationEvidence(BaseModel):
@@ -1033,6 +1103,78 @@ def _enforce_discretionary_order_funding(req: ExecutionRequest) -> None:
                 "message": decision.get("message") or "裁量投資枠を確認できません",
             },
         )
+
+
+def _is_risk_increasing(direction: Direction | str) -> bool:
+    value = direction.value if isinstance(direction, Direction) else str(direction)
+    return value.lower() in {"buy", "margin_buy", "short"}
+
+
+def _execution_preflight_payload(req: ExecutionRequest) -> dict:
+    return {
+        "ticker": req.ticker,
+        "direction": req.direction.value,
+        "order_type": req.order_type,
+        "quantity": req.quantity,
+        "price": req.price,
+        "limit_price": req.limit_price,
+        "currency": req.currency.value if req.currency else None,
+        "account": req.account.value if req.account else None,
+        "analysis_id": req.analysis_id,
+        "action_state_id": req.action_state_id,
+        "execution_owner": req.execution_owner,
+        "execution_broker": req.execution_broker,
+        "execution_position_keys": req.execution_position_keys,
+    }
+
+
+def _enforce_execution_preflight(req: ExecutionRequest) -> dict | None:
+    """Enforce the reviewed envelope only for a new risk-increasing order.
+
+    Filling a broker order is historical fact, so it must remain recordable;
+    the caller records that absence explicitly instead of rejecting it.
+    """
+    if req.status != Status.ordered or not _is_risk_increasing(req.direction):
+        return None
+    from execution_preflight import action_digest, has_acknowledgement, validate_preflight_token
+
+    digest = action_digest(_execution_preflight_payload(req))
+    try:
+        claims = validate_preflight_token(req.preflight_token, digest=digest)
+    except (ValueError, RuntimeError) as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "preflight_required_or_identity_mismatch",
+                "message": str(exc),
+            },
+        ) from exc
+    disposition = str(claims.get("disposition") or "")
+    if disposition == "hard_reject":
+        raise HTTPException(
+            status_code=409,
+            detail={"code": "preflight_hard_reject", "message": "絶対リスク上限により発注を記録できません"},
+        )
+    acknowledged = False
+    if disposition == "confirmation_required":
+        acknowledged = has_acknowledgement(
+            base_dir=BASE_DIR, token=str(req.preflight_token), digest=digest,
+        )
+        if not acknowledged:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "preflight_human_acknowledgement_required",
+                    "message": "現在のリスク状態を確認し、明示承認してから発注を記録してください",
+                },
+            )
+    return {
+        "action_digest": digest,
+        "disposition": disposition,
+        "acknowledged": acknowledged,
+        "expires_at": claims.get("expires_at"),
+        "review_context": claims.get("review_context") or {},
+    }
 
 
 def _enforce_ordered_exit_inventory(req: ExecutionRequest) -> None:
@@ -2220,6 +2362,46 @@ def _log_action_stage_executed(
 # エンドポイント
 # ============================================================
 
+@router.post("/api/actions/preflight")
+async def preflight_execution(req: PreflightRequest):
+    """Read-only, deterministic risk check for a manually placed order.
+
+    It deliberately does not run a new analysis or write any portfolio state.
+    The response token binds the reviewed action for 60 minutes.
+    """
+    from execution_preflight import evaluate_preflight
+
+    result = evaluate_preflight(req.execution_payload(), base_dir=BASE_DIR)
+    readiness, readiness_reasons = _linked_ai_readiness_values(
+        analysis_id=req.analysis_id,
+        action_state_id=req.action_state_id,
+        ticker=req.ticker,
+        direction=req.direction.value,
+    )
+    result["linked_execution_readiness"] = readiness
+    result["linked_execution_reasons"] = readiness_reasons
+    return result
+
+
+@router.post("/api/actions/preflight/acknowledge")
+async def acknowledge_preflight(req: PreflightAcknowledgement):
+    """Append the user's explicit acknowledgement for a caution preflight."""
+    from execution_preflight import append_acknowledgement
+
+    try:
+        with process_lock("portfolio_ledger"):
+            row = append_acknowledgement(
+                base_dir=BASE_DIR,
+                token=req.preflight_token,
+                digest=req.action_digest,
+                acknowledgement_reason=req.acknowledgement_reason,
+            )
+    except (ValueError, RuntimeError) as exc:
+        raise HTTPException(status_code=409, detail={"code": "preflight_acknowledgement_invalid", "message": str(exc)}) from exc
+    except LockBusy as exc:
+        raise HTTPException(status_code=409, detail="portfolio ledger is busy") from exc
+    return {"ok": True, "acknowledgement": row}
+
 @router.post("/api/actions/execute")
 async def save_execution(req: ExecutionRequest):
     """
@@ -2228,6 +2410,7 @@ async def save_execution(req: ExecutionRequest):
     """
     _validate_action_state_link(req)
     linked_readiness, linked_block_reasons = _enforce_ai_order_readiness(req)
+    preflight = _enforce_execution_preflight(req)
     _enforce_discretionary_order_funding(req)
     _enforce_ordered_exit_inventory(req)
     _validate_contribution_link(req)
@@ -2355,6 +2538,11 @@ async def save_execution(req: ExecutionRequest):
                 "reconciled_at": req.reconciled_at,
                 "reconciliation_snapshot_hash": req.reconciliation_snapshot_hash,
                 "contribution_id":     req.contribution_id,
+                "preflight_action_digest": (preflight or {}).get("action_digest"),
+                "preflight_disposition": (preflight or {}).get("disposition"),
+                "preflight_acknowledged": bool((preflight or {}).get("acknowledged")),
+                "preflight_expires_at": (preflight or {}).get("expires_at"),
+                "preflight_review_context": (preflight or {}).get("review_context") or None,
                 "sell_all":        req.sell_all,
                 "name":            req.name,
                 "note":            req.note,
@@ -2431,6 +2619,11 @@ async def save_execution(req: ExecutionRequest):
             if req.status == Status.ordered and linked_readiness is not None:
                 record["readiness_at_order"] = linked_readiness
                 record["execution_block_reasons_at_order"] = linked_block_reasons
+            if req.status in {Status.executed, Status.partial} and _is_risk_increasing(req.direction):
+                # A fill is never denied simply because it was reported after
+                # the fact.  Keep the missing preflight visible to all ledger
+                # consumers instead of implying it had been reviewed.
+                record["reported_without_preflight"] = not bool(preflight)
             if req.status in {Status.executed, Status.partial} and linked_readiness not in {None, "ready"}:
                 record["executed_despite_readiness"] = True
                 record["readiness_at_execution"] = linked_readiness

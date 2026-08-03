@@ -1,5 +1,4 @@
 """T10: API 認証 — POST/PUT/DELETE/PATCH は X-API-Key 必須、GET は緩和"""
-import os
 import pytest
 from fastapi.testclient import TestClient
 
@@ -7,8 +6,7 @@ from fastapi.testclient import TestClient
 @pytest.fixture
 def app_client(monkeypatch, tmp_path):
     """API キーを固定して TestClient を作成"""
-    # ALLOW_UNAUTH を無効化、API_KEY を固定
-    monkeypatch.delenv('ALLOW_UNAUTH', raising=False)
+    # API key を固定
     monkeypatch.delenv('KAIROS_API_KEY', raising=False)
     monkeypatch.setenv('ALMANAC_API_KEY', 'test-key-abc123')
 
@@ -36,6 +34,13 @@ def test_get_root_no_auth(app_client):
 
 def test_post_without_key_returns_403(app_client):
     """POST は X-API-Key 必須 — 無ければ 403"""
+    r = app_client.post('/api/actions/execute', json={'ticker': 'NVDA'})
+    assert r.status_code == 403
+
+
+def test_allow_unauth_environment_cannot_bypass_write_auth(app_client, monkeypatch):
+    """The retired migration variable must not revive an unauthenticated API."""
+    monkeypatch.setenv("ALLOW_UNAUTH", "1")
     r = app_client.post('/api/actions/execute', json={'ticker': 'NVDA'})
     assert r.status_code == 403
 

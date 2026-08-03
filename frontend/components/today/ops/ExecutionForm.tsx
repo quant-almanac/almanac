@@ -13,6 +13,15 @@ type FundingOption = {
   broker?: string
   available_jpy?: number
 }
+type Preflight = {
+  disposition: 'ready' | 'confirmation_required' | 'hard_reject'
+  action_digest: string
+  preflight_token: string
+  expires_at: string
+  reasons: { code: string; message: string }[]
+  hard_reasons: { code: string; message: string }[]
+  metrics?: Record<string, number | string | null>
+}
 
 const DIRECTIONS = [
   { value: 'buy', label: '買い' },
@@ -92,16 +101,111 @@ export default function ExecutionForm({ row, onClose, historical = false, fundin
   const [contributionId, setContributionId] = useState('')
   const [saving, setSaving] = useState(false)
   const [result, setResult] = useState<{ ok: boolean; message: string } | null>(null)
+  const [preflight, setPreflight] = useState<Preflight | null>(null)
+  const [acknowledgementReason, setAcknowledgementReason] = useState('')
+  const [preflightAcknowledged, setPreflightAcknowledged] = useState(false)
   const [recordedId, setRecordedId] = useState<string | null>(null) // 記録済み → 修正対象
   const idempotencyKey = useRef<string | null>(null)
 
   const isMargin = direction === 'margin_buy' || direction === 'short' || direction === 'cover'
-  const isRiskIncreasing = direction === 'buy' || direction === 'margin_buy'
+  const isRiskIncreasing = direction === 'buy' || direction === 'margin_buy' || direction === 'short'
   const quantityUnit = row.ticker === '1489.T' || row.ticker === '1306.T' ? '口' : '株'
   const needsPriceQty = status !== 'cancelled'
   const editMode = recordedId != null
+  const [preflightInputKey, setPreflightInputKey] = useState<string | null>(null)
+
+  function preflightPayload() {
+    return {
+      ticker: row.ticker, direction,
+      order_type: row.order_type ?? null,
+      quantity: needsPriceQty && !sellAll && quantity ? parseFloat(quantity) : null,
+      price: needsPriceQty && price ? parseFloat(price) : null,
+      limit_price: row.limit_price ?? null,
+      currency, account,
+      analysis_id: row.analysis_id ?? null,
+      action_state_id: row.action_state_id ?? row.lifecycle.id ?? null,
+      execution_owner: row.execution_owner ?? null,
+      execution_broker: row.execution_broker ?? null,
+      execution_position_keys: row.execution_position_keys ?? null,
+    }
+  }
+
+  async function runPreflight() {
+    const payload = preflightPayload()
+    setSaving(true)
+    setResult(null)
+    setPreflightAcknowledged(false)
+    try {
+      const res = await apiFetch('/api/actions/preflight', {
+        method: 'POST', body: JSON.stringify(payload),
+      })
+      const json = await res.json().catch(() => ({}))
+      if (!res.ok) {
+        setResult({ ok: false, message: apiErrorMessage(json, `発注前確認に失敗: HTTP ${res.status}`) })
+        return
+      }
+      setPreflight(json as Preflight)
+      setPreflightInputKey(JSON.stringify(payload))
+      const messages = [...(json.hard_reasons ?? []), ...(json.reasons ?? [])]
+        .map((reason: { message: string }) => reason.message)
+      setResult({
+        ok: json.disposition === 'ready',
+        message: json.disposition === 'ready'
+          ? '発注前リスク確認を通過しました（60分有効）。'
+          : messages.join(' / ') || '人間の確認が必要です。',
+      })
+    } catch (err) {
+      setResult({ ok: false, message: `発注前確認に失敗: ${String(err)}` })
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  async function acknowledgePreflight() {
+    if (!preflight || !acknowledgementReason.trim()) {
+      setResult({ ok: false, message: '承認理由を入力してください。' })
+      return
+    }
+    setSaving(true)
+    try {
+      const res = await apiFetch('/api/actions/preflight/acknowledge', {
+        method: 'POST',
+        body: JSON.stringify({
+          preflight_token: preflight.preflight_token,
+          action_digest: preflight.action_digest,
+          acknowledgement_reason: acknowledgementReason.trim(),
+        }),
+      })
+      const json = await res.json().catch(() => ({}))
+      if (!res.ok) {
+        setResult({ ok: false, message: apiErrorMessage(json, `承認保存に失敗: HTTP ${res.status}`) })
+        return
+      }
+      setPreflightAcknowledged(true)
+      setResult({ ok: true, message: '人間承認を監査ログへ記録しました。発注を記録できます。' })
+    } catch (err) {
+      setResult({ ok: false, message: `承認保存に失敗: ${String(err)}` })
+    } finally {
+      setSaving(false)
+    }
+  }
 
   async function handleSave() {
+    const preflightIsCurrent = preflightInputKey === JSON.stringify(preflightPayload())
+    if (status === 'ordered' && isRiskIncreasing) {
+      if (!preflight || !preflightIsCurrent) {
+        setResult({ ok: false, message: '先に「発注前確認」を実行してください。' })
+        return
+      }
+      if (preflight.disposition === 'hard_reject') {
+        setResult({ ok: false, message: '絶対リスク上限により、この発注は記録できません。' })
+        return
+      }
+      if (preflight.disposition === 'confirmation_required' && !preflightAcknowledged) {
+        setResult({ ok: false, message: '警告内容を確認し、理由を入力して明示承認してください。' })
+        return
+      }
+    }
     idempotencyKey.current ??=
       globalThis.crypto?.randomUUID?.() ??
       `execution-${Date.now()}-${Math.random().toString(16).slice(2)}`
@@ -125,6 +229,7 @@ export default function ExecutionForm({ row, onClose, historical = false, fundin
           execution_broker: row.execution_broker ?? null,
           execution_position_keys: row.execution_position_keys ?? null,
           contribution_id: contributionId || null,
+          preflight_token: status === 'ordered' && isRiskIncreasing && preflightIsCurrent ? preflight?.preflight_token ?? null : null,
           idempotency_key: idempotencyKey.current,
         }),
       })
@@ -243,6 +348,33 @@ export default function ExecutionForm({ row, onClose, historical = false, fundin
         </Field>
       )}
 
+      {status === 'ordered' && isRiskIncreasing && !historical && (() => {
+        const preflightIsCurrent = preflightInputKey === JSON.stringify(preflightPayload())
+        const shownPreflight = preflightIsCurrent ? preflight : null
+        return (
+          <div style={{ marginTop: 12, padding: 12, border: `1px solid ${shownPreflight?.disposition === 'hard_reject' ? OPS.redSoft : OPS.border}`, borderRadius: 6, background: OPS.panelAlt }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
+              <strong style={{ color: OPS.text, fontSize: 13 }}>発注前リスク確認</strong>
+              <button type="button" onClick={runPreflight} disabled={saving} style={{ ...smallButton, color: OPS.gold, borderColor: `${OPS.gold}88` }}>
+                {shownPreflight ? '確認を再実行' : '発注前確認'}
+              </button>
+              {shownPreflight && <span style={{ color: shownPreflight.disposition === 'ready' ? OPS.green : shownPreflight.disposition === 'hard_reject' ? OPS.redSoft : OPS.amber, fontSize: 12 }}>
+                {shownPreflight.disposition === 'ready' ? '確認済み（60分）' : shownPreflight.disposition === 'hard_reject' ? '絶対上限：拒否' : '人間確認が必要'}
+              </span>}
+            </div>
+            {shownPreflight && [...shownPreflight.hard_reasons, ...shownPreflight.reasons].map((reason) => (
+              <p key={reason.code} style={{ color: OPS.sub, fontSize: 12, lineHeight: 1.55, margin: '8px 0 0' }}>{reason.message}</p>
+            ))}
+            {shownPreflight?.disposition === 'confirmation_required' && !preflightAcknowledged && (
+              <div style={{ display: 'flex', gap: 8, marginTop: 10 }}>
+                <input aria-label="リスク警告を承認する理由" value={acknowledgementReason} onChange={e => setAcknowledgementReason(e.target.value)} placeholder="警告を理解したうえで発注する理由" style={inputSt} />
+                <button type="button" onClick={acknowledgePreflight} disabled={saving} style={smallButton}>明示承認</button>
+              </div>
+            )}
+          </div>
+        )
+      })()}
+
       <Field label="備考（任意）">
         <input value={note} onChange={e => setNote(e.target.value)} placeholder="楽天証券での約定メモなど" style={inputSt} />
       </Field>
@@ -280,4 +412,8 @@ const selSt: React.CSSProperties = {
 const inputSt: React.CSSProperties = {
   background: OPS.panel, border: `1px solid ${OPS.border}`, borderRadius: 5, color: OPS.text,
   fontSize: 14, padding: '8px 10px', fontFamily: OPS.mono, outline: 'none', width: '100%', boxSizing: 'border-box',
+}
+const smallButton: React.CSSProperties = {
+  background: 'none', border: `1px solid ${OPS.border}`, borderRadius: 5,
+  color: OPS.text, fontSize: 12, padding: '6px 10px', cursor: 'pointer', whiteSpace: 'nowrap',
 }

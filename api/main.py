@@ -7,9 +7,7 @@ P0-3: localhost バインド + 書き込み系エンドポイントの X-API-Key
 - POST / PUT / DELETE / PATCH は X-API-Key ヘッダ必須
 - API キーは ~/.config/almanac/api_key (0600) か環境変数 ALMANAC_API_KEY
   を優先し、移行期間は旧 ALMANAC 名にも fallback する
-- 環境変数 ALLOW_UNAUTH=1 で認証をバイパス（段階移行用）
 """
-import os
 import sys
 from pathlib import Path
 
@@ -29,7 +27,6 @@ app = FastAPI(title="ALMANAC API", version="5.0.0")
 # ============================================================
 
 API_KEY = load_api_key()
-ALLOW_UNAUTH = os.environ.get("ALLOW_UNAUTH", "").strip() == "1"
 # 認証不要パス（読み取り専用 or ヘルスチェック）
 _AUTH_EXEMPT_PATHS = {"/", "/health", "/docs", "/openapi.json", "/redoc"}
 
@@ -37,9 +34,6 @@ _AUTH_EXEMPT_PATHS = {"/", "/health", "/docs", "/openapi.json", "/redoc"}
 @app.middleware("http")
 async def api_key_auth(request: Request, call_next):
     """書き込み系（POST/PUT/DELETE/PATCH）のみ X-API-Key を要求。"""
-    if ALLOW_UNAUTH:
-        return await call_next(request)
-
     method = request.method.upper()
     path = request.url.path
 

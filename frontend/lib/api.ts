@@ -1,7 +1,7 @@
 export const API_BASE = process.env.NEXT_PUBLIC_API_BASE || 'http://localhost:8000'
 
 // P0-3: 書き込み系は X-API-Key ヘッダを注入。
-// 開発時は ALLOW_UNAUTH=1 が FastAPI 側で有効なので省略可。
+// 書き込み要求は開発・本番を問わず FastAPI の API key 認証が必須。
 // 本番は frontend/.env.local に NEXT_PUBLIC_ALMANAC_API_KEY を設定。
 const API_KEY = process.env.NEXT_PUBLIC_ALMANAC_API_KEY || ''
 

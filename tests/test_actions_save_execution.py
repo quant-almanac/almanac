@@ -399,6 +399,70 @@ def test_save_execution_records_to_execution_log(isolated) -> None:
     assert rec["quote_as_of"] == "2026-07-28T09:00:00+09:00"
 
 
+def test_ordered_buy_requires_current_preflight_and_acknowledgement(isolated, monkeypatch) -> None:
+    """The actual order-record path enforces the same night-time risk result."""
+    import execution_preflight as preflight
+
+    _write_json(isolated["holdings"], {})
+    _write_json(isolated["account"], {
+        "balance": 500_000.0, "usd_balance": 0.0,
+        "fx_rate_usdjpy": 150.0, "total_cash": 500_000.0,
+    })
+    _write_json(isolated["analysis"], {"risk": {"var_95_decimal": 0.01}})
+    (isolated["holdings"].parent / "guard_state.json").write_text(
+        json.dumps({"daily_pnl_pct": -0.0301, "monthly_pnl_pct": -0.001}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(preflight, "load_api_key", lambda: "test-preflight-key")
+    monkeypatch.setattr(preflight, "_prospective_concentration", lambda payload, base_dir: 0.04)
+
+    request_values = {
+        "ticker": "7203.T", "direction": "buy", "quantity": 1, "price": 1000.0,
+        "order_type": "limit", "limit_price": 990.0,
+        "currency": "JPY", "account": "特定", "execution_owner": "husband",
+        "execution_broker": "rakuten", "execution_position_keys": ["7203.T"],
+    }
+    reviewed = asyncio.run(actions.preflight_execution(actions.PreflightRequest(**request_values)))
+    assert reviewed["disposition"] == "confirmation_required"
+
+    ordered = ExecutionRequest(
+        **request_values, status="ordered", preflight_token=reviewed["preflight_token"],
+    )
+    with pytest.raises(HTTPException) as exc:
+        asyncio.run(actions.save_execution(ordered))
+    assert exc.value.status_code == 409
+    assert exc.value.detail["code"] == "preflight_human_acknowledgement_required"
+
+    acknowledgement = asyncio.run(actions.acknowledge_preflight(actions.PreflightAcknowledgement(
+        preflight_token=reviewed["preflight_token"],
+        action_digest=reviewed["action_digest"],
+        acknowledgement_reason="daily shock reviewed after close",
+    )))
+    assert acknowledgement["ok"] is True
+    saved = asyncio.run(actions.save_execution(ordered))
+    assert saved["ok"] is True
+    record = _read(isolated["executions"])["executions"][0]
+    assert record["preflight_disposition"] == "confirmation_required"
+    assert record["preflight_acknowledged"] is True
+    assert "daily_loss_block" in record["preflight_review_context"]["reason_codes"]
+    acknowledgement_rows = [
+        json.loads(line)
+        for line in (isolated["holdings"].parent / "execution_preflight_acknowledgements.jsonl")
+        .read_text(encoding="utf-8").splitlines()
+    ]
+    assert "daily_loss_block" in acknowledgement_rows[-1]["review_context"]["reason_codes"]
+
+
+def test_reported_fill_is_recorded_without_preflight_not_rejected(isolated) -> None:
+    result = asyncio.run(actions.save_execution(ExecutionRequest(
+        ticker="7203.T", direction="buy", quantity=1, price=1000.0,
+        currency="JPY", account="特定", status="executed",
+    )))
+    assert result["ok"] is True
+    record = _read(isolated["executions"])["executions"][0]
+    assert record["reported_without_preflight"] is True
+
+
 def test_broker_confirmed_fill_requires_complete_evidence(isolated) -> None:
     req = ExecutionRequest(
         ticker="7203.T",
@@ -633,8 +697,11 @@ def test_reported_fill_is_accepted_and_audited_when_readiness_is_blocked(isolate
     assert _read(files["action_state"])["actions"][action_id]["status"] == "filled"
 
 
-def test_zero_funding_blocks_new_order_but_not_reported_fill(isolated) -> None:
+def test_zero_funding_blocks_new_order_but_not_reported_fill(isolated, monkeypatch) -> None:
     files = isolated
+    # This test isolates funding precedence; the preflight contract itself is
+    # exercised end-to-end above.
+    monkeypatch.setattr(actions, "_enforce_execution_preflight", lambda req: None)
     _write_json(files["execution_plan"], {
         "status": "active",
         "budgets": {
@@ -869,8 +936,9 @@ def test_buy_same_ticker_different_account_creates_separate_position(isolated) -
     assert rec.get("provenance_incomplete") is not True
 
 
-def test_linked_nisa_order_inherits_owner_broker_and_position_keys(isolated) -> None:
+def test_linked_nisa_order_inherits_owner_broker_and_position_keys(isolated, monkeypatch) -> None:
     files = isolated
+    monkeypatch.setattr(actions, "_enforce_execution_preflight", lambda req: None)
     _write_json(files["action_state"], {"actions": {
         "state-1489": {
             "id": "state-1489",
@@ -1319,9 +1387,10 @@ def test_save_execution_buy_jt_ticker_with_auto_currency(isolated) -> None:
     assert "9984.T" in holdings
 
 
-def test_save_execution_ordered_status_does_not_deduct_cash(isolated) -> None:
+def test_save_execution_ordered_status_does_not_deduct_cash(isolated, monkeypatch) -> None:
     """status=ordered should not deduct cash (not yet executed)."""
     files = isolated
+    monkeypatch.setattr(actions, "_enforce_execution_preflight", lambda req: None)
     _write_json(files["account"], {
         "balance":        500_000.0,
         "usd_balance":    0.0,
