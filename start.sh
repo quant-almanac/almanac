@@ -7,9 +7,9 @@ cd "$(cd "$(dirname "$0")" && pwd)"
 echo "=== ALMANAC v5.0 起動 ==="
 echo "$(date)"
 
-# v4.0 の旧プロセスが残っていれば停止（launchd管理分は対象外）
+# 旧botコマンドだけを停止（launchd管理分は対象外）。Streamlit/Ollama
+# dashboard was removed; the supported UI is the Next.js console below.
 pkill -f "bot_commands.py" 2>/dev/null && echo "bot_commands.py: 旧プロセス停止"
-pkill -f "streamlit run" 2>/dev/null && echo "streamlit: 旧プロセス停止"
 
 sleep 1
 

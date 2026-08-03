@@ -18,12 +18,6 @@ if [ -f "$HOME/.config/almanac/api_key" ]; then
 else
     echo "[AUTH] WARN: ~/.config/almanac/api_key missing. Generate via: mkdir -p ~/.config/almanac && python -c 'import secrets; print(secrets.token_urlsafe(32))' > ~/.config/almanac/api_key && chmod 600 ~/.config/almanac/api_key"
 fi
-# P0-2: ALLOW_UNAUTH の自動有効化を廃止。
-# 認証バイパスが必要な場合は明示的に `ALLOW_UNAUTH=1 ./start_v5.sh` で起動すること。
-if [ "${ALLOW_UNAUTH:-0}" = "1" ]; then
-    echo "[AUTH] ⚠️  ALLOW_UNAUTH=1（明示指定）— 認証スキップ中、トラブルシュート用途のみで使用すること"
-fi
-
 # FastAPI (Background) — 127.0.0.1 バインド（LAN 全開を防止）
 echo "[1/2] FastAPI バックエンド起動中... (http://127.0.0.1:8000)"
 source venv/bin/activate
