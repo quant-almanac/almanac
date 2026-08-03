@@ -5,6 +5,7 @@
 - 進捗ファイル書き込み
 """
 import json
+import re
 import sys
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -15,6 +16,18 @@ HISTORY_PATH  = BASE_DIR / "ai_analysis_history.json"
 PROGRESS_PATH = BASE_DIR / "analysis_progress.json"
 CACHE_HOURS   = 6
 HISTORY_MAX   = 5
+
+_HISTORY_STANCES = {
+    "defensive",
+    "neutral",
+    "moderately_aggressive",
+    "aggressive",
+}
+_HISTORY_ACTION_TYPES = {
+    "buy", "add", "margin_buy", "sell", "rebalance", "short", "cover",
+    "dca", "trim", "reduce", "stop_loss", "take_profit",
+}
+_HISTORY_TICKER_RE = re.compile(r"^[A-Z0-9][A-Z0-9._-]{0,19}$")
 
 # utils はルートに存在
 sys.path.insert(0, str(BASE_DIR))
@@ -79,7 +92,13 @@ def save_cache(data: dict) -> None:
 
 
 def load_history_context() -> str:
-    """過去の分析履歴を Opus プロンプト用テキストに変換"""
+    """過去の分析履歴を構造化された方向情報だけにして返す。
+
+    ``stance_reason``、``risk_warnings``、action自由文は過去のLLM出力で、
+    現在の構造化データから再検証できない。これらを次回プロンプトへ戻すと、
+    誤った金融数値やmetric意味が自己強化されるため、監査artifactには保持しても
+    分析入力には使わない。
+    """
     hist = load_json(HISTORY_PATH, {"history": []})
     # 後方互換: list/dict 両対応
     if isinstance(hist, list):
@@ -90,13 +109,30 @@ def load_history_context() -> str:
         records = []
     if not records:
         return "（過去の分析履歴なし — 初回分析）"
-    lines = []
+    lines = [
+        "※ 過去履歴は構造化された方向情報のみ。過去の自由文・金融数値は再利用せず、"
+        "本日の構造化入力から再計算すること。"
+    ]
     for r in records:
+        if not isinstance(r, dict):
+            continue
+        stance = str(r.get("overall_stance") or "").strip().lower()
+        if stance not in _HISTORY_STANCES:
+            stance = "unknown"
+        actions = []
+        for action in (r.get("priority_actions") or [])[:3]:
+            if not isinstance(action, dict):
+                continue
+            ticker = str(action.get("ticker") or "").strip().upper()
+            action_type = str(action.get("type") or "").strip().lower()
+            if (
+                _HISTORY_TICKER_RE.fullmatch(ticker)
+                and action_type in _HISTORY_ACTION_TYPES
+            ):
+                actions.append(f"{ticker}:{action_type}")
+        as_of = str(r.get("as_of") or "unknown")[:32]
         lines.append(
-            f"[{r['as_of']}] スタンス={r['overall_stance']} / テーマ: {r['weekly_theme']}\n"
-            f"  根拠: {r['stance_reason']}\n"
-            f"  推奨: {', '.join((a['ticker'] or '-') + ': ' + a['type'] for a in r['priority_actions'][:3])}\n"
-            f"  リスク: {'; '.join(r['risk_warnings'][:2])}"
+            f"[{as_of}] stance={stance} / actions={','.join(actions) or 'none'}"
         )
     return "\n---\n".join(lines)
 
