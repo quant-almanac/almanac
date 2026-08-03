@@ -57,21 +57,25 @@ env で上書き可:
 | 制約 | 閾値 | env override | 違反時の挙動 |
 |---|---|---|---|
 | portfolio ledger integrity | `ok is not False` | — | 不整合が明示された場合、実行可能な提案を reject |
-| ex-ante VaR_1d_95% | 弱気・ストレス時 `< 1.2%` / 通常時 `< 1.6%` / 強気かつ VIX<25 時 `< 2.0%` | `POLICY_VAR_THRESHOLD`（絶対上限は `POLICY_VAR_MAX_THRESHOLD`、既定2.3%） | 閾値以上なら新規 buy/add/dca/margin_buy を reject |
-| current drawdown | ≤ -8% で block | `POLICY_DD_BLOCK_THRESHOLD` | 新規 buy を原則停止。実損益ガードが許可したDCAラダーだけは別上限で扱う |
-| current drawdown | ≤ -5% で警戒 | `POLICY_DD_CAUTION_THRESHOLD` | urgency 降格 + size 半減 |
-| current drawdown | ≤ -15% | — | 自動損切りせず、追加リスクを止めて人間の緊急レビュー |
+| ex-ante VaR_1d_95% | 弱気・ストレス時 `< 1.2%` / 通常時 `< 1.4%` / 強気かつ VIX<25 時 `< 1.6%` / 絶対上限 `< 1.8%` | — | 朝のpolicy gateはregime閾値以上の新規buy系をreject。発注前はregime閾値以上を明示確認へ送り、絶対上限以上をhard reject |
+| daily P&L shock | `> -3%` | — | -3%以下では新規riskを停止し、人間確認へ送る |
+| rolling 30-day P&L shock | `> -6% / -9% / -12%` | — | stage 1/2/3で新規riskを停止。stage 3もsell/cover/hedge/stopを止める「全取引停止」ではない |
+| flow-adjusted current drawdown | ≤ -5% | — | caution。urgency降格 + size半減 |
+| flow-adjusted current drawdown | ≤ -8% | — | 通常の新規riskを停止し、人間確認へ送る |
+| flow-adjusted current drawdown | ≤ -10% | — | 戦術・投機risk budget 50%のde-risk案を人reviewへ送る。自動size乗数・自動売却ではない |
+| flow-adjusted current drawdown | ≤ -12% | — | risk増加freeze + 緊急人review |
+| flow-adjusted current drawdown | ≤ -15% | — | 運用目標逸脱を記録。自動損切り・自動全清算はしない |
 | VIX (extreme) | < 40 | `POLICY_VIX_BLOCK_THRESHOLD` | margin_buy / short を reject、buy urgency 降格 |
 | leverage_status | ∈ {warning, deleverage, emergency} | — | margin_buy reject |
 | earnings 5 営業日以内 | — | — | 該当 ticker への buy を原則 reject。イベント取引の明示理由がある場合のみ後段capつきで暫定許可 |
 | CVaR tail sample | 安定していること | — | margin_buy を reject。クリーン履歴不足だけが理由なら、buy系をsize半減 + urgency降格 |
 | data_freshness | ≥ 0.7 | `POLICY_FRESHNESS_THRESHOLD` | high urgency を medium に降格 |
 
-すべて `policy_engine.RULES` に実装。後付けで足すルールも本ファイルに追記すること。
+固定risk閾値の唯一の権威はversion管理された`risk_policy.py`とし、AI tuningやenv overrideで緩和しない。過去のtunable値は監査履歴としてだけ保持する。分析時の候補gateは`policy_engine.RULES`、発注直前の再評価は`POST /api/actions/preflight`で同じpolicyを使う。後付けで足すルールも本ファイルに追記すること。
 
-VaR の3段階は `policy_engine.build_context_from_synthesis_inputs()` が、シナリオ・
-レジーム・VIX・実損益ガードの状態から決める。`POLICY_VAR_THRESHOLD` を明示した場合は
-その値を使うが、`POLICY_VAR_MAX_THRESHOLD` を超える値にはならない。
+VaRの3段階は`policy_engine.build_context_from_synthesis_inputs()`と発注前checkが、シナリオ・レジーム・VIX・実損益ガードの状態から決める。stress判定はbullより優先し、好況ラベルだけでloss shock中のbudgetを緩めない。
+
+drawdown gateは、60 effective NAV日、60 forward shadow effective日、cash-flow coverage 95%以上、invalid/estimated inputなし、手動reconciliation記録を満たすflow-adjusted seriesを人が明示昇格した後だけ使う。悪化は即時。回復は-3% / -6% / -8% / -10%を上回る状態が5 effective NAV日続いたときに一段だけ進み、freeze解除には承認者・日時・根拠を残す。
 
 ## 4. 受入れ基準 (継続評価)
 
@@ -182,7 +186,7 @@ BL の View 入力源は P2 で independent alpha (factor signal / analyst conse
 | オプション | signal only | IV・skew等を分析入力に使う。オプション注文機能はない |
 | Kelly | shadow | 反実仮想を毎分析で記録し、実サイズは変更しない |
 | FX hedge / 先物 | shadow | 経済的エクスポージャーと仮想目標を記録。注文機能はない |
-| 税務取得費 | compare | legacy と総平均法を同一snapshotで比較。税務actionは新計算の検証完了まで作らない |
+| 税務取得費 | total_average (fail-closed) | completeな総平均法に準ずる計算だけを税務fieldの権威とする。不完全時はunavailableで、FIFOは比較表示に限定し、税務actionを作らない |
 | GINN | candidate validation | manifest を満たす昇格済みモデルだけ推論可。未昇格時はGARCH |
 | Execution plan gate | observe | would-filterを記録するが、それだけでactionを削除しない |
 

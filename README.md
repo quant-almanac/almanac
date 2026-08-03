@@ -225,8 +225,9 @@ in the machine-calculated size.
 | Rule | What it does |
 |---|---|
 | `ledger_integrity` | If the event ledger is inconsistent, no executable action passes. Fail-closed. |
-| `var_budget` | Ex-ante 1-day 95% VaR at or above budget → reject **all** new buying. The budget moves with the regime (1.2% stress / 1.6% normal / 2.0% confirmed bull with VIX < 25). Raising it by environment variable still cannot pass 2.3%. |
-| `dd_stage` | Drawdown ≤ −8% → new buys normally stop; ≤ −5% → urgency downgraded and size halved. A deterministic DCA-ladder exception is separately bounded. |
+| `var_budget` | Ex-ante 1-day 95% VaR at or above the fixed regime budget rejects new buying in morning synthesis (1.2% stress / 1.4% normal / 1.6% confirmed bull with VIX < 25). Execution preflight requires acknowledgement above that budget and hard-rejects at the absolute 1.8% cap. |
+| `loss_guard` | Daily P&L at or below −3%, or rolling 30-day P&L at or below −6% / −9% / −12%, stops new risk at the corresponding shock stage. These values are not drawdown proxies. |
+| `dd_stage` | After explicit promotion of the flow-adjusted series: −5% caution; −8% new-risk review; −10% human-reviewed de-risk plan; −12% risk-increase freeze; −15% objective breach. There is no automatic liquidation. |
 | `leverage_block` | Leverage status in warning/deleverage/emergency → no new margin positions |
 | `earnings_blackout` | Within 5 business days of earnings → normally reject buy / add / DCA. An explicit high-confidence event-trade exception is capped downstream. |
 | `freshness_downgrade` | Inputs too old → downgrade rather than trust them |
@@ -238,7 +239,7 @@ Two design choices matter more than the individual thresholds:
 - **Fail closed where safety depends on the answer.** A policy-engine failure or missing safety-critical evidence blocks the affected action instead of becoming "no objection." Less critical freshness gaps may downgrade an action to review. Several rules distinguish `False` from `None` explicitly so "unknown" cannot masquerade as "safe."
 - **Rejections are recorded, not discarded.** Rejected and modified actions are written into the analysis output with their reason, so the gate's behavior is auditable after the fact — you can ask why a trade you expected never appeared.
 
-The default thresholds are intended to implement [`objective.md`](objective.md), the version-controlled definition of what the system is optimizing. When a limit changes, the objective, runtime configuration, code, and regression tests should be kept in sync.
+The default thresholds are intended to implement [`objective.md`](objective.md), the version-controlled definition of what the system is optimizing. Portfolio guardrails live in the fixed, versioned `risk_policy.py`; historical AI-tuned values are audit records only. When a limit changes, the objective, code, documentation and regression tests should be kept in sync.
 
 ### 7. Scenarios and playbooks
 
@@ -256,6 +257,8 @@ The thing to note is that **a playbook proposal does not bypass the gate**. Inje
 proposal → readiness (ready | review | blocked) → human places the order at their broker
          → human records the fill → executed | partial → event ledger → portfolio state
 ```
+
+For a risk-increasing order, the dashboard performs a deterministic, read-only preflight immediately before the local `ordered` record. The signed decision is valid for 60 minutes and is invalidated by a change to the instrument, direction, order type, quantity, price/limit, currency, account or route. Ordinary risk-limit breaches require a visible human acknowledgement; the 1.8% VaR and 10% concentration caps are hard rejects. Repricing repeats this check without adding another AI analysis. ALMANAC still cannot prevent an order entered directly in the broker UI. Sell, cover, hedge and stop actions remain available, and already-observed `executed` / `partial` facts are recorded even when preflight evidence is missing.
 
 Recording a fill is deliberately separated from applying it to the portfolio. An execution whose account/route cannot be determined unambiguously is stored as a *fact that happened* and held as `portfolio_application_pending` rather than being guessed into the wrong account — because a wrong attribution silently corrupts every downstream tax lot, NISA allowance, and performance figure. Writes are idempotent through a client-generated key, so a double-submitted form cannot become two trades.
 
@@ -449,7 +452,7 @@ Specific instrument codes are intentionally omitted here because product classif
 
 `tax_harvest_scanner.py` runs on a schedule and surfaces loss-harvest candidates for a human to act on. `tax_optimizer.py` covers NISA headroom and foreign tax credit simulation.
 
-The API uses a mode-independent v2 schema separating economic, taxable and NISA realised P&L. A `legacy|compare|total_average` flag changes the calculation source, not the response shape. The total-average-like path is account-level and fail-closed on missing FX or incomplete history; until owner-and-broker scope and broker reconciliation are complete, it remains comparison/advisory data and specific-lot selection is not actionable.
+The API uses a mode-independent v2 schema separating economic, taxable and NISA realised P&L. `ALMANAC_TAX_BASIS_MODE` defaults to `total_average`; `legacy` and `compare` remain audit modes, but FIFO can never silently become the tax authority. The total-average-like path is account-level and fail-closed on missing FX, identity or history: tax-facing values become explicitly unavailable, while FIFO remains visible only under `comparison`. Until owner-and-broker scope and broker reconciliation are complete, loss-harvest output is observation-only and specific-lot selection is not actionable.
 
 NISA migration candidates keep owner, broker, account and instrument identity together. Missing identity data makes the plan non-actionable, and positions or tax lots with the same ticker at different brokers are not combined. The endpoint is advisory and human-execution-only.
 
@@ -507,7 +510,7 @@ The current snapshot exposes 20 routes, split by purpose.
 | `/risk` | VaR, drawdown, concentration |
 | `/screening` | Screener output |
 | `/decision` | AI decision support |
-| `/executions`, `/trade`, `/history` | Recording fills, and the history of them |
+| `/executions`, `/trade` | Recording fills and reviewing execution history (`/history` redirects permanently to `/executions`) |
 | `/nisa`, `/cash`, `/margin` | Tax-exempt allowance, cash, margin |
 | `/scenarios`, `/strategy` | Scenarios and strategy |
 | `/disclosures` | Disclosure feed |
@@ -624,6 +627,7 @@ Use `.env.example` as a template. CLI analysis secrets are supplied through the 
 | `DASHSCOPE_API_KEY` | Direct Qwen adapter; otherwise that adapter can fall back to OpenRouter or Groq |
 | `TELEGRAM_TOKEN`, `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID` | Push notifications for alerts and daily briefings |
 | `ALMANAC_API_KEY`, `NEXT_PUBLIC_ALMANAC_API_KEY` | Auth key for write endpoints (recording trades, editing tuning params) — read-only browsing works without it |
+| `ALMANAC_CATALYST_CONTEXT_MODE` | `on` (default) injects measured catalyst context into final synthesis; `off` keeps the hypothesis log but omits that context. It does not change analysis frequency |
 | `ALMANAC_OFFSITE_REMOTE`, `ALMANAC_REQUIRE_OFFSITE_BACKUP` | rclone backup destination and whether watchdog requires a recent off-site copy |
 | `ALMANAC_ESPP_*` | Employee-stock-plan tracking; disabled (`0`) by default |
 | `ALMANAC_CONTRIBUTION_SCHEDULE_JSON` | Recurring cash-flow definitions; empty by default |
@@ -770,9 +774,9 @@ Your own NAV is different. **Nobody else has a record of what you held that day.
 
 `nav_backfill.py` can reconstruct it afterwards. It anchors on your current holdings and rewinds trade and cash-flow events from the ledger, so it is a derivation rather than interpolation. But the result is marked `estimated=1`, because mutual funds stay pinned at their anchor valuation and gaps in price data are approximated.
 
-That mark carries weight. The lookup for the previous NAV **excludes estimated rows**, because daily P&L feeds the drawdown and VaR gates and an estimate should not be treated as a measurement.
+That mark carries weight. The lookup for the previous measured NAV **excludes estimated rows**. Daily and rolling P&L shock guards use measured observations, while the separate flow-adjusted drawdown shadow also excludes invalid/estimated inputs; an estimate must not silently become risk-gating evidence.
 
-So skipping a day means the next day's "daily" P&L is computed against the day *before* that one, and the −4% / −8% thresholds shift accordingly. **A backfill restores the chart; it does not restore the measured chain the guardrails read.**
+So skipping a day means the next day's "daily" P&L is computed against the day *before* that one, and the −3% daily and −6% / −9% / −12% rolling-loss checks shift accordingly. **A backfill restores the chart; it does not restore the measured chain the guardrails read.**
 
 **Recovering from a missed run**
 

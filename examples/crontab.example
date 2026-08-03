@@ -6,7 +6,7 @@
 #
 # The daily AI analysis, disclosure ingestion, NAV recording and benchmark
 # rebuild are NOT here — those run from launchagents/ (macOS). This file covers
-# the screeners only.
+# screeners plus the read-only monthly governance draft.
 #
 # Times are local (the reference deployment runs Asia/Tokyo). Weekday numbering
 # is cron's: 0 = Sunday, 1-5 = Mon-Fri.
@@ -52,3 +52,9 @@ ALMANAC_DIR=/path/to/ALMANAC
 0  7 * * 0,4 cd "$ALMANAC_DIR" && ./run_with_secrets.sh venv/bin/python long_term_screener.py                      >> logs/screener.log 2>&1
 30 8 * * 1   cd "$ALMANAC_DIR" && ./run_with_secrets.sh venv/bin/python long_term_screener.py batch-poll           >> logs/screener.log 2>&1
 30 8 * * 5   cd "$ALMANAC_DIR" && ./run_with_secrets.sh venv/bin/python long_term_screener.py batch-poll           >> logs/screener.log 2>&1
+
+# ---------------------------------------------------------------------------
+# Monthly governance draft — report generation only. It never promotes or
+# retires a lane. The emitted heartbeat lets watchdog surface failure/missed run.
+# ---------------------------------------------------------------------------
+30 7 1 * * cd "$ALMANAC_DIR" && ./run_with_secrets.sh venv/bin/python monthly_governance_report.py                >> logs/monthly_governance.log 2>&1

@@ -68,3 +68,13 @@ def test_reconcile_broker_does_not_notify_when_clean(monkeypatch, tmp_path):
     assert summary["has_discrepancy"] is False
     assert "telegram_notified" not in summary
     assert sent == []
+
+
+def test_missing_broker_input_is_a_warning_not_a_clean_skip(monkeypatch, tmp_path):
+    monkeypatch.setattr("sys.argv", ["broker_reconcile_cron.py", "--csv-dir", str(tmp_path)])
+    heartbeats = []
+    monkeypatch.setattr("utils.heartbeat", lambda *args, **kwargs: heartbeats.append((args, kwargs)))
+
+    assert cron._main() == 2
+    assert heartbeats
+    assert heartbeats[0][0][1] == "warn"

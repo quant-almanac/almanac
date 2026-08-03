@@ -194,7 +194,13 @@ household cashは配分・tactical reserve計算では集約できますが、�
 
 `policy_engine.py`は決定論的です。主なcheckはdrawdown/VaR/VIX、regime size cap、leverage、NISA/account、earnings/macro blackout、order-intent conflict、discretionary funding、concentration、minimum unitです。
 
+`risk_policy.py`を、portfolio guardrailの唯一のversion管理された権威とします。日次P&L、30日rolling P&L、peak drawdownは別metricであり、値の大きさから単位を推測したり、P&L proxyをdrawdownと呼び替えたりしません。固定loss shock水準は日次-3%、30日-6% / -9% / -12%です。ex-ante 1日95% VaR budgetはstress 1.2%、通常1.4%、confirmed bullかつVIX<25だけ1.6%、絶対上限1.8%です。発注時の単一銘柄集中度は8%からreview、10%でrejectします。過去にAI tuningされたrisk値は監査履歴にだけ残します。
+
+flow-adjusted drawdownはshadow seriesから始めます。60 effective NAV日、60 forward shadow effective日、cash-flow coverage 95%以上、invalid/estimated inputなし、手動reconciliation記録、を全て満たした後だけ人が昇格できます。昇格後は-5% / -8% / -10% / -12%で即時悪化し、-15%はobjective breachです。回復は-3% / -6% / -8% / -10%を上回る状態が5 effective NAV日続いたときに一段だけ進み、`freeze`解除には記録付き人承認も必要です。-10%状態は戦術・投機risk budget 50%のde-risk案を人reviewへ送り、自動size乗数や自動清算にはしません。
+
 readinessは加算的でseverityは単調です。後段checkが`blocked`を`review/ready`へ改善できません。reasonは構造化して保存します。stale/unknown position、unverified claim、ambiguous account、未解決sizing、直近eventは契約に従い降格/拒否します。
+
+riskを増やす注文を記録する直前に、`POST /api/actions/preflight`が現在のloss guard、regime別VaR budget、注文後集中度、昇格済みdrawdown stateを決定論的かつread-onlyで再評価します。署名済み結果は60分有効で、ticker、direction、order type、quantity、price/limit、currency、account/route、action identityに結び付きます。通常の閾値超過は理由を表示して人の明示確認を記録し、VaR 1.8%、集中度10%、またはidentity変更はhard rejectです。指値再計算はこのcheckだけを再実行し、朝のAI分析を増やしません。sell、cover、hedge、stopは通します。`executed`と`partial`は既発生の事実なので拒否せず、preflight欠落を`reported_without_preflight`として残します。
 
 `execution_invalidation_state.json`は過去analysis/actionへの不変overlayです。Today、API、backlog、notification、action-state consumerが同じresolverを使います。原文履歴は消さず、旧actionの実行・dedup復活を防ぎます。過去fill報告は可能です。
 
@@ -256,7 +262,7 @@ tax v2 schemaは常に次を分離します。
 - taxable realized P&L
 - NISA realized P&L
 
-`ALMANAC_TAX_BASIS_MODE=legacy|compare|total_average`は計算元だけ変え、API fieldを変えません。total-average-like engineはowner/broker/account/instrument別にfee、FX、split/merge、transfer、opening balanceを扱い、不完全historyはfail-closedです。broker税務値があれば表示の権威、内部ledgerは照合値です。
+`ALMANAC_TAX_BASIS_MODE=legacy|compare|total_average`はAPI fieldを変えず、既定は`total_average`です。税務fieldへ値を入れられるのはcompleteなtotal-average-like結果だけで、`legacy`と`compare`はFIFOを監査比較として残しても権威へ無言昇格しません。engineはowner/broker/account/instrument別にfee、FX、split/merge、transfer、opening balanceを扱い、不完全historyでは税務値を明示的にunavailableにします。broker税務値があれば表示の権威、内部ledgerは照合値です。
 
 NISA損益を課税口座と通算しません。年間投資枠と翌年復活する生涯保有限度額は別です。migrationはowner/brokerを跨げません。lot IDは監査lineageだけで、税額はposition平均basisを使います。
 
@@ -326,7 +332,7 @@ git diff --check
 
 ## 22. 書込み権威と注文境界
 
-`POST`、`PUT`、`PATCH`、`DELETE`はlocal state mutationでありbroker注文ではありません。write routeは既定で`X-API-Key`を要求します。`ALLOW_UNAUTH=1`は意図的に危険なlocal-development overrideで、production controlと扱いません。
+`POST`、`PUT`、`PATCH`、`DELETE`はlocal state mutationでありbroker注文ではありません。すべてのwrite routeが`X-API-Key`を要求し、実行時に認証を迂回する環境変数はありません。read-only routeはkeyなしで利用できます。
 
 | 書込み分類 | 変更し得るもの | 意味してはならないもの |
 |---|---|---|
@@ -336,7 +342,7 @@ git diff --check
 | feature/configuration control | 独立して認可されたlocal switch/parameter | policy bypass、execution approval、遡及的な証明 |
 | correction/rollback | 新しいcorrection、invalidation、read mode | 元監査eventの破壊的書換え |
 
-公開API routeに注文をsubmitする契約やbroker order routingはありません。implementation reviewではbutton表示やHTTP verbで推測せず、endpointとbroker-client境界から確認します。System UIはこれらcontrolのoperator viewであり、第二の権威ではありません。
+公開API routeに注文をsubmitする契約やbroker order routingはありません。強制可能な境界は手動発注前のpreflight表示とlocalの`status=ordered`遷移までで、外部broker画面へ直接入力された注文は止められません。implementation reviewではbutton表示やHTTP verbで推測せず、endpointとbroker-client境界から確認します。System UIはこれらcontrolのoperator viewであり、第二の権威ではありません。
 
 ## 23. 文章から始めるreview手順
 

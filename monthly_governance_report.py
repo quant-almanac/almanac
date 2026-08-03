@@ -18,6 +18,7 @@ promote(昇格) / maintain(維持) / retire(廃止) / insufficient_data(判定�
 """
 from __future__ import annotations
 
+import argparse
 import json
 from datetime import datetime, timezone
 from pathlib import Path
@@ -214,7 +215,7 @@ def _leveraged_decay_section(data: Optional[dict]) -> dict:
     }
 
 
-def _red_team_section() -> dict:
+def _red_team_section(*, base_dir: Path = BASE_DIR) -> dict:
     """攻めバックログ項目2: RedTeamのreject判断がsave-rate的に的確かを判定する。
 
     save-rate = rejectしたのに実際に下落した割合 (高いほど的確に止めている)。
@@ -226,7 +227,10 @@ def _red_team_section() -> dict:
     except Exception as e:
         return {"available": False, "reason": f"red_team_ledger 読み込み失敗: {e}"}
 
-    stats = aggregate_save_rate()
+    stats = aggregate_save_rate(
+        verdict_log_path=base_dir / "red_team_verdict_log.jsonl",
+        outcome_log_path=base_dir / "red_team_outcome_log.jsonl",
+    )
     n = stats["n_reject_measured"]
     save_rate = stats["save_rate"]
 
@@ -242,7 +246,7 @@ def _red_team_section() -> dict:
     return {"available": True, "verdict": verdict, "reason": reason, **stats}
 
 
-def _disclosure_feature_section() -> dict:
+def _disclosure_feature_section(*, base_dir: Path = BASE_DIR) -> dict:
     """攻めバックログ項目3: 開示特徴量タイプ別の昇格/維持/廃止ドラフト判定。"""
     try:
         from disclosure_feature_promotion import aggregate_by_disclosure_type, promotion_verdicts
@@ -250,7 +254,10 @@ def _disclosure_feature_section() -> dict:
         return {"available": False, "reason": f"disclosure_feature_promotion 読み込み失敗: {e}"}
 
     try:
-        agg = aggregate_by_disclosure_type()
+        agg = aggregate_by_disclosure_type(
+            features_path=base_dir / "data" / "disclosure_features.jsonl",
+            outcome_log_path=base_dir / "catalyst_outcome_log.jsonl",
+        )
         verdicts = promotion_verdicts(agg)
     except Exception as e:
         return {"available": False, "reason": f"集計失敗: {e}"}
@@ -325,7 +332,7 @@ def _jp_event_drift_section(data: Optional[dict]) -> dict:
     }
 
 
-def _swing_lane_section() -> dict:
+def _swing_lane_section(*, base_dir: Path = BASE_DIR) -> dict:
     """攻めバックログ項目5(前半): Swingレーンのサイズ昇格ラダー判定材料。
 
     swing_lane_kpi.compute_swing_kpis() は独自の verdict (promote/maintain/demote/
@@ -337,7 +344,8 @@ def _swing_lane_section() -> dict:
         return {"available": False, "reason": f"swing_lane_kpi 読み込み失敗: {e}"}
 
     try:
-        stats = compute_swing_kpis()
+        from almanac.runtime_config import resolve_db_path
+        stats = compute_swing_kpis(db_path=resolve_db_path(base_dir))
     except Exception as e:
         return {"available": False, "reason": f"集計失敗: {e}"}
 
@@ -396,14 +404,15 @@ def _screener_lane_section(book: Optional[dict]) -> dict:
     }
 
 
-def generate_report() -> dict:
-    """レーン横断の月次ガバナンスドラフトを生成する。自動アクションは取らない。"""
-    agent_data = _load_json(AGENT_RELIABILITY_PATH)
-    scenario_data = _load_json(SCENARIO_PROMOTION_PATH)
-    action_state = _load_json(ACTION_STATE_PATH)
-    leveraged_decay_data = _load_json(LEVERAGED_DECAY_PATH)
-    shadow_book_data = _load_json(DISCLOSURE_SHADOW_BOOK_PATH)
-    screener_shadow_data = _load_json(SCREENER_SHADOW_BOOK_PATH)
+def generate_report(*, base_dir: Path | str = BASE_DIR) -> dict:
+    """Generate a read-only governance draft from an injectable state root."""
+    root = Path(base_dir)
+    agent_data = _load_json(root / "agent_reliability.json")
+    scenario_data = _load_json(root / "scenario_promotion_summary.json")
+    action_state = _load_json(root / "action_state.json")
+    leveraged_decay_data = _load_json(root / "leveraged_decay_signals.json")
+    shadow_book_data = _load_json(root / "data" / "disclosure_shadow_book.json")
+    screener_shadow_data = _load_json(root / "data" / "screener_shadow_book.json")
 
     return {
         "generated_at": datetime.now(timezone.utc).isoformat(),
@@ -412,9 +421,9 @@ def generate_report() -> dict:
         "scenarios": _scenario_section(scenario_data),
         "tax_harvest": _tax_harvest_section(action_state),
         "leveraged_decay": _leveraged_decay_section(leveraged_decay_data),
-        "red_team": _red_team_section(),
-        "disclosure_features": _disclosure_feature_section(),
-        "swing_lane": _swing_lane_section(),
+        "red_team": _red_team_section(base_dir=root),
+        "disclosure_features": _disclosure_feature_section(base_dir=root),
+        "swing_lane": _swing_lane_section(base_dir=root),
         "jp_event_drift": _jp_event_drift_section(shadow_book_data),
         "screener_lane": _screener_lane_section(screener_shadow_data),
         "lanes_without_instrumentation": LANES_WITHOUT_INSTRUMENTATION,
@@ -501,11 +510,44 @@ def format_text_summary(report: dict) -> str:
     return "\n".join(lines)
 
 
-def main() -> int:
-    report = generate_report()
-    DEFAULT_REPORT_DIR.mkdir(exist_ok=True)
-    out_path = DEFAULT_REPORT_DIR / f"governance_{datetime.now().strftime('%Y%m')}.json"
+def write_report(report: dict, *, output_dir: Path | str = DEFAULT_REPORT_DIR) -> Path:
+    out_dir = Path(output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / f"governance_{datetime.now().strftime('%Y%m')}.json"
     out_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+    return out_path
+
+
+def _record_heartbeat(status: str, *, error: str | None = None, extra: dict | None = None) -> None:
+    """Expose monthly success/failure to watchdog without changing finance state."""
+    try:
+        from utils import heartbeat
+        heartbeat("monthly_governance_report", status, error=error, extra=extra)
+    except Exception:
+        # Report generation remains fail-loud even if operational telemetry is
+        # unavailable.  The original exception is never replaced or hidden.
+        pass
+
+
+def main(argv: Optional[list[str]] = None) -> int:
+    parser = argparse.ArgumentParser(description="Read-only monthly governance draft")
+    parser.add_argument("--base-dir", default=str(BASE_DIR))
+    parser.add_argument("--output-dir", default=str(DEFAULT_REPORT_DIR))
+    args = parser.parse_args(argv)
+    try:
+        report = generate_report(base_dir=args.base_dir)
+        out_path = write_report(report, output_dir=args.output_dir)
+    except Exception as exc:
+        _record_heartbeat("error", error=f"{type(exc).__name__}: {exc}"[:500])
+        raise
+    _record_heartbeat(
+        "ok",
+        extra={
+            "report_path": str(out_path),
+            "generated_at": report.get("generated_at"),
+            "automatic_promotion": False,
+        },
+    )
     print(format_text_summary(report))
     print(f"\n[saved] {out_path}")
     return 0

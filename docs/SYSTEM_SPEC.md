@@ -223,7 +223,13 @@ Household cash can be aggregated for allocation and tactical-reserve calculation
 
 `policy_engine.py` is deterministic. Major checks include drawdown/VaR/VIX gates, regime size caps, leverage rules, NISA/account eligibility, earnings and macro blackouts, order-intent conflicts, discretionary funding, concentration and minimum tradable units.
 
+`risk_policy.py` is the single version-controlled authority for portfolio guardrails. Daily P&L, rolling 30-day P&L and peak drawdown are separate metrics; no consumer may infer a unit from magnitude or relabel a P&L proxy as drawdown. The fixed loss-shock levels are -3% daily and -6% / -9% / -12% rolling 30-day. Ex-ante one-day 95% VaR budgets are 1.2% in stress, 1.4% normally and 1.6% only in a confirmed bull regime with VIX below 25; 1.8% is the absolute cap. Execution-time single-instrument concentration requires review from 8% and is rejected at 10%. Historical AI-tuned risk values remain audit data only.
+
+Flow-adjusted drawdown begins as a shadow series. It can be promoted manually only after at least 60 effective NAV days, 60 forward shadow effective days, at least 95% cash-flow coverage, no invalid/estimated inputs and a recorded reconciliation. Promoted states worsen immediately at -5% / -8% / -10% / -12%, while -15% records an objective breach. Recovery moves only one state at a time after five effective NAV days above -3% / -6% / -8% / -10%; leaving `freeze` also requires recorded human approval. The -10% state produces a human-reviewed de-risking plan for 50% of the tactical/speculative risk budget; it is not an automatic size multiplier or liquidation order.
+
 Readiness is additive and severity-monotonic: a later check cannot improve `blocked` to `review` or `ready`. Reasons are structured and retained. Stale/unknown position evidence, unverified claims, ambiguous accounts, unresolved sizing and imminent events downgrade or block according to contract.
+
+Immediately before a risk-increasing order is recorded, `POST /api/actions/preflight` reruns a deterministic, read-only check of current loss guards, the regime VaR budget, prospective concentration and any promoted drawdown state. Its signed result lasts 60 minutes and binds ticker, direction, order type, quantity, price/limit, currency, account/route and action identity. Ordinary threshold breaches require an explicit recorded acknowledgement; the 1.8% VaR cap, 10% concentration cap or changed identity is a hard rejection. Repricing reruns this check but does not rerun the morning AI analysis. Sell, cover, hedge and stop paths remain available. `executed` and `partial` are historical facts and are never rejected; missing preflight is retained as `reported_without_preflight`.
 
 `execution_invalidation_state.json` is an immutable overlay over historical analyses/actions. Today, API, backlog, notifications and action-state consumers use the same resolver. Invalidation does not delete source history; it prevents an old action from becoming executable or being revived by deduplication. Historical fill reporting remains possible.
 
@@ -285,7 +291,7 @@ The v2 tax schema always separates:
 - taxable realized P&L;
 - NISA realized P&L.
 
-`ALMANAC_TAX_BASIS_MODE=legacy|compare|total_average` changes the calculation source, not the API fields. The total-average-like engine scopes owner, broker, account and instrument; handles fees, FX, splits/merges, transfers and opening balances; and fails closed on incomplete history. Broker tax values are authoritative when supplied; the internal ledger is a reconciliation value.
+`ALMANAC_TAX_BASIS_MODE=legacy|compare|total_average` does not change the API fields and defaults to `total_average`. Only a complete total-average-like result can populate the tax-facing authority; `legacy` and `compare` retain FIFO as audit comparison and never silently promote it. The total-average-like engine scopes owner, broker, account and instrument; handles fees, FX, splits/merges, transfers and opening balances; and returns explicitly unavailable tax values on incomplete history. Broker tax values are authoritative when supplied; the internal ledger is a reconciliation value.
 
 NISA gains/losses are not netted with taxable accounts. Annual investment capacity and the lifetime holding allowance restored in the following year are separate. A migration may never cross owner or broker identity. Lot IDs remain audit lineage; tax estimates use the position-level average basis, not a hand-picked low-gain lot.
 
@@ -361,9 +367,9 @@ evidence about a live household portfolio.
 ## 22. Write authority and order boundary
 
 `POST`, `PUT`, `PATCH` or `DELETE` means a local state mutation, not an order
-to a broker. Write routes require `X-API-Key` by default; `ALLOW_UNAUTH=1` is a
-deliberately unsafe local-development override and must not be treated as a
-production control.
+to a broker. Every write route requires `X-API-Key`; there is no runtime
+authentication-bypass environment variable. Read-only routes remain available
+without the key.
 
 | Write class | May change | Must not imply |
 |---|---|---|
@@ -374,6 +380,9 @@ production control.
 | Correction/rollback | A new correction, invalidation or read-mode selection | Destructive rewriting of the original audit event |
 
 No public API route submits an order or holds a broker-order-routing contract.
+The enforceable boundary is the preflight shown before manual placement and the
+local transition to `status=ordered`; ALMANAC cannot stop an order entered
+directly in an external broker UI.
 An implementation review should prove this from the endpoint and broker-client
 boundaries rather than inferring it from a button label or from the HTTP verb.
 The System UI is an operator view of these controls; it is not a separate

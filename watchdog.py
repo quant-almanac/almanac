@@ -80,8 +80,9 @@ AI_OUTPUT_MAX_STALE_SEC = 26 * 3600   # 平日次の analyzer cron 想定
 # 想定周期（秒）。これを超えて heartbeat が来ないと stale とみなす。
 # cron/LaunchAgent の実行間隔 + 1 回分の猶予。
 EXPECTED_INTERVALS = {
-    # 平日朝・引け後の 2 回。週末は実行されないので weekday_only=True で評価。
-    # portfolio_analyst が 06:00 の本線、analyzer_delta はその後の軽量差分監視。
+    # portfolio_analyst is the one morning AI analysis. analyzer_delta is a
+    # separate lightweight observer and must not be described as a second
+    # full portfolio analysis.
     'portfolio_analyst': {'max_stale_sec': 26 * 3600, 'weekday_only': True},
     # 'analyzer' は --delta-only 運用で 'analyzer_delta' に heartbeat されるため
     # こちらを監視する（旧 'analyzer' キーは永遠に空で false positive の原因だった）。
@@ -109,6 +110,8 @@ EXPECTED_INTERVALS = {
     # 毎月1日06:00。翌月の実行までに十分な猶予を持たせつつ、2回連続で
     # 欠落すれば stale になる。疑似現金/MMFは再構築対象外。
     'parquet_rebuilder': {'max_stale_sec': 40 * 24 * 3600, 'weekday_only': False},
+    # Monthly report generation only.  It never promotes or retires a lane.
+    'monthly_governance_report': {'max_stale_sec': 40 * 24 * 3600, 'weekday_only': False},
     # 以下は heartbeat 未登録・優先度低のため監視対象外（必要になったら復活）:
     #   'short_screener', 'weekly_report', 'portfolio_agent'
 }
@@ -123,6 +126,7 @@ NOTIFY_STALE_SCRIPTS = {
     'analyzer_delta',
     'data_fetcher',
     'margin_manager',
+    'monthly_governance_report',
 }
 RECENT_EXECUTION_ISSUE_HOURS = 48
 

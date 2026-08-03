@@ -5,6 +5,8 @@ import json
 import sys
 from pathlib import Path
 
+import pytest
+
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
@@ -16,18 +18,22 @@ def _write(path: Path, data: dict) -> None:
     path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
 
 
-def test_missing_files_report_unavailable_not_fabricated(tmp_path, monkeypatch):
-    monkeypatch.setattr(mgr, "AGENT_RELIABILITY_PATH", tmp_path / "missing1.json")
-    monkeypatch.setattr(mgr, "SCENARIO_PROMOTION_PATH", tmp_path / "missing2.json")
-    monkeypatch.setattr(mgr, "ACTION_STATE_PATH", tmp_path / "missing3.json")
-    monkeypatch.setattr(mgr, "LEVERAGED_DECAY_PATH", tmp_path / "missing4.json")
-
-    report = mgr.generate_report()
+def test_missing_files_report_unavailable_not_fabricated(tmp_path):
+    report = mgr.generate_report(base_dir=tmp_path)
 
     assert report["analyst_agents"]["available"] is False
     assert report["scenarios"]["available"] is False
     assert report["tax_harvest"]["available"] is False
     assert report["leveraged_decay"]["available"] is False
+
+
+def test_generate_report_accepts_an_isolated_state_root(tmp_path):
+    _write(tmp_path / "action_state.json", {"actions": {}})
+    report = mgr.generate_report(base_dir=tmp_path)
+    out_path = mgr.write_report(report, output_dir=tmp_path / "out")
+    assert report["tax_harvest"]["available"] is True
+    assert out_path.parent == tmp_path / "out"
+    assert out_path.exists()
 
 
 def test_leveraged_decay_zero_positions_is_insufficient_data_not_retire():
@@ -245,8 +251,22 @@ def test_tax_harvest_no_entries_yet_is_insufficient_data_not_retire():
     assert section["verdict"] == "insufficient_data"
 
 
-def test_generate_report_end_to_end_against_real_files_does_not_crash():
-    # 本番ファイルに対して読み取り専用で実行できることの smoke test（書き込みなし）
-    report = mgr.generate_report()
-    assert "generated_at" in report
-    assert "lanes_without_instrumentation" in report
+def test_main_isolated_writes_only_report_and_success_heartbeat(tmp_path, monkeypatch):
+    _write(tmp_path / "action_state.json", {"actions": {}})
+    heartbeats = []
+    monkeypatch.setattr(mgr, "_record_heartbeat", lambda status, **kwargs: heartbeats.append((status, kwargs)))
+
+    assert mgr.main(["--base-dir", str(tmp_path), "--output-dir", str(tmp_path / "reports")]) == 0
+    assert list((tmp_path / "reports").glob("governance_*.json"))
+    assert heartbeats[0][0] == "ok"
+    assert heartbeats[0][1]["extra"]["automatic_promotion"] is False
+
+
+def test_main_failure_is_fail_loud_and_records_error_heartbeat(tmp_path, monkeypatch):
+    heartbeats = []
+    monkeypatch.setattr(mgr, "generate_report", lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("boom")))
+    monkeypatch.setattr(mgr, "_record_heartbeat", lambda status, **kwargs: heartbeats.append((status, kwargs)))
+
+    with pytest.raises(RuntimeError, match="boom"):
+        mgr.main(["--base-dir", str(tmp_path), "--output-dir", str(tmp_path / "reports")])
+    assert heartbeats == [("error", {"error": "RuntimeError: boom"})]

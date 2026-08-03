@@ -241,8 +241,9 @@ fallback利用で`degraded`のmacroはwatchdogへ警告しますが、それだ�
 | ルール | 内容 |
 |---|---|
 | `ledger_integrity` | 履歴台帳につじつまが合わない箇所があれば、実行できる提案を一切通さない |
-| `var_budget` | 想定される1日の損失（VaR、95%水準）が上限以上なら、新規の買いを**すべて**却下。上限は相場で動きます（弱気・ストレス時 1.2% ／ 通常 1.6% ／ 強気確認かつ VIX<25 で 2.0%）。環境変数で緩めても 2.3% は超えられません |
-| `dd_stage` | 資産の落ち込みが −8% 以下なら原則として新規の買いを停止。−5% 以下なら緊急度を下げ、数量を半分に。積立の階段買いだけは例外だが、それも上限管理下に置く |
+| `var_budget` | 想定される1日の損失（VaR、95%水準）が固定regime上限以上なら、朝の統合時に新規買いを却下。上限はstress 1.2% ／ 通常1.4% ／ 強気確認かつVIX<25で1.6%。発注前確認ではregime上限超過を明示確認へ送り、絶対上限1.8%はhard reject |
+| `loss_guard` | 日次P&Lが−3%以下、または30日rolling P&Lが−6% / −9% / −12%以下なら、段階に応じて新規riskを止める。これらをdrawdownの代理値にはしない |
+| `dd_stage` | flow-adjusted系列を明示昇格した後だけ、−5%注意、−8%新規risk確認、−10%人review付きde-risk案、−12%risk増加freeze、−15%目標逸脱。自動清算はしない |
 | `leverage_block` | 借入の状態が警戒・縮小・緊急のいずれかなら、新規の信用建てを禁止 |
 | `earnings_blackout` | 決算発表の5営業日前からは、その銘柄の買い・買い増し・積立を原則却下。よほど確信度の高いイベント狙いだけは例外だが、後段で上限をかける |
 | `freshness_downgrade` | 判断材料が古ければ、そのまま信じずに格下げする |
@@ -255,7 +256,7 @@ fallback利用で`degraded`のmacroはwatchdogへ警告しますが、それだ�
 
 **却下したものは捨てずに残す。** 却下・修正された提案は、その理由とともに分析結果に書き出します。だから後から「なぜあの売買が出てこなかったのか」を追跡できます。
 
-なお、これらの数値は思いつきで決めたものではなく、[`objective.md`](objective.md)（何を目指すかを定めたバージョン管理下の文書）を実装したものです。上限を変えるときは、目的の文書・設定・コード・テストをまとめて更新します。
+なお、これらの数値は思いつきで決めたものではなく、[`objective.md`](objective.md)（何を目指すかを定めたバージョン管理下の文書）を実装したものです。Portfolio guardrailは固定・version管理された`risk_policy.py`に置き、過去のAI tuning値は監査履歴としてだけ残します。上限を変えるときは、目的の文書・コード・説明・テストをまとめて更新します。
 
 ### 7. シナリオとプレイブック
 
@@ -273,6 +274,8 @@ fallback利用で`degraded`のmacroはwatchdogへ警告しますが、それだ�
 提案 → 実行可否の判定（すぐ可 | 要確認 | 不可） → 人間が証券会社で発注
      → 人間が約定を記録 → 約定済み | 一部約定 → 履歴台帳 → 保有情報へ反映
 ```
+
+riskを増やす注文では、localの`ordered`記録直前にdashboardが決定論的かつread-onlyのpreflightを実行します。署名済み結果は60分有効で、銘柄・方向・order type・数量・price/limit・currency・account・routeが変われば失効します。通常のrisk上限超過は理由を見せて人の明示確認へ送り、VaR 1.8%と集中度10%はhard rejectです。指値再計算はこのcheckだけを繰り返し、AI分析回数を増やしません。それでも外部broker画面へ直接入れた注文をALMANACが止めることはできません。sell・cover・hedge・stopは通し、既に起きた`executed` / `partial`はpreflight証拠が無くても事実として記録します。
 
 ここで意図的に分けているのが、**「約定を記録すること」と「保有情報に反映すること」**です。
 
@@ -485,7 +488,7 @@ T3 は T1・T2 の組み合わせではなく、独立した「キャピチュ�
 
 `tax_harvest_scanner.py` が定期実行され、損出し候補を human-only で提示します。`tax_optimizer.py` は NISA残枠と外国税額控除のシミュレーションを担当します。
 
-APIはmodeによらず常にv2 schemaを返し、経済的損益・課税損益・NISA損益を分離します。`legacy|compare|total_average`は算出元だけを切り替え、field構成は変えません。総平均法に準ずる経路は口座単位で、FX欠落や履歴不足ではfail-closedです。本人・証券会社単位の照合が終わるまでは比較・助言用で、特定lotを選ぶ提案はactionableにしません。
+APIはmodeによらず常にv2 schemaを返し、経済的損益・課税損益・NISA損益を分離します。`ALMANAC_TAX_BASIS_MODE`の既定は`total_average`です。`legacy`と`compare`は監査用に残しますが、FIFOが税務上の権威へ無言fallbackすることはありません。口座単位の総平均法に準ずる経路でFX・identity・履歴が欠ければ、税務fieldを明示的にunavailableとし、FIFOは`comparison`にだけ表示します。本人・証券会社単位の照合が終わるまでは損出し結果を観測専用とし、特定lotを選ぶ提案はactionableにしません。
 
 NISA移管候補は、本人・証券会社・口座・銘柄の組を崩さずに扱います。識別情報が欠ければ実行不可とし、同じ銘柄・口座名でも証券会社が違う保有や取得履歴は合算しません。APIの出力は助言専用で、実行は人が行います。
 
@@ -543,7 +546,7 @@ MOM = MTUM − SPY   QMJ = QUAL − SPY      LVOL = SPLV − SPY  ほか
 | `/risk` | VaR・ドローダウン・集中度 |
 | `/screening` | スクリーナーの結果 |
 | `/decision` | AI判断支援 |
-| `/executions`・`/trade`・`/history` | 約定の記録と履歴 |
+| `/executions`・`/trade` | 約定の記録と履歴（`/history`は`/executions`へ恒久redirect） |
 | `/nisa`・`/cash`・`/margin` | 非課税枠・現金・信用取引 |
 | `/scenarios`・`/strategy` | シナリオと戦略 |
 | `/disclosures` | 開示情報 |
@@ -662,6 +665,7 @@ MOM = MTUM − SPY   QMJ = QUAL − SPY      LVOL = SPLV − SPY  ほか
 | `DASHSCOPE_API_KEY` | Qwen へ直接つなぐためのキー。未設定時は OpenRouter または Groq への代替経路あり |
 | `TELEGRAM_TOKEN`, `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID` | アラートと日次まとめのプッシュ通知 |
 | `ALMANAC_API_KEY`, `NEXT_PUBLIC_ALMANAC_API_KEY` | 書き込み操作（取引の記録・設定変更）の認証キー。閲覧だけなら不要 |
+| `ALMANAC_CATALYST_CONTEXT_MODE` | `on`（既定）は計測済みcatalyst contextを最終統合へ渡し、`off`はhypothesis logだけ残して注入しない。分析頻度は変えない |
 | `ALMANAC_OFFSITE_REMOTE`, `ALMANAC_REQUIRE_OFFSITE_BACKUP` | rclone の外部保存先と、watchdog が外部バックアップを必須にするかどうか |
 | `ALMANAC_ESPP_*` | 持株会（従業員株式制度）の追跡設定。既定はすべて無効（`0`） |
 | `ALMANAC_CONTRIBUTION_SCHEDULE_JSON` | 定期積立の設定。既定は空 |
@@ -814,9 +818,9 @@ NEXT_PUBLIC_ALMANAC_API_KEY=<~/.config/almanac/api_key の中身>
 
 `nav_backfill.py` で後から再構築はできます。現在の保有を起点に、台帳の売買・入出金イベントを逆算する方式なので、当てずっぽうの補間ではありません。ただし結果には `estimated=1` の印が付きます。投資信託は基準日の評価で固定され、価格が欠けている部分は近似になるためです。
 
-この印には実務上の意味があります。前日NAVを取り出す処理は、**推定行を除外します**。日次損益はドローダウンやVaRの判定に流れるので、推定値を実測として扱わない設計です。
+この印には実務上の意味があります。前日の実測NAVを取り出す処理は、**推定行を除外します**。日次・30日P&L shock guardは実測観測を使い、別系統のflow-adjusted drawdown shadowもinvalid/estimated inputを除外します。推定値をrisk gateの証拠へ暗黙昇格させません。
 
-結果として、1日飛ばすと翌日の日次損益は「前日比」ではなく「2日前比」で計算されます。−4% / −8% の判定がその分ずれます。**グラフの見た目は backfill で戻せますが、ガードレールが見る実測の連なりは戻りません。**
+結果として、1日飛ばすと翌日の日次損益は「前日比」ではなく「2日前比」で計算されます。日次−3%と30日−6% / −9% / −12%の判定がその分ずれます。**グラフの見た目は backfill で戻せますが、ガードレールが見る実測の連なりは戻りません。**
 
 **取りこぼしたときの復旧**
 

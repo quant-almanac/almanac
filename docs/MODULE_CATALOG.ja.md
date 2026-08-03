@@ -12,7 +12,7 @@
 |---|---|---|
 | live | `portfolio_analyst.py`, `portfolio_agent.py`, `bot_commands.py`, `telegram_bot.py`, `generate_dashboard.py`, `weekly_report.py` | 日次CLI/API向け分析と人への表示 |
 | live | `daily_health_check.py`, `watchdog.py`, `alert.py`, `nightly_recheck.py`, `post_run_verify.py` | health、stale出力検知、実行後整合 |
-| optional | `streamlit_app.py`, `decision_support.py`, `ollama_chat.py` | 代替UIとon-demand判断/chat |
+| optional | `decision_support.py` | 主Next.js console外のon-demand判断支援 |
 | shared | `utils.py` | atomic I/O、secrets、heartbeat、FX cache、共通処理 |
 
 大規模なorchestration本体は`analyst/` packageです。§15ではなく本台帳§14も参照してください。
@@ -40,19 +40,20 @@
 | Lifecycle | Modules | 境界 |
 |---|---|---|
 | live | `action_stage_log.py`, `action_state_tracker.py`, `execution_invalidation.py` | stage監査、action lifecycle、invalidation |
-| live | `execution_readiness.py`, `execution_safety.py`, `policy_engine.py` | 決定論的採用、freshness、安全gate |
+| live | `execution_readiness.py`, `execution_safety.py`, `execution_preflight.py`, `policy_engine.py` | 決定論的採用、freshness、署名付き発注前安全gate |
 | live | `feature_controls.py` | runtime機能switch、実効状態の理由、fail-closed UI contract |
 | live | `order_intent_resolver.py`, `exit_sizing.py`, `execution_explanation.py`, `action_amounts.py` | 冪等intent、決定論的数量、構造化金額表示 |
 | observe | `execution_plan_engine.py`, `execution_plan_observer.py`, `execution_quality.py` | plan budget、enforce readiness、shortfall |
-| live | `behavioral_guard.py`, `margin_manager.py` | drawdown行動guardと信用管理 |
+| live | `behavioral_guard.py`, `margin_manager.py` | 実損益P&L shock guardと信用管理 |
 
 ## 5. Risk・allocation・quant研究
 
 | Lifecycle | Modules | 境界 |
 |---|---|---|
-| live | `risk_engine.py`, `portfolio_risk_returns.py`, `risk_model_validation.py` | VaR/CVaR、保有based return、Kupiec |
+| live | `risk_policy.py`, `risk_engine.py`, `portfolio_risk_returns.py`, `risk_model_validation.py` | 版管理された固定上限、VaR/CVaR、保有based return、Kupiec |
 | optional | `portfolio_optimizer.py`, `optimize.py`, `bl_alpha_sources.py` | allocation objectiveと独立BL view |
 | live/advisory | `market_regime_v2.py`, `regime_params.py`, `vix_classification.py`, `vix_tracker.py` | regime/rate/shock policy、volatility state |
+| shadow/manual-promote | `drawdown_state_machine.py`, `drawdown_enforcement.py` | flow調整DDのhysteresisと明示的enforcement昇格 |
 | live | `drawdown_dca_engine.py`, `leveraged_decay_monitor.py` | DCA ladderとleveraged decay |
 | research/default-deny | `ginn_model.py` | candidate training、promotion manifest、GARCH fallback |
 | shadow | `kelly_sizing.py`, `kelly_shadow.py` | 推薦統計とhalf-Kelly反実仮想 |

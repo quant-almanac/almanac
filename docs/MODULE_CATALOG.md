@@ -12,7 +12,7 @@ This is an ownership map, not a claim that every file is live. The lifecycle col
 |---|---|---|
 | live | `portfolio_analyst.py`, `portfolio_agent.py`, `bot_commands.py`, `telegram_bot.py`, `generate_dashboard.py`, `weekly_report.py` | Daily CLI/API-facing analysis and human presentation |
 | live | `daily_health_check.py`, `watchdog.py`, `alert.py`, `nightly_recheck.py`, `post_run_verify.py` | Health, stale-output detection and post-run consistency |
-| optional | `streamlit_app.py`, `decision_support.py`, `ollama_chat.py` | Alternate UI and on-demand decision/chat tools |
+| optional | `decision_support.py` | On-demand decision support outside the primary Next.js console |
 | shared | `utils.py` | Atomic I/O, secrets, heartbeats, FX cache and common utilities |
 
 ## 2. LLM routing, analysis and cost
@@ -40,19 +40,20 @@ The large orchestration implementation lives in the `analyst/` package; see §15
 | Lifecycle | Modules | Boundary |
 |---|---|---|
 | live | `action_stage_log.py`, `action_state_tracker.py`, `execution_invalidation.py` | Stage audit, action lifecycle and invalidation overlay |
-| live | `execution_readiness.py`, `execution_safety.py`, `policy_engine.py` | Deterministic admission, freshness and safety gates |
+| live | `execution_readiness.py`, `execution_safety.py`, `execution_preflight.py`, `policy_engine.py` | Deterministic admission, freshness and signed pre-order safety gates |
 | live | `feature_controls.py` | Runtime feature switches, effective-state reasons and fail-closed UI contract |
 | live | `order_intent_resolver.py`, `exit_sizing.py`, `execution_explanation.py`, `action_amounts.py` | Idempotent intent, deterministic quantity and structured amount display |
 | observe | `execution_plan_engine.py`, `execution_plan_observer.py`, `execution_quality.py` | Plan budgets, enforce-readiness evidence and implementation shortfall |
-| live | `behavioral_guard.py`, `margin_manager.py` | Drawdown behavior guard and margin-position controls |
+| live | `behavioral_guard.py`, `margin_manager.py` | Realized-P&L shock guard and margin-position controls |
 
 ## 5. Risk, allocation and quantitative research
 
 | Lifecycle | Modules | Boundary |
 |---|---|---|
-| live | `risk_engine.py`, `portfolio_risk_returns.py`, `risk_model_validation.py` | VaR/CVaR, holding-based returns and Kupiec validation |
+| live | `risk_policy.py`, `risk_engine.py`, `portfolio_risk_returns.py`, `risk_model_validation.py` | Versioned fixed limits, VaR/CVaR, holding-based returns and Kupiec validation |
 | optional | `portfolio_optimizer.py`, `optimize.py`, `bl_alpha_sources.py` | Allocation objectives and independent Black-Litterman views |
 | live/advisory | `market_regime_v2.py`, `regime_params.py`, `vix_classification.py`, `vix_tracker.py` | Regime/rate/shock policy and volatility-state inputs |
+| shadow/manual-promote | `drawdown_state_machine.py`, `drawdown_enforcement.py` | Flow-adjusted DD hysteresis and explicit enforcement promotion |
 | live | `drawdown_dca_engine.py`, `leveraged_decay_monitor.py` | DCA ladder and leveraged-product decay |
 | research/default-deny | `ginn_model.py` | Candidate training, promotion manifest and GARCH fallback |
 | shadow | `kelly_sizing.py`, `kelly_shadow.py` | Recommendation statistics and counterfactual half-Kelly cap |

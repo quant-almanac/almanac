@@ -25,13 +25,16 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from datetime import date, timedelta
 from pathlib import Path
 from typing import Optional
 
 BASE_DIR = Path(__file__).parent
-DEFAULT_CSV_DIR = Path.home() / "Downloads" / "broker_csv"
+# A dedicated landing directory is explicit operational input.  The old
+# Downloads path made an absent folder look like a successful quiet run.
+DEFAULT_CSV_DIR = Path(os.environ.get("ALMANAC_BROKER_CSV_DIR", BASE_DIR / "data" / "broker_ingest"))
 
 
 def _find_latest_csv(broker: str, csv_dir: Path) -> Optional[Path]:
@@ -154,7 +157,7 @@ def reconcile_broker(
     return summary
 
 
-def _main() -> None:
+def _main() -> int:
     parser = argparse.ArgumentParser(description="Weekly broker reconcile cron wrapper")
     parser.add_argument("--csv-dir", default=str(DEFAULT_CSV_DIR),
                         help=f"CSV 配置ディレクトリ (default: {DEFAULT_CSV_DIR})")
@@ -179,7 +182,13 @@ def _main() -> None:
         for broker in [b.strip() for b in args.brokers.split(",") if b.strip()]:
             latest = _find_latest_csv(broker, csv_dir)
             if latest is None:
-                results.append({"broker": broker, "skipped": "no CSV found"})
+                results.append({
+                    "broker": broker,
+                    "status": "warn",
+                    "error_code": "broker_input_missing",
+                    "skipped": "no CSV found",
+                    "csv_dir": str(csv_dir),
+                })
                 continue
             try:
                 r = reconcile_broker(
@@ -188,7 +197,7 @@ def _main() -> None:
                 )
                 results.append(r)
             except Exception as e:
-                err = {"broker": broker, "csv": str(latest), "error": str(e)}
+                err = {"broker": broker, "status": "error", "csv": str(latest), "error": str(e)}
                 results.append(err)
                 if args.notify:
                     # ALMANAC: telegram disabled — ai_analysis only
@@ -197,7 +206,13 @@ def _main() -> None:
 
     position_csv = _find_latest_position_csv(csv_dir)
     if position_csv is None:
-        results.append({"scope": "rakuten_taxable_cost_basis", "skipped": "no position CSV found"})
+        results.append({
+            "scope": "rakuten_taxable_cost_basis",
+            "status": "warn",
+            "error_code": "broker_position_input_missing",
+            "skipped": "no position CSV found",
+            "csv_dir": str(csv_dir),
+        })
     else:
         try:
             cost_report = reconcile_tax_cost_basis(position_csv)
@@ -211,7 +226,7 @@ def _main() -> None:
                 # )
                 pass
         except Exception as e:
-            results.append({"scope": "rakuten_taxable_cost_basis", "error": str(e)})
+            results.append({"scope": "rakuten_taxable_cost_basis", "status": "error", "error": str(e)})
 
     print(json.dumps({
         "date_from": date_from,
@@ -220,14 +235,26 @@ def _main() -> None:
     }, ensure_ascii=False, indent=2, default=str))
 
     # heartbeat
+    ok = False
     try:
         from utils import heartbeat
-        ok = all(("error" not in r and not r.get("has_discrepancy", False)) for r in results)
-        heartbeat("broker_reconcile_cron", "ok" if ok else "warn",
-                  extra={"brokers": [r.get("broker") for r in results]})
+        ok = all(
+            r.get("status") not in {"warn", "error"}
+            and "error" not in r
+            and not r.get("has_discrepancy", False)
+            for r in results
+        )
+        heartbeat(
+            "broker_reconcile_cron", "ok" if ok else "warn",
+            extra={"brokers": [r.get("broker") for r in results], "results": results},
+        )
     except Exception:
         pass
+    # Current cron redirection does not transport process status anywhere; the
+    # heartbeat above is the operational signal.  Exit 2 still makes manual
+    # and future wrapper invocations visibly distinguish missing input.
+    return 0 if ok else 2
 
 
 if __name__ == "__main__":
-    _main()
+    raise SystemExit(_main())
