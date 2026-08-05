@@ -31,6 +31,11 @@ SKIP_ALERT_KEYS = {
 _ALERT_PRICE_CACHE: dict[str, tuple[float, float]] = {}
 ALERT_PRICE_CACHE_TTL_SEC = 900  # 15分。5分ループで同じ yfinance socket を増やさない。
 
+# Telegram 送信の一時障害リトライ。2s → 4s の指数バックオフで合計待機は最大 6 秒:
+# 朝の分析 (LaunchAgent 6:15) を実質遅らせず、数秒の DNS 断は吸収できる幅。
+TELEGRAM_MAX_ATTEMPTS = 3
+TELEGRAM_RETRY_BASE_SEC = 2.0
+
 
 def load_alert_log() -> dict:
     return load_json(ALERT_LOG_FILE, default={})
@@ -51,26 +56,79 @@ def already_sent(log: dict, key: str) -> bool:
 def mark_sent(log: dict, key: str):
     log[key] = datetime.now().isoformat()
 
+def _telegram_retry_after(response) -> float | None:
+    """Read Telegram's ``retry_after`` hint from a 429 response, if present."""
+    try:
+        payload = response.json()
+    except Exception:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    params = payload.get("parameters")
+    raw = params.get("retry_after") if isinstance(params, dict) else None
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return None
+    return value if value >= 0 else None
+
+
 def send_telegram(message) -> bool:
     """Send one Telegram message and report the actual API result.
 
     The caller owns HTML escaping because some alert call sites intentionally
     use supported Telegram HTML tags.  Transport failures must not be hidden:
     ``raise_for_status`` includes Bot API 4xx responses such as malformed HTML.
+
+    Transient failures are retried (2026-08-05): a momentary DNS outage used to
+    drop the entire morning briefing, because every caller gets one attempt and
+    ``send_to_telegram`` aborts the whole batch on the first failure.  Only
+    failures that a retry can actually fix are retried -- connection/DNS errors,
+    timeouts, 429 rate limits, and 5xx.  A 4xx still propagates immediately:
+    malformed HTML is permanent, and retrying it would just delay the error.
+    Retrying a timeout can in principle duplicate a message that Telegram did
+    accept; a duplicate alert is preferred over a silently missing one.
     """
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         return False
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    response = requests.post(url, data={
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": message,
-        "parse_mode": "HTML"
-    }, timeout=15)
-    response.raise_for_status()
-    payload = response.json()
-    if not isinstance(payload, dict) or payload.get("ok") is not True:
-        raise RuntimeError(f"Telegram Bot API rejected message: {payload!r}")
-    return True
+    for attempt in range(1, TELEGRAM_MAX_ATTEMPTS + 1):
+        last_attempt = attempt == TELEGRAM_MAX_ATTEMPTS
+        backoff = TELEGRAM_RETRY_BASE_SEC * (2 ** (attempt - 1))
+        try:
+            response = requests.post(url, data={
+                "chat_id": TELEGRAM_CHAT_ID,
+                "text": message,
+                "parse_mode": "HTML"
+            }, timeout=15)
+        except (requests.ConnectionError, requests.Timeout) as exc:
+            # Never reached Telegram (DNS failure, refused/reset connection,
+            # or no response in time), so a retry cannot duplicate a delivery.
+            if last_attempt:
+                raise
+            print(f'[WARN] Telegram送信リトライ {attempt}/{TELEGRAM_MAX_ATTEMPTS} ({type(exc).__name__}): {exc}')
+            time.sleep(backoff)
+            continue
+
+        # ``status_code`` is absent on the minimal response doubles used by
+        # tests and legacy wrappers; those fall through to raise_for_status().
+        status = getattr(response, "status_code", None)
+        if isinstance(status, int) and (status == 429 or 500 <= status < 600):
+            if last_attempt:
+                response.raise_for_status()
+            hinted = _telegram_retry_after(response) if status == 429 else None
+            delay = hinted if hinted is not None else backoff
+            print(f'[WARN] Telegram送信リトライ {attempt}/{TELEGRAM_MAX_ATTEMPTS} (HTTP {status}, {delay:.1f}s待機)')
+            time.sleep(delay)
+            continue
+
+        response.raise_for_status()
+        payload = response.json()
+        if not isinstance(payload, dict) or payload.get("ok") is not True:
+            raise RuntimeError(f"Telegram Bot API rejected message: {payload!r}")
+        return True
+    # TELEGRAM_MAX_ATTEMPTS >= 1 guarantees the loop returns or raises above.
+    raise AssertionError("unreachable: telegram retry loop exhausted without result")
 
 def load_holdings():
     """保有銘柄を読み込む"""
