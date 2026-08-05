@@ -1050,8 +1050,19 @@ def _save_candidates(result: dict, output_path: Path | None = None) -> None:
         with os.fdopen(fd, 'w', encoding='utf-8') as f:
             json.dump(result, f, ensure_ascii=False, indent=2)
         os.replace(tmp, target)
-    except Exception:
-        pass
+    except Exception as e:
+        # 握り潰さない。short_candidates.json は decision snapshot の
+        # screening カテゴリを構成する意思決定入力で、書けていないのに
+        # 「候補 N 件」とだけログに出ると、下流は 72h 後に stale となり
+        # 全発注候補が review に落ちる — 症状が出るのは5日後で、原因は
+        # ログに残らない。2026-08-05 に実際にこれが起きた (launchd の
+        # maxfiles=256 枯渇で mkstemp が OSError(24) を返していた)。
+        print(
+            f'[short] ❌ 候補ファイルを書き込めませんでした: {target.name}: '
+            f'{type(e).__name__}: {e}',
+            file=sys.stderr,
+        )
+        raise
 
 
 def load_last_candidates() -> dict:
