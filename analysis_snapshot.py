@@ -230,10 +230,32 @@ def _provenance_for_file(
     max_age_hours: float,
     now: datetime,
     source_label: str,
+    attestation_scope: Optional[str] = None,
+    base_dir: Optional[Path] = None,
 ) -> SourceProvenance:
+    """ファイル由来の as_of で鮮度を判定する。
+
+    ``attestation_scope`` を渡した場合、その対象について有効な
+    「証券会社の内容と一致している」表明があれば as_of を表明時刻まで
+    進める (2026-08-05)。holdings/account は楽天CSV取込でしか更新されず、
+    96h の壁時計だけで判定すると4日ごとに必ず stale 化して発注候補が
+    ready にならない自己ロックになるため。表明はその時点の内容ハッシュに
+    紐づくので、内容が変われば自動的に失効する。
+    """
     as_of = _extract_json_timestamp(path, ts_keys)
+    label = source_label
+    if attestation_scope:
+        from holdings_freshness import effective_source_as_of
+
+        as_of, origin = effective_source_as_of(
+            scope=attestation_scope,
+            file_as_of=as_of,
+            base_dir=Path(base_dir) if base_dir is not None else path.parent,
+        )
+        if origin == "attestation":
+            label = f"{source_label}(attested)"
     return SourceProvenance(
-        source=source_label,
+        source=label,
         source_as_of=as_of.isoformat() if as_of else None,
         retrieved_at=now.isoformat(),
         freshness_status=_freshness_status(as_of, now=now, max_age_hours=max_age_hours),
@@ -260,11 +282,13 @@ def build_base_snapshot(*, base_dir: Path = BASE_DIR, now: Optional[datetime] = 
         base_dir / "holdings.json", ts_keys=("__mtime__",),
         max_age_hours=stale_after_hours("holdings"),
         now=now, source_label="holdings.json",
+        attestation_scope="holdings", base_dir=base_dir,
     )
     cash = _provenance_for_file(
         base_dir / "account.json", ts_keys=("last_updated",),
         max_age_hours=stale_after_hours("cash"),
         now=now, source_label="account.json",
+        attestation_scope="cash", base_dir=base_dir,
     )
     prices = _provenance_for_file(
         base_dir / "technical_state.json", ts_keys=("cached_at",),
@@ -292,25 +316,35 @@ def build_base_snapshot(*, base_dir: Path = BASE_DIR, now: Optional[datetime] = 
         now=now, source_label="news_signal_candidates.json",
     )
 
+    # 各ファイルを *その生産者の周期に対応する* ポリシーで評価し、最も悪い
+    # status を採る。以前は3ファイルの最古 as_of に一律 72h を当てていたが、
+    # long_term_screener は日・木の週2回 (最大96h間隔) なので構造的に必ず
+    # stale になり、日次の2ファイルが新鮮でも screening 全体を stale にして
+    # いた (2026-08-05)。保守的に「最も悪いものを採る」性質は維持する。
     screening_files = [
-        (base_dir / "short_candidates.json", ("generated_at", "as_of")),
-        (base_dir / "margin_long_candidates.json", ("generated_at",)),
-        (base_dir / "long_term_screen_results.json", ("as_of",)),
+        (base_dir / "short_candidates.json", ("generated_at", "as_of"), "screening"),
+        (base_dir / "margin_long_candidates.json", ("generated_at",), "screening"),
+        (base_dir / "long_term_screen_results.json", ("as_of",), "screening_long_term"),
     ]
+    _status_rank = {"fresh": 0, "degraded": 1, "stale": 2, "unknown": 3}
     screening_as_of: Optional[datetime] = None
-    for path, keys in screening_files:
+    screening_status = "fresh"
+    for path, keys, policy_source in screening_files:
         ts = _extract_json_timestamp(path, keys)
         if ts is not None and (screening_as_of is None or ts < screening_as_of):
-            screening_as_of = ts  # 複数ファイルの中で最も古いものを採用 (保守的)
+            screening_as_of = ts  # 表示用は最古を採用 (保守的)
+        status = _freshness_status(
+            ts, now=now, max_age_hours=stale_after_hours(policy_source),
+        )
+        if _status_rank[status] > _status_rank[screening_status]:
+            screening_status = status
     screening = SourceProvenance(
-        source="+".join(p.name for p, _ in screening_files),
+        source="+".join(p.name for p, _, _ in screening_files),
         source_as_of=screening_as_of.isoformat() if screening_as_of else None,
         retrieved_at=now.isoformat(),
-        freshness_status=_freshness_status(
-            screening_as_of, now=now, max_age_hours=stale_after_hours("screening"),
-        ),
+        freshness_status=screening_status,
         max_age_policy_hours=stale_after_hours("screening"),
-        artifact_hash=_combined_hash([p for p, _ in screening_files]),
+        artifact_hash=_combined_hash([p for p, _, _ in screening_files]),
     )
 
     return BaseSnapshot(

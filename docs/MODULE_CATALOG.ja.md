@@ -70,7 +70,7 @@
 | live | `sector_rotation.py`, `sector_strength_updater.py` | sector state |
 | shared | `instrument_metadata.py`, `pseudo_tickers.py`, `download_tickers.py`, `expand_tickers.py` | instrument identity、synthetic ID、universe |
 | maintenance | `parquet_rebuilder.py`, `sync_jp_universe_prices.py` | local price store修復、JP同期 |
-| live | `analysis_snapshot.py`, `freshness_policy.py`, `claim_provenance.py` | decision input凍結、refresh/stale不変条件、claim lineage |
+| live | `analysis_snapshot.py`, `freshness_policy.py`, `claim_provenance.py`, `holdings_freshness.py` | decision input凍結、refresh/stale不変条件、claim lineage |
 
 ## 7. Screener とcandidate計測
 

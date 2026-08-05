@@ -70,7 +70,7 @@ The large orchestration implementation lives in the `analyst/` package; see §15
 | live | `sector_rotation.py`, `sector_strength_updater.py` | Sector state |
 | shared | `instrument_metadata.py`, `pseudo_tickers.py`, `download_tickers.py`, `expand_tickers.py` | Instrument identity, synthetic IDs and universe files |
 | maintenance | `parquet_rebuilder.py`, `sync_jp_universe_prices.py` | Local price-store repair and JP-universe synchronization |
-| live | `analysis_snapshot.py`, `freshness_policy.py`, `claim_provenance.py` | Frozen decision inputs, refresh/staleness invariants and claim lineage |
+| live | `analysis_snapshot.py`, `freshness_policy.py`, `claim_provenance.py`, `holdings_freshness.py` | Frozen decision inputs, refresh/staleness invariants and claim lineage |
 
 ## 7. Screeners and candidate measurement
 
