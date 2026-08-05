@@ -43,6 +43,13 @@ SOURCE_FRESHNESS_POLICIES: dict[str, FreshnessPolicy] = {
     "macro": FreshnessPolicy(refresh_after_hours=12.0, stale_after_hours=24.0),
     "news": FreshnessPolicy(refresh_after_hours=6.0, stale_after_hours=12.0),
     "screening": FreshnessPolicy(refresh_after_hours=None, stale_after_hours=72.0),
+    # 長期スクリーニングだけは cron が日・木の週2回 (0 7 * * 0,4)。日曜→木曜は
+    # 96h 空くので、日次ソースと同じ 72h を課すと毎サイクル必ず stale になり、
+    # 「最も古いものを採用」する screening カテゴリ全体を道連れにする
+    # (2026-08-05: 日次2ファイルは 0.0h/13.4h と新鮮なのに、この1本が 73.6h で
+    # 全発注候補が review に落ちていた)。生産者の実周期を refresh 側に明示し、
+    # stale はそれを上回る値にして契約 refresh < stale を成立させる。
+    "screening_long_term": FreshnessPolicy(refresh_after_hours=96.0, stale_after_hours=120.0),
     "options": FreshnessPolicy(refresh_after_hours=12.0, stale_after_hours=24.0),
 }
 

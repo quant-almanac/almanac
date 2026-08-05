@@ -173,8 +173,13 @@ def test_screening_uses_short_as_of_not_scanned_count(tmp_path):
 
     base = snap.build_base_snapshot(base_dir=tmp_path, now=now)
 
+    # source_as_of は引き続き最古のファイル (long_term) の as_of を表示する。
     assert base.screening.source_as_of == "2026-07-27T07:03:00"
-    assert base.screening.freshness_status == "degraded"
+    # status は 2026-08-05 からファイルごとの生産者周期で評価する。long_term は
+    # 日・木の週2回なので 42.9h は自身の 120h ポリシー内で fresh、日次2本も
+    # 7h/6h で fresh。旧実装は最古の as_of に一律 72h を当てて degraded として
+    # いたが、それは週2回の生産者に日次の基準を課していたための誤判定だった。
+    assert base.screening.freshness_status == "fresh"
 
 
 def test_base_snapshot_hash_changes_when_file_content_changes(tmp_path):
