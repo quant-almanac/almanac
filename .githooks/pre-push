@@ -1,0 +1,8 @@
+#!/bin/sh
+# Public pushes must pass the same historical disclosure check as CI.
+set -eu
+
+while read -r local_ref local_sha remote_ref remote_sha; do
+  test "$local_sha" = "0000000000000000000000000000000000000000" && continue
+  python scripts/check_public_safety.py --history "$local_sha"
+done
