@@ -3,6 +3,18 @@ from datetime import date
 import contribution_schedule as schedule
 
 
+def test_empty_environment_schedule_has_no_cash_reservations(monkeypatch):
+    monkeypatch.delenv("ALMANAC_CONTRIBUTION_SCHEDULE_JSON", raising=False)
+    assert schedule._load_contributions() == []
+
+    monkeypatch.setattr(schedule, "CONTRIBUTIONS", [])
+    assert schedule.cash_route_outflows(
+        owner="wife", broker="sbi", currency="JPY",
+        cash_route="CASH_JPY_SBI_WIFE",
+        date_from="2026-08-07", date_to="2026-08-13",
+    ) == []
+
+
 def test_only_explicit_broker_cash_schedule_reserves_its_wallet(monkeypatch):
     monkeypatch.setattr(schedule, "CONTRIBUTIONS", [
         {

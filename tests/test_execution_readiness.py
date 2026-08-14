@@ -1082,3 +1082,26 @@ def test_reason_scope_distinguishes_candidate_and_analysis_failures():
     assert (global_reason["reason_scope"], global_reason["scope_key"]) == (
         "analysis", "analysis:global",
     )
+
+
+def test_capacity_below_minimum_is_blocked_with_dedicated_reason(tmp_path):
+    now = datetime(2026, 8, 14, 6, 15, tzinfo=JST)
+    _write_base(tmp_path, now, ticker="1306.T")
+    result = classify_execution_readiness({
+        "ticker": "1306.T", "type": "buy", "order_type": "limit",
+        "limit_price": 3_500, "quantity": 150,
+        "max_executable_quantity_below_minimum": True,
+        "max_executable_quantity": 40,
+        "minimum_executable_quantity": 50,
+        "max_executable_notional_jpy": 140_000,
+        "minimum_executable_notional_jpy": 175_000,
+        "capacity_shortfall_jpy": 35_000,
+    }, base_dir=tmp_path, now=now)
+
+    assert result["execution_readiness"] == "blocked"
+    reason = next(
+        row for row in result["execution_block_reasons"]
+        if row["code"] == "max_executable_quantity_below_minimum"
+    )
+    assert reason["capacity_shortfall_jpy"] == 35_000
+    assert "必要余力差額" in reason["message"]

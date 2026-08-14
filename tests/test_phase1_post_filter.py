@@ -3228,6 +3228,9 @@ def test_policy_rejected_actions_remain_visible_when_all_blocked():
     assert result["post_filter"]["all_actions_filtered"] is True
     assert "META" in result["telegram_message"]
     assert "参考候補" in result["telegram_message"]
+    assert result["decision_summary"]["candidate_count"] == 1
+    assert result["decision_summary"]["filtered_count"] == 1
+    assert result["decision_summary"]["count_conservation_ok"] is True
 
 
 def test_policy_rejected_non_executable_action_keeps_intrinsic_reason(monkeypatch):
@@ -3788,6 +3791,46 @@ def test_wallet_capacity_downsizes_buy_without_changing_route(monkeypatch, tmp_p
     assert action["execution_capacity_mode"] == "downsized"
     assert action["estimated_notional_jpy"] == 175_000
     assert action["execution_account"] == "特定"
+
+
+def test_wallet_capacity_below_minimum_stays_visible_for_readiness(monkeypatch, tmp_path):
+    import execution_readiness
+
+    _silence_external_filters(monkeypatch)
+    monkeypatch.setattr(tunable_params, "get", _tp_get)
+    monkeypatch.setattr(
+        execution_readiness,
+        "resolve_cash_buying_capacity",
+        lambda action, **kwargs: {
+            "readiness": "ready",
+            "effective_cash": 143_000,
+            "currency": "JPY",
+            "cash_capacity_observation": {"capacity_valid_until": "2026-08-14T15:30:00+09:00"},
+        },
+    )
+    synthesis = {
+        "priority_actions": [{
+            "ticker": "1306.T", "type": "buy", "amount_hint": "150口",
+            "quantity": 150, "decision_price": 3_500, "limit_price": 3_500,
+            "currency": "JPY", "execution_owner": "husband",
+            "execution_broker": "rakuten", "execution_account": "特定",
+            "tier": "Long", "confidence_pct": 75,
+        }],
+    }
+
+    result = analyst._phase1_post_filter(
+        synthesis, 30_000_000, fx_rate=150, positions=[], base_dir=tmp_path,
+        side_effects=False,
+    )
+
+    assert len(result["priority_actions"]) == 1
+    action = result["priority_actions"][0]
+    assert action["execution_capacity_mode"] == "below_minimum"
+    assert action["quantity"] == 150
+    assert action["max_executable_quantity"] == 40
+    assert action["minimum_executable_quantity"] == 50
+    assert action["capacity_shortfall_jpy"] == 32_000
+    assert result["_filtered_actions"] == []
 
 
 def test_reproposal_suppression_starts_only_with_versioned_prior_run(tmp_path):

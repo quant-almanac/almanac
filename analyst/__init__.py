@@ -7255,6 +7255,7 @@ def _phase1_post_filter(
     cash_info: dict | None = None,
     execution_plan: dict | None = None,
     rebalance_medium: dict | None = None,
+    base_dir: Path | None = None,
     now: datetime | None = None,
     side_effects: bool = True,
 ) -> dict:
@@ -7269,6 +7270,7 @@ def _phase1_post_filter(
     """
     if not isinstance(synthesis, dict):
         return synthesis
+    state_dir = Path(base_dir) if base_dir is not None else BASE_DIR
     analysis_now = now or datetime.now(ZoneInfo("Asia/Tokyo"))
     if analysis_now.tzinfo is None:
         analysis_now = analysis_now.replace(tzinfo=ZoneInfo("Asia/Tokyo"))
@@ -7392,15 +7394,21 @@ def _phase1_post_filter(
                 [],
                 context_blocks=synthesis.get("context_blocks") if isinstance(synthesis.get("context_blocks"), dict) else {},
             )
+        candidate_count = len(policy_rejected_rows)
+        filtered_count = len(policy_rejected_rows)
+        review_count = 0
+        deferred_count = 0
         synthesis["decision_summary"] = {
-            "candidate_count": len(policy_rejected_rows),
+            "candidate_count": candidate_count,
             "executable_count": 0,
-            "review_count": 0,
-            "filtered_count": len(policy_rejected_rows),
-            "deferred_count": 0,
+            "review_count": review_count,
+            "filtered_count": filtered_count,
+            "deferred_count": deferred_count,
             "no_action_classification": "system_constraints" if policy_rejected_rows else "market_no_trade",
             "reason_counts": synthesis.get("_filtered_action_summary") or {},
-            "count_conservation_ok": True,
+            "count_conservation_ok": (
+                candidate_count == filtered_count + review_count + deferred_count
+            ),
         }
         _set_operational_stance(
             synthesis,
@@ -7507,7 +7515,7 @@ def _phase1_post_filter(
         # VIX を market_meta から拾う（指定なければ None でも OK）
         _vix = None
         try:
-            mm_path = BASE_DIR / "vix_state.json"
+            mm_path = state_dir / "vix_state.json"
             if mm_path.exists():
                 _vix = float(json.loads(mm_path.read_text()).get("vix") or 0) or None
         except Exception:
@@ -7520,7 +7528,7 @@ def _phase1_post_filter(
     try:
         from execution_safety import canonical_broker, canonical_owner, load_nisa_profiles
 
-        _nisa_raw_for_routes, _nisa_profiles_for_routes = load_nisa_profiles(BASE_DIR)
+        _nisa_raw_for_routes, _nisa_profiles_for_routes = load_nisa_profiles(state_dir)
     except Exception:
         canonical_broker = lambda value: str(value or "").strip().lower()  # type: ignore
         canonical_owner = lambda value: str(value or "").strip().lower()  # type: ignore
@@ -7580,7 +7588,7 @@ def _phase1_post_filter(
     # 優先 2: holdings.json を直接読む（後方互換）
     if not holdings_price_map:
         try:
-            h_path = BASE_DIR / "holdings.json"
+            h_path = state_dir / "holdings.json"
             if h_path.exists():
                 h_data = json.loads(h_path.read_text(encoding="utf-8"))
                 # 旧形式: {"positions": [...]}
@@ -8232,7 +8240,7 @@ def _phase1_post_filter(
 
             capacity = resolve_cash_buying_capacity(
                 action,
-                base_dir=BASE_DIR,
+                base_dir=state_dir,
                 now=analysis_now,
             )
         except Exception as exc:
@@ -8266,7 +8274,7 @@ def _phase1_post_filter(
             from execution_safety import evaluate_nisa_capacity, is_nisa_account
 
             if is_nisa_account(action.get("execution_account") or action.get("account")):
-                nisa_capacity = evaluate_nisa_capacity(action, base_dir=BASE_DIR, now=analysis_now)
+                nisa_capacity = evaluate_nisa_capacity(action, base_dir=state_dir, now=analysis_now)
                 action["nisa_capacity_observation"] = {
                     key: nisa_capacity.get(key)
                     for key in (
@@ -8306,6 +8314,11 @@ def _phase1_post_filter(
             action["execution_capacity_mode"] = "below_minimum"
             action["max_executable_quantity_below_minimum"] = True
             action["minimum_executable_quantity"] = minimum_quantity
+            action["max_executable_notional_jpy"] = round(maximum_quantity * unit_jpy)
+            action["minimum_executable_notional_jpy"] = round(minimum_quantity * unit_jpy)
+            action["capacity_shortfall_jpy"] = round(
+                max(0.0, minimum_quantity * unit_jpy - maximum_jpy)
+            )
             return estimated_jpy
 
         _rewrite_action_shares(action, maximum_quantity)
@@ -8480,7 +8493,7 @@ def _phase1_post_filter(
                 enrich_action_routing,
             )
 
-            a = enrich_action_routing(a, base_dir=BASE_DIR)
+            a = enrich_action_routing(a, base_dir=state_dir)
             from position_identity import position_identity_for_action
             _routed_identity = position_identity_for_action(a)
             if _routed_identity is not None:
@@ -8837,14 +8850,13 @@ def _phase1_post_filter(
         # (1) 最低取引額（少額ポジションの整理は免除）
         amt = _maybe_resize_kabu_mini_over_cap(a, amt)
         amt = _maybe_resize_to_wallet_capacity(a, amt)
-        if a.get("max_executable_quantity_below_minimum"):
-            a["filtered_reason"] = (
-                "max_executable_quantity_below_minimum: 確認済み実効買付余力の範囲では、"
-                f"最小取引額を満たす数量（{a.get('minimum_executable_quantity')}）を確保できません"
-            )
-            filtered.append(a); continue
-        amt = _maybe_bump_small_buy(a, amt)
-        if 0 <= amt < threshold:
+        capacity_below_minimum = bool(a.get("max_executable_quantity_below_minimum"))
+        # Keep this candidate on the board so readiness can explain the wallet
+        # shortfall.  The unchanged original amount must not be reclassified by
+        # the generic minimum, single-action-cap, or execution-plan filters.
+        if not capacity_below_minimum:
+            amt = _maybe_bump_small_buy(a, amt)
+        if not capacity_below_minimum and 0 <= amt < threshold:
             # 出口免除: 少額ポジション（評価額 < small_position_threshold_jpy）の sell/trim/stop_loss/take_profit は通す
             # → 「TXN 1株保有を売れない」永久ホールド問題を解消
             try:
@@ -8909,7 +8921,11 @@ def _phase1_post_filter(
         # （上書きを許すと「結局プロンプト注意書きに頼る」構造に戻ってしまうため）。
         # continuous DCA (amt=inf) は対象外。amt<0 (金額推定不能) は通常buy系では
         # 検証不能として fail-closed で reject する。
-        if atype_lc in {"buy", "add", "dca", "margin_buy", "short"} and amt != float("inf"):
+        if (
+            not capacity_below_minimum
+            and atype_lc in {"buy", "add", "dca", "margin_buy", "short"}
+            and amt != float("inf")
+        ):
             cap_profile = _single_action_cap_profile(a)
             cap_jpy = cap_profile["cap_jpy"]
             if amt < 0:
@@ -8938,7 +8954,10 @@ def _phase1_post_filter(
         # (1c) execution_plan — 週次/月次計画との整合。
         # H2 hard cap / DONE_LIST / blackout / tax など既存ガードを緩めないため、
         # ここは単発上限チェック後にのみ実行する。
-        if atype_lc in {"buy", "add", "dca", "margin_buy", "sell", "trim", "reduce", "short", "cover"}:
+        if (
+            not capacity_below_minimum
+            and atype_lc in {"buy", "add", "dca", "margin_buy", "sell", "trim", "reduce", "short", "cover"}
+        ):
             cap_profile_for_plan = _single_action_cap_profile(a)
             ok_plan, plan_reason = _apply_execution_plan_gate(a, amt, cap_profile_for_plan["cap_jpy"])
             if not ok_plan:
@@ -9124,7 +9143,7 @@ def _phase1_post_filter(
 
     try:
         from execution_readiness import apply_execution_readiness
-        apply_execution_readiness(kept, base_dir=BASE_DIR, now=analysis_now)
+        apply_execution_readiness(kept, base_dir=state_dir, now=analysis_now)
     except Exception as exc:
         for action in kept:
             action["execution_readiness"] = "review"
@@ -9135,7 +9154,7 @@ def _phase1_post_filter(
     _downgrade_quantity_sync_failures(kept)
     kept, reproposal_suppressed = _suppress_repeated_candidate_failures(
         kept,
-        base_dir=BASE_DIR,
+        base_dir=state_dir,
         now=analysis_now,
     )
     if reproposal_suppressed:

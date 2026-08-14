@@ -937,6 +937,29 @@ def classify_execution_readiness(
 
     if action.get("non_executable"):
         add("review", "non_executable_candidate", str(action.get("non_executable_reason") or "非実行候補"))
+    if action.get("max_executable_quantity_below_minimum"):
+        minimum_quantity = action.get("minimum_executable_quantity")
+        shortfall_jpy = action.get("capacity_shortfall_jpy")
+        message = (
+            "確認済み実効買付余力の範囲では、"
+            f"最小取引額を満たす数量（{minimum_quantity}）を確保できません"
+        )
+        if shortfall_jpy not in (None, ""):
+            try:
+                message += f"（必要余力差額 約¥{float(shortfall_jpy):,.0f}）"
+            except (TypeError, ValueError):
+                pass
+        add(
+            "blocked",
+            "max_executable_quantity_below_minimum",
+            message,
+            max_executable_quantity=action.get("max_executable_quantity"),
+            minimum_executable_quantity=minimum_quantity,
+            max_executable_notional_jpy=action.get("max_executable_notional_jpy"),
+            minimum_executable_notional_jpy=action.get("minimum_executable_notional_jpy"),
+            capacity_shortfall_jpy=shortfall_jpy,
+            capacity_valid_until=action.get("capacity_valid_until"),
+        )
     if action.get("execution_plan_would_filter"):
         # Observe mode measures policy disagreement; it must not enforce it.
         advisories.append({
