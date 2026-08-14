@@ -181,6 +181,183 @@ def _requested_buy_notional(action: dict, *, currency: str) -> float | None:
     return None
 
 
+def _business_days_between(start: datetime, end: datetime) -> int:
+    """Conservative weekday counter for stale-order observability only."""
+    if end < start:
+        return 0
+    day = start.date()
+    total = 0
+    while day < end.date():
+        day += timedelta(days=1)
+        if day.weekday() < 5:
+            total += 1
+    return total
+
+
+def _open_cash_order_reservations(
+    *,
+    base_dir: Path,
+    owner: str,
+    broker: str,
+    currency: str,
+    now: datetime,
+) -> dict:
+    """Summarise live ordered buys sharing a broker-cash wallet.
+
+    Ordered records are never auto-cancelled.  They therefore continue to
+    reserve buying power and are surfaced with their age so the user can
+    reconcile the broker order rather than silently recovering capacity.
+    """
+    try:
+        from execution_reconciliation import load_effective_execution_records
+        from execution_safety import canonical_broker, canonical_owner, economic_direction
+
+        rows = load_effective_execution_records(base_dir=base_dir)
+    except Exception as exc:
+        return {
+            "status": "unresolved",
+            "reserved_cash": None,
+            "reservation_count": 0,
+            "unresolved_reason": type(exc).__name__,
+            "reservations": [],
+        }
+
+    terminal_by_state: dict[str, datetime] = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        status = str(row.get("status") or "").lower()
+        if status not in {"executed", "partial", "filled", "done", "cancelled", "skip"}:
+            continue
+        state_id = str(row.get("action_state_id") or "")
+        when, _ = _execution_timestamp(row)
+        if state_id and when is not None:
+            terminal_by_state[state_id] = max(terminal_by_state.get(state_id, when), when)
+
+    reservations: list[dict] = []
+    unresolved: list[str] = []
+    for row in rows:
+        if not isinstance(row, dict) or str(row.get("status") or "").lower() != "ordered":
+            continue
+        state_id = str(row.get("action_state_id") or "")
+        ordered_at, _ = _execution_timestamp(row)
+        if state_id and ordered_at is not None and terminal_by_state.get(state_id, ordered_at) >= ordered_at:
+            continue
+        row_owner = canonical_owner(row.get("execution_owner") or row.get("owner"))
+        row_broker = canonical_broker(row.get("execution_broker") or row.get("broker"))
+        row_currency = str(
+            row.get("cash_currency")
+            or row.get("currency")
+            or ("JPY" if str(row.get("ticker") or "").upper().endswith(".T") else "")
+        ).upper()
+        if row_owner != owner or row_broker != broker or row_currency != currency:
+            continue
+        if economic_direction(row.get("direction") or row.get("type")) != "buy":
+            continue
+        reserved = _requested_buy_notional(row, currency=currency)
+        if reserved is None:
+            unresolved.append(str(row.get("id") or state_id or "unknown"))
+            continue
+        age_days = _business_days_between(ordered_at, now) if ordered_at else None
+        reservations.append({
+            "execution_id": row.get("id"),
+            "action_state_id": state_id or None,
+            "reserved_cash": round(reserved, 2),
+            "ordered_at": ordered_at.isoformat() if ordered_at else None,
+            "business_days_open": age_days,
+            "stale_requires_confirmation": bool(age_days is not None and age_days > 10),
+        })
+    return {
+        "status": "unresolved" if unresolved else "ok",
+        "reserved_cash": round(sum(row["reserved_cash"] for row in reservations), 2),
+        "reservation_count": len(reservations),
+        "oldest_ordered_at": min(
+            (row["ordered_at"] for row in reservations if row.get("ordered_at")),
+            default=None,
+        ),
+        "stale_reservation_count": sum(
+            1 for row in reservations if row.get("stale_requires_confirmation")
+        ),
+        "unresolved_execution_ids": unresolved,
+        "reservations": reservations,
+    }
+
+
+def _execution_timestamp(record: dict) -> tuple[datetime | None, str | None]:
+    for key in ("ordered_at", "placed_at", "executed_at_time", "saved_at", "recommended_at"):
+        timestamp = _parse_local_timestamp(record.get(key), local_tz=ZoneInfo("Asia/Tokyo"))
+        if timestamp is not None:
+            return timestamp, key
+    return None, None
+
+
+def _cash_capacity_valid_until(action: dict, *, now: datetime) -> datetime | None:
+    """Return the next executable session close, without inventing T+N rules."""
+    try:
+        from execution_safety import market_session_context
+
+        context = market_session_context(action.get("ticker"), now)
+    except Exception:
+        return None
+    for key in ("next_market_close", "market_close"):
+        parsed = _parse_local_timestamp(context.get(key), local_tz=ZoneInfo("Asia/Tokyo"))
+        if parsed is not None:
+            return parsed.astimezone(now.tzinfo)
+    return None
+
+
+def _scheduled_cash_outflows(
+    *,
+    owner: str,
+    broker: str,
+    currency: str,
+    cash_route: str,
+    resource_as_of: datetime,
+    capacity_valid_until: datetime,
+) -> dict:
+    """Reserve known standing-order outflows after the cash snapshot.
+
+    Schedule dates are nominal day-level facts.  Same-day inclusion cannot be
+    inferred from a snapshot timestamp, so it is reserved as well rather than
+    being credited optimistically.  The uncertainty remains visible in the
+    observation and prevents a later auto-resize from treating it as settled.
+    """
+    try:
+        from contribution_schedule import cash_route_outflows
+
+        rows = cash_route_outflows(
+            owner=owner,
+            broker=broker,
+            currency=currency,
+            cash_route=cash_route,
+            date_from=resource_as_of.date().isoformat(),
+            date_to=capacity_valid_until.date().isoformat(),
+        )
+    except Exception as exc:
+        return {"status": "unresolved", "amount": None, "rows": [], "error": type(exc).__name__}
+    reserved_rows = []
+    same_day = []
+    for when, contribution in rows:
+        item = {
+            "date": when.isoformat(),
+            "id": contribution.get("id"),
+            "amount": float(contribution.get("amount") or 0),
+            "label": contribution.get("label"),
+        }
+        if when > resource_as_of.date():
+            reserved_rows.append(item)
+        else:
+            same_day.append(item)
+            reserved_rows.append(item)
+    return {
+        "status": "ok",
+        "amount": round(sum(row["amount"] for row in reserved_rows), 2),
+        "rows": reserved_rows,
+        "same_day_rows": same_day,
+        "same_day_attribution_uncertain": bool(same_day),
+    }
+
+
 def _cash_snapshot_execution_authority(
     *,
     base_dir: Path,
@@ -324,6 +501,7 @@ def evaluate_cash_buying_power(
     *,
     base_dir: Path,
     now: datetime | None = None,
+    capacity_only: bool = False,
 ) -> dict:
     """Check an explicitly routed cash buy against that wallet only.
 
@@ -453,7 +631,7 @@ def evaluate_cash_buying_power(
                 **details,
             }],
         }
-    if required is None:
+    if required is None and not capacity_only:
         return {
             "required": True,
             "readiness": "blocked",
@@ -463,7 +641,10 @@ def evaluate_cash_buying_power(
                 **details,
             }],
         }
-    if required > balance:
+    # Preserve the direct, self-evident insufficiency result even when the
+    # snapshot timestamp is absent.  Effective-capacity accounting below is a
+    # stricter second check for requests that the reported balance could cover.
+    if required is not None and required > balance and not capacity_only:
         return {
             "required": True,
             "readiness": "blocked",
@@ -474,7 +655,6 @@ def evaluate_cash_buying_power(
                 **details,
             }],
         }
-
     now = now or datetime.now(ZoneInfo("Asia/Tokyo"))
     if now.tzinfo is None:
         now = now.replace(tzinfo=ZoneInfo("Asia/Tokyo"))
@@ -533,6 +713,79 @@ def evaluate_cash_buying_power(
         ),
         "cash_resource_authority_source": authority["authority_source"],
     })
+    capacity_valid_until = _cash_capacity_valid_until(action, now=now)
+    if capacity_valid_until is None:
+        return {
+            "required": True,
+            "readiness": "blocked",
+            "reasons": [{
+                "code": "cash_capacity_window_unresolved",
+                "message": "買付余力を有効とみなす市場セッション終了を確認できません",
+                **details,
+            }],
+        }
+    scheduled = _scheduled_cash_outflows(
+        owner=owner,
+        broker=broker,
+        currency=currency,
+        cash_route=route,
+        resource_as_of=effective_resource_as_of,
+        capacity_valid_until=capacity_valid_until,
+    )
+    reservations = _open_cash_order_reservations(
+        base_dir=base_dir,
+        owner=owner,
+        broker=broker,
+        currency=currency,
+        now=now,
+    )
+    capacity_observation = {
+        "cash_route": route,
+        "snapshot_balance": round(balance, 2),
+        "capacity_valid_until": capacity_valid_until.isoformat(),
+        "scheduled_outflows": scheduled,
+        "active_order_reservations": reservations,
+    }
+    if scheduled.get("status") != "ok":
+        return {
+            "required": True,
+            "readiness": "blocked",
+            "reasons": [{
+                "code": "cash_scheduled_outflow_unresolved",
+                "message": "現金スナップショット当日の定期引落を帰属できないため、買付余力を確定できません",
+                "cash_capacity_observation": capacity_observation,
+                **details,
+            }],
+        }
+    if reservations.get("status") != "ok":
+        return {
+            "required": True,
+            "readiness": "blocked",
+            "reasons": [{
+                "code": "cash_order_reservation_unresolved",
+                "message": "未約定買い注文の予約額を確定できないため、買付余力を確定できません",
+                "cash_capacity_observation": capacity_observation,
+                **details,
+            }],
+        }
+    effective_cash = balance - float(scheduled["amount"] or 0) - float(reservations["reserved_cash"] or 0)
+    capacity_observation["effective_cash"] = round(effective_cash, 2)
+    details["cash_capacity_observation"] = capacity_observation
+    details["available_cash"] = round(effective_cash, 2)
+    if required is not None and required > effective_cash and not capacity_only:
+        return {
+            "required": True,
+            "readiness": "blocked",
+            "reasons": [{
+                "code": "cash_balance_insufficient",
+                "message": (
+                    f"{route} の実効買付余力{effective_cash:,.2f}{currency}では"
+                    f"{required:,.2f}{currency}を買付できません"
+                ),
+                "shortfall": round(required - effective_cash, 2),
+                **details,
+            }],
+        }
     invalidating = authority["invalidating_event"]
     if invalidating is not None:
         return {
@@ -552,7 +805,111 @@ def evaluate_cash_buying_power(
     # Orders/fills are reserved by the intent/execution ledgers.  A manual
     # deposit, withdrawal or trade performed outside ALMANAC must be imported;
     # otherwise no local system can observe it.
-    return {"required": True, "readiness": "ready", "reasons": [], **details}
+    return {
+        "required": not capacity_only,
+        "readiness": "ready",
+        "reasons": [],
+        **details,
+    }
+
+
+def resolve_cash_buying_capacity(
+    action: dict,
+    *,
+    base_dir: Path,
+    now: datetime | None = None,
+) -> dict:
+    """Resolve routed cash capacity without treating the proposed size as an order.
+
+    Quantity normalisation must use exactly the same route, standing-order and
+    live-order reservation accounting as execution readiness.  This wrapper
+    deliberately exposes that calculation instead of creating another wallet
+    model.  It never turns an unresolved route into a usable capacity.
+    """
+    result = evaluate_cash_buying_power(
+        action,
+        base_dir=base_dir,
+        now=now,
+        capacity_only=True,
+    )
+    observation = result.get("cash_capacity_observation")
+    if not isinstance(observation, dict):
+        observation = next(
+            (
+                row.get("cash_capacity_observation")
+                for row in result.get("reasons") or []
+                if isinstance(row, dict)
+                and isinstance(row.get("cash_capacity_observation"), dict)
+            ),
+            None,
+        )
+    return {
+        "readiness": result.get("readiness") or "blocked",
+        "reasons": list(result.get("reasons") or []),
+        "cash_route": result.get("cash_route"),
+        "currency": result.get("currency"),
+        "effective_cash": result.get("available_cash"),
+        "cash_capacity_observation": observation,
+    }
+
+
+def _reason_scope(action: dict, row: dict) -> tuple[str, str]:
+    """Return a stable scope for retry/suppression diagnostics.
+
+    The same reason code can be global in one run and ticker-specific in
+    another.  Scope is therefore data-derived, never a hard-coded code list.
+    """
+    code = str(row.get("code") or "unknown")
+    ticker = str(action.get("ticker") or "").upper()
+    identity = str(
+        row.get("account_resource_identity")
+        or action.get("account_resource_identity")
+        or ""
+    )
+    route = str(row.get("cash_route") or action.get("cash_route") or "")
+    if code.startswith("cash_"):
+        key = identity or route
+        return ("wallet", f"wallet:{key}" if key else "wallet:unresolved")
+    if code.startswith((
+        "technical_", "market_quote_", "earnings_", "nisa_", "holding_", "exit_",
+        "recent_opposite_", "same_session_opposite_", "opposite_execution_",
+        "opposite_intent_", "cross_scope_opposite_", "cross_owner_opposite_",
+        "execution_route_", "order_type_", "limit_price_", "market_order_",
+        "no_trade_zone", "non_executable_candidate",
+    )):
+        return ("ticker", f"ticker:{ticker}" if ticker else "ticker:unresolved")
+    plan_ids = row.get("plan_item_ids") or action.get("execution_plan_conflict_item_ids") or []
+    if code.startswith("execution_plan"):
+        normalized = ",".join(sorted(str(value) for value in plan_ids if value not in (None, "")))
+        return ("plan", f"plan:{normalized}" if normalized else "plan:unresolved")
+    position = str(row.get("position_identity_key") or action.get("position_identity_key") or "")
+    if position:
+        return ("position", f"position:{position}")
+    if code.startswith((
+        "claim_provenance_", "decision_snapshot_", "portfolio_snapshot_",
+        "tier_direction_source_", "execution_readiness_error",
+    )):
+        return ("analysis", "analysis:global")
+    if ticker:
+        # Unknown action-level reasons stay attached to the candidate.  Calling
+        # every new code global would hide a ticker-specific failure from the
+        # retry policy until this mapping happened to be updated.
+        return ("ticker", f"ticker:{ticker}")
+    return ("analysis", "analysis:global")
+
+
+def annotate_reason_scopes(action: dict, rows: list[dict]) -> list[dict]:
+    """Attach reason scope metadata used by no-action and retry summaries."""
+    annotated: list[dict] = []
+    for raw in rows:
+        if not isinstance(raw, dict):
+            continue
+        row = dict(raw)
+        scope, scope_key = _reason_scope(action, row)
+        row.setdefault("reason_scope", scope)
+        row.setdefault("scope_key", scope_key)
+        annotated.append(row)
+    return annotated
 
 
 def classify_execution_readiness(
@@ -581,7 +938,12 @@ def classify_execution_readiness(
     if action.get("non_executable"):
         add("review", "non_executable_candidate", str(action.get("non_executable_reason") or "非実行候補"))
     if action.get("execution_plan_would_filter"):
-        add("review", "execution_plan_observe_conflict", "execution planのobserve判定では非実行")
+        # Observe mode measures policy disagreement; it must not enforce it.
+        advisories.append({
+            "code": "execution_plan_observe_conflict",
+            "message": "execution planのobserve判定では非実行候補（実行可否は他の発注条件で判定）",
+            "execution_plan_decision": action.get("execution_plan_decision"),
+        })
     if action.get("execution_plan_direction_conflict"):
         add(
             "review",
@@ -642,21 +1004,37 @@ def classify_execution_readiness(
 
     snapshot_issues = action.get("decision_snapshot_freshness_issues")
     if isinstance(snapshot_issues, list) and snapshot_issues:
-        add(
-            "review",
-            "decision_snapshot_input_stale",
-            "分析に使用した凍結入力に stale/unknown データがあります",
-            issues=[dict(row) for row in snapshot_issues if isinstance(row, dict)],
-            decision_snapshot_id=action.get("decision_snapshot_id"),
-        )
+        blocking = [
+            dict(row) for row in snapshot_issues
+            if isinstance(row, dict) and str(row.get("category") or "") in {"prices", "fx"}
+        ]
+        informational = [
+            dict(row) for row in snapshot_issues
+            if isinstance(row, dict) and str(row.get("category") or "") not in {"prices", "fx"}
+        ]
+        if blocking:
+            add(
+                "review",
+                "decision_snapshot_input_stale",
+                "分析に使用した価格・FXデータが古いため再分析を推奨します",
+                issues=blocking,
+                decision_snapshot_id=action.get("decision_snapshot_id"),
+            )
+        if informational:
+            advisories.append({
+                "code": "decision_snapshot_input_stale",
+                "message": "分析入力に stale データがあります（非ブロック: cash/holdings等）",
+                "issues": informational,
+                "decision_snapshot_id": action.get("decision_snapshot_id"),
+            })
     if action.get("confidence_evidence_verified") is False:
-        add(
-            "review",
-            "claim_provenance_unverified",
-            "確率・確信度を支える claim provenance を検証できません",
-            claim_ids=action.get("claim_ids") or [],
-            unverified_numeric_claims=action.get("unverified_numeric_claims") or [],
-        )
+        advisories.append({
+            "code": "claim_provenance_unverified",
+            "message": "確率・確信度を支える claim provenance を検証できません",
+            "claim_ids": action.get("claim_ids") or [],
+            "unverified_numeric_claims": action.get("unverified_numeric_claims") or [],
+            "provenance_unverified_reason": action.get("claim_provenance_unverified_reason"),
+        })
 
     action_type = str(action.get("type") or "").lower()
     ticker = str(action.get("ticker") or "")
@@ -775,6 +1153,16 @@ def classify_execution_readiness(
         }
     readiness = _merge(readiness, str(cash_result.get("readiness") or "ready"))
     reasons.extend(cash_result.get("reasons") or [])
+    cash_capacity_observation = cash_result.get("cash_capacity_observation")
+    if not isinstance(cash_capacity_observation, dict):
+        cash_capacity_observation = next(
+            (
+                row.get("cash_capacity_observation")
+                for row in cash_result.get("reasons") or []
+                if isinstance(row, dict) and isinstance(row.get("cash_capacity_observation"), dict)
+            ),
+            None,
+        )
 
     # The once-daily analysis intentionally runs after the US close and before
     # the JPX open.  Those are valid planning windows: keep the action ready,
@@ -927,11 +1315,15 @@ def classify_execution_readiness(
     elif not order_type and not action.get("no_trade_zone"):
         add("review", "order_type_missing", "注文方式の再評価が必要")
 
+    reasons = annotate_reason_scopes(action, reasons)
+    advisories = annotate_reason_scopes(action, advisories)
     result = {
         "execution_readiness": readiness,
         "execution_block_reasons": reasons,
         "execution_advisories": advisories,
     }
+    if isinstance(cash_capacity_observation, dict):
+        result["cash_capacity_observation"] = cash_capacity_observation
     if market_context is not None:
         result["market_session"] = market_context
         if market_context.get("status") == "closed" and any(

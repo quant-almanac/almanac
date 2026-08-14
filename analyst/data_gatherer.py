@@ -22,6 +22,36 @@ from insider_restrictions import is_restricted_ticker
 from vix_classification import format_vix_level_ja
 from pseudo_tickers import is_non_earnings_ticker
 
+
+def _load_short_candidate_source(base_dir: Path = BASE_DIR) -> tuple[dict, str, str]:
+    """Return the newest valid short scan, preferring morning only on ties."""
+    sources = [
+        ("short_candidates_morning.json", "morning"),
+        ("short_candidates.json", "regular"),
+    ]
+    candidates: list[tuple[float, int, str, str, dict]] = []
+    for filename, label in sources:
+        candidate = load_json(base_dir / filename, {})
+        if not isinstance(candidate, dict) or not isinstance(candidate.get("candidates"), list):
+            continue
+        source_path = base_dir / filename
+        source_ts = source_path.stat().st_mtime if source_path.exists() else 0.0
+        for field in ("generated_at", "as_of"):
+            raw_ts = candidate.get(field)
+            if not raw_ts:
+                continue
+            try:
+                parsed = datetime.fromisoformat(str(raw_ts).replace("Z", "+00:00"))
+                source_ts = parsed.timestamp()
+                break
+            except (TypeError, ValueError):
+                continue
+        candidates.append((source_ts, 1 if label == "morning" else 0, filename, label, candidate))
+    if not candidates:
+        return {}, "", ""
+    _, _, filename, label, candidate = max(candidates)
+    return candidate, filename, label
+
 # ── ニュース取得対象 ─────────────────────────────────────
 NEWS_MARKET_TICKERS = [
     "SPY", "^VIX", "^TNX", "GC=F", "CL=F", "EWJ", "EWG", "DX-Y.NYB",
@@ -1238,7 +1268,10 @@ def gather_data() -> dict:
 
     lt_screen = load_json(BASE_DIR / "long_term_screen_results.json")
     opt_result = load_json(BASE_DIR / "optimization_result.json")
-    short_cands_raw = load_json(BASE_DIR / "short_candidates.json")
+    # The 6:15 analysis must consume the morning short scan when it exists.
+    # Previously the evening artifact won unconditionally, making the short
+    # lane appear frozen even though the morning scanner had refreshed it.
+    short_cands_raw, short_source_name, short_source_label = _load_short_candidate_source(BASE_DIR)
     margin_long_raw = _load_margin_long_candidates()
     screening = {
         "long_term": lt_screen,
@@ -1246,8 +1279,13 @@ def gather_data() -> dict:
         "short_candidates": short_cands_raw.get("candidates", []),
         "short_candidates_meta": {
             key: short_cands_raw.get(key)
-            for key in ("scanned", "shortable_count", "vix_blocked")
+            for key in ("scanned", "shortable_count", "vix_blocked", "generated_at", "as_of")
             if key in short_cands_raw
+        },
+        "short_candidates_source": {
+            "filename": short_source_name or None,
+            "label": short_source_label or None,
+            "used_morning_artifact": short_source_label == "morning",
         },
         "margin_long_candidates": margin_long_raw.get("candidates", []),
         "margin_long_blocked": margin_long_raw.get("blocked", False),

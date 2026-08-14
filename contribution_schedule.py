@@ -77,6 +77,41 @@ def expected_count(date_from: str, date_to: str) -> int:
     return len(occurrences(date_from, date_to))
 
 
+def cash_route_outflows(
+    *,
+    owner: str,
+    broker: str,
+    currency: str,
+    cash_route: str,
+    date_from: str,
+    date_to: str,
+) -> List[Tuple[date, dict]]:
+    """Return only explicitly wallet-funded scheduled outflows.
+
+    Public deployments provide schedules through the environment.  A broker
+    label alone is never evidence that a contribution consumes discretionary
+    broker cash: every reserving row must opt in with
+    ``funding_source=broker_cash`` and name the exact ``cash_route``.
+    """
+    owner = str(owner or "").strip().lower()
+    broker = str(broker or "").strip().lower()
+    currency = str(currency or "").upper()
+    cash_route = str(cash_route or "").strip()
+    if not cash_route:
+        return []
+    return [
+        (when, contribution)
+        for when, contribution in occurrences(date_from, date_to)
+        if (
+            str(contribution.get("funding_source") or "") == "broker_cash"
+            and str(contribution.get("cash_route") or "") == cash_route
+            and str(contribution.get("owner") or "").strip().lower() == owner
+            and str(contribution.get("broker") or "").strip().lower() == broker
+            and str(contribution.get("currency") or "").upper() == currency
+        )
+    ]
+
+
 def generate_transactions(date_from: str, date_to: str) -> List[dict]:
     """cash_transactions.json 互換の transaction dict を schedule から生成。
 

@@ -6,9 +6,11 @@ from zoneinfo import ZoneInfo
 import pytest
 
 from execution_readiness import (
+    annotate_reason_scopes,
     classify_execution_readiness,
     evaluate_cash_buying_power,
     portfolio_snapshot_health,
+    resolve_cash_buying_capacity,
 )
 
 
@@ -625,7 +627,7 @@ def test_unadjusted_price_series_blocks_buy(tmp_path):
     }
 
 
-def test_execution_plan_would_filter_is_review_not_ready(tmp_path):
+def test_execution_plan_would_filter_is_advisory_in_observe_mode(tmp_path):
     now = datetime(2026, 7, 14, 6, 0, tzinfo=JST)
     _write_base(tmp_path, now)
     (tmp_path / "account.json").write_text(json.dumps({
@@ -643,8 +645,9 @@ def test_execution_plan_would_filter_is_review_not_ready(tmp_path):
         "execution_broker": "rakuten", "execution_account": "一般",
         "execution_plan_would_filter": True,
     }, base_dir=tmp_path, now=now)
-    assert result["execution_readiness"] == "review"
-    assert any(row["code"] == "execution_plan_observe_conflict" for row in result["execution_block_reasons"])
+    assert result["execution_readiness"] == "ready"
+    assert not any(row["code"] == "execution_plan_observe_conflict" for row in result["execution_block_reasons"])
+    assert any(row["code"] == "execution_plan_observe_conflict" for row in result["execution_advisories"])
 
 
 def test_exit_with_opposite_active_plan_is_review_not_blocked(tmp_path):
@@ -975,7 +978,7 @@ def test_fund_market_order_is_exempt_from_equity_spread_rule(tmp_path):
     assert result["execution_readiness"] == "ready"
 
 
-def test_replay_2026_07_14_keeps_4063_and_robo_off_the_execution_board(tmp_path):
+def test_observe_plan_conflict_is_advisory_while_other_guards_still_block(tmp_path):
     now = datetime(2026, 7, 14, 6, 8, tzinfo=JST)
     _write_base(tmp_path, now, ticker="4063.T")
     raw = json.loads((tmp_path / "technical_state.json").read_text(encoding="utf-8"))
@@ -997,13 +1000,16 @@ def test_replay_2026_07_14_keeps_4063_and_robo_off_the_execution_board(tmp_path)
     assert [row["execution_readiness"] for row in rows] == ["blocked", "blocked"]
     codes_4063 = {reason["code"] for reason in rows[0]["execution_block_reasons"]}
     codes_robo = {reason["code"] for reason in rows[1]["execution_block_reasons"]}
-    assert "execution_plan_observe_conflict" in codes_4063
+    assert "execution_plan_observe_conflict" not in codes_4063
+    assert "execution_plan_observe_conflict" in {
+        row["code"] for row in rows[0]["execution_advisories"]
+    }
     assert "market_order_low_urgency" in codes_4063
     assert "market_order_spread_too_wide" in codes_robo
     assert sum(row["execution_readiness"] == "ready" for row in rows) == 0
 
 
-def test_unverified_claim_provenance_downgrades_ready_action_to_review(tmp_path):
+def test_unverified_claim_provenance_is_advisory(tmp_path):
     now = datetime(2026, 7, 21, 6, 15, tzinfo=JST)
     _write_base(tmp_path, now, ticker="1489.T")
     result = classify_execution_readiness({
@@ -1018,9 +1024,61 @@ def test_unverified_claim_provenance_downgrades_ready_action_to_review(tmp_path)
         "claim_ids": ["snapshot:action:1"],
         "unverified_numeric_claims": ["利上げ確率35.8%"],
     }, base_dir=tmp_path, now=now)
-    assert result["execution_readiness"] == "review"
+    assert "claim_provenance_unverified" not in {
+        row["code"] for row in result["execution_block_reasons"]
+    }
     reason = next(
-        row for row in result["execution_block_reasons"]
+        row for row in result["execution_advisories"]
         if row["code"] == "claim_provenance_unverified"
     )
     assert reason["claim_ids"] == ["snapshot:action:1"]
+
+
+def test_capacity_resolution_reserves_explicit_wallet_schedule(tmp_path, monkeypatch):
+    import contribution_schedule as schedule
+
+    monkeypatch.setattr(schedule, "CONTRIBUTIONS", [{
+        "id": "broker_cash_example", "label": "Example broker cash contribution",
+        "amount": 25_000, "currency": "JPY", "cadence": "weekly",
+        "weekday": 0, "owner": "wife", "broker": "sbi",
+        "funding_source": "broker_cash", "cash_route": "CASH_JPY_SBI_WIFE",
+    }])
+    now = datetime(2026, 8, 13, 6, 0, tzinfo=JST)
+    (tmp_path / "holdings.json").write_text(json.dumps({
+        "CASH_JPY_SBI_WIFE": {
+            "ticker": "CASH_JPY_SBI_WIFE", "shares": 200_000,
+            "available_to_trade_jpy": 200_000, "currency": "JPY",
+            "balance_status": "confirmed", "reconciliation_required": False,
+            "source_as_of": "2026-08-07T11:55:00+09:00",
+        },
+    }), encoding="utf-8")
+    action = {
+        "ticker": "1306.T", "type": "buy", "quantity": 150, "limit_price": 3_500,
+        "execution_owner": "wife", "execution_broker": "sbi",
+        "execution_account": "NISA成長投資枠",
+    }
+
+    normal = evaluate_cash_buying_power(action, base_dir=tmp_path, now=now)
+    capacity = resolve_cash_buying_capacity(action, base_dir=tmp_path, now=now)
+
+    assert normal["readiness"] == "blocked"
+    assert normal["reasons"][0]["code"] == "cash_balance_insufficient"
+    assert capacity["readiness"] == "ready"
+    assert capacity["effective_cash"] == 175_000
+    assert capacity["cash_capacity_observation"]["scheduled_outflows"]["amount"] == 25_000
+
+
+def test_reason_scope_distinguishes_candidate_and_analysis_failures():
+    candidate = annotate_reason_scopes(
+        {"ticker": "SPY"},
+        [{"code": "same_session_opposite_execution", "message": "opposite fill"}],
+    )[0]
+    global_reason = annotate_reason_scopes(
+        {"ticker": "SPY"},
+        [{"code": "claim_provenance_unverified", "message": "stale parents"}],
+    )[0]
+
+    assert (candidate["reason_scope"], candidate["scope_key"]) == ("ticker", "ticker:SPY")
+    assert (global_reason["reason_scope"], global_reason["scope_key"]) == (
+        "analysis", "analysis:global",
+    )

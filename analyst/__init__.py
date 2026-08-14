@@ -10,6 +10,7 @@ analyst パッケージ — portfolio_analyst.py のモジュール分割版
     data_gatherer.py — データ収集（市場指標・ニュース・決算・スナップショット）
     __init__.py      — run_analysis / get_cached / send_to_telegram（公開 API）
 """
+import copy
 import json
 import math
 import os
@@ -44,6 +45,7 @@ from analysis_output_validation import (
 from almanac.runtime_config import get_env
 from freshness_policy import refresh_after_hours
 from instrument_metadata import (
+    canonical_ticker,
     jp_trading_unit_prompt,
     quantity_label_for_ticker,
     trading_unit_for_ticker,
@@ -4555,6 +4557,26 @@ def _direction_of(action_type) -> str:
     return "other"
 
 
+def _action_scope_for_direction_conflict(action: dict) -> dict[str, str]:
+    """Return deterministic routing facts for retry fingerprints."""
+    try:
+        from execution_safety import canonical_broker, canonical_owner
+
+        owner = canonical_owner(action.get("execution_owner") or action.get("owner"))
+        broker = canonical_broker(action.get("execution_broker") or action.get("broker"))
+    except Exception:
+        owner = str(action.get("execution_owner") or action.get("owner") or "").strip().lower()
+        broker = str(action.get("execution_broker") or action.get("broker") or "").strip().lower()
+    return {
+        "owner": owner,
+        "broker": broker,
+        "account": str(action.get("execution_account") or action.get("account") or "").strip(),
+        "investment_type": _normalized_investment_tier(
+            action.get("execution_investment_type") or action.get("tier")
+        ),
+    }
+
+
 def _load_recent_recommendations(days: int = 14) -> list:
     """直近 N 日の自分の推奨ログを返す。"""
     from datetime import timedelta
@@ -4872,12 +4894,256 @@ def _reindex_final_action_ranks(actions: list[dict]) -> list[dict]:
     return ranked
 
 
+def _reason_class_for_action(row: dict) -> str:
+    """Classify a readiness reason without discarding its scoped evidence."""
+    code = str(row.get("code") or "")
+    scope = str(row.get("reason_scope") or "")
+    if code.startswith("cash_"):
+        return "cash_constraint"
+    if code.startswith("execution_plan"):
+        return "plan_constraint"
+    if code.startswith(("technical_", "market_quote_", "earnings_", "nisa_", "exit_", "holding_")):
+        return "candidate_constraint"
+    if scope == "analysis" or code.startswith(("portfolio_snapshot", "decision_snapshot")):
+        return "system_input"
+    return "review_constraint"
+
+
+def _annotate_dominant_reasons(actions: list[dict]) -> dict:
+    """Persist one explained blocker per non-ready candidate for summaries.
+
+    Several safeguards can correctly apply to one action.  The no-action
+    explanation must not let a secondary technical warning hide a concrete
+    wallet shortfall, so it chooses a deterministic dominant reason while
+    retaining the complete list on the action.
+    """
+    priority = {
+        "cash_constraint": 0,
+        "plan_constraint": 1,
+        "candidate_constraint": 2,
+        "review_constraint": 3,
+        "system_input": 4,
+    }
+    counts: dict[str, int] = {}
+    class_counts: dict[str, int] = {}
+    for action in actions:
+        if not isinstance(action, dict) or action.get("execution_readiness") == "ready":
+            continue
+        rows = [row for row in action.get("execution_block_reasons") or [] if isinstance(row, dict)]
+        if not rows:
+            continue
+        ranked = sorted(
+            rows,
+            key=lambda row: (
+                priority.get(_reason_class_for_action(row), 99),
+                str(row.get("code") or ""),
+            ),
+        )
+        winner = ranked[0]
+        code = str(winner.get("code") or "execution_review")
+        reason_class = _reason_class_for_action(winner)
+        action["dominant_reason_code"] = code
+        action["dominant_reason_class"] = reason_class
+        action["dominant_reason_scope"] = winner.get("reason_scope")
+        action["dominant_reason_scope_key"] = winner.get("scope_key")
+        counts[code] = counts.get(code, 0) + 1
+        class_counts[reason_class] = class_counts.get(reason_class, 0) + 1
+    return {"codes": counts, "classes": class_counts}
+
+
+_REPROPOSAL_POLICY_VERSION = "candidate_retry_v1"
+_REPROPOSAL_RECHECK_SESSIONS = 3
+
+
+def _reproposal_exchange_context(ticker: object) -> tuple[str, ZoneInfo]:
+    normalized = canonical_ticker(ticker)
+    if normalized.endswith(".T") or is_pseudo_market_ticker(normalized):
+        return "JPX", ZoneInfo("Asia/Tokyo")
+    return "NYSE", ZoneInfo("America/New_York")
+
+
+def _reproposal_session_age(ticker: object, earlier: datetime, later: datetime) -> int | None:
+    """Count exchange sessions strictly after ``earlier`` through ``later``."""
+    exchange, local_tz = _reproposal_exchange_context(ticker)
+    start = earlier.astimezone(local_tz).date()
+    end = later.astimezone(local_tz).date()
+    if end < start:
+        return None
+    try:
+        import pandas_market_calendars as mcal  # type: ignore
+
+        schedule = mcal.get_calendar(exchange).schedule(
+            start_date=start.isoformat(),
+            end_date=end.isoformat(),
+        )
+    except Exception:
+        return None
+    return sum(1 for value in schedule.index.date if start < value <= end)
+
+
+def _reproposal_recheck_after(ticker: object, now: datetime) -> str | None:
+    """Return the third future exchange session used to re-show a candidate."""
+    exchange, local_tz = _reproposal_exchange_context(ticker)
+    local_date = now.astimezone(local_tz).date()
+    try:
+        import pandas_market_calendars as mcal  # type: ignore
+
+        schedule = mcal.get_calendar(exchange).schedule(
+            start_date=(local_date + timedelta(days=1)).isoformat(),
+            end_date=(local_date + timedelta(days=15)).isoformat(),
+        )
+    except Exception:
+        return None
+    future = [value for value in schedule.index.date if value > local_date]
+    if len(future) < _REPROPOSAL_RECHECK_SESSIONS:
+        return None
+    return future[_REPROPOSAL_RECHECK_SESSIONS - 1].isoformat()
+
+
+def _suppress_repeated_candidate_failures(
+    actions: list[dict],
+    *,
+    base_dir: Path,
+    now: datetime,
+) -> tuple[list[dict], list[dict]]:
+    """Hide a repeated blocked buy only after the new scoped policy observed it.
+
+    Historical rows predate the policy and are intentionally ignored.  The
+    fingerprint is ``(code, scope_key)``: two ticker-local technical lags are
+    not accidentally collapsed into a global issue, while a real wallet or
+    plan constraint can stop repeating the same unusable order.
+    """
+    try:
+        history = json.loads((base_dir / "ai_recommendation_log.json").read_text(encoding="utf-8"))
+        history = history if isinstance(history, list) else []
+    except Exception:
+        history = []
+    prior: dict[tuple[str, str, str, tuple[str, str]], dict] = {}
+    current_date = now.astimezone(ZoneInfo("Asia/Tokyo")).date()
+    for row in history:
+        if not isinstance(row, dict) or row.get("reproposal_policy_version") != _REPROPOSAL_POLICY_VERSION:
+            continue
+        if str(row.get("execution_readiness") or "") == "ready":
+            continue
+        try:
+            recorded_at = datetime.fromisoformat(str(row.get("as_of") or "").replace("Z", "+00:00"))
+            if recorded_at.tzinfo is None:
+                recorded_at = recorded_at.replace(tzinfo=ZoneInfo("Asia/Tokyo"))
+            if recorded_at.astimezone(ZoneInfo("Asia/Tokyo")).date() >= current_date:
+                continue
+        except (TypeError, ValueError):
+            # An undated row cannot prove a prior analysis day.
+            continue
+        fingerprint = row.get("reproposal_reason_fingerprint")
+        if not isinstance(fingerprint, (list, tuple)) or len(fingerprint) != 2:
+            continue
+        key = (
+            canonical_ticker(row.get("ticker")),
+            _direction_of(row.get("type")),
+            str(row.get("execution_scope_key") or ""),
+            (str(fingerprint[0]), str(fingerprint[1])),
+        )
+        existing = prior.get(key)
+        if existing is None or recorded_at > existing["recorded_at"]:
+            prior[key] = {"recorded_at": recorded_at, "row": row}
+
+    kept: list[dict] = []
+    suppressed: list[dict] = []
+    for action in actions:
+        if not isinstance(action, dict) or _direction_of(action.get("type")) != "buy":
+            kept.append(action)
+            continue
+        action["reproposal_policy_version"] = _REPROPOSAL_POLICY_VERSION
+        if action.get("execution_readiness") == "ready":
+            kept.append(action)
+            continue
+        rows = [row for row in action.get("execution_block_reasons") or [] if isinstance(row, dict)]
+        if not rows:
+            kept.append(action)
+            continue
+        class_priority = {
+            "cash_constraint": 0,
+            "plan_constraint": 1,
+            "candidate_constraint": 2,
+            "review_constraint": 3,
+            "system_input": 4,
+        }
+        winner = sorted(
+            rows,
+            key=lambda row: (
+                class_priority.get(_reason_class_for_action(row), 99),
+                str(row.get("code") or ""),
+                str(row.get("scope_key") or ""),
+            ),
+        )[0]
+        reason_class = _reason_class_for_action(winner)
+        scope_key = str(winner.get("scope_key") or "")
+        # Analysis-wide input failures remain visible; suppressing them would
+        # hide a system repair task rather than rotate an investment candidate.
+        if reason_class == "system_input" or not scope_key:
+            kept.append(action)
+            continue
+        fingerprint = (str(winner.get("code") or "execution_review"), scope_key)
+        scope = _action_scope_for_direction_conflict(action)
+        execution_scope_key = "|".join(
+            str(scope.get(key) or "") for key in ("owner", "broker", "account", "investment_type")
+        )
+        action["reproposal_reason_fingerprint"] = list(fingerprint)
+        action["execution_scope_key"] = execution_scope_key
+        key = (canonical_ticker(action.get("ticker")), "buy", execution_scope_key, fingerprint)
+        prior_match = prior.get(key)
+        if prior_match is None:
+            kept.append(action)
+            continue
+        prior_row = prior_match["row"]
+        prior_at = prior_match["recorded_at"]
+        prior_recheck = str(prior_row.get("reproposal_recheck_after") or "")
+        if prior_row.get("reproposal_suppressed") and prior_recheck:
+            try:
+                exchange, local_tz = _reproposal_exchange_context(action.get("ticker"))
+                del exchange
+                recheck_date = datetime.fromisoformat(prior_recheck).date()
+                if now.astimezone(local_tz).date() >= recheck_date:
+                    # Deliberately surface the candidate again.  If the same
+                    # reason remains, this run becomes the next baseline and
+                    # may start a new bounded suppression window tomorrow.
+                    kept.append(action)
+                    continue
+            except (TypeError, ValueError):
+                kept.append(action)
+                continue
+        elif _reproposal_session_age(action.get("ticker"), prior_at, now) != 1:
+            # Initial suppression requires consecutive exchange sessions.
+            # An older, non-consecutive failure is not evidence that the
+            # candidate is still stuck for the same reason.
+            kept.append(action)
+            continue
+
+        recheck_after = prior_recheck or _reproposal_recheck_after(action.get("ticker"), now)
+        if not recheck_after:
+            # Calendar resolution is part of the retry contract.  If it cannot
+            # be resolved, keep the candidate visible rather than suppressing
+            # it forever with no deterministic wake-up date.
+            kept.append(action)
+            continue
+        action["reproposal_suppressed"] = True
+        action["reproposal_suppressed_at"] = now.isoformat()
+        action["reproposal_recheck_after"] = recheck_after
+        action["filtered_reason"] = (
+            f"reproposal_suppressed: {fingerprint[0]} ({fingerprint[1]}) が"
+            f"直前取引セッションでも未解消のため、{recheck_after} に再評価"
+        )
+        suppressed.append(action)
+    return kept, suppressed
+
+
 def _set_operational_stance(
     synthesis: dict,
     reason_counts: dict,
     executable_count: int,
     *,
     actions: list[dict] | None = None,
+    dominant_reason_classes: dict[str, int] | None = None,
 ) -> None:
     """Keep model market stance separate from what may be acted on today."""
     if executable_count > 0:
@@ -4908,7 +5174,7 @@ def _set_operational_stance(
             "label": "休場明けの再評価待ち",
             "reason": "休場日に生成された指値は次の取引セッションで価格・板を更新してから再提案します",
         }
-    elif any(str(code).startswith(("portfolio_snapshot", "technical_data")) for code in reason_counts):
+    elif dominant_reason_classes and set(dominant_reason_classes) == {"system_input"}:
         state = {
             "code": "await_data_refresh",
             "label": "データ更新待ち",
@@ -6955,6 +7221,32 @@ def _downgrade_quantity_sync_failures(actions: list[dict]) -> list[dict]:
     return actions
 
 
+def _execution_plan_action_cap_jpy(action: dict, execution_plan: dict | None) -> float | None:
+    """Return the active plan's per-action cap without inventing a default."""
+    if not isinstance(execution_plan, dict):
+        return None
+    budgets = execution_plan.get("budgets")
+    if not isinstance(budgets, dict):
+        return None
+    source = str(action.get("source") or "").lower()
+    decision = str(
+        action.get("execution_plan_decision")
+        or action.get("execution_plan_observed_decision")
+        or ""
+    ).lower()
+    opportunity = "opportun" in source or "opportun" in decision
+    key = (
+        "max_single_opportunity_action_jpy"
+        if opportunity
+        else "max_single_normal_action_jpy"
+    )
+    try:
+        value = float(budgets.get(key))
+    except (TypeError, ValueError):
+        return None
+    return value if math.isfinite(value) and value > 0 else None
+
+
 def _phase1_post_filter(
     synthesis: dict,
     portfolio_total: float,
@@ -7589,10 +7881,16 @@ def _phase1_post_filter(
             pct, abs_jpy, label = _max_single_action_pct, 1_500_000.0, "core_or_dca"
         else:
             pct, abs_jpy, label = 0.025, 750_000.0, "individual"
+        cap_jpy = min(total * pct, abs_jpy)
+        plan_cap_jpy = _execution_plan_action_cap_jpy(action, execution_plan)
+        if plan_cap_jpy is not None and atype in {"buy", "add", "dca", "margin_buy"}:
+            cap_jpy = min(cap_jpy, plan_cap_jpy)
+            label = f"{label}+execution_plan"
         return {
-            "cap_jpy": min(total * pct, abs_jpy),
+            "cap_jpy": cap_jpy,
             "pct": pct,
             "abs_jpy": abs_jpy,
+            "execution_plan_cap_jpy": plan_cap_jpy,
             "label": label,
         }
 
@@ -7847,6 +8145,12 @@ def _phase1_post_filter(
         old_hint = str(action.get("amount_hint") or "")
         new_hint = f"{target_shares}{label}"
         action["amount_hint"] = new_hint
+        # ``amount_hint`` is presentation data.  Persist the structured value
+        # too, otherwise a later notional/readiness pass can resurrect the
+        # original LLM quantity from ``quantity``.
+        action["quantity"] = target_shares
+        if _direction_of(action.get("type")) == "buy":
+            action["requested_buy_quantity"] = target_shares
         body = str(action.get("action") or "")
         if body:
             if old_hint and old_hint in body:
@@ -7897,6 +8201,126 @@ def _phase1_post_filter(
         )
         if old_hint and old_hint != action["amount_hint"]:
             action.setdefault("_warnings", []).append(f"amount_hint auto-resized: {old_hint} → {action['amount_hint']}")
+        return resized_jpy
+
+    def _maybe_resize_to_wallet_capacity(action: dict, estimated_jpy: float) -> float:
+        """Shrink a routable cash buy to its confirmed effective wallet capacity.
+
+        This is intentionally a normalisation step, not a second cash gate:
+        ``resolve_cash_buying_capacity`` delegates all route, scheduled-outflow
+        and open-order reservation logic to ``execution_readiness``.  Unknown
+        capacity leaves the original candidate intact for that gate to block
+        with its precise reason.
+        """
+        if _direction_of(action.get("type")) != "buy":
+            return estimated_jpy
+        # Scenario monitor rows carry a separately bounded allocation and can
+        # be intentionally marked provisional.  They are either promoted by
+        # their dedicated gate or filtered there; a wallet resize must not
+        # rewrite that source contract before the promotion decision.
+        if action.get("source_observe_only"):
+            return estimated_jpy
+        action_type = str(action.get("type") or "").lower()
+        if action_type not in {"buy", "add", "dca"}:
+            return estimated_jpy
+        current_quantity = max(0, _parse_amount_hint_shares(action))
+        unit_jpy = _unit_jpy_for_action(action)
+        if current_quantity <= 0 or unit_jpy <= 0 or estimated_jpy <= 0 or not math.isfinite(estimated_jpy):
+            return estimated_jpy
+        try:
+            from execution_readiness import resolve_cash_buying_capacity
+
+            capacity = resolve_cash_buying_capacity(
+                action,
+                base_dir=BASE_DIR,
+                now=analysis_now,
+            )
+        except Exception as exc:
+            action["execution_capacity_resolution_error"] = f"{type(exc).__name__}: {str(exc)[:160]}"
+            return estimated_jpy
+        effective_cash = capacity.get("effective_cash")
+        try:
+            effective_cash = float(effective_cash)
+        except (TypeError, ValueError):
+            effective_cash = None
+        observation = capacity.get("cash_capacity_observation")
+        if isinstance(observation, dict):
+            action["cash_capacity_observation"] = observation
+        if capacity.get("readiness") != "ready" or effective_cash is None:
+            return estimated_jpy
+
+        cap_profile = _single_action_cap_profile(action)
+        capacity_currency = str(
+            capacity.get("currency")
+            or action.get("currency")
+            or ("JPY" if str(action.get("ticker") or "").endswith(".T") else "USD")
+        ).upper()
+        maximum_jpy = min(
+            effective_cash * (fx_rate if capacity_currency == "USD" else 1.0),
+            cap_profile["cap_jpy"],
+        )
+        # A NISA order also consumes a distinct annual resource.  Reuse its
+        # authoritative event-based calculator and resize only when the sole
+        # issue is the proposed amount exceeding an otherwise resolved limit.
+        try:
+            from execution_safety import evaluate_nisa_capacity, is_nisa_account
+
+            if is_nisa_account(action.get("execution_account") or action.get("account")):
+                nisa_capacity = evaluate_nisa_capacity(action, base_dir=BASE_DIR, now=analysis_now)
+                action["nisa_capacity_observation"] = {
+                    key: nisa_capacity.get(key)
+                    for key in (
+                        "nisa_capacity_identity", "nisa_capacity_remaining_jpy",
+                        "nisa_capacity_baseline", "nisa_capacity_baseline_source",
+                    )
+                }
+                nisa_codes = {
+                    str(row.get("code") or "")
+                    for row in nisa_capacity.get("reasons") or [] if isinstance(row, dict)
+                }
+                unresolved_nisa = nisa_codes - {"nisa_capacity_insufficient"}
+                remaining_nisa = nisa_capacity.get("nisa_capacity_remaining_jpy")
+                if unresolved_nisa or remaining_nisa is None:
+                    return estimated_jpy
+                maximum_jpy = min(maximum_jpy, float(remaining_nisa))
+        except Exception as exc:
+            action["nisa_capacity_resolution_error"] = f"{type(exc).__name__}: {str(exc)[:160]}"
+            return estimated_jpy
+        lot = _entry_lot_size(action)
+        maximum_quantity = int(math.floor(maximum_jpy / unit_jpy / lot) * lot)
+        if maximum_quantity >= current_quantity:
+            return estimated_jpy
+
+        minimum_quantity = int(math.ceil(threshold / unit_jpy / lot) * lot)
+        action.update({
+            "execution_capacity_policy_version": "wallet_capacity_v1",
+            "original_quantity": current_quantity,
+            "original_notional_jpy": round(estimated_jpy),
+            "max_executable_quantity": maximum_quantity,
+            "effective_cash": round(effective_cash, 2),
+            "capacity_valid_until": (
+                observation.get("capacity_valid_until") if isinstance(observation, dict) else None
+            ),
+        })
+        if maximum_quantity < minimum_quantity or maximum_quantity <= 0:
+            action["execution_capacity_mode"] = "below_minimum"
+            action["max_executable_quantity_below_minimum"] = True
+            action["minimum_executable_quantity"] = minimum_quantity
+            return estimated_jpy
+
+        _rewrite_action_shares(action, maximum_quantity)
+        resized_jpy = maximum_quantity * unit_jpy
+        action["execution_capacity_mode"] = "downsized"
+        action["estimated_notional_jpy"] = round(resized_jpy)
+        detail = (
+            f"確認済み実効買付余力に合わせて {current_quantity}{quantity_label_for_ticker(action.get('ticker'))} "
+            f"→ {maximum_quantity}{quantity_label_for_ticker(action.get('ticker'))}（約¥{resized_jpy/10000:.1f}万）へ縮小"
+        )
+        action["execution_capacity_detail"] = detail
+        action["execution_note"] = (
+            f"{action.get('execution_note')} / {detail}"
+            if action.get("execution_note") else detail
+        )
         return resized_jpy
 
     def _total_cash_available_jpy() -> float:
@@ -8412,6 +8836,13 @@ def _phase1_post_filter(
 
         # (1) 最低取引額（少額ポジションの整理は免除）
         amt = _maybe_resize_kabu_mini_over_cap(a, amt)
+        amt = _maybe_resize_to_wallet_capacity(a, amt)
+        if a.get("max_executable_quantity_below_minimum"):
+            a["filtered_reason"] = (
+                "max_executable_quantity_below_minimum: 確認済み実効買付余力の範囲では、"
+                f"最小取引額を満たす数量（{a.get('minimum_executable_quantity')}）を確保できません"
+            )
+            filtered.append(a); continue
         amt = _maybe_bump_small_buy(a, amt)
         if 0 <= amt < threshold:
             # 出口免除: 少額ポジション（評価額 < small_position_threshold_jpy）の sell/trim/stop_loss/take_profit は通す
@@ -8702,6 +9133,16 @@ def _phase1_post_filter(
                 "message": f"実行可否判定に失敗: {type(exc).__name__}: {str(exc)[:160]}",
             })
     _downgrade_quantity_sync_failures(kept)
+    kept, reproposal_suppressed = _suppress_repeated_candidate_failures(
+        kept,
+        base_dir=BASE_DIR,
+        now=analysis_now,
+    )
+    if reproposal_suppressed:
+        filtered.extend(reproposal_suppressed)
+        synthesis["suppressed_reproposals"] = [dict(action) for action in reproposal_suppressed]
+    else:
+        synthesis.pop("suppressed_reproposals", None)
 
     # The model's original rank is audit data.  The actionable/review board
     # needs contiguous ranks after all deterministic filters have run.
@@ -8809,6 +9250,7 @@ def _phase1_post_filter(
         for row in action.get("execution_block_reasons") or []:
             code = str(row.get("code") or "execution_review") if isinstance(row, dict) else "execution_review"
             reason_counts[code] = reason_counts.get(code, 0) + 1
+    dominant_reasons = _annotate_dominant_reasons(kept)
     executable_count = sum(1 for action in kept if action.get("execution_readiness") == "ready")
     readiness_review_count = sum(1 for action in kept if action.get("execution_readiness") != "ready")
     review_count = readiness_review_count + len(deferred)
@@ -8816,14 +9258,20 @@ def _phase1_post_filter(
         no_action_classification = None
     elif not actions:
         no_action_classification = "market_no_trade"
-    elif any(code.startswith("portfolio_snapshot") or code.startswith("technical_data") for code in reason_counts):
+    elif dominant_reasons["classes"] and set(dominant_reasons["classes"]) == {"system_input"}:
         no_action_classification = "data_unavailable"
     elif reason_counts.get("stale_order_requires_confirmation") and len(reason_counts) == 1:
         no_action_classification = "state_reconciliation_required"
     else:
         no_action_classification = "system_constraints"
-    _set_operational_stance(synthesis, reason_counts, executable_count, actions=kept)
-    synthesis["decision_summary"] = {
+    _set_operational_stance(
+        synthesis,
+        reason_counts,
+        executable_count,
+        actions=kept,
+        dominant_reason_classes=dominant_reasons["classes"],
+    )
+    decision_summary = {
         "candidate_count": len(actions),
         "executable_count": executable_count,
         "review_count": review_count,
@@ -8833,6 +9281,10 @@ def _phase1_post_filter(
         "reason_counts": reason_counts,
         "count_conservation_ok": len(actions) == len(kept) + len(filtered) + len(deferred),
     }
+    if dominant_reasons["codes"]:
+        decision_summary["dominant_reason_counts"] = dominant_reasons["codes"]
+        decision_summary["dominant_reason_class_counts"] = dominant_reasons["classes"]
+    synthesis["decision_summary"] = decision_summary
     if kabu_mini_verification_needed and side_effects:
         try:
             from kabu_mini_eligibility import record_kabu_mini_verification_needed
@@ -9262,10 +9714,18 @@ def _log_recommendations(synthesis: dict, market_meta: dict) -> None:
         except Exception:
             existing = []
 
-    actions = synthesis.get("priority_actions", [])
+    actions = [
+        row for row in (synthesis.get("priority_actions") or [])[:7]
+        if isinstance(row, dict)
+    ]
+    suppressed_actions = [
+        row for row in (synthesis.get("suppressed_reproposals") or [])[:7]
+        if isinstance(row, dict)
+    ]
+    logged_actions = actions + suppressed_actions
     as_of   = datetime.now().isoformat()
 
-    for a in actions[:7]:  # 上位 7 件まで記録
+    for a in logged_actions:
         ticker = a.get("ticker")
         if not ticker:
             continue
@@ -9329,6 +9789,14 @@ def _log_recommendations(synthesis: dict, market_meta: dict) -> None:
             "execution_eligible": execution_eligible,
             "execution_readiness": readiness,
             "execution_block_reasons": block_reasons,
+            "reproposal_policy_version": a.get("reproposal_policy_version"),
+            "reproposal_reason_fingerprint": a.get("reproposal_reason_fingerprint"),
+            "execution_scope_key": a.get("execution_scope_key"),
+            "reproposal_suppressed": bool(a.get("reproposal_suppressed")),
+            "reproposal_suppressed_at": a.get("reproposal_suppressed_at"),
+            "reproposal_recheck_after": a.get("reproposal_recheck_after"),
+            "dominant_reason_code": a.get("dominant_reason_code"),
+            "dominant_reason_class": a.get("dominant_reason_class"),
             "decision_snapshot_hash": a.get("decision_snapshot_hash"),
             "quote_as_of": a.get("quote_as_of"),
             "vix_at_rec":      market_meta.get("vix"),
@@ -9346,11 +9814,14 @@ def _log_recommendations(synthesis: dict, market_meta: dict) -> None:
         existing = existing[-MAX_ENTRIES:]
 
     atomic_write_json(log_path, existing)
-    print(f"  📝 推奨ログ保存: {len(actions[:7])}件 → ai_recommendation_log.json")
+    print(
+        f"  📝 推奨ログ保存: {len(logged_actions)}件"
+        f"（表示{len(actions)} / 抑制{len(suppressed_actions)}）→ ai_recommendation_log.json"
+    )
     # 発注状態管理: stop_loss / sell (high urgency) を追跡
     try:
         from action_state_tracker import record_recommendations as _record_acts
-        _n_tracked = _record_acts(actions[:7], source="opus")
+        _n_tracked = _record_acts(actions, source="opus")
         if _n_tracked:
             print(f"  📌 発注追跡登録: {_n_tracked}件 → action_state.json")
     except Exception:
@@ -9688,6 +10159,157 @@ def _inject_playbook_actions(synthesis: dict, data: dict) -> dict:
 
     return {"injected": injected, "skipped": skipped,
             "used_jpy": round(used_jpy), "cap_jpy": round(total_cap_jpy)}
+
+
+def _build_candidate_funnel(tier_results: dict[str, object], data: dict) -> dict:
+    """Expose every deterministic entry source before LLM synthesis narrows it.
+
+    This is an audit/fallback input, never an executable action list.  Keeping
+    it separate prevents ``new_candidates`` / ``new_entries`` from being
+    accidentally treated as tier order intents by the opposite-direction gate.
+    """
+    sources = (
+        ("Long", "new_candidates"),
+        ("Medium", "new_entries"),
+    )
+    by_ticker: dict[str, dict] = {}
+    errors: list[dict] = []
+    generated_count = 0
+    for tier, key in sources:
+        result = tier_results.get(tier)
+        if not isinstance(result, dict):
+            errors.append({"tier": tier, "field": key, "code": "tier_result_invalid"})
+            continue
+        rows = result.get(key)
+        if rows is None:
+            rows = []
+        if not isinstance(rows, list):
+            errors.append({"tier": tier, "field": key, "code": "candidate_field_invalid"})
+            continue
+        for raw in rows:
+            if not isinstance(raw, dict):
+                continue
+            ticker = canonical_ticker(raw.get("ticker"))
+            if not ticker:
+                continue
+            generated_count += 1
+            entry = by_ticker.setdefault(ticker, {"ticker": ticker, "sources": [], "screen_passed": False})
+            entry["sources"].append({"tier": tier, "field": key})
+            for field in ("score", "composite_score", "price", "currency", "reason", "name", "sector"):
+                if entry.get(field) in (None, "") and raw.get(field) not in (None, ""):
+                    entry[field] = raw.get(field)
+
+    long_term = ((data.get("screening") or {}).get("long_term") or {}) if isinstance(data, dict) else {}
+    passed = long_term.get("passed") if isinstance(long_term, dict) else []
+    passed_count = 0
+    if not isinstance(passed, list):
+        errors.append({"tier": "screening", "field": "long_term.passed", "code": "candidate_field_invalid"})
+        passed = []
+    for raw in passed:
+        if not isinstance(raw, dict):
+            continue
+        ticker = canonical_ticker(raw.get("ticker"))
+        if not ticker:
+            continue
+        passed_count += 1
+        entry = by_ticker.setdefault(ticker, {"ticker": ticker, "sources": [], "screen_passed": False})
+        entry["screen_passed"] = True
+        entry["sources"].append({"tier": "screening", "field": "long_term.passed"})
+        for field in ("score", "composite_score", "price", "currency", "reason", "name", "sector", "ai_thesis"):
+            if raw.get(field) not in (None, ""):
+                entry[field] = raw.get(field)
+
+    candidates = list(by_ticker.values())
+    for entry in candidates:
+        try:
+            entry["source_score"] = float(entry.get("score") or entry.get("composite_score") or 0)
+        except (TypeError, ValueError):
+            entry["source_score"] = 0.0
+        entry["eligible_for_fallback"] = bool(entry.get("screen_passed"))
+    candidates.sort(key=lambda row: (-float(row.get("source_score") or 0), str(row.get("ticker") or "")))
+    return {
+        "version": 1,
+        "complete": not errors,
+        "errors": errors,
+        "generated_candidate_count": generated_count,
+        "screen_passed_count": passed_count,
+        "unique_candidate_count": len(candidates),
+        "candidates": candidates,
+    }
+
+
+def _fallback_action_from_candidate(
+    candidate: dict,
+    *,
+    positions: list[dict],
+    fx_rate: float,
+    single_action_cap_jpy: float,
+) -> dict | None:
+    """Create one routed, bounded add candidate from an already-passed screen row."""
+    ticker = canonical_ticker(candidate.get("ticker"))
+    if not ticker or not candidate.get("screen_passed"):
+        return None
+    try:
+        from insider_restrictions import is_restricted_ticker
+
+        if is_restricted_ticker(ticker):
+            return None
+    except Exception:
+        # A fallback must not invent an order when restriction data itself is
+        # unreadable; the ordinary policy engine remains the final authority.
+        return None
+    matches = [
+        row for row in positions
+        if isinstance(row, dict) and canonical_ticker(row.get("ticker")) == ticker
+    ]
+    # A fallback never guesses a wallet for a new name or across duplicate
+    # scopes.  Existing uniquely routed holdings (such as V) may be added.
+    if len(matches) != 1:
+        return None
+    position = matches[0]
+    try:
+        price = float(candidate.get("price") or position.get("current_price") or 0)
+    except (TypeError, ValueError):
+        return None
+    if price <= 0:
+        return None
+    currency = str(candidate.get("currency") or position.get("currency") or ("JPY" if ticker.endswith(".T") else "USD")).upper()
+    unit_jpy = price * (fx_rate if currency == "USD" else 1.0)
+    if unit_jpy <= 0:
+        return None
+    lot = trading_unit_for_ticker(ticker) if ticker.endswith(".T") else 1
+    lot = max(1, int(lot or 1))
+    quantity = int(math.floor(single_action_cap_jpy / unit_jpy / lot) * lot)
+    if quantity <= 0:
+        return None
+    label = quantity_label_for_ticker(ticker)
+    return {
+        "type": "add",
+        "ticker": ticker,
+        "tier": "Long",
+        "urgency": "medium",
+        "confidence_pct": 70,
+        "quantity": quantity,
+        "requested_buy_quantity": quantity,
+        "amount_hint": f"{quantity}{label}",
+        "currency": currency,
+        "decision_price": price,
+        "limit_price": price,
+        "order_type": "limit",
+        "execution_owner": position.get("owner"),
+        "execution_broker": position.get("broker"),
+        "execution_account": position.get("account"),
+        "execution_investment_type": position.get("investment_type"),
+        "source": "candidate_funnel_fallback",
+        "fallback_candidate": True,
+        "fallback_source_score": candidate.get("source_score"),
+        "fallback_source_fields": list(candidate.get("sources") or []),
+        "reason": (
+            f"候補ファネルのlong_term.passed（score={candidate.get('source_score')})から、"
+            "通常合成に新規買いが無い場合の上限1件候補"
+        ),
+        "action": f"{ticker} を {quantity}{label}、指値 {price:g} で買い増し候補として再評価",
+    }
 
 
 # ── メインエントリー ─────────────────────────────────────
@@ -10370,6 +10992,15 @@ def run_analysis(force: bool = False) -> dict:
         print(f"  ⚠️ 自動補完エラー（スキップ）: {_e}")
     # ────────────────────────────────────────────────────────────────
 
+    _tier_results_for_funnel = {
+        "Long": long_analysis,
+        "Medium": medium_analysis,
+        "Swing": short_positions_analysis,
+        "MarginLong": margin_long_analysis,
+        "ShortSell": short_selling_analysis,
+    }
+    _candidate_funnel = _build_candidate_funnel(_tier_results_for_funnel, data)
+
     print("  ✅ Sonnet×3 + book-aware×2 + Red Team 分析完了")
 
     # Phase 1B: エージェント間不一致スコアリング
@@ -10861,6 +11492,7 @@ def run_analysis(force: bool = False) -> dict:
             ) from _synth_err
 
     if isinstance(synthesis, dict):
+        synthesis["candidate_funnel"] = _candidate_funnel
         for _amount_action in synthesis.get("priority_actions") or []:
             if isinstance(_amount_action, dict):
                 canonicalize_action_amount_hint(_amount_action, in_place=True)
@@ -11140,6 +11772,7 @@ def run_analysis(force: bool = False) -> dict:
     # ── P1-17/P1-21: Deterministic Policy Engine gate ──
     # AI の priority_actions を ex-ante 制約 (VaR / DD stage / leverage / earnings / VIX / freshness)
     # で deterministic にフィルタする。プロンプト依頼ではなくコード側で執行する。
+    _fallback_policy_context = None
     if isinstance(synthesis, dict) and isinstance(synthesis.get("priority_actions"), list):
         try:
             from policy_engine import apply_policy_gate, build_context_from_synthesis_inputs
@@ -11184,6 +11817,7 @@ def run_analysis(force: bool = False) -> dict:
                 earnings_blackout_tickers = _blackout_tickers,
                 portfolio_integrity = data.get("portfolio_integrity") if isinstance(data, dict) else None,
             )
+            _fallback_policy_context = _pe_ctx
             # Stage 6B: 反実仮想 (Kelly影実行) は raw actions (policy 適用前) を
             # 使う。次行で synthesis["priority_actions"] が accepted へ置換される
             # ため、その前に参照を確保しておく (deepcopy は kelly_shadow 側で行う)。
@@ -11420,6 +12054,134 @@ def run_analysis(force: bool = False) -> dict:
     except Exception as _pe:
         _pf_quarantined = _quarantine_post_filter_failure(synthesis, _pe)
         print(f"  ⚠️ Phase1 post-filter エラー → fail-closed で {_pf_quarantined} 件を実行保留に隔離: {_pe}")
+
+    # When the synthesis produced no executable risk-increasing action, try
+    # exactly one *already screen-passed, already held* Long/Medium candidate.
+    # This closes the information-loss gap without creating a second policy or
+    # readiness path: the candidate is passed through the same policy engine
+    # and a side-effect-free Phase 1 trial before it can join the board.
+    if isinstance(synthesis, dict):
+        _summary_before_fallback = synthesis.get("decision_summary") or {}
+        _ready_risk_before = any(
+            isinstance(_a, dict)
+            and _a.get("execution_readiness") == "ready"
+            and _direction_of(_a.get("type")) == "buy"
+            for _a in synthesis.get("priority_actions") or []
+        )
+        _fallback_record: dict = {
+            "version": 1,
+            "attempted": False,
+            "reason": None,
+            "attempts": [],
+            "selected": None,
+        }
+        if int(_summary_before_fallback.get("executable_count") or 0) == 0 and not _ready_risk_before:
+            _funnel = synthesis.get("candidate_funnel") or {}
+            if not isinstance(_funnel, dict) or not _funnel.get("complete"):
+                _fallback_record["reason"] = "candidate_funnel_incomplete"
+                synthesis["fallback_attempt"] = _fallback_record
+                _funnel = {"candidates": []}
+            _existing = {
+                canonical_ticker(_a.get("ticker"))
+                for _a in synthesis.get("priority_actions") or []
+                if isinstance(_a, dict)
+            }
+            _cap_jpy = min(float(data.get("portfolio_total") or 0) * 0.025, 750_000.0)
+            _plan_cap_jpy = _execution_plan_action_cap_jpy(
+                {"type": "add", "source": "candidate_funnel_fallback"},
+                data.get("execution_plan") if isinstance(data, dict) else None,
+            )
+            if _plan_cap_jpy is not None:
+                _cap_jpy = min(_cap_jpy, _plan_cap_jpy)
+            _positions_for_fallback = [
+                _p for _p in data.get("positions") or [] if isinstance(_p, dict)
+            ]
+            for _candidate in (_funnel.get("candidates") or []) if isinstance(_funnel, dict) else []:
+                if not isinstance(_candidate, dict) or not _candidate.get("eligible_for_fallback"):
+                    continue
+                _ticker = canonical_ticker(_candidate.get("ticker"))
+                if not _ticker or _ticker in _existing:
+                    continue
+                _fallback_record["attempted"] = True
+                _trial_action = _fallback_action_from_candidate(
+                    _candidate,
+                    positions=_positions_for_fallback,
+                    fx_rate=float(_fx),
+                    single_action_cap_jpy=_cap_jpy,
+                )
+                if _trial_action is None:
+                    _fallback_record["attempts"].append({"ticker": _ticker, "outcome": "route_or_price_unresolved"})
+                    continue
+                if _fallback_policy_context is None:
+                    _fallback_record["attempts"].append({"ticker": _ticker, "outcome": "policy_context_unavailable"})
+                    break
+                try:
+                    from policy_engine import apply_policy_gate
+
+                    _trial_policy = apply_policy_gate([_trial_action], _fallback_policy_context)
+                except Exception as _fallback_policy_error:
+                    _fallback_record["attempts"].append({
+                        "ticker": _ticker,
+                        "outcome": "policy_error",
+                        "error": type(_fallback_policy_error).__name__,
+                    })
+                    break
+                if not _trial_policy.accepted:
+                    _fallback_record["attempts"].append({"ticker": _ticker, "outcome": "policy_rejected"})
+                    continue
+                _trial_synthesis = copy.deepcopy(synthesis)
+                _trial_synthesis["priority_actions"] = [dict(_trial_policy.accepted[0])]
+                _trial_synthesis["policy_filtered_actions"] = []
+                _phase1_post_filter(
+                    _trial_synthesis,
+                    float(data.get("portfolio_total") or 0),
+                    fx_rate=float(_fx),
+                    positions=data.get("positions"),
+                    cash_info=data.get("cash_info"),
+                    execution_plan=data.get("execution_plan"),
+                    rebalance_medium=data.get("rebalance_medium"),
+                    now=_analysis_now,
+                    side_effects=False,
+                )
+                _trial_kept = _trial_synthesis.get("priority_actions") or []
+                _selected = next(
+                    (
+                        row for row in _trial_kept
+                        if isinstance(row, dict) and row.get("execution_readiness") == "ready"
+                    ),
+                    None,
+                )
+                if _selected is None:
+                    _fallback_record["attempts"].append({
+                        "ticker": _ticker,
+                        "outcome": "readiness_rejected",
+                        "decision_summary": _trial_synthesis.get("decision_summary") or {},
+                    })
+                    continue
+                synthesis.setdefault("priority_actions", []).append(dict(_trial_policy.accepted[0]))
+                _fallback_record["selected"] = {
+                    "ticker": _ticker,
+                    "quantity": _selected.get("quantity"),
+                    "estimated_notional_jpy": _selected.get("estimated_notional_jpy"),
+                }
+                _fallback_record["reason"] = "no_ready_risk_increasing_action_after_primary_synthesis"
+                _phase1_post_filter(
+                    synthesis,
+                    float(data.get("portfolio_total") or 0),
+                    fx_rate=float(_fx),
+                    positions=data.get("positions"),
+                    cash_info=data.get("cash_info"),
+                    execution_plan=data.get("execution_plan"),
+                    rebalance_medium=data.get("rebalance_medium"),
+                    now=_analysis_now,
+                    side_effects=False,
+                )
+                break
+            if not _fallback_record["attempted"] and _fallback_record["reason"] is None:
+                _fallback_record["reason"] = "no_eligible_unrepresented_candidate"
+        else:
+            _fallback_record["reason"] = "primary_analysis_has_executable_action"
+        synthesis["fallback_attempt"] = _fallback_record
     if isinstance(synthesis, dict):
         _rebuild_readiness_narrative(synthesis)
     if isinstance(synthesis, dict):

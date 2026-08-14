@@ -3663,3 +3663,185 @@ def test_exit_opposite_active_buy_plan_is_propagated_for_readiness(monkeypatch):
     assert action["execution_plan_requires_review"] is True
     assert action["execution_plan_conflict_item_ids"] == [plan_item_id]
     assert "active buy/add plan" in action["execution_plan_conflict_reason"]
+
+
+def test_candidate_funnel_uses_long_and_medium_discovery_contracts():
+    result = analyst._build_candidate_funnel(
+        {
+            "Long": {"new_candidates": [{"ticker": "AAPL", "score": 120, "price": 200, "currency": "USD"}]},
+            "Medium": {"new_entries": [{"ticker": "JPM", "score": 90, "price": 150, "currency": "USD"}]},
+        },
+        {"screening": {"long_term": {"passed": [{"ticker": "AAPL", "score": 120, "price": 200, "currency": "USD"}]}}},
+    )
+
+    assert result["complete"] is True
+    assert result["generated_candidate_count"] == 2
+    assert result["unique_candidate_count"] == 2
+    rows = {row["ticker"]: row for row in result["candidates"]}
+    assert rows["AAPL"]["eligible_for_fallback"] is True
+    assert rows["JPM"]["eligible_for_fallback"] is False
+
+
+def test_candidate_funnel_reports_invalid_source_shape():
+    result = analyst._build_candidate_funnel(
+        {"Long": {"new_candidates": {}}, "Medium": {"new_entries": []}},
+        {"screening": {"long_term": {"passed": []}}},
+    )
+
+    assert result["complete"] is False
+    assert result["errors"] == [
+        {"tier": "Long", "field": "new_candidates", "code": "candidate_field_invalid"}
+    ]
+
+
+def test_fallback_candidate_is_limited_by_active_plan_cap():
+    cap = analyst._execution_plan_action_cap_jpy(
+        {"type": "add", "source": "candidate_funnel_fallback"},
+        {"budgets": {"max_single_normal_action_jpy": 250_000}},
+    )
+    action = analyst._fallback_action_from_candidate(
+        {
+            "ticker": "AAPL", "price": 200, "currency": "USD",
+            "screen_passed": True, "source_score": 120, "sources": [],
+        },
+        positions=[{
+            "ticker": "AAPL", "current_price": 200, "currency": "USD",
+            "owner": "husband", "broker": "rakuten", "account": "taxable",
+            "investment_type": "long",
+        }],
+        fx_rate=150,
+        single_action_cap_jpy=cap,
+    )
+
+    assert cap == 250_000
+    assert action is not None
+    assert action["quantity"] == 8
+    assert action["quantity"] * 200 * 150 == 240_000
+    assert (action["quantity"] + 1) * 200 * 150 > cap
+
+
+def test_fallback_jpx_candidate_respects_board_lot():
+    action = analyst._fallback_action_from_candidate(
+        {
+            "ticker": "7203.T", "price": 2_500, "currency": "JPY",
+            "screen_passed": True, "source_score": 100, "sources": [],
+        },
+        positions=[{
+            "ticker": "7203.T", "current_price": 2_500, "currency": "JPY",
+            "owner": "husband", "broker": "rakuten", "account": "taxable",
+            "investment_type": "long",
+        }],
+        fx_rate=150,
+        single_action_cap_jpy=250_000,
+    )
+
+    assert action is not None
+    assert action["quantity"] == 100
+
+
+def test_wallet_capacity_downsizes_buy_without_changing_route(monkeypatch, tmp_path):
+    import execution_readiness
+
+    _silence_external_filters(monkeypatch)
+    monkeypatch.setattr(analyst, "BASE_DIR", tmp_path)
+    monkeypatch.setattr(tunable_params, "get", _tp_get)
+    monkeypatch.setattr(
+        execution_readiness,
+        "resolve_cash_buying_capacity",
+        lambda action, **kwargs: {
+            "readiness": "ready",
+            "effective_cash": 175_000,
+            "currency": "JPY",
+            "cash_capacity_observation": {"capacity_valid_until": "2026-08-14T15:00:00+09:00"},
+        },
+    )
+    synthesis = {
+        "priority_actions": [{
+            "ticker": "1306.T", "type": "buy", "amount_hint": "150口",
+            "quantity": 150, "decision_price": 3_500, "limit_price": 3_500,
+            "currency": "JPY", "execution_owner": "husband",
+            "execution_broker": "rakuten", "execution_account": "特定",
+            "tier": "Long", "confidence_pct": 75,
+        }],
+    }
+    plan = {
+        "status": "disabled",
+        "budgets": {"max_single_normal_action_jpy": 250_000},
+    }
+
+    result = analyst._phase1_post_filter(
+        synthesis,
+        30_000_000,
+        fx_rate=150,
+        positions=[{
+            "ticker": "1306.T", "current_price": 3_500, "currency": "JPY",
+            "shares": 100, "owner": "husband", "broker": "rakuten",
+            "account": "特定", "investment_type": "long",
+        }],
+        execution_plan=plan,
+        now=datetime(2026, 8, 14, 6, 15, tzinfo=ZoneInfo("Asia/Tokyo")),
+        side_effects=False,
+    )
+
+    action = result["priority_actions"][0]
+    assert action["quantity"] == 50
+    assert action["execution_capacity_mode"] == "downsized"
+    assert action["estimated_notional_jpy"] == 175_000
+    assert action["execution_account"] == "特定"
+
+
+def test_reproposal_suppression_starts_only_with_versioned_prior_run(tmp_path):
+    now = datetime(2026, 8, 14, 6, 15, tzinfo=ZoneInfo("Asia/Tokyo"))
+    scope = "husband|rakuten|特定|long"
+    (tmp_path / "ai_recommendation_log.json").write_text(json.dumps([{
+        "as_of": "2026-08-13T06:15:00+09:00",
+        "ticker": "1306.T", "type": "buy", "execution_readiness": "blocked",
+        "reproposal_policy_version": analyst._REPROPOSAL_POLICY_VERSION,
+        "reproposal_reason_fingerprint": ["cash_balance_insufficient", "wallet:CASH_JPY"],
+        "execution_scope_key": scope,
+    }]), encoding="utf-8")
+    action = {
+        "ticker": "1306.T", "type": "buy", "execution_readiness": "blocked",
+        "execution_owner": "husband", "execution_broker": "rakuten",
+        "execution_account": "特定", "tier": "Long",
+        "execution_block_reasons": [{
+            "code": "cash_balance_insufficient", "reason_scope": "wallet",
+            "scope_key": "wallet:CASH_JPY",
+        }],
+    }
+
+    kept, suppressed = analyst._suppress_repeated_candidate_failures(
+        [action], base_dir=tmp_path, now=now,
+    )
+
+    assert kept == []
+    assert suppressed[0]["reproposal_suppressed"] is True
+    assert suppressed[0]["reproposal_reason_fingerprint"] == [
+        "cash_balance_insufficient", "wallet:CASH_JPY",
+    ]
+
+
+def test_legacy_reproposal_history_does_not_suppress(tmp_path):
+    now = datetime(2026, 8, 14, 6, 15, tzinfo=ZoneInfo("Asia/Tokyo"))
+    (tmp_path / "ai_recommendation_log.json").write_text(json.dumps([{
+        "as_of": "2026-08-13T06:15:00+09:00",
+        "ticker": "AAPL", "type": "buy", "execution_readiness": "blocked",
+        "reproposal_reason_fingerprint": ["cash_balance_insufficient", "wallet:USD"],
+        "execution_scope_key": "husband|rakuten|taxable|long",
+    }]), encoding="utf-8")
+    action = {
+        "ticker": "AAPL", "type": "buy", "execution_readiness": "blocked",
+        "execution_owner": "husband", "execution_broker": "rakuten",
+        "execution_account": "taxable", "tier": "Long",
+        "execution_block_reasons": [{
+            "code": "cash_balance_insufficient", "reason_scope": "wallet",
+            "scope_key": "wallet:USD",
+        }],
+    }
+
+    kept, suppressed = analyst._suppress_repeated_candidate_failures(
+        [action], base_dir=tmp_path, now=now,
+    )
+
+    assert kept == [action]
+    assert suppressed == []
