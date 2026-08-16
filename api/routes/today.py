@@ -34,6 +34,128 @@ def _load(name: str) -> dict:
         return {}
 
 
+def _build_cash_status(execution_plan_state: dict, holdings: dict) -> list[dict]:
+    """Render every known cash wallet; never hard-code one broker's rows."""
+    cash_info = execution_plan_state.get("cash_info") if isinstance(execution_plan_state, dict) else {}
+    projection = execution_plan_state.get("cash_wallet_projection") if isinstance(execution_plan_state, dict) else {}
+    wallets = cash_info.get("wallets") if isinstance(cash_info, dict) else []
+    projected_rows = projection.get("wallets") if isinstance(projection, dict) else []
+    projected_by_key = {
+        str(row.get("wallet_key")): row
+        for row in projected_rows if isinstance(row, dict) and row.get("wallet_key")
+    }
+    rows: list[dict] = []
+    for wallet in wallets if isinstance(wallets, list) else []:
+        if not isinstance(wallet, dict) or not wallet.get("wallet_key"):
+            continue
+        wallet_key = str(wallet["wallet_key"])
+        resources = [str(value) for value in wallet.get("resources") or [] if value]
+        mirror = next(
+            (holdings.get(resource) for resource in resources if isinstance(holdings.get(resource), dict)),
+            {},
+        ) if isinstance(holdings, dict) else {}
+        projected = projected_by_key.get(wallet_key) or {}
+        status = str(mirror.get("balance_status") or "confirmed")
+        available_native = wallet.get("available_native")
+        rows.append({
+            "key": resources[0] if len(resources) == 1 else wallet_key,
+            "wallet_key": wallet_key,
+            "resources": resources,
+            "owner": wallet.get("owner"),
+            "broker": wallet.get("broker"),
+            "settlement_pool": wallet.get("settlement_pool"),
+            "currency": wallet.get("currency"),
+            "effective_balance": available_native,
+            "reported_balance": mirror.get("reported_balance_jpy", available_native),
+            "reported_as_of": mirror.get("reported_as_of", wallet.get("source_as_of")),
+            "ledger_delta_since_report": mirror.get("ledger_delta_since_report_jpy", 0),
+            "balance_status": status,
+            "reconciliation_required": bool(mirror.get("reconciliation_required", False)),
+            "available_for_new_buy": available_native if status == "confirmed" else 0,
+            "projected_balance": projected.get("projected_available_native"),
+            "projection_status": projected.get("status"),
+            "projection_authoritative_for_new_buys": bool(
+                projection.get("authoritative_for_new_buys", False)
+            ) if isinstance(projection, dict) else False,
+        })
+    return rows
+
+
+def _build_funding_alternatives(actions: list[dict], cash_status: list[dict]) -> list[dict]:
+    """Show routes that are possible to compare; never infer or move cash."""
+    wallets = [row for row in cash_status if isinstance(row, dict)]
+    out: list[dict] = []
+    for action in actions:
+        if not isinstance(action, dict) or str(action.get("type") or "").lower() not in {"buy", "add", "dca"}:
+            continue
+        currency = str(action.get("currency") or ("JPY" if str(action.get("ticker") or "").endswith(".T") else "USD")).upper()
+        current = {
+            "kind": "current_route",
+            "owner": action.get("execution_owner"),
+            "broker": action.get("execution_broker"),
+            "account": action.get("execution_account"),
+            "currency": currency,
+        }
+        alternatives = [current]
+        for wallet in wallets:
+            if str(wallet.get("currency") or "").upper() != currency:
+                continue
+            alternatives.append({
+                "kind": "taxable_wallet",
+                "owner": wallet.get("owner"),
+                "broker": wallet.get("broker"),
+                "account": "課税",
+                "currency": currency,
+                "wallet_key": wallet.get("wallet_key"),
+                "available_native": wallet.get("available_for_new_buy"),
+            })
+            if action.get("execution_owner") == "wife" and wallet.get("owner") == "husband":
+                alternatives.append({
+                    "kind": "cross_owner_transfer_then_current_route",
+                    "from_owner": "husband",
+                    "from_broker": wallet.get("broker"),
+                    "to_owner": "wife",
+                    "to_broker": action.get("execution_broker"),
+                    "currency": currency,
+                    "wallet_key": wallet.get("wallet_key"),
+                    "available_native": wallet.get("available_for_new_buy"),
+                    "confirmation_endpoint": "/api/cash/cross-owner-transfer/confirm",
+                    "tax_notice": "税務確認の必要性を記録するだけで、非課税判定・税務助言はしません。",
+                })
+            if action.get("execution_owner") == "wife" and wallet.get("owner") == "husband":
+                alternatives.append({
+                    "kind": "cross_owner_transfer_then_current_route",
+                    "from_owner": "husband",
+                    "from_broker": wallet.get("broker"),
+                    "to_owner": "wife",
+                    "to_broker": action.get("execution_broker"),
+                    "currency": currency,
+                    "wallet_key": wallet.get("wallet_key"),
+                    "available_native": wallet.get("available_for_new_buy"),
+                    "confirmation_endpoint": "/api/cash/cross-owner-transfer/confirm",
+                    "tax_notice": "税務確認の必要性を記録するだけで、非課税判定・税務助言はしません。",
+                })
+        opposite_currency = "USD" if currency == "JPY" else "JPY"
+        for wallet in wallets:
+            if (wallet.get("owner"), wallet.get("broker"), str(wallet.get("currency") or "").upper()) == (
+                "husband", "rakuten", opposite_currency,
+            ):
+                alternatives.append({
+                    "kind": "fx_then_taxable_wallet",
+                    "owner": "husband",
+                    "broker": "rakuten",
+                    "account": "課税",
+                    "from_currency": opposite_currency,
+                    "currency": currency,
+                    "wallet_key": wallet.get("wallet_key"),
+                    "available_native": wallet.get("available_for_new_buy"),
+                    "confirmation_endpoint": "/api/cash/fx-conversions/confirm",
+                })
+        alternatives.append({"kind": "no_trade", "label": "見送り"})
+        out.append({"ticker": action.get("ticker"), "action_type": action.get("type"), "alternatives": alternatives})
+    return out
+
+
 def _load_effective_execution_log() -> dict:
     """Return the read-only execution view used by Today."""
     try:
@@ -1577,30 +1699,11 @@ def _build_today() -> dict:
             or row.get("portfolio_application_pending") is True
         )
     ]
-    cash_status = []
-    if isinstance(holdings_raw, dict):
-        for cash_key in ("CASH_JPY_SBI", "CASH_JPY_SBI_WIFE"):
-            row = holdings_raw.get(cash_key)
-            if not isinstance(row, dict):
-                continue
-            is_wife = cash_key.endswith("_WIFE")
-            default_status = "estimated" if is_wife else "confirmed"
-            cash_status.append({
-                "key": cash_key,
-                "owner": "wife" if is_wife else "husband",
-                "broker": "sbi",
-                "currency": "JPY",
-                "effective_balance": row.get("shares"),
-                "reported_balance": row.get("reported_balance_jpy", row.get("shares")),
-                "reported_as_of": row.get("reported_as_of", "2026-05-12" if is_wife else None),
-                "ledger_delta_since_report": row.get("ledger_delta_since_report_jpy", 0),
-                "balance_status": row.get("balance_status", default_status),
-                "reconciliation_required": bool(row.get("reconciliation_required", is_wife)),
-                "available_for_new_buy": (
-                    row.get("available_to_trade_jpy", row.get("shares"))
-                    if row.get("balance_status", default_status) == "confirmed" else 0
-                ),
-            })
+    cash_status = _build_cash_status(execution_plan_state, holdings_raw)
+    funding_alternatives = _build_funding_alternatives(board + review_board, cash_status)
+    optimizer_state = _load("portfolio_optimization.json")
+    optimizer_health = (optimizer_state.get("allocation_health") if isinstance(optimizer_state, dict) else {}) or {}
+    allocator_comparisons = _load("capital_allocator_comparisons.json")
 
     return {
         "as_of": as_of_str,
@@ -1637,11 +1740,16 @@ def _build_today() -> dict:
         },
         "candidate_funnel": synthesis.get("candidate_funnel") or {},
         "fallback_attempt": synthesis.get("fallback_attempt") or {},
+        "capital_allocator": synthesis.get("capital_allocator") or {},
+        "capital_allocator_comparison": synthesis.get("capital_allocator_comparison") or {},
+        "capital_allocator_comparisons": allocator_comparisons,
+        "optimizer_health": optimizer_health,
         "suppressed_reproposals": synthesis.get("suppressed_reproposals") or [],
         "board_notes": board_notes,
         "backlog": backlog,
         "pending_portfolio_applications": pending_portfolio_applications,
         "cash_status": cash_status,
+        "funding_alternatives": funding_alternatives,
         "engine": engine,
         "report": report,
         "scorecard": scorecard,

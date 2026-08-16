@@ -120,6 +120,23 @@ def test_buy_sectors_gap_uses_long_total_not_portfolio_total():
     assert buy_sectors["Energy"]["gap_jpy"] == pytest.approx(200_000)
 
 
+def test_rebalance_never_creates_an_independent_cash_budget():
+    result = re.calculate_rebalance_actions(
+        _snapshot(_LONG_POSITIONS),
+        available_cash=9_000_000,
+        monthly_budget=200_000,
+    )
+
+    assert result["summary"]["cash_budget_authority"] == "execution_plan_state"
+    assert result["summary"]["available_cash"] is None
+    assert result["summary"]["monthly_budget"] is None
+    assert result["new_cash_plan"] == [{
+        "action": "execution plan に委譲",
+        "detail": "新規買付予算・wallet余力・NISA枠は execution plan / allocator を正本として判定します。",
+        "budget_authority": "execution_plan_state",
+    }]
+
+
 # ── geo分析 / NISA保護は全体スコープを維持すべき ──────────────────────────
 
 _M_EWG  = _position("EWG",          "USD", "Other", "medium", 5_000_000, account="特定")

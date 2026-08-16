@@ -125,6 +125,7 @@ VALID_EVENT_TYPES = {
     "nisa_use",       # NISA 枠使用（非現金、後で枠復活も別 event）
     # P0 (Codex 2026-05-17): broker_balance_import 4 モード対応
     "internal_transfer",  # 管理対象口座内移動 (SBI→楽天 等)。audit のみ、TWR には影響させない
+    "cross_owner_transfer",  # 名義間資金移動。税務確認記録を伴うが税務判定はしない
     "reconcile",          # ブローカー残高に合わせた内部補正。audit のみ、TWR には影響させない
 }
 

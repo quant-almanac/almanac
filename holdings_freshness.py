@@ -149,17 +149,65 @@ def effective_source_as_of(
     file_as_of: Optional[datetime],
     base_dir: Path = BASE_DIR,
 ) -> tuple[Optional[datetime], str]:
-    """ファイル由来の as_of と有効な表明のうち、新しい方を返す。
+    """ファイル由来の as_of と有効な利用者表明のうち新しい方を返す。
 
-    Returns: (as_of, source_label)  source_label は "file" か "attestation"。
+    現金の台帳前送りは wallet ごとの権限・通貨・event種別を区別する設計へ
+    作り直すまで無効化している。旧 sidecar は鮮度根拠に採用してはならない。
     """
+    best_at = file_as_of
+    best_label = "file"
+
     attestation = latest_valid_attestation(scope=scope, base_dir=base_dir)
     attested_at = _parse_iso(attestation.get("attested_at")) if attestation else None
-    if attested_at is None:
-        return file_as_of, "file"
-    if file_as_of is None or attested_at > file_as_of:
-        return attested_at, "attestation"
-    return file_as_of, "file"
+    if attested_at is not None and (best_at is None or attested_at > best_at):
+        best_at, best_label = attested_at, "attestation"
+
+    return best_at, best_label
+
+
+# ---------------------------------------------------------------------------
+# 旧現金rollforwardの隔離
+#
+# 旧実装は account.json の後続 ``cash_flow`` を口座・通貨・event 種別を
+# 区別せず合算していた。そのため妻SBI積立と楽天クレカ積立を夫楽天現金へ
+# 誤って足し得る。正しい wallet 別投影 (cash_wallet_projection.json,
+# provenance=wallet_ledger_projection_v1) を実装するまで、互換APIとCLIは
+# 明示的に無効化する。旧 sidecar は読まず、どの財務artifactも書き換えない。
+# ---------------------------------------------------------------------------
+
+CASH_ROLLFORWARD_FILE_NAME = "cash_rollforward.json"
+
+
+def _cash_rollforward_path(base_dir: Path) -> Path:
+    return base_dir / CASH_ROLLFORWARD_FILE_NAME
+
+
+def plan_cash_rollforward(*, base_dir: Path = BASE_DIR) -> dict:
+    """Return an explicit fail-closed result for the retired aggregate path."""
+    del base_dir
+    return {
+        "ok": False,
+        "status": "disabled",
+        "reason_code": "wallet_scoped_projection_required",
+        "reason": (
+            "旧rollforward-cashは口座・通貨・event種別を区別しないため無効です。"
+            "wallet_ledger_projection_v1を使用してください。"
+        ),
+    }
+
+
+def apply_cash_rollforward(
+    *, base_dir: Path = BASE_DIR, now: Optional[datetime] = None
+) -> dict:
+    """Refuse to persist the retired aggregate cash-forward path."""
+    del now
+    return plan_cash_rollforward(base_dir=base_dir)
+
+
+def latest_valid_cash_rollforward(*, base_dir: Path = BASE_DIR) -> Optional[dict]:
+    """Never trust an artifact produced by the retired aggregate path."""
+    del base_dir
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -319,6 +367,12 @@ def main() -> int:
     p_roll = sub.add_parser("rollforward", help="broker確認済み約定を holdings に適用する")
     p_roll.add_argument("--apply", action="store_true", help="実際に書き込む (既定は dry-run)")
 
+    p_cash = sub.add_parser(
+        "rollforward-cash",
+        help="無効化済み。wallet別現金投影への移行待ち",
+    )
+    p_cash.add_argument("--apply", action="store_true", help="実際に書き込む (既定は dry-run)")
+
     sub.add_parser("status", help="現在の有効な表明を表示する")
 
     args = parser.parse_args()
@@ -336,6 +390,11 @@ def main() -> int:
         result = apply_rollforward() if args.apply else plan_rollforward()
         print(json.dumps(result, ensure_ascii=False, indent=2, default=str))
         return 0
+
+    if args.command == "rollforward-cash":
+        result = apply_cash_rollforward() if args.apply else plan_cash_rollforward()
+        print(json.dumps(result, ensure_ascii=False, indent=2, default=str))
+        return 2
 
     status = {
         s: latest_valid_attestation(scope=s) for s in ATTESTABLE_SCOPES

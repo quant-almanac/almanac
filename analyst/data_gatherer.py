@@ -1374,8 +1374,8 @@ def gather_data() -> dict:
         "note": "USD建て購入はUSD口座残高から、JPY建て購入はJPY口座残高から。USD→JPY転換はFXコスト発生。",
     }
 
-    # P0-6: rebalance に実 cash を渡す（旧コードは available_cash=0 固定で
-    # 現金があるのに売却寄りのリバランスが提案される構造だった）。
+    # rebalance は配分差分だけを扱う。新規買付資金は execution plan / allocator
+    # が wallet別に決めるため、ここで合算現金を渡して二重に配備しない。
     #
     # 2026-07 AI動的外貨比率: 通貨目標は currency_policy で解決した有効方針を注入する。
     # AI が見る通貨内訳は whole_portfolio / long_tier の両方を渡し、rebalance に適用する
@@ -1400,7 +1400,7 @@ def gather_data() -> dict:
         except Exception as _cp_e:
             current_currency_policy = {"source": "static_fallback", "reason": f"resolve 失敗: {_cp_e}"}
         rebalance = calculate_rebalance_actions(
-            snap, available_cash=total_cash_jpy, currency_targets=currency_targets)
+            snap, available_cash=None, currency_targets=currency_targets)
     except Exception:
         rebalance = {}
 

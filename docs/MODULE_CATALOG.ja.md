@@ -34,6 +34,7 @@
 | human-only | `credit_card_investment.py`, `espp_plan_manager.py`, `employee_plan_exit.py` | recurring card・持株会集中/exit |
 | advisory | `nisa_allocator.py`, `nisa_migration_planner.py` | owner別NISA枠・migration |
 | live/advisory | `rebalance_engine.py`, `rebalance_planner.py` | driftと人が行うrebalance plan |
+| live | `cash_wallet_projection.py` | wallet別の読み取り専用cash投影監査。broker確認済み買付余力を置換しない |
 
 ## 4. Execution lifecycle と安全
 
@@ -52,6 +53,7 @@
 |---|---|---|
 | live | `risk_policy.py`, `risk_engine.py`, `portfolio_risk_returns.py`, `risk_model_validation.py` | 版管理された固定上限、VaR/CVaR、保有based return、Kupiec |
 | optional | `portfolio_optimizer.py`, `optimize.py`, `bl_alpha_sources.py` | allocation objectiveと独立BL view |
+| live | `capital_allocator.py` | 既存安全gate通過後の通常risk-increasing actionを決定論的に最終選抜 |
 | live/advisory | `market_regime_v2.py`, `regime_params.py`, `vix_classification.py`, `vix_tracker.py` | regime/rate/shock policy、volatility state |
 | shadow/manual-promote | `drawdown_state_machine.py`, `drawdown_enforcement.py` | flow調整DDのhysteresisと明示的enforcement昇格 |
 | live | `drawdown_dca_engine.py`, `leveraged_decay_monitor.py` | DCA ladderとleveraged decay |

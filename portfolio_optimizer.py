@@ -5,6 +5,7 @@ HMMレジーム調整・CVaR最小化・最大Sharpe比・等リスク配分
 """
 
 import json
+import math
 import os
 import warnings
 import numpy as np
@@ -166,11 +167,18 @@ def optimize_pypfopt(
             inv_vol = 1.0 / vols
             raw_w = inv_vol / inv_vol.sum()
             raw = {t: round(float(raw_w[t]), 4) for t in returns.columns}
+            raw_series = pd.Series(raw, dtype=float).reindex(returns.columns).fillna(0.0)
+            annual_return = float(mu.dot(raw_series))
+            annual_volatility = float(np.sqrt(raw_series.T.dot(cov).dot(raw_series)))
+            sharpe = (
+                (annual_return - risk_free_rate) / annual_volatility
+                if annual_volatility > 0 else None
+            )
             return {
                 'weights':         raw,
-                'expected_return': round(float(mu.dot(pd.Series(raw))), 4),
-                'volatility':      None,
-                'sharpe':          None,
+                'expected_return': round(annual_return, 4),
+                'volatility':      round(annual_volatility, 4),
+                'sharpe':          round(float(sharpe), 4) if sharpe is not None else None,
                 'method':          'equal_risk',
             }
         else:
@@ -651,6 +659,75 @@ def compute_risk_parity_weights(
     }
 
 
+def assess_allocation_health(result: dict) -> dict:
+    """Classify whether an optimizer result may influence capital allocation.
+
+    Optimizer output is research evidence, not an authority by default.  A
+    method that degraded into a fallback or produced implausible statistics
+    must be visible in the report but cannot select a ticker, account, or
+    order size.
+    """
+    if not isinstance(result, dict):
+        return {
+            "health": "invalid",
+            "allocation_eligible": False,
+            "health_reasons": ["optimizer_result_not_object"],
+        }
+
+    reasons: list[str] = []
+    method = str(result.get("method") or "")
+    weights = result.get("weights")
+    if result.get("error"):
+        reasons.append("optimizer_error")
+    if method.endswith("_fallback"):
+        reasons.append("optimizer_fallback")
+    if not isinstance(weights, dict) or not weights:
+        reasons.append("weights_missing")
+    else:
+        try:
+            normalized = [float(weight) for weight in weights.values()]
+        except (TypeError, ValueError):
+            normalized = []
+            reasons.append("weights_non_numeric")
+        if normalized:
+            if not all(math.isfinite(weight) and weight >= 0 for weight in normalized):
+                reasons.append("weights_non_finite_or_negative")
+            total_weight = sum(normalized)
+            if not 0.98 <= total_weight <= 1.02:
+                reasons.append("weights_not_normalized")
+
+    metrics = {
+        "expected_return": result.get("expected_return"),
+        "volatility": result.get("volatility"),
+        "sharpe": result.get("sharpe"),
+    }
+    parsed: dict[str, float] = {}
+    for name, value in metrics.items():
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            reasons.append(f"{name}_missing")
+            continue
+        if not math.isfinite(number):
+            reasons.append(f"{name}_non_finite")
+            continue
+        parsed[name] = number
+
+    if "volatility" in parsed and not 0.001 <= parsed["volatility"] <= 2.0:
+        reasons.append("volatility_out_of_range")
+    if "expected_return" in parsed and abs(parsed["expected_return"]) > 0.40:
+        reasons.append("expected_return_out_of_range")
+    if "sharpe" in parsed and abs(parsed["sharpe"]) > 3.0:
+        reasons.append("sharpe_out_of_range")
+
+    health = "healthy" if not reasons else "invalid"
+    return {
+        "health": health,
+        "allocation_eligible": health == "healthy",
+        "health_reasons": reasons,
+    }
+
+
 def run_optimization(
     lookback_days: int = 252,
     methods: Optional[list] = None,
@@ -706,21 +783,29 @@ def run_optimization(
 
         # レジーム調整
         res['regime_weights'] = regime_adjusted_weights(res['weights'], regime)
+        res.update(assess_allocation_health(res))
         results[method]       = res
 
     # 推奨: レジームに応じて手法を選択
-    recommended = {
+    regime_preference = {
         'A_強気': 'max_sharpe',
         'B_中立': 'min_cvar',
         'C_弱気': 'equal_risk',
     }.get(regime, 'min_cvar')
+    recommended = (
+        regime_preference
+        if results.get(regime_preference, {}).get("allocation_eligible") is True
+        else "equal_risk"
+        if results.get("equal_risk", {}).get("allocation_eligible") is True
+        else None
+    )
 
     # Part E-2: Vol Targeting — 推奨手法の metrics.annualized_vol から
     # portfolio 全体の scale (0.7〜1.2) を算出して返り値に含める。
     vol_target: dict = {}
     try:
         from risk_engine import compute_vol_target_scale, TARGET_ANNUAL_VOL
-        rec_metrics = results.get(recommended, {}).get('metrics') or {}
+        rec_metrics = results.get(recommended, {}) if recommended else {}
         predicted_vol = rec_metrics.get('annualized_vol') or rec_metrics.get('volatility')
         if predicted_vol:
             vt = compute_vol_target_scale(float(predicted_vol), TARGET_ANNUAL_VOL, persist=True)
@@ -746,6 +831,15 @@ def run_optimization(
         'regime':          regime,
         'results':         results,
         'recommended':     recommended,
+        'regime_preference': regime_preference,
+        'allocation_health': {
+            method: {
+                "health": row.get("health"),
+                "allocation_eligible": row.get("allocation_eligible"),
+                "reasons": row.get("health_reasons") or [],
+            }
+            for method, row in results.items()
+        },
         'vol_target':      vol_target,
         'risk_parity':     risk_parity,
         'as_of':           datetime.now().strftime('%Y-%m-%d %H:%M'),

@@ -2385,6 +2385,23 @@ def generate_execution_plan(*, base_dir: Path = BASE_DIR, now: datetime | None =
         sector_catalog_summary=sector_summary,
         sector_catalog_warnings=sector_warnings,
     )
+    try:
+        from cash_wallet_projection import build_wallet_projection, write_wallet_projection
+
+        projection = build_wallet_projection(
+            plan.get("cash_info") or {},
+            base_dir=base_dir,
+            now=now,
+        )
+        plan["cash_wallet_projection"] = projection
+        if write:
+            write_wallet_projection(projection, base_dir=base_dir)
+    except Exception as exc:
+        # The reported cash resource remains authoritative. A derived audit
+        # projection must not break plan generation or invent buying power.
+        plan.setdefault("warnings", []).append(
+            f"cash_wallet_projection_unavailable:{type(exc).__name__}"
+        )
     if write:
         atomic_write_json(base_dir / "execution_plan_state.json", plan)
     return plan

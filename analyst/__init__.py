@@ -1974,8 +1974,19 @@ def _analyze_long(data: dict, shared_ctx: str = "") -> dict:
     positions = [p for p in data["positions"] if p.get("investment_type") == "long"]
     candidates = data["screening"]["long_term"].get("passed", [])[:5]
     opt = data["screening"]["optimization"]
-    rec_method = opt.get("recommended", "max_sharpe") if opt else "max_sharpe"
-    rec_weights = (opt.get("results", {}).get(rec_method, {}).get("weights", {}) if opt else {})
+    rec_method = opt.get("recommended") if isinstance(opt, dict) else None
+    rec_result = (opt.get("results", {}).get(rec_method, {}) if rec_method else {})
+    # Only a healthy inverse-volatility/risk-parity result may be shown as a
+    # supporting allocation reference.  Max-Sharpe and fallback outputs remain
+    # research diagnostics and never become an order-sizing authority.
+    if (
+        rec_method == "equal_risk"
+        and rec_result.get("allocation_eligible") is True
+    ):
+        rec_weights = rec_result.get("weights", {})
+    else:
+        rec_method = "allocation_reference_unavailable"
+        rec_weights = {}
     rebalance_actions = data["rebalance"].get("action_plan", [])[:4]
 
     total = sum(p.get("value_jpy", 0) for p in positions) or 1
@@ -2320,9 +2331,14 @@ def _analyze_margin_long(data: dict, shared_ctx: str = "") -> dict:
 def _analyze_short_positions(data: dict, shared_ctx: str = "") -> dict:
     positions = [p for p in data["positions"] if p.get("investment_type") == "swing"]
 
-    if not positions:
-        return {"health": "good", "summary": "swingポジションなし", "priority_actions": [],
-                "hold_notes": [], "loss_management": "なし", "ginn_vol": {}}
+    # 保有ゼロでも即 return してはいけない。このレーンの責務は
+    # 「保有ポジション管理 ＋ スクリーニング由来の新規スイング候補評価」の2つで、
+    # 後者は保有の有無と無関係に成立する。
+    #
+    # 旧実装はここで早期 return しており、下の新規候補抽出に到達しなかった。
+    # その結果 TXN/ANET を決済した 2026-07 以降、保有0 → 候補ゼロ → 新規に建たない
+    # → 保有0 のまま、という自己ロックに陥っていた（鮮度デッドロックと同型）。
+    # 打ち切り判定は候補抽出の後に移し、「保有も候補も無い」ときだけ返す。
 
     pos_summary = [{
         "ticker": p["ticker"], "name": p.get("name", ""),
@@ -2432,16 +2448,29 @@ def _analyze_short_positions(data: dict, shared_ctx: str = "") -> dict:
                 )
         screen_buy_text = "\n".join(lines) + "\n"
 
+    # 打ち切りはここ（候補抽出の後）。保有も新規候補も無いときだけ LLM を呼ばずに返す。
+    if not positions and not (buy_signals or watch_signals or jp_watch_signals):
+        return {"health": "good", "summary": "swingポジションなし・新規候補なし", "priority_actions": [],
+                "hold_notes": [], "loss_management": "なし", "ginn_vol": {}}
+
+    # 保有ゼロのときは損切り警告が意味を成さないので、保有節ごと出し分ける。
+    if positions:
+        positions_section = f"""### 現在のポジション（保有日数・損益・ストップロス含む）
+{json.dumps(pos_summary, ensure_ascii=False)}
+⚠️ 損切りラインの根拠を必ず確認すること。"stop_loss_source": "suggested" は自動計算値。
+   含み損が-20%超の場合、継続理由を明確に示すか、損切りを強く推奨すること。"""
+    else:
+        positions_section = """### 現在のポジション
+現在 swing 保有はゼロ。既存ポジションの管理判断は不要で、
+下記スクリーニング候補からの新規エントリー評価のみ行うこと。"""
+
     prompt = f"""## Swingティア分析：保有ポジション管理 ＋ 新規スイング候補評価
 ※このSonnetは空売り・信用は扱わない。既存ポジションの継続/損切り判断と、スクリーニングBUYシグナルからの新規エントリー推奨を行う。
 ※市場環境・レジーム・シナリオはキャッシュコンテキスト参照。
 
 {earnings_text}
 
-### 現在のポジション（保有日数・損益・ストップロス含む）
-{json.dumps(pos_summary, ensure_ascii=False)}
-⚠️ 損切りラインの根拠を必ず確認すること。"stop_loss_source": "suggested" は自動計算値。
-   含み損が-20%超の場合、継続理由を明確に示すか、損切りを強く推奨すること。
+{positions_section}
 
 {screen_buy_text}
 {_ginn_vol_str}
@@ -10331,6 +10360,116 @@ def _fallback_action_from_candidate(
     }
 
 
+def _apply_capital_allocator(
+    synthesis: dict,
+    data: dict,
+    *,
+    fx_rate: float,
+    analysis_id: str | None,
+    as_of: str,
+) -> None:
+    """Apply the final normal-buy allocator after every existing safety gate.
+
+    The allocator is not another candidate generator: it only ranks already
+    ``ready`` actions and can only downgrade a normal risk-increasing buy.
+    Sell/trim, scenario, and Swing contracts retain their own policy paths.
+    """
+    if not isinstance(synthesis, dict) or not isinstance(synthesis.get("priority_actions"), list):
+        return
+    try:
+        from capital_allocator import allocate_actions, record_comparison
+        from tunable_params import get as _tp_get
+
+        configured_mode = str(_tp_get("capital_allocator_mode", "enforce") or "enforce").lower()
+        mode = configured_mode if configured_mode in {"legacy", "enforce"} else "enforce"
+        try:
+            min_jpy = float(_tp_get("min_action_jpy", 150_000)) / 3
+            min_pct = float(_tp_get("min_action_pct_of_portfolio", 0.005))
+            minimum_notional = max(min_jpy, float(data.get("portfolio_total") or 0) * min_pct)
+        except Exception:
+            minimum_notional = 150_000.0
+
+        prior_normal_buys = 0
+        try:
+            from execution_reconciliation import load_effective_execution_records
+
+            analysis_day = str(as_of)[:10]
+            for execution in load_effective_execution_records(base_dir=BASE_DIR):
+                if not isinstance(execution, dict):
+                    continue
+                if str(execution.get("status") or "").lower() not in {"executed", "partial", "filled"}:
+                    continue
+                if str(execution.get("saved_at") or execution.get("executed_at_time") or "")[:10] != analysis_day:
+                    continue
+                if _direction_of(execution.get("direction") or execution.get("action_type") or execution.get("type")) == "buy":
+                    prior_normal_buys += 1
+        except Exception:
+            # Read failure must not create additional buying capacity.
+            prior_normal_buys = 1
+
+        allocated, report = allocate_actions(
+            synthesis.get("priority_actions") or [],
+            mode=mode,
+            fx_rate=float(fx_rate),
+            min_trade_jpy=minimum_notional,
+            prior_normal_buys_today=prior_normal_buys,
+        )
+        synthesis["priority_actions"] = allocated
+        report["minimum_notional_jpy"] = round(minimum_notional)
+        report["run_id"] = analysis_id or str(as_of)
+        synthesis["capital_allocator"] = report
+
+        # Keep a five-run, human-readable legacy comparison even in enforce
+        # mode.  It has no effect on holdings, cash, or candidate selection.
+        comparison = {
+            "mode": report["mode"],
+            "legacy_ready_tickers": report["legacy_ready_tickers"],
+            "allocator_selected_ticker": report["selected_ticker"],
+            "exclusions": report["exclusions"],
+            "explanation_status": "explainable",
+            "normal_daily_buy_limit": 1,
+        }
+        synthesis["capital_allocator_comparison"] = record_comparison(
+            report["run_id"], comparison, base_dir=BASE_DIR,
+        )
+
+        summary = synthesis.get("decision_summary")
+        if isinstance(summary, dict):
+            actions = synthesis.get("priority_actions") or []
+            summary["executable_count"] = sum(
+                1 for row in actions
+                if isinstance(row, dict) and row.get("execution_readiness") == "ready"
+            )
+            summary["review_count"] = sum(
+                1 for row in actions
+                if isinstance(row, dict) and row.get("execution_readiness") != "ready"
+            ) + int(summary.get("deferred_count") or 0)
+            reason_counts = dict(summary.get("reason_counts") or {})
+            for row in actions:
+                if not isinstance(row, dict) or row.get("execution_readiness") == "ready":
+                    continue
+                for reason in row.get("execution_block_reasons") or []:
+                    if isinstance(reason, dict) and reason.get("code"):
+                        code = str(reason["code"])
+                        reason_counts[code] = reason_counts.get(code, 0) + 1
+            summary["reason_counts"] = reason_counts
+            _set_operational_stance(
+                synthesis,
+                reason_counts,
+                executable_count=int(summary["executable_count"]),
+                actions=actions,
+            )
+    except Exception as exc:
+        # Allocation failure must never manufacture an executable action.  The
+        # original post-filter result remains intact and the output explains
+        # that the legacy result was retained for this run.
+        synthesis["capital_allocator"] = {
+            "mode": "legacy",
+            "error": type(exc).__name__,
+            "fallback": "allocator_error_kept_existing_post_filter_result",
+        }
+
+
 # ── メインエントリー ─────────────────────────────────────
 
 def _with_analysis_run_context(function):
@@ -12201,6 +12340,14 @@ def run_analysis(force: bool = False) -> dict:
         else:
             _fallback_record["reason"] = "primary_analysis_has_executable_action"
         synthesis["fallback_attempt"] = _fallback_record
+    if isinstance(synthesis, dict):
+        _apply_capital_allocator(
+            synthesis,
+            data,
+            fx_rate=float(_fx),
+            analysis_id=_asl_analysis_id,
+            as_of=_asl_as_of,
+        )
     if isinstance(synthesis, dict):
         _rebuild_readiness_narrative(synthesis)
     if isinstance(synthesis, dict):

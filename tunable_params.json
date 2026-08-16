@@ -1408,5 +1408,27 @@
     "last_rationale": "Execution plan enforce readiness をコードで強制し、早すぎる昇格を防止",
     "ai_recommended_at": null,
     "auto_apply": false
+  },
+  "capital_allocator_mode": {
+    "value": "enforce",
+    "default": "enforce",
+    "min": null,
+    "max": null,
+    "step": null,
+    "unit": "mode",
+    "type": "choice",
+    "options": [
+      "legacy",
+      "enforce"
+    ],
+    "category": "execution_plan",
+    "label": "Capital Allocator 動作モード",
+    "desc": "enforceでは通常のrisk-increasing buy/add/dcaを1日1件・1件25万円までの決定論的allocatorで選抜する。legacyは既存採否を保存して比較だけ行う。",
+    "ai_recommended": null,
+    "ai_rationale": null,
+    "last_changed": "2026-08-16T00:00:00+09:00",
+    "last_changed_by": "codex",
+    "last_rationale": "AI候補と最終資本配分を分離し、既存gate後の通常買付を決定論化",
+    "auto_apply": false
   }
 }

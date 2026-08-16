@@ -8,6 +8,7 @@ P0-3: localhost バインド + 書き込み系エンドポイントの X-API-Key
 - API キーは ~/.config/almanac/api_key (0600) か環境変数 ALMANAC_API_KEY
   を優先し、移行期間は旧 ALMANAC 名にも fallback する
 """
+import os
 import sys
 from pathlib import Path
 
@@ -18,7 +19,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from almanac.runtime_config import load_api_key
-from api.routes import dashboard, portfolio, risk, signals, ws, chart, rebalance, margin, nisa, admin, decision, screening, strategy, ai_analysis, actions, contributions, chat, macro, batch, agent, market, scenario, comparison, dca, tuning, performance, disclosure, today, system_status, features
+from api.routes import dashboard, portfolio, risk, signals, ws, chart, rebalance, margin, nisa, admin, decision, screening, strategy, ai_analysis, actions, contributions, chat, macro, batch, agent, market, scenario, comparison, dca, tuning, performance, disclosure, today, system_status, features, allocator
 
 app = FastAPI(title="ALMANAC API", version="5.0.0")
 
@@ -100,6 +101,7 @@ app.include_router(agent.router)
 app.include_router(market.router)
 app.include_router(scenario.router)
 app.include_router(comparison.router)
+app.include_router(allocator.router)
 app.include_router(dca.router)
 app.include_router(tuning.router)
 app.include_router(performance.router)  # 整理 #6: TWR / tax-lots / policy-decisions / ledger-events

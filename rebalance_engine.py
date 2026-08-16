@@ -307,8 +307,8 @@ def _filter_micro_actions(
 
 def calculate_rebalance_actions(
     snapshot:        dict,
-    available_cash:  float = 0,
-    monthly_budget:  float = 200_000,   # クレカ積立¥20万
+    available_cash:  float | None = None,
+    monthly_budget:  float | None = None,
     currency_targets: dict | None = None,
 ) -> dict:
     """
@@ -316,8 +316,8 @@ def calculate_rebalance_actions(
 
     Args:
         snapshot:       portfolio_manager.build_portfolio_snapshot() の出力
-        available_cash: 追加投資可能な現金（円）
-        monthly_budget: 毎月の新規投資予算（円）
+        available_cash: 互換引数。新規買付予算には使用しない。
+        monthly_budget: 互換引数。新規買付予算には使用しない。
 
     Returns:
         {
@@ -374,10 +374,15 @@ def calculate_rebalance_actions(
                 'target':   f'{currency_targets[ccy]["min"]*100:.0f}〜{currency_targets[ccy]["max"]*100:.0f}%',
             })
 
-    # 新規資金の振り分け提案
-    new_cash_plan = _plan_new_cash_allocation(
-        buy_sectors, buy_currencies, available_cash, monthly_budget
-    )
+    # 予算正本は execution_plan_state / capital allocator である。ここは
+    # 配分の差分を説明するだけで、旧来の「実現金 + 月20万円」を新規買付へ
+    # 二重に割り当てない。互換引数は呼び出し元の移行完了まで受け付けるが、
+    # 発注額には一切使わない。
+    new_cash_plan = [{
+        'action': 'execution plan に委譲',
+        'detail': '新規買付予算・wallet余力・NISA枠は execution plan / allocator を正本として判定します。',
+        'budget_authority': 'execution_plan_state',
+    }]
 
     # 欧州集中リスク分析
     geo = analyze_geographic_concentration(snapshot)
@@ -418,8 +423,9 @@ def calculate_rebalance_actions(
             'european_ratio':        geo['european_ratio'],
             'european_concentration': geo['status'] == 'warning',
             'quarterly_check_due':   is_quarter,
-            'available_cash':        available_cash,
-            'monthly_budget':        monthly_budget,
+            'available_cash':        None,
+            'monthly_budget':        None,
+            'cash_budget_authority': 'execution_plan_state',
             'total_jpy':             total,
             'core_total_jpy':        core_total,
             'core_position_count':   len(core_snap.get('positions', [])),

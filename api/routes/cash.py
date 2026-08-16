@@ -15,6 +15,8 @@ api/routes/cash.py — Fix 8 (2026-04-24): 現金入出金 API
 """
 from __future__ import annotations
 
+import hashlib
+import json
 import sys
 from copy import deepcopy
 from datetime import datetime
@@ -114,6 +116,29 @@ class CashReconcileRequest(BaseModel):
         if not value:
             raise ValueError("値は必須です")
         return value
+
+
+class FXConversionConfirmRequest(BaseModel):
+    owner: CashOwner = CashOwner.husband
+    broker: CashBroker = CashBroker.rakuten
+    from_currency: CashCurrency
+    to_currency: CashCurrency
+    from_amount: float = Field(..., gt=0)
+    fx_rate_usdjpy: float = Field(..., gt=50, lt=500)
+    idempotency_key: str = Field(..., min_length=8, max_length=200)
+    source: str = Field(..., min_length=1, max_length=200)
+
+
+class CrossOwnerTransferConfirmRequest(BaseModel):
+    from_owner: CashOwner
+    from_broker: CashBroker
+    to_owner: CashOwner
+    to_broker: CashBroker
+    currency: CashCurrency
+    amount: float = Field(..., gt=0)
+    idempotency_key: str = Field(..., min_length=8, max_length=200)
+    source: str = Field(..., min_length=1, max_length=200)
+    tax_review_acknowledged: bool = False
 
 
 # ────────────────────────────────────────────────────────
@@ -413,6 +438,148 @@ def _apply_cash_change(req: CashRequest, tx_type: TxType) -> dict:
         raise HTTPException(status_code=409, detail="portfolio ledger is busy") from e
 
 
+def _movement_fingerprint(kind: str, payload: dict) -> str:
+    encoded = json.dumps({"kind": kind, **payload}, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _idempotent_movement_replay(tx_log: dict, *, idempotency_key: str, fingerprint: str) -> dict | None:
+    rows = tx_log.get("transactions") if isinstance(tx_log, dict) else []
+    for row in rows if isinstance(rows, list) else []:
+        if not isinstance(row, dict) or row.get("idempotency_key") != idempotency_key:
+            continue
+        if row.get("request_fingerprint") != fingerprint:
+            raise HTTPException(status_code=409, detail="同じ idempotency_key に異なる内容は使用できません")
+        result = row.get("result") if isinstance(row.get("result"), dict) else {"transaction": row}
+        return {**result, "idempotent_replay": True}
+    return None
+
+
+def _apply_route_delta(
+    *,
+    account: dict,
+    holdings: dict,
+    owner: CashOwner,
+    broker: CashBroker,
+    currency: CashCurrency,
+    delta: float,
+    confirmed: bool,
+) -> str:
+    """Apply one explicit cash leg; undefined routes and negative balances fail closed."""
+    key = _holdings_key(currency, broker, owner)
+    row = holdings.get(key)
+    if not isinstance(row, dict):
+        raise HTTPException(status_code=500, detail=f"holdings.json に {key} がありません")
+    current = float(row.get("shares", 0) or 0)
+    updated = round(current + float(delta), 2)
+    if updated < -1e-8:
+        raise HTTPException(status_code=400, detail=f"{key} 残高不足（現在: {current}、必要額: {-delta}）")
+    row["shares"] = max(0.0, updated)
+    holdings[key] = row
+
+    if owner == CashOwner.husband and broker == CashBroker.rakuten:
+        account_key = "balance" if currency == CashCurrency.JPY else "usd_balance"
+        account_current = float(account.get(account_key, 0) or 0)
+        account_updated = round(account_current + float(delta), 2)
+        if account_updated < -1e-8:
+            raise HTTPException(status_code=400, detail=f"楽天 {currency.value} 残高不足")
+        account[account_key] = max(0.0, account_updated)
+
+    if key == "CASH_JPY_SBI_WIFE":
+        available = float(row.get("available_to_trade_jpy", current) or 0) + float(delta)
+        if available < -1e-8:
+            raise HTTPException(status_code=400, detail=f"{key} 買付余力不足")
+        row["available_to_trade_jpy"] = max(0.0, round(available, 2))
+        row["unavailable_cash_jpy"] = round(max(float(row["shares"]) - available, 0.0), 2)
+        row["ledger_delta_since_report_jpy"] = round(
+            float(row.get("ledger_delta_since_report_jpy", 0) or 0) + float(delta), 2
+        )
+        row["balance_status"] = "confirmed" if confirmed else "estimated"
+        row["reconciliation_required"] = not confirmed
+        holdings[key] = row
+    return key
+
+
+def _refresh_execution_plan_after_cash_movement(result: dict) -> None:
+    try:
+        from execution_plan_engine import generate_execution_plan
+
+        generate_execution_plan(base_dir=ACCOUNT_FILE.parent, write=True)
+        result["execution_plan_refreshed"] = True
+    except Exception as exc:
+        result["execution_plan_refreshed"] = False
+        result["execution_plan_refresh_warning"] = str(exc)[:200]
+
+
+def _confirm_movement(
+    *,
+    kind: str,
+    idempotency_key: str,
+    fingerprint_payload: dict,
+    apply_legs,
+    ledger_legs: list[dict],
+    audit: dict,
+) -> dict:
+    """Commit a confirmed multi-leg movement once, with durable JSON replay data.
+
+    This is deliberately separate from deposit/withdraw: FX and cross-owner
+    movements are not external cash flows and therefore must not be classified
+    as a tax-free internal transfer or enter TWR cash-flow accounting.
+    """
+    fingerprint = _movement_fingerprint(kind, fingerprint_payload)
+    try:
+        with process_lock("portfolio_ledger"):
+            original_account = _load_required_dict(ACCOUNT_FILE, "account.json")
+            original_holdings = _load_required_dict(HOLDINGS_FILE, "holdings.json")
+            original_tx_log = _load_required_dict(TX_FILE, "cash_transactions.json")
+            replay = _idempotent_movement_replay(
+                original_tx_log, idempotency_key=idempotency_key, fingerprint=fingerprint,
+            )
+            if replay is not None:
+                return replay
+            account, holdings, tx_log = deepcopy(original_account), deepcopy(original_holdings), deepcopy(original_tx_log)
+            routes = apply_legs(account, holdings)
+            _sync_account_cash_totals(account)
+            account["last_updated"] = datetime.now().date().isoformat()
+            movement_id = f"{kind}_{fingerprint[:20]}"
+            result = {
+                "ok": True,
+                "movement_id": movement_id,
+                "kind": kind,
+                "routes": routes,
+                "idempotent_replay": False,
+            }
+            tx = {
+                "id": movement_id,
+                "timestamp": datetime.now(SYSTEM_LOCAL_TZ).isoformat(timespec="seconds"),
+                "type": kind,
+                "idempotency_key": idempotency_key,
+                "request_fingerprint": fingerprint,
+                "audit": audit,
+                "result": result,
+            }
+            rows = tx_log.get("transactions") if isinstance(tx_log.get("transactions"), list) else []
+            rows.append(tx)
+            tx_log["transactions"] = rows
+            try:
+                _save_json(ACCOUNT_FILE, account)
+                _save_json(HOLDINGS_FILE, holdings)
+                _save_json(TX_FILE, tx_log)
+                from event_ledger import append_event
+                for index, leg in enumerate(ledger_legs):
+                    append_event(event_id=f"{movement_id}:{index}", source="api", **leg)
+            except Exception as exc:
+                _save_json(ACCOUNT_FILE, original_account)
+                _save_json(HOLDINGS_FILE, original_holdings)
+                _save_json(TX_FILE, original_tx_log)
+                raise HTTPException(status_code=500, detail=f"cash movement を反映できなかったため巻き戻しました: {exc}") from exc
+    except LockBusy as exc:
+        raise HTTPException(status_code=409, detail="portfolio ledger is busy") from exc
+    _invalidate_portfolio_cache()
+    _refresh_execution_plan_after_cash_movement(result)
+    return result
+
+
 # ────────────────────────────────────────────────────────
 # Endpoints
 # ────────────────────────────────────────────────────────
@@ -479,6 +646,118 @@ async def reconcile_cash(req: CashReconcileRequest):
             }
     except LockBusy as exc:
         raise HTTPException(status_code=409, detail="portfolio ledger is busy") from exc
+
+
+@router.post("/api/cash/fx-conversions/confirm")
+async def confirm_fx_conversion(req: FXConversionConfirmRequest):
+    """Record a broker-confirmed FX conversion as two explicit wallet cash legs."""
+    if req.owner != CashOwner.husband or req.broker != CashBroker.rakuten:
+        raise HTTPException(status_code=409, detail="現時点でFX確認は夫楽天のJPY/USD walletだけに対応しています")
+    if req.from_currency == req.to_currency:
+        raise HTTPException(status_code=422, detail="from_currency と to_currency は異なる必要があります")
+    converted = (
+        round(req.from_amount * req.fx_rate_usdjpy, 2)
+        if req.from_currency == CashCurrency.USD else round(req.from_amount / req.fx_rate_usdjpy, 2)
+    )
+    from_route = _holdings_key(req.from_currency, req.broker, req.owner)
+    to_route = _holdings_key(req.to_currency, req.broker, req.owner)
+    payload = {
+        "owner": req.owner.value, "broker": req.broker.value,
+        "from_currency": req.from_currency.value, "to_currency": req.to_currency.value,
+        "from_amount": req.from_amount, "fx_rate_usdjpy": req.fx_rate_usdjpy,
+        "source": req.source,
+    }
+
+    def apply_legs(account: dict, holdings: dict) -> list[str]:
+        return [
+            _apply_route_delta(
+                account=account, holdings=holdings, owner=req.owner, broker=req.broker,
+                currency=req.from_currency, delta=-req.from_amount, confirmed=True,
+            ),
+            _apply_route_delta(
+                account=account, holdings=holdings, owner=req.owner, broker=req.broker,
+                currency=req.to_currency, delta=converted, confirmed=True,
+            ),
+        ]
+
+    return _confirm_movement(
+        kind="fx_conversion",
+        idempotency_key=req.idempotency_key,
+        fingerprint_payload=payload,
+        apply_legs=apply_legs,
+        ledger_legs=[
+            {
+                "event_type": "fx_conversion", "direction": "out", "quantity": req.from_amount,
+                "price": 1.0, "currency": req.from_currency.value, "fx_rate_usdjpy": req.fx_rate_usdjpy,
+                "account": req.broker.value, "note": req.source,
+                "raw_payload": {"owner": req.owner.value, "broker": req.broker.value, "cash_route": from_route, "cash_sign": -1},
+            },
+            {
+                "event_type": "fx_conversion", "direction": "in", "quantity": converted,
+                "price": 1.0, "currency": req.to_currency.value, "fx_rate_usdjpy": req.fx_rate_usdjpy,
+                "account": req.broker.value, "note": req.source,
+                "raw_payload": {"owner": req.owner.value, "broker": req.broker.value, "cash_route": to_route, "cash_sign": 1},
+            },
+        ],
+        audit={**payload, "converted_amount": converted},
+    )
+
+
+@router.post("/api/cash/cross-owner-transfer/confirm")
+async def confirm_cross_owner_transfer(req: CrossOwnerTransferConfirmRequest):
+    """Record a confirmed cross-owner transfer without making a tax judgement."""
+    if req.from_owner == req.to_owner:
+        raise HTTPException(status_code=422, detail="名義間移動には異なるfrom_owner/to_ownerが必要です")
+    if not req.tax_review_acknowledged:
+        raise HTTPException(
+            status_code=422,
+            detail="tax_review_acknowledged=true が必要です（税務確認の必要性を認識した記録であり、非課税判定ではありません）",
+        )
+    from_route = _holdings_key(req.currency, req.from_broker, req.from_owner)
+    to_route = _holdings_key(req.currency, req.to_broker, req.to_owner)
+    payload = {
+        "from_owner": req.from_owner.value, "from_broker": req.from_broker.value,
+        "to_owner": req.to_owner.value, "to_broker": req.to_broker.value,
+        "currency": req.currency.value, "amount": req.amount, "source": req.source,
+        "tax_review_acknowledged": True,
+    }
+
+    def apply_legs(account: dict, holdings: dict) -> list[str]:
+        return [
+            _apply_route_delta(
+                account=account, holdings=holdings, owner=req.from_owner, broker=req.from_broker,
+                currency=req.currency, delta=-req.amount, confirmed=True,
+            ),
+            _apply_route_delta(
+                account=account, holdings=holdings, owner=req.to_owner, broker=req.to_broker,
+                currency=req.currency, delta=req.amount, confirmed=False,
+            ),
+        ]
+
+    return _confirm_movement(
+        kind="cross_owner_transfer",
+        idempotency_key=req.idempotency_key,
+        fingerprint_payload=payload,
+        apply_legs=apply_legs,
+        ledger_legs=[
+            {
+                "event_type": "cross_owner_transfer", "direction": "out", "quantity": req.amount,
+                "price": 1.0, "currency": req.currency.value, "fx_rate_usdjpy": None,
+                "account": req.from_broker.value, "note": req.source,
+                "raw_payload": {"owner": req.from_owner.value, "broker": req.from_broker.value, "cash_route": from_route, "cash_sign": -1, "tax_review_acknowledged": True},
+            },
+            {
+                "event_type": "cross_owner_transfer", "direction": "in", "quantity": req.amount,
+                "price": 1.0, "currency": req.currency.value, "fx_rate_usdjpy": None,
+                "account": req.to_broker.value, "note": req.source,
+                "raw_payload": {"owner": req.to_owner.value, "broker": req.to_broker.value, "cash_route": to_route, "cash_sign": 1, "tax_review_acknowledged": True},
+            },
+        ],
+        audit={
+            **payload,
+            "tax_notice": "tax_review_acknowledged は税務確認の必要性を認識した記録であり、非課税判定・税務助言ではありません。",
+        },
+    )
 
 
 @router.get("/api/cash/transactions")
