@@ -28,7 +28,7 @@ def _seed(monkeypatch, tmp_path):
     monkeypatch.setattr(cash, "TX_FILE", tx)
     ledger_calls = []
     import event_ledger
-    monkeypatch.setattr(event_ledger, "append_event", lambda **kwargs: ledger_calls.append(kwargs) or {"duplicate": False})
+    monkeypatch.setattr(event_ledger, "append_events", lambda *, events, **kwargs: ledger_calls.extend(events) or [{"duplicate": False} for _ in events])
     return account, holdings, tx, ledger_calls
 
 

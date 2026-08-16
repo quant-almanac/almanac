@@ -64,6 +64,15 @@ def test_append_event_idempotent(tmp_db):
     assert r2["amount_jpy"] == r1["amount_jpy"]
 
 
+def test_append_events_validates_every_leg_before_any_ledger_write(tmp_db):
+    with pytest.raises(ValueError, match="unknown event_type"):
+        el.append_events(events=[
+            {"event_id": "transfer-out", "event_type": "cash_flow", "direction": "out", "quantity": 100, "price": 1.0, "currency": "JPY"},
+            {"event_id": "transfer-bad", "event_type": "not-an-event"},
+        ], db_path=tmp_db)
+    assert el.query_events(db_path=tmp_db) == []
+
+
 def test_append_event_sell_is_positive(tmp_db):
     r = el.append_event(
         event_type="trade", ticker="AAPL", direction="sell",

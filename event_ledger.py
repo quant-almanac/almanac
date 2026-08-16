@@ -418,106 +418,64 @@ def _validate_amount_jpy(
 # Public API: append / query
 # ============================================================
 
-def append_event(
-    *,
-    event_type: str,
-    occurred_at: Optional[str] = None,
-    ticker: Optional[str] = None,
-    direction: Optional[str] = None,
-    quantity: Optional[float] = None,
-    price: Optional[float] = None,
-    currency: Optional[str] = None,
-    fx_rate_usdjpy: Optional[float] = None,
-    account: Optional[str] = None,
-    source: str = "api",
-    note: Optional[str] = None,
-    raw_payload: Optional[dict] = None,
-    event_id: Optional[str] = None,
-    db_path: Optional[Path] = None,
-) -> dict:
-    """
-    新規 event を append する。
-
-    idempotency:
-      event_id を渡せば再呼出は no-op (既存行を返す)。
-      未指定なら UUID4 を発行。
-
-    Returns:
-      {"event_id": str, "rowid": int, "duplicate": bool, "amount_jpy": float | None}
-
-    Raises:
-      ValueError: event_type 不正、direction 不正
-    """
+def _prepared_event(event: dict) -> dict:
+    if not isinstance(event, dict):
+        raise ValueError("ledger event must be a dict")
+    row = dict(event)
+    event_type = row.get("event_type")
+    direction = row.get("direction")
     if event_type not in VALID_EVENT_TYPES:
         raise ValueError(f"unknown event_type: {event_type}. allowed: {sorted(VALID_EVENT_TYPES)}")
     if direction is not None and direction not in VALID_DIRECTIONS:
         raise ValueError(f"unknown direction: {direction}. allowed: {sorted(VALID_DIRECTIONS)}")
+    row["event_id"] = str(row.get("event_id") or uuid.uuid4().hex)
+    row["occurred_at"] = row.get("occurred_at") or datetime.now().isoformat(timespec="seconds")
+    row["source"] = row.get("source") or "api"
+    amount_jpy = _to_amount_jpy(quantity=row.get("quantity"), price=row.get("price"), currency=row.get("currency"), fx_rate_usdjpy=row.get("fx_rate_usdjpy"), direction=direction)
+    _validate_amount_jpy(event_type=event_type, quantity=row.get("quantity"), price=row.get("price"), currency=row.get("currency"), fx_rate_usdjpy=row.get("fx_rate_usdjpy"), amount_jpy=amount_jpy)
+    row["amount_jpy"] = amount_jpy
+    return row
 
-    if event_id is None:
-        event_id = uuid.uuid4().hex
-    if occurred_at is None:
-        occurred_at = datetime.now().isoformat(timespec="seconds")
 
-    amount_jpy = _to_amount_jpy(
-        quantity=quantity, price=price, currency=currency,
-        fx_rate_usdjpy=fx_rate_usdjpy, direction=direction,
-    )
-    _validate_amount_jpy(
-        event_type=event_type,
-        quantity=quantity,
-        price=price,
-        currency=currency,
-        fx_rate_usdjpy=fx_rate_usdjpy,
-        amount_jpy=amount_jpy,
-    )
-
+def append_events(*, events: list[dict], db_path: Optional[Path] = None) -> list[dict]:
+    """Append a set of events in one all-or-nothing SQLite transaction."""
+    prepared = [_prepared_event(event) for event in events]
+    event_ids = [row["event_id"] for row in prepared]
+    if len(event_ids) != len(set(event_ids)):
+        raise ValueError("duplicate event_id within append_events batch")
     init_schema(db_path)
+    results: list[dict] = []
     with _conn(db_path) as c:
-        # idempotency check
-        existing = c.execute(
-            "SELECT id, amount_jpy FROM ledger_events WHERE event_id = ?",
-            (event_id,),
-        ).fetchone()
-        if existing is not None:
-            return {
-                "event_id": event_id,
-                "rowid": int(existing["id"]),
-                "duplicate": True,
-                "amount_jpy": existing["amount_jpy"],
-            }
+        for row in prepared:
+            existing = c.execute("SELECT id, amount_jpy FROM ledger_events WHERE event_id = ?", (row["event_id"],)).fetchone()
+            if existing is not None:
+                results.append({"event_id": row["event_id"], "rowid": int(existing["id"]), "duplicate": True, "amount_jpy": existing["amount_jpy"]})
+                continue
+            cur = c.execute("""
+                INSERT INTO ledger_events (event_id, occurred_at, recorded_at, event_type, ticker, direction,
+                 quantity, price, currency, fx_rate_usdjpy, amount_jpy, account, source, note, raw_payload)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                row["event_id"], row["occurred_at"], datetime.now().isoformat(timespec="seconds"), row["event_type"],
+                row.get("ticker"), row.get("direction"), row.get("quantity"), row.get("price"), row.get("currency"),
+                row.get("fx_rate_usdjpy"), row["amount_jpy"], row.get("account"), row["source"], row.get("note"),
+                json.dumps(row["raw_payload"], ensure_ascii=False) if row.get("raw_payload") is not None else None,
+            ))
+            results.append({"event_id": row["event_id"], "rowid": int(cur.lastrowid), "duplicate": False, "amount_jpy": row["amount_jpy"]})
+    return results
 
-        cur = c.execute(
-            """
-            INSERT INTO ledger_events
-              (event_id, occurred_at, recorded_at, event_type, ticker, direction,
-               quantity, price, currency, fx_rate_usdjpy, amount_jpy, account,
-               source, note, raw_payload)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                event_id,
-                occurred_at,
-                datetime.now().isoformat(timespec="seconds"),
-                event_type,
-                ticker,
-                direction,
-                quantity,
-                price,
-                currency,
-                fx_rate_usdjpy,
-                amount_jpy,
-                account,
-                source,
-                note,
-                json.dumps(raw_payload, ensure_ascii=False) if raw_payload is not None else None,
-            ),
-        )
-        return {
-            "event_id": event_id,
-            "rowid": int(cur.lastrowid),
-            "duplicate": False,
-            "amount_jpy": amount_jpy,
-        }
+
+def append_event(*, event_type: str, occurred_at: Optional[str] = None, ticker: Optional[str] = None,
+                 direction: Optional[str] = None, quantity: Optional[float] = None, price: Optional[float] = None,
+                 currency: Optional[str] = None, fx_rate_usdjpy: Optional[float] = None, account: Optional[str] = None,
+                 source: str = "api", note: Optional[str] = None, raw_payload: Optional[dict] = None,
+                 event_id: Optional[str] = None, db_path: Optional[Path] = None) -> dict:
+    """Append one event; see :func:`append_events` for transactional batches."""
+    return append_events(events=[{
+        "event_type": event_type, "occurred_at": occurred_at, "ticker": ticker, "direction": direction,
+        "quantity": quantity, "price": price, "currency": currency, "fx_rate_usdjpy": fx_rate_usdjpy,
+        "account": account, "source": source, "note": note, "raw_payload": raw_payload, "event_id": event_id,
+    }], db_path=db_path)[0]
 
 
 def _superseded_ids(rows: list) -> set:

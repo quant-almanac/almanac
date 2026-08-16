@@ -224,10 +224,20 @@ def derive_cash_info(
             "available_native": 0.0,
             "available_jpy": 0,
             "resources": [],
+            "source_as_of": normalized.get("source_as_of"),
+            "source_as_of_status": "resolved",
         })
         wallet["available_native"] += float(normalized.get("available_native") or 0)
         wallet["available_jpy"] += _jpy(normalized.get("available_jpy"))
         wallet["resources"].append(str(normalized.get("resource") or ""))
+        incoming_as_of = normalized.get("source_as_of")
+        existing_as_of = wallet.get("source_as_of")
+        if _parse_dt(incoming_as_of) is None or _parse_dt(existing_as_of) is None:
+            wallet["source_as_of"] = None
+            wallet["source_as_of_status"] = "unresolved"
+        elif _parse_dt(incoming_as_of) != _parse_dt(existing_as_of):
+            wallet["source_as_of"] = None
+            wallet["source_as_of_status"] = "multiple_resource_timestamps"
 
     if account_confirmed and jpy_balance:
         _append_resource({

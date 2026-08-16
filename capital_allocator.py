@@ -13,6 +13,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from action_amounts import synchronize_resized_action_prose
+from instrument_metadata import canonical_ticker, quantity_label_for_ticker, trading_unit_for_ticker
 from utils import atomic_write_json, load_json
 
 BASE_DIR = Path(__file__).parent
@@ -97,6 +99,42 @@ def _append_reason(action: dict[str, Any], code: str, message: str) -> None:
         reasons.append({"code": code, "message": message})
 
 
+def _lot_size_for_action(action: dict[str, Any]) -> int:
+    """Return the smallest executable quantity for this already-ready action."""
+    ticker = canonical_ticker(action.get("ticker"))
+    if not ticker.endswith(".T"):
+        return 1
+    channel = str(action.get("execution_channel") or action.get("broker_channel") or "").lower()
+    if str(action.get("type") or "").lower() in {"buy", "add"} and channel == "rakuten_kabu_mini_open":
+        return 1
+    return max(1, int(trading_unit_for_ticker(ticker)))
+
+
+def _resize_quantity_fields(
+    row: dict[str, Any], *, quantity: int, resized: int,
+    old_estimated_jpy: float, estimated_jpy: float,
+) -> dict[str, Any]:
+    """Synchronize structured and displayed values after a deterministic cap."""
+    label = quantity_label_for_ticker(canonical_ticker(row.get("ticker")))
+    old_hint = str(row.get("amount_hint") or f"{quantity}{label}")
+    new_hint = f"{resized}{label}"
+    out = dict(row)
+    out["quantity"] = resized
+    out["requested_buy_quantity"] = resized
+    out["amount_hint"] = new_hint
+    out["estimated_notional_jpy"] = round(estimated_jpy)
+    out["capital_allocator_size_applied"] = {
+        "quantity": {"from": quantity, "to": resized},
+        "amount_hint": {"from": old_hint, "to": new_hint},
+        "estimated_notional_jpy": {"from": round(old_estimated_jpy), "to": round(estimated_jpy)},
+    }
+    out, _ = synchronize_resized_action_prose(
+        out, old_hint=old_hint, new_hint=new_hint,
+        old_notional_jpy=old_estimated_jpy, new_notional_jpy=estimated_jpy,
+    )
+    return out
+
+
 def _cap_quantity(
     action: dict[str, Any],
     *,
@@ -113,12 +151,17 @@ def _cap_quantity(
     if quantity <= 0 or estimated <= 0:
         return row, "capital_allocator_notional_unresolved"
     unit_jpy = estimated / quantity
+    lot_size = _lot_size_for_action(row)
     resized = int(math.floor(cap_jpy / unit_jpy))
+    resized = (resized // lot_size) * lot_size
     if resized <= 0 or resized * unit_jpy < min_trade_jpy:
         return row, "capital_allocator_quantity_below_minimum"
-    row["quantity"] = resized
-    row["requested_buy_quantity"] = resized
-    row["estimated_notional_jpy"] = round(resized * unit_jpy)
+    row = _resize_quantity_fields(
+        row, quantity=quantity, resized=resized,
+        old_estimated_jpy=estimated, estimated_jpy=resized * unit_jpy,
+    )
+    if row.get("action_quantity_sync_failed") or row.get("prose_numeric_sync_failed"):
+        return row, "capital_allocator_quantity_sync_failed"
     row["capital_allocator_resized_from_quantity"] = quantity
     row["capital_allocator_resized_reason"] = "normal_action_cap_jpy"
     return row, None
@@ -156,7 +199,12 @@ def allocate_actions(
             if failure:
                 candidate.update(resized)
                 candidate["execution_readiness"] = "review"
-                _append_reason(candidate, failure, "通常枠の上限内では最低取引額を満たせません")
+                message = {
+                    "capital_allocator_quantity_below_minimum": "通常枠の上限内では最低取引額を満たせません",
+                    "capital_allocator_quantity_sync_failed": "通常枠への数量縮小後、表示文を安全に同期できませんでした",
+                    "capital_allocator_notional_unresolved": "通常枠を適用するための数量または金額を解決できませんでした",
+                }.get(failure, "通常枠の確認が必要です")
+                _append_reason(candidate, failure, message)
                 exclusions.append({"ticker": candidate.get("ticker"), "reason": failure})
                 continue
             candidate.update(resized)
@@ -196,6 +244,55 @@ def comparison_path(base_dir: Path = BASE_DIR) -> Path:
     return Path(base_dir) / COMPARISON_FILE
 
 
+def _action_identity(action: dict[str, Any]) -> tuple[str, str, str, str, str]:
+    return (
+        canonical_ticker(action.get("ticker")), str(action.get("type") or "").lower(),
+        str(action.get("execution_owner") or "").lower(), str(action.get("execution_broker") or "").lower(),
+        str(action.get("execution_account") or "").lower(),
+    )
+
+
+def build_comparison(
+    legacy_actions: list[dict[str, Any]], allocated_actions: list[dict[str, Any]], report: dict[str, Any], *,
+    count_conservation_ok: bool | None,
+) -> dict[str, Any]:
+    """Describe whether allocator changes have a structured explanation."""
+    reasons: list[str] = []
+    legacy_by_id = {_action_identity(row): row for row in legacy_actions if isinstance(row, dict)}
+    selected = [row for row in allocated_actions if isinstance(row, dict) and row.get("capital_allocator_selected")]
+    if len(selected) > 1:
+        reasons.append("multiple_allocator_selected_actions")
+    for row in selected:
+        original = legacy_by_id.get(_action_identity(row))
+        if original is None:
+            reasons.append("allocator_selected_outside_legacy_candidates")
+            continue
+        if not all(row.get(key) for key in ("execution_owner", "execution_broker", "execution_account")):
+            reasons.append("allocator_selected_route_incomplete")
+        original_quantity = _number(original.get("quantity", original.get("requested_buy_quantity")), default=0)
+        selected_quantity = _number(row.get("quantity", row.get("requested_buy_quantity")), default=0)
+        if selected_quantity != original_quantity:
+            applied = row.get("capital_allocator_size_applied")
+            if not (
+                isinstance(applied, dict)
+                and applied.get("quantity", {}).get("from") == int(original_quantity)
+                and applied.get("quantity", {}).get("to") == int(selected_quantity)
+                and str(row.get("amount_hint") or "").startswith(f"{int(selected_quantity)}")
+                and not row.get("action_quantity_sync_failed")
+                and not row.get("prose_numeric_sync_failed")
+            ):
+                reasons.append("allocator_quantity_change_unexplained")
+    if count_conservation_ok is not True:
+        reasons.append("decision_count_conservation_unverified")
+    return {
+        "mode": report.get("mode"), "legacy_ready_tickers": report.get("legacy_ready_tickers") or [],
+        "allocator_selected_ticker": report.get("selected_ticker"), "exclusions": report.get("exclusions") or [],
+        "explanation_status": "explainable" if not reasons else "unexplainable",
+        "explanation_reasons": reasons, "normal_daily_buy_limit": 1,
+        "count_conservation_ok": count_conservation_ok is True,
+    }
+
+
 def record_comparison(run_id: str, comparison: dict[str, Any], *, base_dir: Path = BASE_DIR) -> dict[str, Any]:
     """Persist the first-five-run human review record without financial side effects."""
     path = comparison_path(base_dir)
@@ -205,7 +302,13 @@ def record_comparison(run_id: str, comparison: dict[str, Any], *, base_dir: Path
     row = {"run_id": str(run_id), "recorded_at": datetime.now().isoformat(timespec="seconds"), **comparison}
     rows = [item for item in rows if isinstance(item, dict) and item.get("run_id") != str(run_id)]
     rows.append(row)
-    state = {"schema_version": 1, "runs": rows[-20:]}
+    initial_rows = state.get("initial_review_runs") if isinstance(state, dict) else []
+    initial_rows = initial_rows if isinstance(initial_rows, list) else []
+    initial_rows = [item for item in initial_rows if isinstance(item, dict) and item.get("run_id") != str(run_id)]
+    if len(initial_rows) < 5:
+        initial_rows.append(dict(row))
+    row["initial_review_window"] = any(item.get("run_id") == str(run_id) for item in initial_rows)
+    state = {"schema_version": 2, "runs": rows[-20:], "initial_review_runs": initial_rows[:5]}
     atomic_write_json(path, state)
     return row
 
@@ -218,9 +321,19 @@ def review_comparison(run_id: str, decision: str, *, base_dir: Path = BASE_DIR) 
     rows = state.get("runs") if isinstance(state, dict) else []
     if not isinstance(rows, list):
         return None
+    reviewed: dict[str, Any] | None = None
     for row in rows:
         if isinstance(row, dict) and row.get("run_id") == str(run_id):
             row["review"] = {"decision": decision, "reviewed_at": datetime.now().isoformat(timespec="seconds")}
-            atomic_write_json(path, {"schema_version": 1, "runs": rows})
-            return row
-    return None
+            reviewed = row
+            break
+    if reviewed is None:
+        return None
+    initial_rows = state.get("initial_review_runs") if isinstance(state, dict) else []
+    if not isinstance(initial_rows, list):
+        initial_rows = []
+    for row in initial_rows:
+        if isinstance(row, dict) and row.get("run_id") == str(run_id):
+            row["review"] = dict(reviewed["review"])
+    atomic_write_json(path, {"schema_version": 2, "runs": rows, "initial_review_runs": initial_rows})
+    return reviewed

@@ -565,9 +565,11 @@ def _confirm_movement(
                 _save_json(ACCOUNT_FILE, account)
                 _save_json(HOLDINGS_FILE, holdings)
                 _save_json(TX_FILE, tx_log)
-                from event_ledger import append_event
-                for index, leg in enumerate(ledger_legs):
-                    append_event(event_id=f"{movement_id}:{index}", source="api", **leg)
+                from event_ledger import append_events
+                append_events(events=[
+                    {"event_id": f"{movement_id}:{index}", "source": "api", **leg}
+                    for index, leg in enumerate(ledger_legs)
+                ])
             except Exception as exc:
                 _save_json(ACCOUNT_FILE, original_account)
                 _save_json(HOLDINGS_FILE, original_holdings)

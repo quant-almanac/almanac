@@ -36,6 +36,9 @@ export default function CommandDeck({ data, children }: { data: TodayOps; childr
   const needsAction = data.board.filter(row => !['placed', 'filled', 'cancelled', 'expired', 'reprice_required'].includes(row.lifecycle.status)).length
   const planPct = plan?.consumption.normal_plan_budget_consumed_pct
   const scenario = data.scenario_summary
+  const allocator = data.capital_allocator ?? {}
+  const comparison = data.capital_allocator_comparison ?? {}
+  const wallets = data.cash_status ?? []
 
   return (
     <section aria-label="今日の指令" style={{ paddingTop: 4 }}>
@@ -64,6 +67,19 @@ export default function CommandDeck({ data, children }: { data: TodayOps; childr
           </div>
         </aside>
       </div>
+      {(Object.keys(allocator).length > 0 || wallets.length > 0) && <section aria-label="資本配分の監査" style={{ marginTop: 16, padding: '13px 15px', border: `1px solid ${OPS.hairline}`, borderRadius: 9, background: OPS.panel }}>
+        <div style={{ display: 'flex', gap: 10, alignItems: 'center' }}>
+          <span style={{ color: OPS.gold, fontFamily: OPS.mono, fontSize: 10.5, letterSpacing: '.1em' }}>CAPITAL ALLOCATION</span>
+          <span style={{ color: OPS.sub, fontSize: 12 }}>通常買付 {String(allocator.selected_count ?? 0)}件 / {String(allocator.mode ?? 'legacy').toUpperCase()}</span>
+          <span style={{ marginLeft: 'auto', color: comparison.explanation_status === 'explainable' ? OPS.green : OPS.amber, fontSize: 12 }}>{comparison.explanation_status === 'explainable' ? '差分説明可能' : '差分確認要'}</span>
+        </div>
+        {wallets.length > 0 && <div style={{ display: 'grid', gap: 6, marginTop: 10 }}>
+          {wallets.map(wallet => <div key={wallet.wallet_key ?? wallet.key} style={{ display: 'flex', justifyContent: 'space-between', color: OPS.sub, fontSize: 12, borderTop: `1px solid ${OPS.hairline}`, paddingTop: 6 }}>
+            <span>{wallet.owner}/{wallet.broker} · {wallet.currency}</span>
+            <span>発注余力 {wallet.currency === 'JPY' ? fmtJpy(wallet.available_for_new_buy) : `$${Number(wallet.available_for_new_buy ?? 0).toLocaleString()}`}</span>
+          </div>)}
+        </div>}
+      </section>}
       {children && <div style={{ marginTop: 16 }}>{children}</div>}
       <ExecutionPlanModal plan={plan} open={planOpen} onClose={() => setPlanOpen(false)} />
     </section>

@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -76,6 +76,31 @@ def _event_wallet_key(event: dict[str, Any], payload: dict[str, Any], wallet_by_
     return None
 
 
+def _parse_timestamp(value: Any) -> datetime | None:
+    if isinstance(value, datetime):
+        parsed = value
+    elif isinstance(value, str) and value.strip():
+        try:
+            parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    else:
+        return None
+    if parsed.tzinfo is not None:
+        return parsed.astimezone(timezone.utc).replace(tzinfo=None)
+    return parsed
+
+
+def _date_only_timestamp(value: Any) -> bool:
+    return isinstance(value, str) and len(value.strip()) == 10 and value.strip()[4:5] == "-" and value.strip()[7:8] == "-"
+
+
+def _exclude_wallet_event(projections: dict[str, dict[str, Any]], excluded_cash_events: list[dict[str, Any]], *, wallet_key: str, event_id: str, event_type: Any, code: str) -> None:
+    row = {"event_id": event_id, "code": code, "event_type": event_type}
+    excluded_cash_events.append(row)
+    projections[wallet_key]["excluded_events"].append(row)
+
+
 def build_wallet_projection(
     cash_info: dict[str, Any],
     *,
@@ -114,6 +139,15 @@ def build_wallet_projection(
         }
         for key, row in wallet_by_key.items()
     }
+    base_times = {key: _parse_timestamp(row.get("base_as_of")) for key, row in projections.items()}
+    base_is_date_only = {key: _date_only_timestamp(row.get("base_as_of")) for key, row in projections.items()}
+    reflected_event_ids = {
+        key: {str(event_id) for event_id in (wallet_by_key[key].get("base_reflected_event_ids") or []) if event_id}
+        for key in projections
+    }
+    for key, base_time in base_times.items():
+        if base_time is None:
+            projections[key]["status"] = "base_timestamp_unresolved"
     unattributed: list[dict[str, Any]] = []
     excluded_cash_events: list[dict[str, Any]] = []
 
@@ -150,6 +184,19 @@ def build_wallet_projection(
                 "code": "cash_event_wallet_unattributed",
                 "event_type": event.get("event_type"),
             })
+            continue
+        if base_times[wallet_key] is None:
+            _exclude_wallet_event(projections, excluded_cash_events, wallet_key=wallet_key, event_id=event_id, event_type=event.get("event_type"), code="cash_event_base_timestamp_unresolved")
+            continue
+        if event_id in reflected_event_ids[wallet_key]:
+            _exclude_wallet_event(projections, excluded_cash_events, wallet_key=wallet_key, event_id=event_id, event_type=event.get("event_type"), code="cash_event_reflected_in_base_balance")
+            continue
+        occurred_at = _parse_timestamp(event.get("occurred_at"))
+        if occurred_at is None:
+            _exclude_wallet_event(projections, excluded_cash_events, wallet_key=wallet_key, event_id=event_id, event_type=event.get("event_type"), code="cash_event_occurred_at_unresolved")
+            continue
+        if occurred_at <= base_times[wallet_key] or (base_is_date_only[wallet_key] and occurred_at.date() == base_times[wallet_key].date()):
+            _exclude_wallet_event(projections, excluded_cash_events, wallet_key=wallet_key, event_id=event_id, event_type=event.get("event_type"), code="cash_event_reflected_in_base_balance")
             continue
         amount = _native_amount(event)
         sign = _event_sign(event, payload)

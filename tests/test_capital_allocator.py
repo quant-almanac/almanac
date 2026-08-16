@@ -1,7 +1,8 @@
-from capital_allocator import allocate_actions, record_comparison, review_comparison
+from capital_allocator import allocate_actions, build_comparison, record_comparison, review_comparison
 
 
 def _buy(ticker: str, quantity: int, *, price: float = 355, fx: float = 159.452) -> dict:
+    estimated = round(quantity * price * fx)
     return {
         "ticker": ticker,
         "type": "add",
@@ -10,7 +11,10 @@ def _buy(ticker: str, quantity: int, *, price: float = 355, fx: float = 159.452)
         "quantity": quantity,
         "requested_buy_quantity": quantity,
         "decision_price": price,
-        "estimated_notional_jpy": round(quantity * price * fx),
+        "estimated_notional_jpy": estimated,
+        "amount_hint": f"{quantity}株",
+        "action": f"{ticker}を{quantity}株、約¥{estimated:,}で買付",
+        "reason": f"{quantity}株を約¥{estimated:,}で通常買付",
         "execution_readiness": "ready",
         "execution_owner": "husband",
         "execution_broker": "rakuten",
@@ -39,7 +43,11 @@ def test_allocator_resizes_within_cap_but_never_forces_below_minimum():
     row = actions[0]
     assert report["selected_ticker"] == "V"
     assert row["quantity"] == 4
+    assert row["requested_buy_quantity"] == 4
+    assert row["amount_hint"] == "4株"
     assert row["estimated_notional_jpy"] == 226_422
+    assert "4株" in row["action"]
+    assert "¥226,422" in row["action"]
 
     tiny, tiny_report = allocate_actions([_buy("V", 1, price=2_000)], fx_rate=159.452)
     assert tiny_report["selected_ticker"] is None
@@ -64,13 +72,34 @@ def test_allocator_comparison_review_is_explicit_and_side_effect_free(tmp_path):
     assert reviewed["review"]["decision"] == "approved"
 
 
+def test_allocator_preserves_jpx_regular_lot_when_capping_quantity():
+    toyota = _buy("7203.T", 200, price=1_500, fx=1)
+    toyota.update({"currency": "JPY", "estimated_notional_jpy": 300_000,
+                   "action": "7203.Tを200株、約¥300,000で買付", "reason": "200株を約¥300,000で通常買付"})
+    actions, report = allocate_actions([toyota], fx_rate=1, min_trade_jpy=100_000)
+    assert report["selected_ticker"] == "7203.T"
+    assert actions[0]["quantity"] == 100
+    assert actions[0]["amount_hint"] == "100株"
+
+
+def test_allocator_comparison_rejects_unstructured_selected_quantity_change():
+    legacy = [_buy("V", 5)]
+    allocated = [_buy("V", 4)]
+    allocated[0].update({"capital_allocator_selected": True, "capital_allocator_size_applied": {"quantity": {"from": 5, "to": 4}}})
+    comparison = build_comparison(legacy, allocated, {"mode": "enforce", "legacy_ready_tickers": ["V"], "selected_ticker": "V"}, count_conservation_ok=True)
+    assert comparison["explanation_status"] == "explainable"
+    allocated[0].pop("capital_allocator_size_applied")
+    comparison = build_comparison(legacy, allocated, {"mode": "enforce", "legacy_ready_tickers": ["V"], "selected_ticker": "V"}, count_conservation_ok=True)
+    assert "allocator_quantity_change_unexplained" in comparison["explanation_reasons"]
+
+
 def test_analyst_integration_updates_decision_summary_after_allocator(monkeypatch, tmp_path):
     import analyst
 
     monkeypatch.setattr(analyst, "BASE_DIR", tmp_path)
     synthesis = {
         "priority_actions": [_buy("V", 4), _buy("OTHER", 4)],
-        "decision_summary": {"candidate_count": 2, "executable_count": 2, "review_count": 0, "deferred_count": 0, "reason_counts": {}},
+        "decision_summary": {"candidate_count": 2, "executable_count": 2, "review_count": 0, "deferred_count": 0, "reason_counts": {}, "count_conservation_ok": True},
         "overall_stance": "neutral",
     }
     analyst._apply_capital_allocator(

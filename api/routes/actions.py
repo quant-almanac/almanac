@@ -981,6 +981,16 @@ def _snapshot_execution_plan_metadata(req: ExecutionRequest) -> dict:
     }
 
 
+def _execution_strategy_class(req: ExecutionRequest) -> str:
+    """Persist the lane that owns this execution's daily-cap contract."""
+    linked = _linked_ai_action(req)
+    if str(linked.get("tier") or "").strip().lower() == "swing":
+        return "swing"
+    if str(linked.get("source") or "").strip().lower().startswith("scenario"):
+        return "scenario"
+    return "normal"
+
+
 def _validate_contribution_link(req: ExecutionRequest) -> None:
     """Validate an explicit contribution id without inferring one.
 
@@ -2529,6 +2539,7 @@ async def save_execution(req: ExecutionRequest):
                 "execution_owner": req.execution_owner,
                 "execution_broker": req.execution_broker,
                 "execution_position_keys": req.execution_position_keys,
+                "strategy_class": _execution_strategy_class(req),
                 "broker_confirmed_filled": req.broker_confirmed_filled,
                 "external_execution_id": req.external_execution_id,
                 "broker_source": req.broker_source,

@@ -497,6 +497,7 @@ export interface TodayOps {
   }>
   cash_status?: Array<{
     key: string
+    wallet_key?: string
     owner: string
     broker: string
     currency: string
@@ -507,7 +508,12 @@ export interface TodayOps {
     balance_status: string
     reconciliation_required: boolean
     available_for_new_buy?: number
+    projected_balance?: number
+    projection_status?: string
   }>
+  capital_allocator?: Record<string, unknown>
+  capital_allocator_comparison?: Record<string, unknown>
+  optimizer_health?: Record<string, unknown>
   engine: Engine
   report: Record<string, TierReport>
   scorecard: Scorecard

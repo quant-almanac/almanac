@@ -10377,7 +10377,7 @@ def _apply_capital_allocator(
     if not isinstance(synthesis, dict) or not isinstance(synthesis.get("priority_actions"), list):
         return
     try:
-        from capital_allocator import allocate_actions, record_comparison
+        from capital_allocator import allocate_actions, build_comparison, record_comparison
         from tunable_params import get as _tp_get
 
         configured_mode = str(_tp_get("capital_allocator_mode", "enforce") or "enforce").lower()
@@ -10401,37 +10401,45 @@ def _apply_capital_allocator(
                     continue
                 if str(execution.get("saved_at") or execution.get("executed_at_time") or "")[:10] != analysis_day:
                     continue
+                strategy_class = str(execution.get("strategy_class") or "").lower()
+                if strategy_class in {"scenario", "swing"}:
+                    continue
                 if _direction_of(execution.get("direction") or execution.get("action_type") or execution.get("type")) == "buy":
                     prior_normal_buys += 1
         except Exception:
             # Read failure must not create additional buying capacity.
             prior_normal_buys = 1
 
+        original_actions = copy.deepcopy(synthesis.get("priority_actions") or [])
+        original_summary = copy.deepcopy(synthesis.get("decision_summary"))
         allocated, report = allocate_actions(
-            synthesis.get("priority_actions") or [],
+            copy.deepcopy(original_actions),
             mode=mode,
             fx_rate=float(fx_rate),
             min_trade_jpy=minimum_notional,
             prior_normal_buys_today=prior_normal_buys,
         )
-        synthesis["priority_actions"] = allocated
         report["minimum_notional_jpy"] = round(minimum_notional)
         report["run_id"] = analysis_id or str(as_of)
-        synthesis["capital_allocator"] = report
 
         # Keep a five-run, human-readable legacy comparison even in enforce
         # mode.  It has no effect on holdings, cash, or candidate selection.
-        comparison = {
-            "mode": report["mode"],
-            "legacy_ready_tickers": report["legacy_ready_tickers"],
-            "allocator_selected_ticker": report["selected_ticker"],
-            "exclusions": report["exclusions"],
-            "explanation_status": "explainable",
-            "normal_daily_buy_limit": 1,
-        }
-        synthesis["capital_allocator_comparison"] = record_comparison(
+        comparison = build_comparison(
+            original_actions, allocated, report,
+            count_conservation_ok=(original_summary or {}).get("count_conservation_ok"),
+        )
+        if comparison["explanation_status"] != "explainable":
+            comparison["mode"] = "legacy"
+            comparison["fallback"] = "allocator_comparison_unexplainable"
+        persisted_comparison = record_comparison(
             report["run_id"], comparison, base_dir=BASE_DIR,
         )
+        if comparison["explanation_status"] != "explainable":
+            report = {**report, "mode": "legacy", "fallback": "allocator_comparison_unexplainable", "comparison_reasons": comparison["explanation_reasons"]}
+            allocated = original_actions
+        synthesis["priority_actions"] = allocated
+        synthesis["capital_allocator"] = report
+        synthesis["capital_allocator_comparison"] = persisted_comparison
 
         summary = synthesis.get("decision_summary")
         if isinstance(summary, dict):
@@ -10444,14 +10452,24 @@ def _apply_capital_allocator(
                 1 for row in actions
                 if isinstance(row, dict) and row.get("execution_readiness") != "ready"
             ) + int(summary.get("deferred_count") or 0)
-            reason_counts = dict(summary.get("reason_counts") or {})
-            for row in actions:
-                if not isinstance(row, dict) or row.get("execution_readiness") == "ready":
-                    continue
-                for reason in row.get("execution_block_reasons") or []:
-                    if isinstance(reason, dict) and reason.get("code"):
-                        code = str(reason["code"])
-                        reason_counts[code] = reason_counts.get(code, 0) + 1
+            def _reason_counter(rows):
+                counts = {}
+                for row in rows:
+                    if not isinstance(row, dict) or row.get("execution_readiness") == "ready":
+                        continue
+                    for reason in row.get("execution_block_reasons") or []:
+                        if isinstance(reason, dict) and reason.get("code"):
+                            code = str(reason["code"])
+                            counts[code] = counts.get(code, 0) + 1
+                return counts
+
+            before_counts = _reason_counter(original_actions)
+            after_counts = _reason_counter(actions)
+            reason_counts = dict((original_summary or {}).get("reason_counts") or {})
+            for code, count in after_counts.items():
+                increment = max(0, count - before_counts.get(code, 0))
+                if increment:
+                    reason_counts[code] = reason_counts.get(code, 0) + increment
             summary["reason_counts"] = reason_counts
             _set_operational_stance(
                 synthesis,
@@ -10463,6 +10481,10 @@ def _apply_capital_allocator(
         # Allocation failure must never manufacture an executable action.  The
         # original post-filter result remains intact and the output explains
         # that the legacy result was retained for this run.
+        if "original_actions" in locals():
+            synthesis["priority_actions"] = original_actions
+        if "original_summary" in locals() and isinstance(original_summary, dict):
+            synthesis["decision_summary"] = original_summary
         synthesis["capital_allocator"] = {
             "mode": "legacy",
             "error": type(exc).__name__,

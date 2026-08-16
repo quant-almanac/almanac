@@ -44,7 +44,7 @@ def test_projection_never_assigns_wife_or_card_schedule_events_to_husband_wallet
 def test_projection_applies_only_explicitly_routed_cash_leg_without_changing_buying_power():
     projection = build_wallet_projection(_cash_info(), now=datetime(2026, 8, 16), event_rows=[
         {"event_id": "fee", "event_type": "fee", "direction": "out", "quantity": 100,
-         "price": 1, "currency": "JPY", "source": "api",
+         "price": 1, "currency": "JPY", "source": "api", "occurred_at": "2026-08-02T09:00:00",
          "raw_payload": {"cash_route": "CASH_JPY_SBI_WIFE"}},
     ])
 
@@ -55,6 +55,27 @@ def test_projection_applies_only_explicitly_routed_cash_leg_without_changing_buy
     assert wife["source_hash"]
     assert wife["valid_until"] is None
     assert projection["authoritative_for_new_buys"] is False
+
+
+def test_projection_excludes_events_at_or_before_broker_balance_baseline():
+    projection = build_wallet_projection(_cash_info(), now=datetime(2026, 8, 16), event_rows=[
+        {"event_id": "historic-fee", "event_type": "fee", "direction": "out", "quantity": 100,
+         "price": 1, "currency": "JPY", "source": "api", "occurred_at": "2026-08-01T00:00:00",
+         "raw_payload": {"cash_route": "CASH_JPY_SBI_WIFE"}},
+    ])
+    wife = next(row for row in projection["wallets"] if row["owner"] == "wife")
+    assert wife["ledger_delta_native"] == 0
+    assert wife["excluded_events"][0]["code"] == "cash_event_reflected_in_base_balance"
+
+
+def test_date_only_balance_baseline_does_not_assume_same_day_event_ordering():
+    projection = build_wallet_projection(_cash_info(), now=datetime(2026, 8, 16), event_rows=[
+        {"event_id": "same-day-fee", "event_type": "fee", "direction": "out", "quantity": 100,
+         "price": 1, "currency": "JPY", "source": "api", "occurred_at": "2026-08-01T18:00:00",
+         "raw_payload": {"cash_route": "CASH_JPY_SBI_WIFE"}},
+    ])
+    wife = next(row for row in projection["wallets"] if row["owner"] == "wife")
+    assert wife["ledger_delta_native"] == 0
 
 
 def test_projection_keeps_unknown_wallet_events_unattributed():
