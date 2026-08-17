@@ -47,6 +47,7 @@ export interface BoardRow {
   budget_impact_jpy?: number
   ai_bounded_gate?: string
   analysis_id?: string
+  decision_flow_key?: string
   action_state_id?: string | null
   execution_readiness?: 'ready' | 'review' | 'blocked' | string
   execution_block_reasons?: { code?: string; message?: string }[]
@@ -67,6 +68,13 @@ export interface BoardRow {
   order_intent_decision?: string
   filter_rule?: string
   minimum_executable_quantity?: number | null
+  minimum_executable_notional_jpy?: number | null
+  capacity_shortfall_jpy?: number | null
+  original_quantity?: number | null
+  original_notional_jpy?: number | null
+  effective_cash?: number | null
+  cash_capacity_observation?: Record<string, unknown>
+  execution_capacity_mode?: string
   estimated_notional_jpy?: number
   impact_nav_pct?: number | null
   days_pending?: number
@@ -240,18 +248,24 @@ export interface PastTrade {
   detail?: string
 }
 
+export interface AlmanacSession {
+  id?: string
+  label: string
+  market?: 'JP' | 'US' | string
+  phase?: 'pre' | 'regular' | 'after' | string
+  start: string
+  end: string
+  timezone?: string
+  is_open_day?: boolean
+  /** 取引所カレンダー由来。休場理由と次回開場（ISO・UTC）。 */
+  calendar_status?: string
+  calendar_reason?: string
+  next_market_open?: string
+}
+
 export interface AlmanacData {
   today: AlmanacEvent[]
-  sessions: {
-    id?: string
-    label: string
-    market?: 'JP' | 'US' | string
-    phase?: 'pre' | 'regular' | 'after' | string
-    start: string
-    end: string
-    timezone?: string
-    is_open_day?: boolean
-  }[]
+  sessions: AlmanacSession[]
   upcoming: AlmanacEvent[]
   past: PastTrade[]
   pnl_by_date: Record<string, number>
@@ -297,6 +311,23 @@ export interface ScenarioSummary {
   watching: number
   alert_level: string | null
   evaluated_at: string | null
+}
+
+/**
+ * 計画のスコープ(投資階層)と一致しない建玉が、その計画の予算を押さえている記録。
+ * 自動取消はせず予約を維持したまま、人間の確認対象として持ち上げるためのもの。
+ */
+export interface ScopeMismatchRecord {
+  source?: string
+  id?: string
+  ticker?: string
+  status?: string
+  notional_jpy?: number
+  plan_item_id?: string
+  /** 計画側が要求する投資階層。 */
+  required_investment_types?: string[]
+  /** 実際の建玉の投資階層。これが上と食い違っているのが不一致。 */
+  candidate_investment_type?: string
 }
 
 export interface ExecutionPlan {
@@ -360,6 +391,10 @@ export interface ExecutionPlan {
     unattributed_monthly_sell_total_count?: number
     unattributed_monthly_sell_total_notional_jpy?: number
     unattributed_monthly_unpriced_count?: number
+    /** スリーブ(long/medium…)の異なる建玉が計画予算を押さえている件数。要人間確認。 */
+    scope_mismatched_open_order_count?: number
+    scope_mismatched_open_order_notional_jpy?: number
+    scope_mismatched_consumption_records?: ScopeMismatchRecord[]
     remaining_normal_jpy?: number
     remaining_opportunity_jpy?: number
     normal_plan_budget_consumed_jpy?: number | null
@@ -454,6 +489,7 @@ export interface ExecutionPlan {
 
 export interface TodayOps {
   as_of?: string
+  analysis_id?: string | null
   generated_at: string
   portfolio_total: number
   portfolio_snapshot: TodayPortfolioSnapshot
@@ -479,6 +515,7 @@ export interface TodayOps {
     reason_counts: Record<string, number>
     count_conservation_ok?: boolean | null
   }
+  decision_flow?: DecisionFlow
   board_notes: { label: string; text: string }[]
   backlog: BoardRow[]
   pending_portfolio_applications?: Array<{
@@ -498,8 +535,10 @@ export interface TodayOps {
   cash_status?: Array<{
     key: string
     wallet_key?: string
+    resources?: string[]
     owner: string
     broker: string
+    settlement_pool?: string
     currency: string
     effective_balance?: number
     reported_balance?: number
@@ -510,9 +549,16 @@ export interface TodayOps {
     available_for_new_buy?: number
     projected_balance?: number
     projection_status?: string
+    projection_authoritative_for_new_buys?: boolean
   }>
+  funding_alternatives?: Array<Record<string, unknown>>
   capital_allocator?: Record<string, unknown>
   capital_allocator_comparison?: Record<string, unknown>
+  capital_allocator_comparisons?: {
+    schema_version?: number
+    runs?: Array<Record<string, unknown>>
+    initial_review_runs?: Array<Record<string, unknown>>
+  }
   optimizer_health?: Record<string, unknown>
   engine: Engine
   report: Record<string, TierReport>
@@ -525,7 +571,95 @@ export interface TodayOps {
   execution_plan?: ExecutionPlan
   scenario_summary?: ScenarioSummary
   holdings_intel: Record<string, HoldingIntel>
-  pulse: { vix?: number }
+  pulse: {
+    vix?: number
+    vix_change_1d?: number | null
+    vix_change_5d?: number | null
+    vix_decay_from_peak_10d_pct?: number | null
+    as_of?: string | null
+    // vix_tracker.py の1mo取得済みバッチをそのまま保存したもの。旧キャッシュには無い場合がある。
+    // vix_change_1d/5d は _safe_pct_change() 由来で単位はすでに% — 別名フィールドは追加しない。
+    vix_history_1mo?: Array<{ date: string; close: number }>
+    // VIXは「市場の鼓動」の一例。原油・米10年債・ドル指数(DXY)も同じ1moバッチ取得の
+    // 実系列で、再取得なしで素通しされる。
+    oil_price?: number | null
+    oil_change_1d_pct?: number | null
+    oil_change_5d_pct?: number | null
+    oil_history_1mo?: Array<{ date: string; close: number }>
+    us_10y?: number | null
+    // 利回りは比ではなく絶対差(pt)で見るのが市場慣行 — %変化フィールドは意図的に無い。
+    us_10y_change_1d_pt?: number | null
+    us_10y_change_5d_pt?: number | null
+    us_10y_history_1mo?: Array<{ date: string; close: number }>
+    dxy_level?: number | null
+    dxy_change_1d_pct?: number | null
+    dxy_change_5d_pct?: number | null
+    dxy_history_1mo?: Array<{ date: string; close: number }>
+  }
+}
+
+export interface DecisionFlowStage {
+  key: 'candidate_generation' | 'synthesis' | 'policy' | 'post_filter' | 'execution_readiness' | 'execution'
+  provenance: 'action_stage_log' | 'today_projection' | 'mixed'
+  source_stage_keys: string[]
+  entered: number | null
+  passed: number | null
+  review: number | null
+  rejected: number | null
+  deferred: number | null
+  executed: number | null
+}
+
+export interface DecisionFlowReason {
+  code: string
+  message?: string
+  provenance: 'action_stage_log' | 'today_overlay'
+}
+
+export interface DecisionFlowAction {
+  key: string
+  ticker?: string
+  type?: string
+  account?: string
+  identity_quality: 'exact' | 'fallback_unique' | 'ambiguous'
+  decision_status: 'ready' | 'review' | 'filtered' | 'deferred' | 'closed'
+  execution_status: 'not_started' | 'ordered' | 'filled' | 'executed' | 'cancelled' | 'expired' | 'reprice_required'
+  stage_states: Record<string, string>
+  reason_codes: string[]
+  reasons: DecisionFlowReason[]
+  confidence_pct?: number
+  estimated_notional_jpy?: number
+}
+
+/** AI合成で採用されなかった候補1件。action_stage_log の tier_generated 由来。 */
+export interface DecisionFlowUnselected {
+  ticker?: string
+  type?: string
+  tier?: string
+  confidence_pct?: number
+  estimated_notional_jpy?: number
+  urgency?: string
+}
+
+export interface DecisionFlow {
+  version: number
+  analysis_id: string | null
+  status: 'complete' | 'partial' | 'unavailable'
+  stages: DecisionFlowStage[]
+  actions: DecisionFlowAction[]
+  unselected?: DecisionFlowUnselected[]
+  detail_coverage: {
+    status: 'complete' | 'sampled' | 'unavailable'
+    filtered_total: number
+    filtered_materialized: number
+    sample_limit: number | null
+  }
+  integrity: {
+    status: 'ok' | 'partial' | 'mismatch' | 'unavailable'
+    scope: 'analysis_id'
+    unit: 'action' | 'account_action' | 'mixed'
+    account_branch_count: number
+  }
 }
 
 export interface TodayPortfolioSnapshot {

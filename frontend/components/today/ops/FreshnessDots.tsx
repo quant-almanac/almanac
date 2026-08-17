@@ -109,7 +109,7 @@ export function FreshnessPanel({
       id={id}
       role="dialog"
       aria-label="データ鮮度の詳細"
-      style={{ zIndex: 70, width: 294, maxWidth: 'calc(100vw - 24px)', background: OPS.panel, border: `1px solid ${OPS.border}`, borderRadius: 8, boxShadow: '0 12px 28px rgba(0,0,0,0.45)', padding: '11px 12px', ...style }}
+      style={{ zIndex: 70, width: 294, maxWidth: 'calc(100vw - 24px)', background: OPS.panelAlt, border: `1px solid ${OPS.border}`, borderRadius: 8, boxShadow: OPS.shadowOverlay, padding: '11px 12px', ...style }}
     >
       <div style={{ color: OPS.gold, fontFamily: OPS.mono, fontSize: 10.5, letterSpacing: '0.09em', marginBottom: 7 }}>DATA FRESHNESS</div>
       {sources.length === 0 ? <p style={{ color: OPS.dim, fontSize: 12, margin: 0 }}>鮮度データはありません。</p> : sources.map(([key, source], index) => {

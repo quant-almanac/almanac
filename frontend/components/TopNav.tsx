@@ -1,7 +1,7 @@
 'use client'
 
-import Link from 'next/link'
 import Image from 'next/image'
+import Link from 'next/link'
 import { usePathname } from 'next/navigation'
 import { useEffect, useRef, useState, useCallback } from 'react'
 import useSWR from 'swr'
@@ -11,7 +11,7 @@ import { OPS } from '@/components/today/ops/tokens'
 type NavItem = { href: string; label: string; icon: string; matches: string[] }
 
 const NAV: NavItem[] = [
-  { href: '/', label: '今日', icon: '◆', matches: ['/', '/today'] },
+  { href: '/', label: '市場判断', icon: '◆', matches: ['/', '/today'] },
   { href: '/portfolio', label: '資産', icon: '◉', matches: ['/portfolio', '/nisa', '/risk', '/margin', '/cash', '/admin'] },
   { href: '/executions', label: '履歴', icon: '▤', matches: ['/executions', '/history'] },
   { href: '/strategy', label: 'リサーチ', icon: '◈', matches: ['/strategy', '/scenarios', '/screening', '/disclosures', '/decision', '/agent', '/performance'] },
@@ -83,14 +83,14 @@ export default function TopNav() {
         position: 'sticky',
         top: 0,
         zIndex: 50,
-        height: 54,
-        background: 'rgba(11,13,18,0.94)',
+        height: 72,
+        background: 'rgba(4,15,29,0.96)',
         backdropFilter: 'blur(20px) saturate(1.1)',
         WebkitBackdropFilter: 'blur(20px) saturate(1.1)',
         borderBottom: `1px solid ${OPS.hairline}`,
         display: 'flex',
         alignItems: 'center',
-        padding: '0 18px',
+        padding: '0 28px',
       }}
     >
       {/* ── Wordmark ── */}
@@ -100,35 +100,30 @@ export default function TopNav() {
           textDecoration: 'none',
           display: 'flex',
           alignItems: 'center',
-          gap: 9,
-          marginRight: 26,
+          gap: 10,
+          marginRight: 42,
           flexShrink: 0,
         }}
       >
-        <div
-          style={{
-            width: 28,
-            height: 28,
-            borderRadius: 7,
-            overflow: 'hidden',
-            flexShrink: 0,
-            border: `1px solid ${OPS.gold}44`,
-            boxShadow: `0 0 12px ${OPS.gold}22`,
-          }}
-        >
-          <Image src="/almanac_logo.png" alt="ALMANAC" width={28} height={28} style={{ display: 'block' }} />
+        <div style={{ width: 42, height: 42, flexShrink: 0, position: 'relative', borderRadius: 6, overflow: 'hidden' }}>
+          {/* almanac-mark.png は黒背景+白マーク。透過版が無いため mix-blend-mode:screen で
+              黒を消し、ヘッダーの地(OPS.bg)に馴染ませる — 黒地の画像そのものは変更しない。 */}
+          {/* alt="" — 隣の "ALMANAC" 文字と同じリンク内にあるため、装飾として扱う
+              (alt を付けるとスクリーンリーダーが "ALMANAC ALMANAC" と二重に読み上げる)。 */}
+          <Image src="/almanac-mark.png" alt="" fill sizes="42px" priority
+            style={{ objectFit: 'contain', mixBlendMode: 'screen' }} />
         </div>
         <span
           className="hidden sm:inline"
           style={{
-            fontFamily: OPS.dot,
-            color: OPS.gold,
-            fontSize: 15,
-            letterSpacing: '0.22em',
+            display: 'flex',
+            flexDirection: 'column',
+            justifyContent: 'center',
             lineHeight: 1,
           }}
         >
-          ALMANAC
+          <strong style={{ fontFamily: OPS.brand, color: OPS.gold, fontSize: 27, fontWeight: 600, letterSpacing: '0.105em' }}>ALMANAC</strong>
+          <small style={{ color: OPS.sub, fontFamily: OPS.display, fontSize: 8.5, letterSpacing: '0.2em', marginTop: 5 }}>MARKET OBSERVATORY</small>
         </span>
       </Link>
 
@@ -160,24 +155,21 @@ export default function TopNav() {
                 data-active={active}
                 style={{
                   textDecoration: 'none',
-                  padding: '6px 12px',
-                  fontFamily: OPS.mono,
-                  fontSize: 13,
+                  padding: '6px 17px',
+                  fontFamily: OPS.display,
+                  fontSize: 16,
                   fontWeight: active ? 600 : 400,
                   color: active ? OPS.gold : OPS.dim,
                   whiteSpace: 'nowrap',
                   flexShrink: 0,
                   display: 'inline-flex',
                   alignItems: 'center',
-                  gap: 6,
-                  letterSpacing: '0.02em',
+                  gap: 0,
+                  letterSpacing: '0.05em',
                   transition: 'color .18s ease',
                   height: '100%',
                 }}
               >
-                <span style={{ fontSize: 12, opacity: active ? 1 : 0.55, transition: 'opacity .18s ease' }}>
-                  {icon}
-                </span>
                 <span className="hidden sm:inline">{label}</span>
               </Link>
             </div>
@@ -204,12 +196,13 @@ export default function TopNav() {
 
       {/* ── Right: portfolio value + derived system health ── */}
       <div style={{ display: 'flex', alignItems: 'center', gap: 12, flexShrink: 0, marginLeft: 12 }}>
+        <span className="hidden lg:inline" style={{ color: OPS.sub, fontFamily: OPS.display, fontSize: 12.5, letterSpacing: '.1em', paddingRight: 2 }}>市場観測所</span>
         {totalM != null && (
           <span
             className="hidden sm:inline"
             style={{
-              fontFamily: OPS.mono,
-              fontSize: 13,
+            fontFamily: OPS.display,
+            fontSize: 15,
               fontWeight: 600,
               color: OPS.text,
               letterSpacing: '-0.01em',
@@ -225,7 +218,7 @@ export default function TopNav() {
             fontSize: 11,
             letterSpacing: '0.12em',
             padding: '3px 10px',
-            borderRadius: 5,
+            borderRadius: 999,
             background: healthBg,
             color: healthColor,
             border: `1px solid ${healthColor}33`,

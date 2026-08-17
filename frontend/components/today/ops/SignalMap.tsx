@@ -1,8 +1,8 @@
 'use client'
 import { useState } from 'react'
-import { OPS, TYPE_META, STANCE_LABEL, fmtJpy } from './tokens'
+import { OPS, TYPE_META, STANCE_LABEL } from './tokens'
 import { SectionHead } from './Shell'
-import BenchmarkChart from './BenchmarkChart'
+import PerformanceChart from './PerformanceChart'
 import ScenarioStrip from './ScenarioStrip'
 import type {
   BoardRow, Engine, RedTeamVerdict, LaneVerdict, ChartsData, DeltaData, BenchmarkData,
@@ -39,14 +39,16 @@ export default function SignalMap({
         note={`候補 ${engine.funnel.find(f => f.key === 'tiers')?.count ?? '—'} → 最終 ${board.length}（個別の位置は 02 発注の地図）`}
       />
 
+      <RationaleSummary engine={engine} delta={delta} benchmark={benchmark} />
+
+      {/* 折り畳みは廃止。隠すほどの情報ではなく、開かないと存在に気づけなかった。 */}
+      <div style={{ marginTop: 12 }}>
+
       {/* シナリオ（Strategy 統合） */}
       <ScenarioStrip />
 
-      {/* 成績チャート */}
-      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(min(100%, 280px), 1fr))', gap: 16, alignItems: 'stretch' }}>
-        {benchmark && <BenchmarkChart data={benchmark} />}
-        <PnlChart data={charts?.pnl ?? []} />
-      </div>
+      {/* 成績チャート: 腕前(%)と金額(円)を1枠のタブに統合 */}
+      <PerformanceChart benchmark={benchmark} pnl={charts?.pnl ?? []} />
 
       <DeltaPanel delta={delta} />
 
@@ -93,7 +95,43 @@ export default function SignalMap({
         />
       </div>
 
+      </div>
+
     </section>
+  )
+}
+
+function RationaleSummary({ engine, delta, benchmark }: {
+  engine: Engine
+  delta?: DeltaData | null
+  benchmark?: BenchmarkData | null
+}) {
+  const adopted = engine.red_team.filter(item => item.verdict !== 'reject')
+  const rejected = engine.red_team.filter(item => item.verdict === 'reject')
+  const used = engine.lanes.filter(item => ['adopt', 'partial', 'adopt_partial'].includes(item.verdict))
+  const lastTwr = benchmark?.portfolio?.at(-1)
+  const cards = [
+    { en: 'MARKET REGIME', title: engine.operational_stance?.label ?? '市場判断', value: engine.funnel.at(-1)?.count != null ? `最終 ${engine.funnel.at(-1)?.count}` : '観測中', body: engine.operational_stance?.reason ?? engine.stance_reason ?? '市場環境を継続観測します。', ink: OPS.paperGreenInk },
+    { en: 'PORTFOLIO', title: 'ベンチマーク比較', value: lastTwr != null ? `${lastTwr >= 0 ? '+' : ''}${lastTwr.toFixed(2)}%` : '—', body: benchmark?.outperf.sp500 != null ? `S&P500円比 ${benchmark.outperf.sp500 >= 0 ? '+' : ''}${benchmark.outperf.sp500.toFixed(2)}pt` : '比較データを集計中', ink: OPS.paperBlueInk },
+    { en: 'DELTA', title: '前回分析との差', value: delta ? `＋${delta.added.length} / −${delta.removed.length}` : '—', body: delta ? `継続 ${delta.kept.length}件 · ${delta.prev_as_of ?? '前回'}比` : '比較可能な前回分析なし', ink: OPS.paperBlueInk },
+    { en: 'ADOPTED', title: '採用した反論', value: `${adopted.length}件`, body: adopted[0] ? redTeamItem(adopted[0], 0).body : '採用した反論はありません。', ink: OPS.paperGreenInk },
+    { en: 'REJECTED', title: '棄却した反論', value: `${rejected.length}件`, body: rejected[0] ? redTeamItem(rejected[0], 0).body : '棄却した反論はありません。', ink: OPS.paperVermilionInk },
+    { en: 'AI LANES', title: '採用した情報レーン', value: `${used.length} / ${engine.lanes.length}`, body: used.slice(0, 3).map(item => item.lane).join(' · ') || '採用レーンなし', ink: OPS.paperBlueInk },
+  ]
+
+  return (
+    <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit,minmax(155px,1fr))', gap: 7 }}>
+      {cards.map(card => (
+        <article key={card.en} style={{ minWidth: 0, minHeight: 126, border: `1px solid ${OPS.paperBorder}`, borderRadius: 8, padding: '11px 12px', background: OPS.paper, color: OPS.paperText }}>
+          <div className="ops-latin" style={{ color: card.ink, fontSize: 8.5, letterSpacing: '.13em' }}>{card.en}</div>
+          <div style={{ display: 'flex', alignItems: 'baseline', justifyContent: 'space-between', gap: 7, marginTop: 7 }}>
+            <strong style={{ fontFamily: OPS.display, fontSize: 13, letterSpacing: '.05em' }}>{card.title}</strong>
+            <b style={{ color: card.ink, fontFamily: OPS.mono, fontSize: 13, whiteSpace: 'nowrap' }}>{card.value}</b>
+          </div>
+          <p style={{ color: OPS.paperSub, fontSize: 10.5, lineHeight: 1.55, margin: '9px 0 0', display: '-webkit-box', WebkitLineClamp: 3, WebkitBoxOrient: 'vertical', overflow: 'hidden' }}>{card.body}</p>
+        </article>
+      ))}
+    </div>
   )
 }
 
@@ -120,8 +158,7 @@ function DeltaPanel({ delta }: { delta?: DeltaData | null }) {
     <div
       className="ops-card"
       style={{
-        background: OPS.panel,
-        border: `1px solid ${OPS.border}`,
+        // background/border/shadow は .ops-card が供給する（inline で上書きしない）
         borderRadius: 10,
         padding: '12px 16px',
         marginTop: 14,
@@ -153,59 +190,6 @@ function DeltaPanel({ delta }: { delta?: DeltaData | null }) {
 }
 
 /* ── 累積損益チャート ───────────────────────────────────── */
-
-function PnlChart({ data }: { data: { d: string; v: number }[] }) {
-  if (data.length < 2) return null
-  const W = 460
-  const H = 130
-  const PAD = { l: 8, r: 58, t: 12, b: 18 }
-  const vals = data.map(p => p.v)
-  let min = Math.min(...vals, 0)
-  let max = Math.max(...vals, 0)
-  const range = max - min || 1
-  min -= range * 0.08
-  max += range * 0.08
-
-  const toX = (i: number) => PAD.l + (i / (data.length - 1)) * (W - PAD.l - PAD.r)
-  const toY = (v: number) => PAD.t + (1 - (v - min) / (max - min)) * (H - PAD.t - PAD.b)
-
-  const line = vals.map((v, i) => `${i === 0 ? 'M' : 'L'}${toX(i).toFixed(1)},${toY(v).toFixed(1)}`).join('')
-  const area = `${line}L${toX(vals.length - 1).toFixed(1)},${toY(0)}L${toX(0).toFixed(1)},${toY(0)}Z`
-  const last = vals[vals.length - 1]
-  const up = last >= 0
-  const color = up ? OPS.green : OPS.redSoft
-
-  return (
-    <div
-      className="ops-card"
-      style={{ background: OPS.panel, border: `1px solid ${OPS.border}`, borderRadius: 10, padding: '12px 16px', flex: 1 }}
-    >
-      <div style={{ display: 'flex', alignItems: 'baseline', fontFamily: OPS.mono, fontSize: 11.5, marginBottom: 4 }}>
-        <span style={{ color: OPS.gold, letterSpacing: '0.14em', fontWeight: 600 }}>
-          P&L 累積（参考・{data.length}日）
-        </span>
-        <span style={{ marginLeft: 'auto', fontSize: 16, fontWeight: 600, color }}>
-          {up ? '+' : ''}
-          {fmtJpy(last)}
-        </span>
-      </div>
-      <div style={{ fontSize: 10.5, color: OPS.dim, marginBottom: 2 }}>円建て · 入出金未調整</div>
-      <svg viewBox={`0 0 ${W} ${H}`} style={{ width: '100%', height: 'auto', display: 'block' }} aria-label="累積損益チャート">
-        <line x1={PAD.l} y1={toY(0)} x2={W - PAD.r} y2={toY(0)} stroke={OPS.border} strokeWidth={1} strokeDasharray="3 3" />
-        <text x={W - PAD.r + 5} y={toY(0) + 3} fontSize={10} fill={OPS.dim} fontFamily={OPS.mono}>¥0</text>
-        <path d={area} fill={color} opacity={0.1} />
-        <path d={line} stroke={color} strokeWidth={1.6} fill="none" />
-        <circle cx={toX(vals.length - 1)} cy={toY(last)} r={2.6} fill={color} />
-        <text x={toX(0)} y={H - 3} fontSize={10} fill={OPS.dim} fontFamily={OPS.mono}>{data[0].d}</text>
-        <text x={toX(vals.length - 1)} y={H - 3} fontSize={10} fill={OPS.dim} fontFamily={OPS.mono} textAnchor="end">
-          {data[data.length - 1].d}
-        </text>
-      </svg>
-    </div>
-  )
-}
-
-/* ── 反論/レーンの3列 ───────────────────────────────────── */
 
 interface VerdictItem {
   key: string

@@ -212,8 +212,7 @@ function AttackGrid({ attacks }: { attacks: RedTeamAttack[] }) {
             key={i}
             className="ops-card"
             style={{
-              background: OPS.panel,
-              border: `1px solid ${OPS.hairline}`,
+              border: `1px solid ${OPS.border}`,
               borderRadius: 8,
               padding: '11px 13px',
               fontSize: 12.5,

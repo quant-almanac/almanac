@@ -1,47 +1,76 @@
 /**
- * ALMANAC Ops — オブシディアン・コンソール デザイントークン (v5)
- * 黒曜石ベース + 朱/金アクセント。数字は等幅、セクション見出しはドットマトリクス（発車標）。
+ * ALMANAC Ops — オブシディアン・コンソール デザイントークン (v8)
+ * 黒曜石ベース + 朱/金アクセント。ブランドは明朝、本文はゴシック、数字は等幅で統一。
+ *
+ * v8 の方針: 「明るさの段差」と「輪郭」でメリハリを作る。
+ *
+ * v7 は面を持ち上げる代わりに 上端ハイライト + 天面グラデ + 多重の落ち影 を
+ * 全ての面に敷いた。これはベベル/エンボス調＝古い見た目になり、しかも地が
+ * 暗いままなので結局読みにくかった。v8 は逆に、
+ *   - 地と面の明度差そのものを大きく取る（影ではなく明るさで階層を作る）
+ *   - 輪郭は 1px の見える境界線で切る
+ *   - 影は「浮いているもの」(モーダル・ポップオーバー) だけに限定する
+ *   - 数字やラベルの発光 (text-shadow) は使わない
+ * 面の階層: bg < panel < panelAlt < raised（sunken は溝のみ）
  */
 
 export const OPS = {
-  // 面
-  bg: '#0B0D12',
-  panel: '#12151C',
-  panelAlt: '#161A22',
-  inset: '#0E1117',
-  border: '#232833',
-  hairline: '#1B202A',
+  // 面 — 影ではなく明度で段差を作る。ここが v8 の要
+  bg: '#031426',       // ページ地
+  sunken: '#04111E',   // 溝（メータートラック・入力欄）
+  inset: '#04111E',    // sunken の別名（既存呼び出し互換）
+  panel: '#071C2E',    // 基本カード
+  panelAlt: '#0C263B', // 段上げ（スタット枠・カード内カード）
+  raised: '#12334C',   // チップ・hover
+
+  border: '#27445A',   // はっきり見える境界線
+  hairline: '#17364C', // 内部の仕切り
 
   // 文字
-  text: '#E9E7DF',
-  sub: '#9C9889',
-  dim: '#807C73', // 旧 #6C6960 (3.5:1) → 4.7:1。補助テキストのAA確保。sub との階層差は維持
-
+  text: '#F6F4EF',
+  sub: '#C6C1B2',
+  dim: '#A09B8D',
 
   // アクセント
-  vermilion: '#E0483C', // 朱 — 新規・要注目
-  gold: '#C9A75D',      // 金 — ラベル・焦点
-  green: '#57BE92',     // 約定・正常
-  amber: '#D9A13B',     // 指値中・注意
-  blue: '#6E8CC3',      // 監視・情報
-  redSoft: '#E08379',   // 警告テキスト
+  vermilion: '#F0655A', // 朱 — 新規・要注目
+  gold: '#E2C078',      // 金 — ラベル・焦点
+  green: '#5FD3A0',     // 約定・正常
+  amber: '#EDB44E',     // 指値中・注意
+  blue: '#8FAAE0',      // 監視・情報
+  redSoft: '#F0958B',   // 警告テキスト
 
-  orchid: '#B98CC9',    // 決算イベント用（朱と区別）
-  orchidBg: 'rgba(185, 140, 201, 0.12)',
+  orchid: '#C89ED6',    // 決算イベント用（朱と区別）
+  orchidBg: 'rgba(200, 158, 214, 0.16)',
 
   // 淡色背景（チップ用）
-  vermilionBg: 'rgba(224, 72, 60, 0.12)',
-  goldBg: 'rgba(201, 167, 93, 0.10)',
-  greenBg: 'rgba(87, 190, 146, 0.10)',
-  amberBg: 'rgba(217, 161, 59, 0.12)',
-  blueBg: 'rgba(110, 140, 195, 0.12)',
-  dimBg: 'rgba(156, 152, 137, 0.08)',
+  vermilionBg: 'rgba(240, 101, 90, 0.16)',
+  goldBg: 'rgba(226, 192, 120, 0.14)',
+  greenBg: 'rgba(95, 211, 160, 0.14)',
+  amberBg: 'rgba(237, 180, 78, 0.16)',
+  blueBg: 'rgba(143, 170, 224, 0.16)',
+  dimBg: 'rgba(198, 193, 178, 0.10)',
+
+  // 明色の「今日の判断」面。暗色面のアクセントを文字に再利用しない。
+  paper: '#F2EDE0',
+  paperText: '#1E2229',
+  paperSub: '#57544C',
+  paperBorder: '#D6CDB8',
+  paperControlBorder: '#8E826A',
+  paperGreenInk: '#0F6B4A',
+  paperAmberInk: '#8A5510',
+  paperVermilionInk: '#A82B1C',
+  paperBlueInk: '#2E4E8F',
+  paperSealInk: '#C0392B',
+
+  // 影 — 実際に浮いているものにだけ。面の装飾には使わない
+  shadow: '0 10px 30px -12px rgba(0,0,0,.7)',
+  shadowOverlay: '0 24px 64px -20px rgba(0,0,0,.8)',
 
   // フォント
-  mono: "'JetBrains Mono', 'SF Mono', ui-monospace, monospace",
-  sans: "'Noto Sans JP', 'Hiragino Sans', 'Yu Gothic', sans-serif",
-  dot: "'DotGothic16', 'Noto Sans JP', monospace", // 発車標ドットマトリクス
-  display: "'Shippori Mincho', 'Hiragino Mincho ProN', 'YuMincho', serif", // 朝刊の大見出し
+  mono: "var(--font-almanac-mono), 'SF Mono', ui-monospace, monospace",
+  sans: "var(--font-almanac-sans), 'Hiragino Sans', 'Yu Gothic', sans-serif",
+  brand: "var(--font-almanac-brand), 'Times New Roman', serif",
+  display: "var(--font-almanac-display), 'Hiragino Mincho ProN', 'YuMincho', serif",
 } as const
 
 /** 発注ボードの状態 → ランプ色/ラベル */
@@ -52,6 +81,7 @@ export const STATUS_META: Record<string, { label: string; color: string; bg: str
   filled: { label: '約定', color: OPS.green, bg: OPS.greenBg },
   cancelled: { label: '取消', color: OPS.dim, bg: OPS.dimBg },
   expired: { label: '期限切れ', color: OPS.dim, bg: OPS.dimBg },
+  reprice_required: { label: '再評価待ち', color: OPS.amber, bg: OPS.amberBg },
 }
 
 /** アクション種別 → 表示 */

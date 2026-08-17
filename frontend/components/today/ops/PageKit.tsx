@@ -1,31 +1,19 @@
 'use client'
 
 import { useEffect, useId, useRef, type ReactNode } from 'react'
+import BrandLoader from '@/components/BrandLoader'
 import { OPS } from './tokens'
+import { OPS_MOTION_CSS } from './motion'
+import { ORNAMENT_CSS } from './ornament'
 import { ContentShell, SHELL_CSS, type ContentWidthMode } from './Shell'
 
 /**
  * ops PageKit — 全スタンドアロンタブ共通の黒曜石ページ基盤。
  * ページ shell / パネル / スタット / チップ / バー / アニメ付きモーダル。
+ * 面とモーションの定義は motion.ts (OPS_MOTION_CSS) が唯一の真実。
  */
 
-export const PAGE_CSS = `
-@keyframes opsFadeUp { from { opacity: 0; transform: translateY(14px); } to { opacity: 1; transform: none; } }
-@keyframes opsModalIn { from { opacity: 0; transform: translateY(10px) scale(.98); } to { opacity: 1; transform: none; } }
-@keyframes opsBackdropIn { from { opacity: 0; } to { opacity: 1; } }
-@keyframes opsBarGrow { from { transform: scaleX(0); } to { transform: scaleX(1); } }
-.ops-sec { animation: opsFadeUp .5s ease both; }
-.ops-card { transition: transform .18s ease, border-color .18s ease, box-shadow .18s ease; }
-.ops-card:hover { transform: translateY(-2px); border-color: rgba(201,167,93,0.5) !important; box-shadow: 0 6px 18px rgba(0,0,0,0.35); }
-.ops-clickable { cursor: pointer; }
-.ops-row { transition: background .15s ease; }
-.ops-row:hover { background: rgba(201,167,93,0.06); }
-.ops-bar-fill { transform-origin: left; animation: opsBarGrow .7s cubic-bezier(.4,0,.2,1) both; }
-@media (prefers-reduced-motion: reduce) {
-  .ops-sec, .ops-bar-fill { animation: none; }
-  .ops-card, .ops-row { transition: none; }
-  .ops-card:hover { transform: none; }
-}
+export const PAGE_CSS = OPS_MOTION_CSS + ORNAMENT_CSS + `
 /* 固定列数Gridは狭幅で折り返せない語(例: "新規エントリー禁止")が縦積みに
    潰れるため、560px未満は1カラムへ落とす。auto-fill(minmax)側は元々
    可変列なので対象外。 */
@@ -65,25 +53,17 @@ export function OpsPage({
         <div style={{ padding: '22px 24px 36px' }}>
           <header className="ops-sec" style={{ marginBottom: 18, display: 'flex', alignItems: 'flex-end', gap: 16 }}>
           <div>
-            <div
-              style={{
-                fontFamily: OPS.dot,
-                fontSize: 11.5,
-                color: OPS.gold,
-                letterSpacing: '0.3em',
-                marginBottom: 6,
-              }}
-            >
+            <div className="ops-latin" style={{ fontSize: 12, color: OPS.gold, marginBottom: 7 }}>
               {en}
             </div>
             <h1
               style={{
-                fontFamily: OPS.sans,
-                fontSize: 'clamp(22px, 2vw, 28px)',
-                fontWeight: 700,
+                fontFamily: OPS.display,
+                fontSize: 'clamp(23px, 2.1vw, 30px)',
+                fontWeight: 600,
                 color: OPS.text,
                 margin: 0,
-                letterSpacing: '0.02em',
+                letterSpacing: '0.08em',
               }}
             >
               {title}
@@ -123,13 +103,13 @@ export function Panel({
   style?: React.CSSProperties
   className?: string
 }) {
+  // ops-card / ops-elev が天面グラデ・上端ハイライト・落ち影を供給する。
+  // ここで background を inline 指定すると立体感が消えるので渡さない。
   return (
     <div
       onClick={onClick}
-      className={`${hover ? 'ops-card' : ''}${onClick ? ' ops-clickable' : ''}${className ? ' ' + className : ''}`}
+      className={`${hover ? 'ops-card' : 'ops-elev'}${onClick ? ' ops-clickable' : ''}${className ? ' ' + className : ''}`}
       style={{
-        background: OPS.panel,
-        border: `1px solid ${OPS.border}`,
         borderRadius: 10,
         padding: pad,
         ...style,
@@ -142,11 +122,13 @@ export function Panel({
 
 export function PanelTitle({ children, right }: { children: ReactNode; right?: ReactNode }) {
   return (
-    <div style={{ display: 'flex', alignItems: 'baseline', marginBottom: 12 }}>
-      <span style={{ fontFamily: OPS.mono, fontSize: 12, color: OPS.gold, letterSpacing: '0.12em', fontWeight: 600 }}>
+    <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 13 }}>
+      {/* 金の縦棒。見出しの起点を明示してブロックの境目を作る */}
+      <span aria-hidden style={{ width: 3, height: 13, borderRadius: 2, background: OPS.gold, flexShrink: 0 }} />
+      <span style={{ fontFamily: OPS.display, fontSize: 13.5, color: OPS.gold, letterSpacing: '0.13em', fontWeight: 600 }}>
         {children}
       </span>
-      {right && <span style={{ marginLeft: 'auto', fontFamily: OPS.mono, fontSize: 11, color: OPS.dim }}>{right}</span>}
+      {right && <span style={{ marginLeft: 'auto', fontFamily: OPS.mono, fontSize: 11.5, color: OPS.dim }}>{right}</span>}
     </div>
   )
 }
@@ -164,16 +146,18 @@ export function Stat({
   color?: string
   sub?: string
 }) {
+  const tone = color ?? OPS.text
   return (
-    <div style={{ background: OPS.panelAlt, borderRadius: 8, padding: '12px 14px', minWidth: 0 }}>
-      <div style={{ fontSize: 11, color: OPS.dim, marginBottom: 5 }}>{label}</div>
-      <div style={{ display: 'flex', alignItems: 'baseline', gap: 4, minWidth: 0 }}>
+    <div className="ops-elev-2 ops-pop" style={{ borderRadius: 8, padding: '13px 15px', minWidth: 0 }}>
+      {/* ラベルは和文が来る（方向・確信度など）。欧文用の ops-latin は使わない */}
+      <div style={{ fontSize: 11.5, color: OPS.dim, marginBottom: 6, letterSpacing: '.04em' }}>{label}</div>
+      <div style={{ display: 'flex', alignItems: 'baseline', gap: 5, minWidth: 0 }}>
         <span
           style={{
             fontFamily: OPS.mono,
-            fontSize: 24,
-            fontWeight: 500,
-            color: color ?? OPS.text,
+            fontSize: 25,
+            fontWeight: 600,
+            color: tone,
             letterSpacing: '-0.02em',
             lineHeight: 1,
             overflow: 'hidden',
@@ -184,9 +168,9 @@ export function Stat({
         >
           {value}
         </span>
-        {unit && <span style={{ fontSize: 12, color: OPS.dim }}>{unit}</span>}
+        {unit && <span style={{ fontSize: 12.5, color: OPS.dim }}>{unit}</span>}
       </div>
-      {sub && <div style={{ fontSize: 10.5, color: OPS.dim, marginTop: 5 }}>{sub}</div>}
+      {sub && <div style={{ fontSize: 11, color: OPS.dim, marginTop: 6 }}>{sub}</div>}
     </div>
   )
 }
@@ -211,12 +195,12 @@ export function Chip({
         display: 'inline-flex',
         alignItems: 'center',
         gap: 4,
-        padding: '2px 9px',
+        padding: '3px 10px',
         borderRadius: 5,
         background: bg,
         color,
-        border: `1px solid ${color}2e`,
-        fontSize: 11,
+        border: `1px solid ${color}4d`,
+        fontSize: 11.5,
         fontFamily: mono ? OPS.mono : OPS.sans,
         whiteSpace: 'nowrap',
       }}
@@ -228,7 +212,7 @@ export function Chip({
 
 export function Bar({ pct, color = OPS.gold, height = 6 }: { pct: number; color?: string; height?: number }) {
   return (
-    <div style={{ flex: 1, height, background: OPS.hairline, borderRadius: height, overflow: 'hidden' }}>
+    <div className="ops-well" style={{ flex: 1, height, borderRadius: height, overflow: 'hidden' }}>
       <div
         className="ops-bar-fill"
         style={{
@@ -303,9 +287,9 @@ export function Modal({
         position: 'fixed',
         inset: 0,
         zIndex: 100,
-        background: 'rgba(6,8,12,0.72)',
-        backdropFilter: 'blur(4px)',
-        WebkitBackdropFilter: 'blur(4px)',
+        background: 'rgba(4,5,9,0.78)',
+        backdropFilter: 'blur(7px) saturate(.9)',
+        WebkitBackdropFilter: 'blur(7px) saturate(.9)',
         display: 'flex',
         alignItems: fitViewport ? 'center' : 'flex-start',
         justifyContent: 'center',
@@ -325,9 +309,11 @@ export function Modal({
           maxWidth: width,
           maxHeight: fitViewport ? 'calc(100vh - 40px)' : undefined,
           background: OPS.panel,
-          border: `1px solid ${OPS.gold}44`,
-          borderRadius: 12,
-          boxShadow: '0 24px 64px rgba(0,0,0,0.6)',
+          border: `1px solid ${OPS.border}`,
+          borderTop: `2px solid ${OPS.gold}`,
+          borderRadius: 10,
+          // 影は「本当に浮いているもの」だけ。モーダルはその代表
+          boxShadow: OPS.shadowOverlay,
           padding: '22px 24px',
           animation: 'opsModalIn .22s cubic-bezier(.4,0,.2,1) both',
           position: 'relative',
@@ -363,20 +349,7 @@ export function Modal({
 }
 
 export function Loading({ label = 'ALMANAC LOADING…' }: { label?: string }) {
-  return (
-    <div
-      style={{
-        padding: '80px 0',
-        textAlign: 'center',
-        color: OPS.dim,
-        fontFamily: OPS.dot,
-        letterSpacing: '0.24em',
-        fontSize: 14,
-      }}
-    >
-      {label}
-    </div>
-  )
+  return <BrandLoader label={label} />
 }
 
 export function Grid({ cols, gap = 12, children, minmax }: { cols?: number; gap?: number; minmax?: number; children: ReactNode }) {

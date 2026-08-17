@@ -473,7 +473,12 @@ function ModalStat({ label, value, sub, color }: { label: string; value: string;
   return <div style={{ background: OPS.inset, border: `1px solid ${OPS.hairline}`, borderRadius: 8, padding: '10px 12px' }}><div style={{ color: OPS.dim, fontSize: 11, marginBottom: 5 }}>{label}</div><div style={{ color: color ?? OPS.text, fontFamily: OPS.mono, fontSize: 16, fontWeight: 700 }}>{value}</div>{sub && <div style={{ color: OPS.dim, fontSize: 10.5, marginTop: 4 }}>{sub}</div>}</div>
 }
 
-const railPanel: CSSProperties = { background: OPS.panel, border: `1px solid ${OPS.border}`, borderRadius: 9, padding: '13px 14px' }
+const railPanel: CSSProperties = {
+  background: OPS.panel,
+  border: `1px solid ${OPS.border}`,
+  borderRadius: 9,
+  padding: '13px 14px',
+}
 const railTitle: CSSProperties = { color: OPS.gold, fontFamily: OPS.mono, fontSize: 12.5, letterSpacing: '0.1em', fontWeight: 600 }
 const filterButton: CSSProperties = { border: '1px solid', borderRadius: 5, cursor: 'pointer', fontFamily: OPS.mono, fontSize: 11.5, padding: '5px 7px' }
 const linkButton: CSSProperties = { background: 'none', border: 'none', color: OPS.gold, cursor: 'pointer', fontFamily: OPS.mono, fontSize: 12.5, padding: 0, marginTop: 12 }

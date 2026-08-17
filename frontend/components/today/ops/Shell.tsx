@@ -1,6 +1,7 @@
 'use client'
 import type { ReactNode } from 'react'
 import { OPS } from './tokens'
+import { DoubleRule } from './ornament'
 
 export type ContentWidthMode = 'standard' | 'wide' | 'fluid'
 
@@ -9,10 +10,10 @@ export type ContentWidthMode = 'standard' | 'wide' | 'fluid'
  * OS display scaling naturally resolve to the effective viewport size.
  */
 export const SHELL_CSS = `
-.ops-shell { --content-max: 1240px; }
-.ops-shell[data-width-mode="wide"] { --content-max: 1240px; }
+.ops-shell { --content-max: min(96vw, 1720px); }
+.ops-shell[data-width-mode="wide"] { --content-max: min(96vw, 1720px); }
 @media (min-width: 1920px) {
-  .ops-shell[data-width-mode="wide"] { --content-max: 1680px; }
+  .ops-shell[data-width-mode="wide"] { --content-max: min(96vw, 1880px); }
 }
 @media (min-width: 2560px) {
   .ops-shell[data-width-mode="wide"] { --content-max: 2200px; }
@@ -71,34 +72,29 @@ export function SectionHead({
           fontWeight: 500,
         }}
       >
-        <span
-          style={{
-            fontFamily: OPS.mono,
-            fontSize: 14,
-            color: OPS.dim,
-            letterSpacing: '0.06em',
-          }}
-        >
-          {no}
+        {/* 連番は漢数字。暦の章立てらしく、縦罫を添えて版面の起点にする */}
+        <span style={{ display: 'inline-flex', alignItems: 'center', gap: 10, alignSelf: 'stretch' }}>
+          <span
+            style={{
+              fontFamily: OPS.display,
+              fontSize: 17,
+              fontWeight: 600,
+              color: OPS.gold,
+              letterSpacing: '.08em',
+            }}
+          >
+            {kanjiNumeral(no)}
+          </span>
+          <span aria-hidden style={{ width: 1, alignSelf: 'stretch', background: OPS.border }} />
         </span>
+        <span className="ops-latin" style={{ fontSize: 19, color: OPS.gold }}>{en}</span>
         <span
           style={{
-            fontFamily: OPS.mono,
-            fontSize: 18,
+            fontFamily: OPS.display,
+            fontSize: 17,
             fontWeight: 600,
-            color: OPS.gold,
-            letterSpacing: '0.22em',
-          }}
-        >
-          {en}
-        </span>
-        <span
-          style={{
-            fontFamily: OPS.sans,
-            fontSize: 16,
-            fontWeight: 500,
             color: OPS.text,
-            letterSpacing: '0.1em',
+            letterSpacing: '0.14em',
           }}
         >
           {jp}
@@ -118,14 +114,18 @@ export function SectionHead({
         )}
         {right && <span style={{ marginLeft: note ? 10 : 'auto', display: 'inline-flex', alignItems: 'center' }}>{right}</span>}
       </h2>
-      <div
-        aria-hidden
-        style={{
-          marginTop: 9,
-          height: 1,
-          background: `linear-gradient(90deg, ${OPS.gold}88, ${OPS.gold}22 30%, ${OPS.hairline} 70%)`,
-        }}
-      />
+      <DoubleRule />
     </div>
   )
+}
+
+const KANJI = ['〇', '一', '二', '三', '四', '五', '六', '七', '八', '九', '十']
+
+/** "01" → "一"。暦の章番号は漢数字で組む。 */
+function kanjiNumeral(no: string): string {
+  const n = Number(no)
+  if (!Number.isFinite(n) || n < 1) return no
+  if (n <= 10) return KANJI[n]
+  if (n < 20) return `十${KANJI[n - 10]}`
+  return no
 }

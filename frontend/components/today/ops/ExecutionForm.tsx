@@ -13,16 +13,6 @@ type FundingOption = {
   broker?: string
   available_jpy?: number
 }
-type Preflight = {
-  disposition: 'ready' | 'confirmation_required' | 'hard_reject'
-  action_digest: string
-  preflight_token: string
-  expires_at: string
-  reasons: { code: string; message: string }[]
-  hard_reasons: { code: string; message: string }[]
-  metrics?: Record<string, number | string | null>
-}
-
 const DIRECTIONS = [
   { value: 'buy', label: '買い' },
   { value: 'sell', label: '売り' },
@@ -83,6 +73,11 @@ function inferSellAll(row: BoardRow): boolean {
   return /全(株|部|量)|全て売却/.test(text)
 }
 
+function localDateTimeValue(now = new Date()): string {
+  const local = new Date(now.getTime() - now.getTimezoneOffset() * 60_000)
+  return local.toISOString().slice(0, 16)
+}
+
 /**
  * 売買記録フォーム — POST /api/actions/execute で記録し、記録後は
  * PATCH /api/actions/executions/{id} で価格/数量/状態/備考を修正できる。
@@ -97,114 +92,43 @@ export default function ExecutionForm({ row, onClose, historical = false, fundin
   const [account, setAccount] = useState(inferAccount(row))
   const [investmentType, setInvestmentType] = useState(inferInvType(row))
   const [currency, setCurrency] = useState<'JPY' | 'USD'>(row.ticker?.endsWith('.T') ? 'JPY' : 'USD')
+  const [executionOwner, setExecutionOwner] = useState(row.execution_owner ?? '')
+  const [executionBroker, setExecutionBroker] = useState(row.execution_broker ?? '')
+  const [brokerConfirmed, setBrokerConfirmed] = useState(false)
+  const [externalExecutionId, setExternalExecutionId] = useState('')
+  const [brokerReportedAt, setBrokerReportedAt] = useState(localDateTimeValue)
+  const [sellAllFilledQuantity, setSellAllFilledQuantity] = useState('')
   const [note, setNote] = useState('')
   const [contributionId, setContributionId] = useState('')
   const [saving, setSaving] = useState(false)
   const [result, setResult] = useState<{ ok: boolean; message: string } | null>(null)
-  const [preflight, setPreflight] = useState<Preflight | null>(null)
-  const [acknowledgementReason, setAcknowledgementReason] = useState('')
-  const [preflightAcknowledged, setPreflightAcknowledged] = useState(false)
   const [recordedId, setRecordedId] = useState<string | null>(null) // 記録済み → 修正対象
   const idempotencyKey = useRef<string | null>(null)
 
   const isMargin = direction === 'margin_buy' || direction === 'short' || direction === 'cover'
   const isRiskIncreasing = direction === 'buy' || direction === 'margin_buy' || direction === 'short'
+  const isFilled = status === 'executed' || status === 'partial'
   const quantityUnit = row.ticker === '1489.T' || row.ticker === '1306.T' ? '口' : '株'
   const needsPriceQty = status !== 'cancelled'
   const editMode = recordedId != null
-  const [preflightInputKey, setPreflightInputKey] = useState<string | null>(null)
 
-  function preflightPayload() {
-    return {
-      ticker: row.ticker, direction,
-      order_type: row.order_type ?? null,
-      quantity: needsPriceQty && !sellAll && quantity ? parseFloat(quantity) : null,
-      price: needsPriceQty && price ? parseFloat(price) : null,
-      limit_price: row.limit_price ?? null,
-      currency, account,
-      analysis_id: row.analysis_id ?? null,
-      action_state_id: row.action_state_id ?? row.lifecycle.id ?? null,
-      execution_owner: row.execution_owner ?? null,
-      execution_broker: row.execution_broker ?? null,
-      execution_position_keys: row.execution_position_keys ?? null,
+  function brokerEvidenceError(): string | null {
+    const confirmedQuantity = sellAll ? sellAllFilledQuantity : quantity
+    if (brokerConfirmed && (
+      !isFilled || !executionOwner || !executionBroker || !externalExecutionId.trim()
+      || !brokerReportedAt || !price || !confirmedQuantity
+    )) {
+      return '証券会社確認済みにするには、名義・証券会社・約定ID・約定日時・価格・実約定数量が必要です。'
     }
-  }
-
-  async function runPreflight() {
-    const payload = preflightPayload()
-    setSaving(true)
-    setResult(null)
-    setPreflightAcknowledged(false)
-    try {
-      const res = await apiFetch('/api/actions/preflight', {
-        method: 'POST', body: JSON.stringify(payload),
-      })
-      const json = await res.json().catch(() => ({}))
-      if (!res.ok) {
-        setResult({ ok: false, message: apiErrorMessage(json, `発注前確認に失敗: HTTP ${res.status}`) })
-        return
-      }
-      setPreflight(json as Preflight)
-      setPreflightInputKey(JSON.stringify(payload))
-      const messages = [...(json.hard_reasons ?? []), ...(json.reasons ?? [])]
-        .map((reason: { message: string }) => reason.message)
-      setResult({
-        ok: json.disposition === 'ready',
-        message: json.disposition === 'ready'
-          ? '発注前リスク確認を通過しました（60分有効）。'
-          : messages.join(' / ') || '人間の確認が必要です。',
-      })
-    } catch (err) {
-      setResult({ ok: false, message: `発注前確認に失敗: ${String(err)}` })
-    } finally {
-      setSaving(false)
-    }
-  }
-
-  async function acknowledgePreflight() {
-    if (!preflight || !acknowledgementReason.trim()) {
-      setResult({ ok: false, message: '承認理由を入力してください。' })
-      return
-    }
-    setSaving(true)
-    try {
-      const res = await apiFetch('/api/actions/preflight/acknowledge', {
-        method: 'POST',
-        body: JSON.stringify({
-          preflight_token: preflight.preflight_token,
-          action_digest: preflight.action_digest,
-          acknowledgement_reason: acknowledgementReason.trim(),
-        }),
-      })
-      const json = await res.json().catch(() => ({}))
-      if (!res.ok) {
-        setResult({ ok: false, message: apiErrorMessage(json, `承認保存に失敗: HTTP ${res.status}`) })
-        return
-      }
-      setPreflightAcknowledged(true)
-      setResult({ ok: true, message: '人間承認を監査ログへ記録しました。発注を記録できます。' })
-    } catch (err) {
-      setResult({ ok: false, message: `承認保存に失敗: ${String(err)}` })
-    } finally {
-      setSaving(false)
-    }
+    return null
   }
 
   async function handleSave() {
-    const preflightIsCurrent = preflightInputKey === JSON.stringify(preflightPayload())
-    if (status === 'ordered' && isRiskIncreasing) {
-      if (!preflight || !preflightIsCurrent) {
-        setResult({ ok: false, message: '先に「発注前確認」を実行してください。' })
-        return
-      }
-      if (preflight.disposition === 'hard_reject') {
-        setResult({ ok: false, message: '絶対リスク上限により、この発注は記録できません。' })
-        return
-      }
-      if (preflight.disposition === 'confirmation_required' && !preflightAcknowledged) {
-        setResult({ ok: false, message: '警告内容を確認し、理由を入力して明示承認してください。' })
-        return
-      }
+    const evidenceError = brokerEvidenceError()
+    const confirmedQuantity = sellAll ? sellAllFilledQuantity : quantity
+    if (evidenceError) {
+      setResult({ ok: false, message: evidenceError })
+      return
     }
     idempotencyKey.current ??=
       globalThis.crypto?.randomUUID?.() ??
@@ -225,11 +149,21 @@ export default function ExecutionForm({ row, onClose, historical = false, fundin
           ai_recommended_order_type: row.order_type ?? null, ai_recommended_limit: row.limit_price ?? null,
           analysis_id: row.analysis_id ?? null,
           action_state_id: row.action_state_id ?? row.lifecycle.id ?? null,
-          execution_owner: row.execution_owner ?? null,
-          execution_broker: row.execution_broker ?? null,
+          execution_owner: executionOwner || null,
+          execution_broker: executionBroker || null,
           execution_position_keys: row.execution_position_keys ?? null,
+          broker_confirmed_filled: brokerConfirmed && isFilled,
+          external_execution_id: brokerConfirmed ? externalExecutionId.trim() : null,
+          broker_source: brokerConfirmed ? 'web_manual_confirmation' : null,
+          broker_reported_at: brokerConfirmed ? new Date(brokerReportedAt).toISOString() : null,
+          filled_quantity: brokerConfirmed ? parseFloat(confirmedQuantity) : null,
+          filled_price: brokerConfirmed ? parseFloat(price) : null,
+          executed_at_time: brokerConfirmed ? new Date(brokerReportedAt).toISOString() : null,
+          reconciled_at: brokerConfirmed ? new Date().toISOString() : null,
           contribution_id: contributionId || null,
-          preflight_token: status === 'ordered' && isRiskIncreasing && preflightIsCurrent ? preflight?.preflight_token ?? null : null,
+          // 発注前リスク確認は画面での手動実行を必須にしていた。サーバ側が
+          // 保存時に自動で測って台帳へ残すので、ここでトークンを渡す必要はない。
+          preflight_token: null,
           idempotency_key: idempotencyKey.current,
         }),
       })
@@ -250,6 +184,12 @@ export default function ExecutionForm({ row, onClose, historical = false, fundin
 
   async function handlePatch() {
     if (!recordedId) return
+    const evidenceError = brokerEvidenceError()
+    const confirmedQuantity = sellAll ? sellAllFilledQuantity : quantity
+    if (evidenceError) {
+      setResult({ ok: false, message: evidenceError })
+      return
+    }
     setSaving(true)
     setResult(null)
     try {
@@ -259,6 +199,14 @@ export default function ExecutionForm({ row, onClose, historical = false, fundin
           price: needsPriceQty && price ? parseFloat(price) : null,
           quantity: needsPriceQty && !sellAll && quantity ? parseFloat(quantity) : null,
           status, note, currency,
+          broker_confirmed_filled: brokerConfirmed && isFilled,
+          external_execution_id: brokerConfirmed ? externalExecutionId.trim() : null,
+          broker_source: brokerConfirmed ? 'web_manual_confirmation' : null,
+          broker_reported_at: brokerConfirmed ? new Date(brokerReportedAt).toISOString() : null,
+          filled_quantity: brokerConfirmed ? parseFloat(confirmedQuantity) : null,
+          filled_price: brokerConfirmed ? parseFloat(price) : null,
+          executed_at_time: brokerConfirmed ? new Date(brokerReportedAt).toISOString() : null,
+          reconciled_at: brokerConfirmed ? new Date().toISOString() : null,
         }),
       })
       const json = await res.json().catch(() => ({}))
@@ -309,6 +257,23 @@ export default function ExecutionForm({ row, onClose, historical = false, fundin
         </Field>
       </div>
 
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(2, 1fr)', gap: 12, marginBottom: 12 }}>
+        <Field label="名義">
+          <select value={executionOwner} onChange={e => setExecutionOwner(e.target.value)} style={selSt} disabled={editMode}>
+            <option value="">選択してください</option>
+            <option value="husband">夫</option>
+            <option value="wife">妻</option>
+          </select>
+        </Field>
+        <Field label="証券会社">
+          <select value={executionBroker} onChange={e => setExecutionBroker(e.target.value)} style={selSt} disabled={editMode}>
+            <option value="">選択してください</option>
+            <option value="rakuten">楽天証券</option>
+            <option value="sbi">SBI証券</option>
+          </select>
+        </Field>
+      </div>
+
       {needsPriceQty && (
         <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 12, marginBottom: 12 }}>
           <Field label={isMargin ? '建値' : '約定価格'}>
@@ -334,6 +299,37 @@ export default function ExecutionForm({ row, onClose, historical = false, fundin
         </div>
       )}
 
+      {isFilled && (
+        <div style={{ marginTop: 12, padding: 12, border: `1px solid ${brokerConfirmed ? OPS.green : OPS.border}`, borderRadius: 6, background: brokerConfirmed ? OPS.greenBg : OPS.panelAlt }}>
+          <label style={{ display: 'flex', alignItems: 'center', gap: 8, color: OPS.text, fontSize: 13, fontWeight: 600 }}>
+            <input
+              type="checkbox"
+              checked={brokerConfirmed}
+              onChange={e => setBrokerConfirmed(e.target.checked)}
+            />
+            証券会社画面でこの約定を確認済み
+          </label>
+          <p style={{ color: OPS.dim, fontSize: 11.5, lineHeight: 1.55, margin: '6px 0 10px' }}>
+            確認済みとして保存すると、この実績がポジション・現金・NISA枠の新しい権威になります。以後の売買もここで記録すれば、時間経過だけを理由にCSVを再取得する必要はありません。
+          </p>
+          {brokerConfirmed && (
+            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 12 }}>
+              <Field label="証券会社の約定ID・注文番号">
+                <input aria-label="証券会社の約定ID・注文番号" value={externalExecutionId} onChange={e => setExternalExecutionId(e.target.value)} placeholder="重複防止に使用" style={inputSt} />
+              </Field>
+              <Field label="約定日時">
+                <input aria-label="約定日時" type="datetime-local" value={brokerReportedAt} onChange={e => setBrokerReportedAt(e.target.value)} style={inputSt} />
+              </Field>
+              {sellAll && (
+                <Field label={`実約定数量（${quantityUnit}）`}>
+                  <input aria-label={`実約定数量（${quantityUnit}）`} value={sellAllFilledQuantity} onChange={e => setSellAllFilledQuantity(e.target.value)} placeholder={`${quantityUnit}数`} style={inputSt} />
+                </Field>
+              )}
+            </div>
+          )}
+        </div>
+      )}
+
       {isRiskIncreasing && !historical && fundingOptions.length > 0 && (
         <Field label="承認済み追加資金（任意）">
           <select aria-label="承認済み追加資金（任意）" value={contributionId} onChange={e => setContributionId(e.target.value)} style={selSt} disabled={editMode}>
@@ -347,33 +343,6 @@ export default function ExecutionForm({ row, onClose, historical = false, fundin
           <span style={{ color: OPS.dim, fontSize: 11.5, lineHeight: 1.5 }}>選択すると、この約定だけが承認済み資金の消化として記録されます。実績の後追い登録は未選択のまま保存できます。</span>
         </Field>
       )}
-
-      {status === 'ordered' && isRiskIncreasing && !historical && (() => {
-        const preflightIsCurrent = preflightInputKey === JSON.stringify(preflightPayload())
-        const shownPreflight = preflightIsCurrent ? preflight : null
-        return (
-          <div style={{ marginTop: 12, padding: 12, border: `1px solid ${shownPreflight?.disposition === 'hard_reject' ? OPS.redSoft : OPS.border}`, borderRadius: 6, background: OPS.panelAlt }}>
-            <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
-              <strong style={{ color: OPS.text, fontSize: 13 }}>発注前リスク確認</strong>
-              <button type="button" onClick={runPreflight} disabled={saving} style={{ ...smallButton, color: OPS.gold, borderColor: `${OPS.gold}88` }}>
-                {shownPreflight ? '確認を再実行' : '発注前確認'}
-              </button>
-              {shownPreflight && <span style={{ color: shownPreflight.disposition === 'ready' ? OPS.green : shownPreflight.disposition === 'hard_reject' ? OPS.redSoft : OPS.amber, fontSize: 12 }}>
-                {shownPreflight.disposition === 'ready' ? '確認済み（60分）' : shownPreflight.disposition === 'hard_reject' ? '絶対上限：拒否' : '人間確認が必要'}
-              </span>}
-            </div>
-            {shownPreflight && [...shownPreflight.hard_reasons, ...shownPreflight.reasons].map((reason) => (
-              <p key={reason.code} style={{ color: OPS.sub, fontSize: 12, lineHeight: 1.55, margin: '8px 0 0' }}>{reason.message}</p>
-            ))}
-            {shownPreflight?.disposition === 'confirmation_required' && !preflightAcknowledged && (
-              <div style={{ display: 'flex', gap: 8, marginTop: 10 }}>
-                <input aria-label="リスク警告を承認する理由" value={acknowledgementReason} onChange={e => setAcknowledgementReason(e.target.value)} placeholder="警告を理解したうえで発注する理由" style={inputSt} />
-                <button type="button" onClick={acknowledgePreflight} disabled={saving} style={smallButton}>明示承認</button>
-              </div>
-            )}
-          </div>
-        )
-      })()}
 
       <Field label="備考（任意）">
         <input value={note} onChange={e => setNote(e.target.value)} placeholder="楽天証券での約定メモなど" style={inputSt} />
@@ -412,8 +381,4 @@ const selSt: React.CSSProperties = {
 const inputSt: React.CSSProperties = {
   background: OPS.panel, border: `1px solid ${OPS.border}`, borderRadius: 5, color: OPS.text,
   fontSize: 14, padding: '8px 10px', fontFamily: OPS.mono, outline: 'none', width: '100%', boxSizing: 'border-box',
-}
-const smallButton: React.CSSProperties = {
-  background: 'none', border: `1px solid ${OPS.border}`, borderRadius: 5,
-  color: OPS.text, fontSize: 12, padding: '6px 10px', cursor: 'pointer', whiteSpace: 'nowrap',
 }

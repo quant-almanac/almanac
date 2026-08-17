@@ -44,4 +44,34 @@ describe('CommandDeck', () => {
     expect(dialog).toBeInTheDocument()
     expect(within(dialog).getByText('より良い候補を待ちます。')).toBeInTheDocument()
   })
+
+  it('surfaces allocator explanation and every wallet rather than hiding non-SBI cash', () => {
+    const allocatorToday = {
+      ...today,
+      capital_allocator: { mode: 'enforce', selected_count: 1, selected_ticker: 'V', normal_action_cap_jpy: 250000 },
+      capital_allocator_comparison: { run_id: 'allocator-run-1', explanation_status: 'explainable' },
+      cash_status: [
+        { key: 'usd', wallet_key: 'husband|rakuten|broker_cash|USD', owner: 'husband', broker: 'rakuten', currency: 'USD', balance_status: 'confirmed', reconciliation_required: false, available_for_new_buy: 54256, projected_balance: 54256 },
+        { key: 'wife', wallet_key: 'wife|sbi|broker_cash|JPY', owner: 'wife', broker: 'sbi', currency: 'JPY', balance_status: 'confirmed', reconciliation_required: false, available_for_new_buy: 192886, projected_balance: 192886 },
+      ],
+      funding_alternatives: [{
+        ticker: '1489.T',
+        funding_workflows: [{
+          kind: 'cross_owner_transfer_then_reprice_buy', can_fund: true,
+          source_owner: 'husband', source_broker: 'sbi', source_wallet_key: 'husband|sbi|broker_cash|JPY', source_available_native: 195324,
+          minimum_transfer_native: 3723,
+          requirement: { kind: 'minimum_executable', target_quantity: 43 },
+        }],
+      }],
+    } as unknown as TodayOps
+    render(<CommandDeck data={allocatorToday} />)
+
+    expect(screen.getByText('資本配分・現金監査')).toBeInTheDocument()
+    expect(screen.getByText('husband/rakuten · USD')).toBeInTheDocument()
+    expect(screen.getByText('wife/sbi · JPY')).toBeInTheDocument()
+    expect(screen.getByText('差分説明可能')).toBeInTheDocument()
+    expect(screen.getByText('1489.T · 最小実行数量 43')).toBeInTheDocument()
+    expect(screen.getByText(/最低 ¥3,723/)).toBeInTheDocument()
+    expect(screen.getByText('再評価後に買付')).toBeInTheDocument()
+  })
 })

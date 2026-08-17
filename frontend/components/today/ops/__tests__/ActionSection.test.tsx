@@ -70,9 +70,9 @@ describe('formatExecutionPlanRationale', () => {
       />,
     )
 
-    expect(screen.getByText('ROBO')).toBeInTheDocument()
+    expect(screen.getAllByText('ROBO').length).toBeGreaterThanOrEqual(1)
     expect(screen.getByText('BLOCKED')).toBeInTheDocument()
-    expect(screen.getByText('スプレッドが広すぎます')).toBeInTheDocument()
+    expect(screen.getAllByText('スプレッドが広すぎます').length).toBeGreaterThanOrEqual(1)
     expect(screen.queryByRole('button', { name: '記録する' })).not.toBeInTheDocument()
     expect(screen.queryByRole('button', { name: '指値を出した' })).not.toBeInTheDocument()
   })

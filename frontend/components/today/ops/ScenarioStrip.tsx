@@ -34,8 +34,6 @@ export default function ScenarioStrip() {
         alignItems: 'center',
         gap: 16,
         flexWrap: 'wrap',
-        background: OPS.panel,
-        border: `1px solid ${OPS.border}`,
         borderLeft: `3px solid ${OPS.green}`,
         borderRadius: 10,
         padding: '10px 16px',

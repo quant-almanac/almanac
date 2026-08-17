@@ -10,6 +10,8 @@ import OrderStrategyRefresh from './OrderStrategyRefresh'
 import Sparkline from './Sparkline'
 import ExecutionForm from './ExecutionForm'
 import OrderMap, { type RejectedDecision } from './OrderMap'
+import PrimaryOrderCard from './PrimaryOrderCard'
+import { SelectionPulse } from './motionAccents'
 import type { BoardRow, ChartsData, ExecutionPlan, ExecutionPlanRationale } from './types'
 
 type FundingOption = NonNullable<NonNullable<ExecutionPlan['contributions']>['sources']>[number]
@@ -27,7 +29,14 @@ type PendingApplication = {
 
 const ACTION_SECTION_CSS = `
 .orders-layout { display:grid; grid-template-columns:minmax(0,1.35fr) minmax(300px,1fr); gap:20px; align-items:start; }
+.review-workspace { display:grid; grid-template-columns:minmax(300px,.92fr) minmax(0,1.35fr); gap:12px; }
+.review-queue { display:flex; flex-direction:column; border:1px solid ${OPS.hairline}; border-radius:9px; overflow:hidden; background:${OPS.panel}; }
+.review-queue-row { position:relative; display:grid; grid-template-columns:62px 70px minmax(0,1fr); gap:9px; align-items:center; min-height:43px; padding:8px 11px; border:0; border-bottom:1px solid ${OPS.hairline}; background:transparent; color:inherit; text-align:left; cursor:pointer; }
+.review-queue-row:last-child { border-bottom:0; }
+.review-queue-row[aria-pressed="true"] { background:${OPS.amberBg}; box-shadow:inset 3px 0 0 ${OPS.amber}; }
+.review-focus { position:relative; min-height:184px; border:1px solid ${OPS.hairline}; border-radius:9px; overflow:hidden; background:${OPS.panel}; padding:13px 15px; }
 @container ops-content (max-width:900px) { .orders-layout { grid-template-columns:minmax(0,1fr); } }
+@container ops-content (max-width:760px) { .review-workspace { grid-template-columns:1fr; } }
 `
 
 export function formatExecutionPlanRationale(reason: string | ExecutionPlanRationale): string {
@@ -70,6 +79,8 @@ export default function ActionSection({
   onHover,
   rejectedDecisions = [],
   pendingPortfolioApplications = [],
+  selectedKey,
+  onDecisionSelect,
 }: {
   board: BoardRow[]
   reviewBoard?: BoardRow[]
@@ -83,9 +94,12 @@ export default function ActionSection({
   onHover?: (i: number | null) => void
   rejectedDecisions?: RejectedDecision[]
   pendingPortfolioApplications?: PendingApplication[]
+  selectedKey?: string | null
+  onDecisionSelect?: (key: string) => void
 }) {
   const [openIdx, setOpenIdx] = useState<number | null>(null)
   const [planModalOpen, setPlanModalOpen] = useState(false)
+  const [reviewSelected, setReviewSelected] = useState(0)
   const quads = quadrantLabels(board)
   const fundingOptions = executionPlan?.contributions?.sources?.filter(source => (source.available_jpy ?? 0) > 0) ?? []
 
@@ -115,12 +129,23 @@ export default function ActionSection({
 
       {executionPlan && <ExecutionPlanSummary plan={executionPlan} onOpen={() => setPlanModalOpen(true)} />}
 
-      {board.length === 0 ? (
-        <div className={rejectedDecisions.length > 0 ? 'orders-layout' : undefined} style={rejectedDecisions.length > 0 ? undefined : { display: 'grid', gridTemplateColumns: '1fr' }}>
+      {board.length === 0 && reviewBoard.length > 0 ? (
+        <ReviewWorkspace
+          items={reviewBoard}
+          activeIndex={Math.max(0, reviewBoard.findIndex(row => row.decision_flow_key === selectedKey) >= 0
+            ? reviewBoard.findIndex(row => row.decision_flow_key === selectedKey)
+            : reviewSelected)}
+          onSelect={(row, index) => {
+            setReviewSelected(index)
+            if (row.decision_flow_key) onDecisionSelect?.(row.decision_flow_key)
+          }}
+        />
+      ) : board.length === 0 ? (
+        <div className={(rejectedDecisions.length > 0 || reviewBoard.length > 0) ? 'orders-layout' : undefined} style={(rejectedDecisions.length > 0 || reviewBoard.length > 0) ? undefined : { display: 'grid', gridTemplateColumns: '1fr' }}>
           <p style={{ fontSize: 15, color: OPS.sub, lineHeight: 1.8, marginTop: executionPlan ? 14 : 0 }}>
             新規の発注はありません。{executionPlan?.today_decision?.reason ?? '観察を続けます。'}
           </p>
-          {onHover && rejectedDecisions.length > 0 && (
+          {onHover && (rejectedDecisions.length > 0 || reviewBoard.length > 0) && (
             <OrderMap
               board={board}
               selected={selected}
@@ -129,6 +154,7 @@ export default function ActionSection({
               onHover={onHover}
               onOpen={i => setOpenIdx(i)}
               rejected={rejectedDecisions}
+              review={reviewBoard}
             />
           )}
         </div>
@@ -136,7 +162,15 @@ export default function ActionSection({
         <div className="orders-layout">
           {/* ── 発注リスト ── */}
           <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
-            {todo.map(({ row, i }) => (
+            {/* 最優先の1件は数値を読ませる主役カードにする。残りは一覧のまま */}
+            {todo.length > 0 && (
+              <PrimaryOrderCard
+                row={todo[0].row}
+                quadrant={quads[todo[0].i]}
+                onOpen={() => { onSelect(todo[0].i); setOpenIdx(todo[0].i) }}
+              />
+            )}
+            {todo.slice(1).map(({ row, i }) => (
               <OrderRow
                 key={`${row.ticker}-${row.rank ?? i}`}
                 row={row} index={i} quadrant={quads[i]}
@@ -183,12 +217,13 @@ export default function ActionSection({
               onHover={onHover}
               onOpen={i => setOpenIdx(i)}
               rejected={rejectedDecisions}
+              review={reviewBoard}
             />
           )}
         </div>
       )}
 
-      {reviewBoard.length > 0 && <ReviewPanel items={reviewBoard} />}
+      {board.length > 0 && reviewBoard.length > 0 && <ReviewPanel items={reviewBoard} />}
 
       {backlog && backlog.length > 0 && <BacklogPanel items={backlog} onOpen={setOpenIdx} board={board} />}
 
@@ -208,6 +243,59 @@ export default function ActionSection({
       </Modal>
       <ExecutionPlanModal plan={executionPlan} open={planModalOpen} onClose={() => setPlanModalOpen(false)} />
     </section>
+  )
+}
+
+function ReviewWorkspace({ items, activeIndex, onSelect }: {
+  items: BoardRow[]
+  activeIndex: number
+  onSelect: (row: BoardRow, index: number) => void
+}) {
+  const active = items[activeIndex] ?? items[0]
+  const reasons = active?.execution_block_reasons ?? []
+  const confidence = Math.max(0, Math.min(100, active?.confidence_pct ?? 50))
+  const maxImpact = Math.max(1, ...items.map(item => item.impact_nav_pct ?? 0))
+  const impact = active?.impact_nav_pct ?? 0
+  const pointX = 9 + confidence * .82
+  const pointY = 82 - Math.min(70, impact / maxImpact * 60)
+
+  return (
+    <div className="review-workspace">
+      <div className="review-queue" aria-label="要確認候補">
+        {items.map((row, index) => (
+          <button key={`${row.ticker}-${row.type}-${index}`} type="button" className="review-queue-row"
+            aria-pressed={index === activeIndex} onClick={() => onSelect(row, index)}>
+            <SelectionPulse active={index === activeIndex} color={OPS.amber} />
+            <strong style={{ color: OPS.text, fontFamily: OPS.mono, fontSize: 13 }}>{row.ticker ?? '—'}</strong>
+            <span style={{ color: OPS.amber, fontFamily: OPS.mono, fontSize: 9.5 }}>{row.execution_readiness === 'blocked' ? 'BLOCKED' : 'REVIEW'}</span>
+            <span style={{ color: OPS.sub, fontSize: 10.5, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{row.execution_block_reasons?.[0]?.message ?? row.action ?? '確認が必要です'}</span>
+          </button>
+        ))}
+      </div>
+      {active && (
+        <div className="review-focus" aria-label={`${active.ticker ?? '候補'}の確認理由`}>
+          <div style={{ display: 'flex', alignItems: 'baseline', gap: 9 }}>
+            <span style={{ color: OPS.amber, fontFamily: OPS.brand, fontSize: 10, letterSpacing: '.12em' }}>REVIEW</span>
+            <strong style={{ color: OPS.text, fontFamily: OPS.mono, fontSize: 17 }}>{active.ticker ?? '—'}</strong>
+            <span style={{ color: OPS.dim, fontSize: 11 }}>{TYPE_META[active.type ?? '']?.label ?? active.type ?? ''}</span>
+          </div>
+          <div style={{ color: OPS.sub, fontSize: 11.5, lineHeight: 1.55, marginTop: 7, minHeight: 36 }}>
+            {reasons.length > 0 ? reasons.map(reason => reason.message ?? reason.code ?? '要確認').join(' / ') : '実行前の確認が必要です。'}
+          </div>
+          <svg viewBox="0 0 100 90" role="img" aria-label="確信度と資産インパクト" style={{ position: 'absolute', right: 14, bottom: 9, width: '48%', maxHeight: 92 }}>
+            <defs><radialGradient id="reviewPoint"><stop stopColor={OPS.amber} stopOpacity=".65"/><stop offset="1" stopColor={OPS.amber} stopOpacity="0"/></radialGradient></defs>
+            {[25, 50, 75].map(x => <line key={`x${x}`} x1={x} y1="8" x2={x} y2="82" stroke={OPS.hairline} strokeWidth=".45" />)}
+            {[22, 42, 62, 82].map(y => <line key={`y${y}`} x1="8" y1={y} x2="92" y2={y} stroke={OPS.hairline} strokeWidth=".45" />)}
+            <circle cx={pointX} cy={pointY} r="10" fill="url(#reviewPoint)" />
+            <circle cx={pointX} cy={pointY} r="3.2" fill={OPS.bg} stroke={OPS.amber} strokeWidth="1.2" />
+            <text x="50" y="89" textAnchor="middle" fill={OPS.dim} fontSize="4.5">確信度 {confidence}%</text>
+          </svg>
+          <div style={{ position: 'absolute', left: 15, bottom: 14, color: OPS.dim, fontFamily: OPS.mono, fontSize: 9.5 }}>
+            発注操作なし<br/><span style={{ color: OPS.amber }}>理由の解消後に再分析</span>
+          </div>
+        </div>
+      )}
+    </div>
   )
 }
 
@@ -329,9 +417,15 @@ function OrderRow({
       onMouseLeave={() => onHover?.(null)}
       className={`ops-card${selected ? ' ops-linked' : ''}`}
       style={{
+        position: 'relative',
         textAlign: 'left',
-        background: highlight ? OPS.panelAlt : OPS.panel,
-        border: `1px solid ${highlight ? OPS.gold + '99' : state.acted ? OPS.hairline : OPS.border}`,
+        background: `linear-gradient(180deg, rgba(255,255,255,.045), rgba(255,255,255,0) 44%), ${highlight ? OPS.panelAlt : OPS.panel}`,
+        // border(一括) と borderLeft(個別) を混ぜると、highlight 切替時に React が
+        // 「shorthand と longhand の競合」を警告し、実際に左罫が消えることがある。
+        // 3辺を個別指定して左だけアクセントに使う。
+        borderTop: `1px solid ${highlight ? OPS.gold + '99' : state.acted ? OPS.hairline : OPS.border}`,
+        borderRight: `1px solid ${highlight ? OPS.gold + '99' : state.acted ? OPS.hairline : OPS.border}`,
+        borderBottom: `1px solid ${highlight ? OPS.gold + '99' : state.acted ? OPS.hairline : OPS.border}`,
         borderLeft: `3px solid ${state.color}`,
         borderRadius: 10,
         padding: '13px 16px',
@@ -344,6 +438,7 @@ function OrderRow({
         opacity: dim ? 0.62 : 1,
       }}
     >
+      <SelectionPulse active={selected} />
       {/* 連番 + 状態ランプ */}
       <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 3, minWidth: 34, flexShrink: 0 }}>
         <span style={{ fontFamily: OPS.mono, fontSize: 18, color: w.verbColor, lineHeight: 1 }}>{rankGlyph(index)}</span>

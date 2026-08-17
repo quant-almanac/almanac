@@ -1,6 +1,7 @@
 'use client'
 import { useState } from 'react'
 import { OPS, TYPE_META, fmtJpy, rankGlyph } from './tokens'
+import { SelectionPulseSvg } from './motionAccents'
 import type { BoardRow } from './types'
 
 export interface RejectedDecision {
@@ -42,6 +43,7 @@ export default function OrderMap({
   onHover,
   onOpen,
   rejected = [],
+  review = [],
 }: {
   board: BoardRow[]
   selected: number
@@ -50,6 +52,8 @@ export default function OrderMap({
   onHover: (i: number | null) => void
   onOpen: (i: number) => void
   rejected?: RejectedDecision[]
+  /** 要確認（review_board）。発注可能ではないが座標を持つので、判断材料として点にする。 */
+  review?: BoardRow[]
 }) {
   const [hoveredRejected, setHoveredRejected] = useState<number | null>(null)
   const dots = board
@@ -65,9 +69,13 @@ export default function OrderMap({
     && Number.isFinite(item.impact_nav_pct)
     && item.impact_nav_pct >= 0
   ))
+  const reviewDots = review
+    .map((b, idx) => ({ ...b, idx }))
+    .filter(b => b.confidence_pct != null && b.impact_nav_pct != null)
   const yMax = Math.max(
     0.8,
     ...dots.map(d => d.impact_nav_pct as number),
+    ...reviewDots.map(d => d.impact_nav_pct as number),
     ...plottedRejected.map(d => d.impact_nav_pct as number),
   ) * 1.35
   const maxNotional = Math.max(1, ...dots.map(d => d.estimated_notional_jpy ?? 0))
@@ -83,9 +91,8 @@ export default function OrderMap({
 
   return (
     <div
+      className="ops-elev"
       style={{
-        background: OPS.panel,
-        border: `1px solid ${OPS.border}`,
         borderRadius: 10,
         padding: '14px 16px 10px',
         alignSelf: 'start',
@@ -94,18 +101,20 @@ export default function OrderMap({
       }}
     >
       <div style={{ display: 'flex', alignItems: 'baseline', gap: 8, marginBottom: 3 }}>
-        <span style={{ fontFamily: OPS.mono, fontSize: 14, color: OPS.gold, letterSpacing: '0.12em', fontWeight: 700 }}>
-          判断地図
+        <span style={{ fontFamily: OPS.display, fontSize: 14, color: OPS.text, letterSpacing: '0.12em', fontWeight: 600 }}>
+          確信度 × 資産インパクト
         </span>
-        <span style={{ fontFamily: OPS.mono, fontSize: 12, color: OPS.dim }}>確信度 × 影響度</span>
+        <span className="ops-latin" style={{ fontSize: 10, color: OPS.dim }}>IMPACT MAP</span>
         <span style={{ marginLeft: 'auto', fontFamily: OPS.mono, fontSize: 11.5, color: OPS.sub }}>
-          採用 {dots.length} · 不採用 {plottedRejected.length}
+          採用 {dots.length} · 要確認 {reviewDots.length} · 不採用 {plottedRejected.length}
         </span>
       </div>
-      <p style={{ fontSize: 12.5, color: OPS.dim, margin: '0 0 5px', lineHeight: 1.55 }}>
-        <span style={{ color: OPS.gold }}>● 採用</span>は大きさ＝金額、<span style={{ color: OPS.vermilion }}>× 不採用</span>。
-        確信度と影響度がある判断のみ表示します。
-      </p>
+      {/* 凡例。実際に描いている系列だけを並べる */}
+      <div style={{ display: 'flex', alignItems: 'center', gap: 14, flexWrap: 'wrap', margin: '0 0 6px' }}>
+        <span style={legendItem}><i style={{ ...legendDot, background: OPS.gold }} />採用<span style={legendNote}>大きさ＝金額</span></span>
+        <span style={legendItem}><i style={{ ...legendDot, background: 'transparent', border: `1.5px solid ${OPS.amber}` }} />要確認</span>
+        <span style={legendItem}><i style={{ ...legendDot, background: 'transparent', border: `1.5px dashed ${OPS.vermilion}` }} />不採用</span>
+      </div>
 
       <svg viewBox={`0 0 ${VB_W} ${VB_H}`} style={{ width: '100%', height: 'auto', display: 'block' }} aria-label="確信度×影響度マップ">
         <rect x={cx} y={PAD_T} width={toX(100) - cx} height={cy - PAD_T} fill={OPS.goldBg} rx={4} />
@@ -123,11 +132,34 @@ export default function OrderMap({
         <text x={cx + 8} y={toY(0) - 8} fontSize={12} fill={OPS.dim} fontFamily={OPS.sans}>流し見</text>
         <text x={PAD_L + 8} y={toY(0) - 8} fontSize={12} fill={OPS.dim} fontFamily={OPS.sans}>優先度低</text>
 
+        {/* x軸: 数値と語の二段。低/中/高があると読み手が位置を掴みやすい */}
         {[0, 50, 100].map(v => (
           <text key={`tx${v}`} x={toX(v)} y={toY(0) + 16} fontSize={12} fill={OPS.dim} textAnchor="middle" fontFamily={OPS.mono}>{v}%</text>
         ))}
-        <text x={PAD_L + PLOT_W / 2} y={VB_H - 6} fontSize={13} fill={OPS.sub} textAnchor="middle" fontFamily={OPS.sans}>AI の確信度 →</text>
-        <text x={13} y={PAD_T + PLOT_H / 2} fontSize={13} fill={OPS.sub} textAnchor="middle" transform={`rotate(-90,13,${PAD_T + PLOT_H / 2})`} fontFamily={OPS.sans}>資産への影響 →</text>
+        {([[0, '低'], [50, '中'], [100, '高']] as const).map(([v, word]) => (
+          <text key={`txw${v}`} x={toX(v)} y={toY(0) + 30} fontSize={12} fill={OPS.sub} textAnchor="middle" fontFamily={OPS.display}>{word}</text>
+        ))}
+        <text x={PAD_L + PLOT_W / 2} y={VB_H - 4} fontSize={13} fill={OPS.sub} textAnchor="middle" fontFamily={OPS.display} letterSpacing="1.5">確信度</text>
+
+        {/* y軸: 高/中/低 */}
+        {([[1, '高'], [0.5, '中'], [0, '低']] as const).map(([f, word]) => (
+          <text key={`tyw${f}`} x={PAD_L - 8} y={toY(yMax * f) + 4} fontSize={12} fill={OPS.sub} textAnchor="end" fontFamily={OPS.display}>{word}</text>
+        ))}
+        <text x={13} y={PAD_T + PLOT_H / 2} fontSize={13} fill={OPS.sub} textAnchor="middle" transform={`rotate(-90,13,${PAD_T + PLOT_H / 2})`} fontFamily={OPS.display} letterSpacing="1.5">資産インパクト</text>
+
+        {/* 要確認。発注可能ではないので塗らず、輪郭だけの琥珀点にする */}
+        {reviewDots.map(item => {
+          const x = toX(item.confidence_pct as number)
+          const y = toY(item.impact_nav_pct as number)
+          return (
+            <g key={`review-plot-${item.ticker}-${item.idx}`} style={{ cursor: 'help' }}>
+              <title>{`${item.ticker} · 要確認\n確信度 ${item.confidence_pct}% · 資産インパクト ${(item.impact_nav_pct as number).toFixed(2)}%`}</title>
+              <circle cx={x} cy={y} r={9} fill={OPS.amberBg} stroke={OPS.amber} strokeWidth={1.6} />
+              <text x={x} y={y + 4} textAnchor="middle" fontSize={10} fill={OPS.amber} fontFamily={OPS.mono}>!</text>
+              <text x={x + 13} y={y + 4} fontSize={11} fill={OPS.sub} fontFamily={OPS.mono}>{item.ticker}</text>
+            </g>
+          )
+        })}
 
         {plottedRejected.map(item => {
           const x = toX(item.confidence_pct as number)
@@ -184,12 +216,10 @@ export default function OrderMap({
               onClick={() => { onSelect(d.idx); onOpen(d.idx) }}
               style={{ cursor: 'pointer' }}
             >
-              {isSel && (
-                <circle cx={x} cy={y} r={r + 8} fill="none" stroke={OPS.gold} strokeWidth={1.5} opacity={0.7}>
-                  <animate attributeName="r" values={`${r + 6};${r + 11};${r + 6}`} dur="1.6s" repeatCount="indefinite" />
-                  <animate attributeName="opacity" values="0.7;0.2;0.7" dur="1.6s" repeatCount="indefinite" />
-                </circle>
-              )}
+              {/* 選択中は静的なリングで状態を示し続け、選択が変わった瞬間だけ
+                  Framer Motion で一度だけ波紋を再生する(常時ループの SMIL は廃止)。 */}
+              {isSel && <circle cx={x} cy={y} r={r + 8} fill="none" stroke={OPS.gold} strokeWidth={1.5} opacity={0.7} />}
+              <SelectionPulseSvg active={isSel} cx={x} cy={y} r={r + 8} />
               {isHover && !isSel && <circle cx={x} cy={y} r={r + 6} fill="none" stroke={OPS.gold} strokeWidth={1.2} opacity={0.5} />}
               <circle cx={x} cy={y} r={r} fill={color} opacity={active ? 0.5 : 0.3} style={{ transition: 'r .15s ease, opacity .15s ease' }} />
               <circle cx={x} cy={y} r={r} fill="none" stroke={color} strokeWidth={active ? 2.4 : 1.6} style={{ transition: 'r .15s ease' }} />
@@ -267,3 +297,12 @@ export default function OrderMap({
     </div>
   )
 }
+
+const legendItem: React.CSSProperties = {
+  display: 'inline-flex', alignItems: 'center', gap: 6,
+  fontFamily: OPS.sans, fontSize: 12, color: OPS.sub,
+}
+const legendDot: React.CSSProperties = {
+  width: 9, height: 9, borderRadius: '50%', flexShrink: 0, display: 'inline-block',
+}
+const legendNote: React.CSSProperties = { color: OPS.dim, fontSize: 11 }

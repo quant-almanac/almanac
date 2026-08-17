@@ -72,6 +72,26 @@ describe('ExecutionForm execution contract', () => {
     expect(payload.execution_broker).toBe('sbi')
   })
 
+  it('submits complete Web broker-confirmation evidence without a CSV hash', async () => {
+    apiFetchMock.mockResolvedValue({ ok: true, status: 200, json: async () => ({ ok: true, id: 'exec-1', portfolio: {} }) })
+    render(<ExecutionForm row={row} onClose={vi.fn()} />)
+
+    fireEvent.change(screen.getByLabelText('約定価格'), { target: { value: '3300' } })
+    fireEvent.click(screen.getByLabelText('証券会社画面でこの約定を確認済み'))
+    fireEvent.change(screen.getByLabelText('証券会社の約定ID・注文番号'), { target: { value: 'SBI-ORDER-123' } })
+    fireEvent.change(screen.getByLabelText('約定日時'), { target: { value: '2026-07-30T09:15' } })
+    fireEvent.click(screen.getByRole('button', { name: '記録する' }))
+
+    await waitFor(() => expect(apiFetchMock).toHaveBeenCalledTimes(1))
+    const payload = JSON.parse(apiFetchMock.mock.calls[0][1].body)
+    expect(payload.broker_confirmed_filled).toBe(true)
+    expect(payload.external_execution_id).toBe('SBI-ORDER-123')
+    expect(payload.broker_source).toBe('web_manual_confirmation')
+    expect(payload.filled_quantity).toBe(100)
+    expect(payload.filled_price).toBe(3300)
+    expect(payload.reconciliation_snapshot_hash).toBeUndefined()
+  })
+
   it('treats historical backlog as cancellation-first and removes ordered', () => {
     render(<ExecutionForm row={row} onClose={vi.fn()} historical />)
     const status = screen.getByLabelText('状態')

@@ -31,7 +31,7 @@ describe('OrderMap', () => {
       />,
     )
 
-    expect(screen.getByText('採用 1 · 不採用 1')).toBeInTheDocument()
+    expect(screen.getByText('採用 1 · 要確認 0 · 不採用 1')).toBeInTheDocument()
     expect(screen.queryByText('NOT ADOPTED · 評価軸外')).not.toBeInTheDocument()
     expect(screen.queryByText('PLTR')).not.toBeInTheDocument()
     expect(screen.getByText('META')).toBeInTheDocument()
@@ -39,5 +39,31 @@ describe('OrderMap', () => {
     fireEvent.mouseEnter(screen.getByLabelText('META 不採用。計画枠を消費済み'))
     expect(screen.getByText('確信度 72% · 影響 0.61%')).toBeInTheDocument()
     expect(screen.getByText('計画枠を消費済み')).toBeInTheDocument()
+  })
+
+  it('plots review candidates even when nothing is orderable', () => {
+    // board=0 の日でも review_board に座標があれば地図は成立する。
+    // ここが空だと「全件要確認」の日に判断材料が一切描かれない。
+    render(
+      <OrderMap
+        board={[]}
+        review={[
+          { ticker: 'QQQ', type: 'buy', action: '買い', confidence_pct: 57, impact_nav_pct: 2.63, lifecycle: { status: 'pending' } },
+          { ticker: 'COST', type: 'sell', action: '売り', confidence_pct: 41, impact_nav_pct: 0.5, lifecycle: { status: 'pending' } },
+          { ticker: 'NOCOORD', type: 'buy', action: '買い', lifecycle: { status: 'pending' } },
+        ] as BoardRow[]}
+        selected={0}
+        hovered={null}
+        onSelect={vi.fn()}
+        onHover={vi.fn()}
+        onOpen={vi.fn()}
+      />,
+    )
+
+    // 座標を持つ2件だけが点になる
+    expect(screen.getByText('採用 0 · 要確認 2 · 不採用 0')).toBeInTheDocument()
+    expect(screen.getByText('QQQ')).toBeInTheDocument()
+    expect(screen.getByText('COST')).toBeInTheDocument()
+    expect(screen.queryByText('NOCOORD')).not.toBeInTheDocument()
   })
 })

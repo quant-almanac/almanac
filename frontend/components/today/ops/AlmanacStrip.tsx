@@ -1,33 +1,67 @@
 'use client'
 
 import Link from 'next/link'
-import { useEffect, useMemo, useState, type CSSProperties } from 'react'
+import { Fragment, useEffect, useMemo, useState, type CSSProperties } from 'react'
 import { OPS, fmtJpy } from './tokens'
+import { Seal } from './ornament'
 import { SectionHead } from './Shell'
 import { ExecutionPlanModal } from './PlanRail'
+import { scopeMismatchLine, scopeMismatchView } from './scopeMismatch'
 import type { AlmanacData, AlmanacEvent, ExecutionPlan, PastTrade } from './types'
 
 const ALMANAC_CSS = `
+.almanac-overview {
+  display:grid;
+  grid-template-columns:minmax(0,1.9fr) minmax(280px,.72fr);
+  gap:10px;
+}
+.almanac-overview-calendar,
+.almanac-overview-plan {
+  border:1px solid ${OPS.hairline};
+  border-radius:10px;
+  background:${OPS.panel};
+  overflow:hidden;
+}
+.almanac-overview-week {
+  display:grid;
+  grid-template-columns:88px repeat(7,minmax(0,1fr));
+  min-height:74px;
+}
+.almanac-overview-week + .almanac-overview-week { border-top:1px solid ${OPS.hairline}; }
+.almanac-overview-label { padding:10px; border-right:1px solid ${OPS.hairline}; background:${OPS.panelAlt}; }
+.almanac-overview-day { min-width:0; padding:8px 7px; border-right:1px solid ${OPS.hairline}; }
+.almanac-overview-day:last-child { border-right:0; }
+.almanac-overview-day.is-today { box-shadow:inset 0 2px 0 ${OPS.gold}; }
+.almanac-heat-note { padding:7px 10px; border-top:1px solid ${OPS.hairline}; color:${OPS.dim};
+  font-family:${OPS.sans}; font-size:9.5px; line-height:1.5; }
+.almanac-heat-note b { color:${OPS.sub}; font-weight:600; }
+.almanac-day-items { display:flex; flex-direction:column; gap:2px; margin-top:6px; min-height:26px; }
+.almanac-day-item { display:flex; align-items:center; gap:4px; min-width:0; color:${OPS.text};
+  font-size:10px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.almanac-day-item i { flex:none; width:4px; height:4px; border-radius:50%; }
+.almanac-day-item b { margin-left:auto; flex:none; color:${OPS.dim}; font-family:${OPS.mono}; font-size:8.5px; font-weight:400; }
+.almanac-day-empty { color:${OPS.dim}; font-size:10px; }
+.almanac-toggle { border:1px solid ${OPS.border}; border-radius:999px; background:transparent; color:${OPS.gold}; padding:4px 10px; font:10.5px ${OPS.mono}; cursor:pointer; }
+.almanac-toggle:hover { border-color:${OPS.gold}; background:${OPS.goldBg}; }
 .market-clock {
   margin-top: 6px;
   border: 1px solid ${OPS.border};
-  border-radius: 12px;
-  background: linear-gradient(145deg, rgba(18,21,28,.98), rgba(11,13,18,.98));
-  padding: 14px 16px 15px;
-  overflow: hidden;
+  border-radius: 10px;
+  background: ${OPS.panel};
+  padding: 15px 17px 16px;
 }
 .market-clock-summary {
   display: grid;
   grid-template-columns: minmax(230px, 1.25fr) repeat(2, minmax(170px, .8fr));
-  gap: 8px;
-  margin-bottom: 14px;
+  gap: 9px;
+  margin-bottom: 15px;
 }
 .market-clock-card {
   min-width: 0;
   border: 1px solid ${OPS.hairline};
   border-radius: 8px;
-  background: rgba(255,255,255,.018);
-  padding: 10px 12px;
+  background: ${OPS.panelAlt};
+  padding: 11px 13px;
 }
 .market-clock-lane {
   display: grid;
@@ -38,9 +72,9 @@ const ALMANAC_CSS = `
 }
 .market-clock-track {
   position: relative;
-  height: 17px;
-  border-left: 1px solid ${OPS.hairline};
-  border-right: 1px solid ${OPS.hairline};
+  height: 18px;
+  border-radius: 4px;
+  background-color: ${OPS.sunken};
   background-image: linear-gradient(to right, ${OPS.hairline} 1px, transparent 1px);
   background-size: 12.5% 100%;
 }
@@ -50,123 +84,26 @@ const ALMANAC_CSS = `
   margin-top: 20px;
   padding-bottom: 4px;
 }
-.almanac-board {
-  min-width: 1120px;
-  position: relative;
-  border-radius: 13px;
-  background-image:
-    linear-gradient(rgba(110,140,195,.022) 1px, transparent 1px),
-    linear-gradient(90deg, rgba(110,140,195,.022) 1px, transparent 1px);
-  background-size: 28px 28px;
-}
-.almanac-month-row,
+.almanac-board { min-width: 1120px; position: relative; }
+
+/* 見出しと本体で同じ2カラム。右カラムは週次カード or 月次スタックが入る */
 .almanac-board-head,
-.almanac-week-row {
+.almanac-board-body {
   display: grid;
   grid-template-columns: minmax(700px, 1.8fr) minmax(390px, 1fr);
-  gap: 8px;
 }
-.almanac-month-row { margin-bottom: 8px; }
-.almanac-board-head { margin-bottom: 7px; align-items: end; }
-.almanac-week-row {
-  position: relative;
-  align-items: stretch;
-  margin-bottom: 7px;
-  border-radius: 10px;
-}
-.almanac-week-row.is-current::before {
-  content: '';
-  position: absolute;
-  inset: -2px;
-  border: 1px solid ${OPS.gold}77;
-  border-radius: 12px;
-  pointer-events: none;
-  box-shadow: 0 0 24px rgba(201,167,93,.08), inset 0 0 18px rgba(201,167,93,.025);
-  z-index: 3;
-}
-.month-plan-lane,
-.month-intel-intro {
-  position: relative;
-  min-width: 0;
-  border: 1px solid ${OPS.border};
-  border-radius: 10px;
-  background: linear-gradient(145deg, rgba(18,21,28,.98), rgba(11,14,19,.98));
-  overflow: hidden;
-}
-.month-plan-lane {
-  padding: 13px 14px 12px;
-  box-shadow: inset 0 1px 0 rgba(255,255,255,.025);
-}
-.month-plan-lane::after {
-  content: '';
-  position: absolute;
-  left: 0;
-  right: 0;
-  bottom: 0;
-  height: 1px;
-  background: linear-gradient(90deg, transparent, ${OPS.blue}77, ${OPS.gold}66, transparent);
-}
-.month-plan-top {
-  display: grid;
-  grid-template-columns: minmax(220px, .72fr) minmax(0, 1.55fr);
-  gap: 16px;
-  align-items: center;
-}
+.almanac-board-head { gap: 8px; margin-bottom: 7px; align-items: end; }
+.almanac-board-body { gap: 7px 8px; align-items: stretch; }
+
 .month-budget-meter {
   position: relative;
-  height: 9px;
+  height: 8px;
   margin-top: 9px;
-  border-radius: 20px;
-  background: ${OPS.hairline};
-  overflow: hidden;
-  box-shadow: inset 0 0 0 1px rgba(255,255,255,.025);
-}
-.month-budget-meter > i {
-  position: absolute;
-  top: 0;
-  bottom: 0;
-  display: block;
-}
-.month-week-grid {
-  display: grid;
-  grid-template-columns: repeat(7, minmax(0, 1fr));
-  gap: 4px;
-}
-.month-week-segment {
-  position: relative;
-  min-width: 0;
-  border: 1px solid ${OPS.hairline};
-  border-radius: 7px;
-  background: rgba(255,255,255,.015);
-  padding: 7px 8px 8px;
+  border-radius: 8px;
+  background: ${OPS.sunken};
   overflow: hidden;
 }
-.month-week-segment.is-plan-week {
-  border-color: ${OPS.gold}88;
-  background: linear-gradient(145deg, ${OPS.goldBg}, rgba(18,21,28,.98));
-  box-shadow: 0 0 16px rgba(201,167,93,.07);
-}
-.month-week-segment.is-plan-week::after {
-  content: '';
-  position: absolute;
-  left: 8px;
-  right: 8px;
-  bottom: 4px;
-  height: 2px;
-  border-radius: 2px;
-  background: linear-gradient(90deg, ${OPS.green} 0 74%, ${OPS.vermilion} 74% 100%);
-  opacity: .8;
-}
-.month-intel-intro {
-  display: grid;
-  grid-template-columns: 1fr auto;
-  align-items: center;
-  gap: 14px;
-  padding: 13px 15px;
-  background:
-    radial-gradient(circle at 90% 10%, rgba(110,140,195,.09), transparent 34%),
-    linear-gradient(145deg, rgba(18,21,28,.98), rgba(11,14,19,.98));
-}
+.month-budget-meter > i { position: absolute; top: 0; bottom: 0; display: block; }
 .calendar-head,
 .calendar-week {
   display: grid;
@@ -186,54 +123,36 @@ const ALMANAC_CSS = `
   padding: 7px 10px;
   color: ${OPS.sub};
   font-family: ${OPS.mono};
-  font-size: 9.5px;
+  font-size: 10.5px;
   letter-spacing: .12em;
 }
-.week-intel-head > div + div { border-left: 1px dashed ${OPS.blue}55; }
+.week-intel-head > div + div { border-left: 1px solid ${OPS.hairline}; }
 .week-meta {
   position: relative;
   min-width: 0;
   min-height: 102px;
   border: 1px solid ${OPS.hairline};
   border-radius: 8px;
-  background: linear-gradient(145deg, rgba(18,21,28,.98), rgba(13,16,22,.98));
+  background: ${OPS.panel};
   padding: 9px 8px 9px 43px;
   overflow: hidden;
 }
-.week-meta::before {
-  content: '';
-  position: absolute;
-  left: 22px;
-  top: -12px;
-  bottom: -12px;
-  width: 1px;
-  background: linear-gradient(${OPS.blue}22, ${OPS.blue}aa 35%, ${OPS.blue}55 72%, ${OPS.blue}11);
-  box-shadow: 0 0 8px rgba(110,140,195,.16);
-}
 .week-node {
   position: absolute;
-  left: 7px;
+  left: 8px;
   top: 11px;
-  width: 31px;
-  height: 31px;
+  width: 30px;
+  height: 30px;
   display: grid;
   place-items: center;
-  border: 1px solid ${OPS.blue}77;
+  border: 1px solid ${OPS.border};
   border-radius: 50%;
-  background: ${OPS.inset};
+  background: ${OPS.panelAlt};
   color: ${OPS.blue};
-  font: 9.5px ${OPS.mono};
-  box-shadow: 0 0 11px rgba(110,140,195,.10);
+  font: 10.5px ${OPS.mono};
 }
-.is-current .week-meta {
-  border-color: ${OPS.gold}55;
-  background: linear-gradient(145deg, ${OPS.goldBg}, rgba(13,16,22,.98));
-}
-.is-current .week-node {
-  border-color: ${OPS.gold};
-  color: ${OPS.gold};
-  box-shadow: 0 0 15px rgba(201,167,93,.23);
-}
+.calendar-week.is-current .week-meta { border-color: ${OPS.gold}; background: ${OPS.goldBg}; }
+.calendar-week.is-current .week-node { border-color: ${OPS.gold}; color: ${OPS.gold}; }
 .week-intelligence-card {
   position: relative;
   min-width: 0;
@@ -242,28 +161,79 @@ const ALMANAC_CSS = `
   grid-template-columns: minmax(0, 1.12fr) minmax(0, .88fr);
   border: 1px solid ${OPS.hairline};
   border-radius: 8px;
-  background:
-    radial-gradient(circle at 100% 0, rgba(110,140,195,.055), transparent 38%),
-    linear-gradient(145deg, rgba(18,21,28,.985), rgba(12,15,20,.985));
+  background: ${OPS.panel};
   overflow: hidden;
-  transition: border-color .18s ease, transform .18s ease, box-shadow .18s ease;
+  transition: border-color .15s ease, background .15s ease;
 }
-.week-intelligence-card:hover {
-  border-color: ${OPS.blue}66;
-  transform: translateY(-1px);
-  box-shadow: 0 7px 20px rgba(0,0,0,.22);
-}
-.is-current .week-intelligence-card { border-color: ${OPS.gold}66; }
-.week-plan-panel,
-.week-result-panel {
-  position: relative;
+.week-intelligence-card:hover { border-color: ${OPS.border}; background: ${OPS.panelAlt}; }
+.week-intelligence-card.is-current { border-color: ${OPS.gold}88; }
+
+/* ── 月次計画スタック ────────────────────────────────
+   未来週の右カラムには「まだ無い週次計画」の空枠しか出せず無意味だった。
+   その領域をまとめて1ブロックにし、月次の4項目を縦に積む。 */
+.monthly-stack {
+  display: flex;
+  flex-direction: column;
   min-width: 0;
-  padding: 9px 10px;
+  min-height: 0;
+  border: 1px solid ${OPS.blue}66;
+  border-radius: 8px;
+  background: ${OPS.panel};
+  /* 行高を固定したので、想定外に中身が伸びた場合はここで逃がす */
+  overflow: auto;
 }
-.week-result-panel {
-  border-left: 1px dashed ${OPS.blue}55;
-  background: rgba(255,255,255,.008);
+.monthly-stack-head {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  flex-wrap: wrap;
+  padding: 9px 12px;
+  background: ${OPS.panelAlt};
+  border-bottom: 1px solid ${OPS.hairline};
 }
+/* flex:1 + justify-content:center にすると、内容が割当高を超えたときに
+   はみ出して次の区画と重なる。内容なりの高さにして、溢れは stack 側で流す。 */
+.monthly-sec {
+  flex: 0 0 auto;
+  min-width: 0;
+  padding: 9px 12px;
+}
+.monthly-sec + .monthly-sec { border-top: 1px solid ${OPS.hairline}; }
+.monthly-sec-head { display: flex; align-items: baseline; gap: 8px; margin-bottom: 6px; }
+.monthly-kpi-grid,
+.monthly-guard-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 5px;
+}
+.monthly-kpi,
+.monthly-guard {
+  min-width: 0;
+  border: 1px solid ${OPS.hairline};
+  border-radius: 6px;
+  background: ${OPS.panelAlt};
+  padding: 5px 7px;
+}
+.monthly-mix-bar {
+  display: flex;
+  height: 8px;
+  margin-top: 7px;
+  border-radius: 8px;
+  background: ${OPS.sunken};
+  overflow: hidden;
+}
+.monthly-priority-list { display: flex; flex-direction: column; }
+.monthly-priority {
+  display: grid;
+  grid-template-columns: 18px minmax(0, 1fr) auto;
+  gap: 7px;
+  align-items: center;
+  min-width: 0;
+  padding: 3px 0;
+}
+.week-plan-panel,
+.week-result-panel { position: relative; min-width: 0; padding: 9px 10px; }
+.week-result-panel { border-left: 1px solid ${OPS.hairline}; }
 .week-plan-button {
   display: block;
   width: 100%;
@@ -282,35 +252,29 @@ const ALMANAC_CSS = `
   margin-top: 5px;
 }
 .plan-item-meter {
-  height: 2px;
-  margin-top: 3px;
-  border-radius: 2px;
-  background: ${OPS.hairline};
+  height: 3px;
+  margin-top: 4px;
+  border-radius: 3px;
+  background: ${OPS.sunken};
   overflow: hidden;
 }
-.plan-item-meter > i {
-  display: block;
-  height: 100%;
-  border-radius: 2px;
-  background: ${OPS.green};
-}
+.plan-item-meter > i { display: block; height: 100%; border-radius: 3px; background: ${OPS.green}; }
 .week-result-meter {
   position: relative;
-  height: 7px;
+  height: 8px;
   margin-top: 8px;
-  border-radius: 10px;
-  background: ${OPS.hairline};
+  border-radius: 8px;
+  background: ${OPS.sunken};
   overflow: hidden;
 }
 .week-result-meter::after {
   content: '';
   position: absolute;
   left: 50%;
-  top: -2px;
-  bottom: -2px;
+  top: 0;
+  bottom: 0;
   width: 1px;
-  background: rgba(233,231,223,.72);
-  box-shadow: 0 0 5px rgba(233,231,223,.18);
+  background: ${OPS.dim};
 }
 .almanac-days {
   display: grid;
@@ -322,30 +286,29 @@ const ALMANAC_CSS = `
   position: relative;
   min-width: 0;
   min-height: 102px;
-  border-radius: 7px;
-  padding: 6px 7px;
-  animation: almanacCellIn .38s ease both;
-  transition: border-color .18s ease, transform .18s ease, background .18s ease;
+  border-radius: 8px;
+  padding: 7px 8px;
+  animation: almanacCellIn .38s cubic-bezier(.22,.8,.3,1) both;
+  transition: border-color .15s ease, background .15s ease;
 }
 .almanac-cell:hover,
-.almanac-cell:focus-visible { transform: translateY(-2px); outline: none; }
-.almanac-today { animation: almanacCellIn .38s ease both, almanacTodayGlow 2.8s ease-in-out infinite; }
+.almanac-cell:focus-visible { outline: none; border-color: ${OPS.gold} !important; }
 @keyframes almanacCellIn { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
-@keyframes almanacTodayGlow {
-  0%, 100% { box-shadow: 0 0 0 1px ${OPS.gold}55, 0 0 0 rgba(201,167,93,0); }
-  50% { box-shadow: 0 0 0 1px ${OPS.gold}99, 0 0 18px rgba(201,167,93,.14); }
-}
 @container ops-content (max-width: 1180px) {
   .market-clock-summary { grid-template-columns: 1fr 1fr; }
   .market-clock-summary .market-clock-card:first-child { grid-column: 1 / -1; }
 }
 @container ops-content (max-width: 760px) {
+  .almanac-overview { grid-template-columns:1fr; }
+  .almanac-overview-week { grid-template-columns:64px repeat(7,minmax(55px,1fr)); min-width:520px; }
+  .almanac-overview-calendar { overflow-x:auto; }
   .market-clock-summary { grid-template-columns: 1fr; }
   .market-clock-summary .market-clock-card:first-child { grid-column: auto; }
   .market-clock-lane { grid-template-columns: 82px minmax(0, 1fr); }
 }
 @media (prefers-reduced-motion: reduce) {
-  .almanac-cell, .almanac-today { animation: none; }
+  .almanac-cell { animation: none; }
+  .week-intelligence-card { transition: none; }
 }
 `
 
@@ -426,6 +389,20 @@ function signedJpy(value: number): string {
   return value > 0 ? `+${fmtJpy(value)}` : value < 0 ? `−${fmtJpy(Math.abs(value))}` : fmtJpy(0)
 }
 
+/**
+ * 日次売買損益のヒートマップ背景。表示期間内の最大変動を基準に濃さを決める。
+ * 値が無い日は無色 — ゼロ(引き分け)と未取得を同じ見た目にしない。
+ */
+export function heatBackground(pnl: number | null | undefined, scale: number): string | undefined {
+  if (pnl == null || !Number.isFinite(pnl) || pnl === 0) return undefined
+  const intensity = Math.min(1, Math.abs(pnl) / Math.max(1, scale))
+  // 下限を置いて、小さな損益の日も「色が付いている」と分かるようにする
+  const alpha = 0.07 + intensity * 0.33
+  return pnl > 0
+    ? `rgba(95, 211, 160, ${alpha.toFixed(3)})`
+    : `rgba(240, 101, 90, ${alpha.toFixed(3)})`
+}
+
 const PLAN_OBJECTIVE_LABEL: Record<string, string> = {
   wife_nisa_growth_capacity: '妻NISA成長枠',
   add_currency_usd: 'USD不足の補正',
@@ -445,6 +422,7 @@ export default function AlmanacStrip({ almanac, plan }: { almanac: AlmanacData; 
   const pnlDays = Object.values(almanac.pnl_by_date ?? {})
   const netPnl = pnlDays.reduce((sum, value) => sum + value, 0)
   const [planOpen, setPlanOpen] = useState(false)
+  const [expanded, setExpanded] = useState(false)
 
   return (
     <section>
@@ -462,12 +440,128 @@ export default function AlmanacStrip({ almanac, plan }: { almanac: AlmanacData; 
             {' · '}執行 {almanac.past.length}件 · 予定 {almanac.upcoming.length}件
           </span>
         }
+        right={
+          <button type="button" className="almanac-toggle" onClick={() => setExpanded(value => !value)}>
+            {expanded ? '要約に戻す' : '複数週を詳しく見る'}
+          </button>
+        }
       />
 
-      <MarketClock almanac={almanac} />
-      <WeekBoard almanac={almanac} plan={plan} onOpenPlan={() => setPlanOpen(true)} />
+      {expanded ? (
+        <>
+          <MarketClock almanac={almanac} />
+          <WeekBoard almanac={almanac} plan={plan} onOpenPlan={() => setPlanOpen(true)} />
+        </>
+      ) : (
+        <AlmanacOverview almanac={almanac} plan={plan} onOpenPlan={() => setPlanOpen(true)} />
+      )}
       <ExecutionPlanModal plan={plan} open={planOpen} onClose={() => setPlanOpen(false)} />
     </section>
+  )
+}
+
+function AlmanacOverview({ almanac, plan, onOpenPlan }: {
+  almanac: AlmanacData
+  plan?: ExecutionPlan
+  onOpenPlan: () => void
+}) {
+  const today = useMemo(() => localDate(almanac.today_str), [almanac.today_str])
+  // 先週から始める。相場暦は「これから」だけでなく「直前に何があったか」を
+  // 読むための帳面なので、実績(トレード・日次損益)が乗る過去週を必ず含める。
+  const start = useMemo(() => addDays(mondayOf(today), -7), [today])
+  const weeks = useMemo(() => [0, 7, 14].map(offset => Array.from({ length: 7 }, (_, index) => addDays(start, offset + index))), [start])
+  const eventMap = useMemo(() => {
+    const map = new Map<string, AlmanacEvent[]>()
+    for (const event of almanac.upcoming) {
+      if (!event.date) continue
+      map.set(event.date, [...(map.get(event.date) ?? []), event])
+    }
+    return map
+  }, [almanac.upcoming])
+  const tradeMap = useMemo(() => {
+    const map = new Map<string, PastTrade[]>()
+    for (const trade of almanac.past) map.set(trade.date, [...(map.get(trade.date) ?? []), trade])
+    return map
+  }, [almanac.past])
+  const monthlyTotal = plan?.budgets.monthly_total_jpy ?? 0
+  const monthlyRemaining = plan?.consumption.monthly_remaining_jpy ?? plan?.budgets.monthly_remaining_jpy ?? monthlyTotal
+  const remainingPct = monthlyTotal > 0 ? Math.max(0, Math.min(100, monthlyRemaining / monthlyTotal * 100)) : 0
+
+  // ヒートマップの濃さは「表示中の3週で一番大きく動いた日」を基準にする。
+  // 全期間の最大にすると平常週がほぼ無色になり、週内の差が読めなくなる。
+  const heatScale = useMemo(() => {
+    const shown = weeks.flat().map(d => almanac.pnl_by_date?.[dkey(d)])
+      .filter((v): v is number => typeof v === 'number' && Number.isFinite(v))
+    return Math.max(1, ...shown.map(Math.abs))
+  }, [weeks, almanac.pnl_by_date])
+
+  return (
+    <div className="almanac-overview">
+      <div className="almanac-overview-calendar" aria-label="先週・今週・来週の相場暦">
+        {weeks.map((days, weekIndex) => (
+          <div className="almanac-overview-week" key={dkey(days[0])}>
+            <div className="almanac-overview-label">
+              <div className="ops-latin" style={{ color: weekIndex === 1 ? OPS.gold : weekIndex === 0 ? OPS.dim : OPS.blue, fontSize: 9.5 }}>
+                {weekIndex === 0 ? 'LAST WEEK' : weekIndex === 1 ? 'THIS WEEK' : 'NEXT WEEK'}
+              </div>
+              <strong style={{ display: 'block', color: OPS.text, fontFamily: OPS.mono, fontSize: 12, marginTop: 7 }}>{fmtRange(days[0], days[6])}</strong>
+            </div>
+            {days.map(day => {
+              const key = dkey(day)
+              const events = eventMap.get(key) ?? []
+              const trades = tradeMap.get(key) ?? []
+              const pnl = almanac.pnl_by_date?.[key]
+              const isToday = key === dkey(today)
+              return (
+                <div key={key} className={`almanac-overview-day${isToday ? ' is-today' : ''}`}
+                  style={{ background: heatBackground(pnl, heatScale) }}
+                  title={pnl == null ? undefined : `${key} 売買損益 ${signedJpy(pnl)}（入出金を除く）`}>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', gap: 3, color: isToday ? OPS.gold : OPS.sub, fontFamily: OPS.mono, fontSize: 10.5 }}>
+                    <span>{day.getMonth() + 1}/{day.getDate()}</span>
+                    <span style={{ color: day.getDay() === 0 ? OPS.vermilion : day.getDay() === 6 ? OPS.blue : OPS.dim }}>{['日','月','火','水','木','金','土'][day.getDay()]}</span>
+                  </div>
+                  {/* 予定は最大2件まで。旧「今週の市場カレンダー」が別枠で出していた
+                      情報をここに統合し、同じ日付を2箇所で見ないようにする。 */}
+                  <div className="almanac-day-items">
+                    {trades.slice(0, 2).map((trade, index) => (
+                      <span key={`t${index}`} className="almanac-day-item" title={`${trade.ticker} ${trade.detail ?? ''}`}>
+                        <i style={{ background: trade.side === 'buy' ? OPS.green : OPS.vermilion }} />
+                        {trade.ticker}
+                      </span>
+                    ))}
+                    {events.slice(0, Math.max(0, 2 - trades.length)).map((event, index) => (
+                      <span key={`e${index}`} className="almanac-day-item" title={event.label}>
+                        <i style={{ background: KIND_COLOR[event.kind] ?? OPS.sub }} />
+                        {event.ticker ?? event.label}
+                        {event.t && <b>{event.t}</b>}
+                      </span>
+                    ))}
+                    {trades.length + events.length === 0 && <span className="almanac-day-empty">—</span>}
+                  </div>
+                  {pnl != null && <div style={{ color: pnl >= 0 ? OPS.green : OPS.redSoft, fontFamily: OPS.mono, fontSize: 9.5, marginTop: 3 }}>{signedJpy(pnl)}</div>}
+                </div>
+              )
+            })}
+          </div>
+        ))}
+        <div className="almanac-heat-note">
+          日付の色 = その日の<b>売買損益</b>（濃さ＝表示期間内の相対的な大きさ）。
+          積立・入出金は差し引き済みで、相場で動いた分だけを表す。
+        </div>
+      </div>
+      <button type="button" className="almanac-overview-plan" onClick={onOpenPlan} style={{ color: 'inherit', textAlign: 'left', padding: 14, cursor: 'pointer' }}>
+        <div style={{ display: 'flex', alignItems: 'baseline', justifyContent: 'space-between', gap: 8 }}>
+          <strong style={{ color: OPS.gold, fontFamily: OPS.display, fontSize: 15, letterSpacing: '.08em' }}>今月の計画</strong>
+          <span style={{ color: plan?.status === 'active' ? OPS.green : OPS.amber, fontFamily: OPS.mono, fontSize: 9.5 }}>{plan?.status === 'active' ? 'ACTIVE' : '要確認'} →</span>
+        </div>
+        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10, marginTop: 14 }}>
+          <div><span style={eyebrow}>残り予算</span><strong style={{ display: 'block', color: OPS.text, fontFamily: OPS.mono, fontSize: 18, marginTop: 4 }}>{fmtJpy(monthlyRemaining)}</strong></div>
+          <div><span style={eyebrow}>優先項目</span><strong style={{ display: 'block', color: OPS.text, fontFamily: OPS.mono, fontSize: 18, marginTop: 4 }}>{plan?.summary.active_items ?? 0}</strong></div>
+        </div>
+        <div style={{ height: 5, borderRadius: 5, background: OPS.sunken, marginTop: 13, overflow: 'hidden' }}><i style={{ display: 'block', width: `${remainingPct}%`, height: '100%', background: OPS.blue }} /></div>
+        <div style={{ color: OPS.sub, fontSize: 11, lineHeight: 1.55, marginTop: 10 }}>{plan?.today_decision.reason ?? '月次計画を確認してください。'}</div>
+      </button>
+    </div>
   )
 }
 
@@ -659,99 +753,153 @@ function WeekBoard({ almanac, plan, onOpenPlan }: { almanac: AlmanacData; plan?:
     return { week, trades, pnlRows, net: pnlRows.reduce((sum, [, value]) => sum + value, 0) }
   })
   const maxWeeklyAbs = Math.max(1, ...weeklyRows.map(row => Math.abs(row.net)))
-  const resultWeekCount = weeklyRows.filter(row => row.trades.length > 0 || row.pnlRows.length > 0).length
-  const activePlanWeekCount = plan?.status === 'active'
-    ? weeks.filter(week => isPlanWeek(week, plan)).length
-    : 0
+  // 最初の「まだ始まっていない週」。ここから下の右カラムを月次スタックが占める。
+  const firstFutureIndex = weeklyRows.findIndex(row => row.week.start > today)
 
   return (
     <div className="almanac-board-scroll">
       <div className="almanac-board">
-        <div className="almanac-month-row">
-          <MonthPlanLane weeks={weeks} plan={plan} today={today} />
-          <div className="month-intel-intro">
-            <div>
-              <div style={{ color: OPS.blue, fontFamily: OPS.mono, fontSize: 10.5, letterSpacing: '.14em' }}>WEEK INTELLIGENCE</div>
-              <div style={{ color: OPS.text, fontSize: 13, fontWeight: 700, marginTop: 6 }}>各週の計画と結果を同じ行で比較</div>
-              <div style={{ color: OPS.dim, fontSize: 10.5, marginTop: 4 }}>結果バーは全週共通スケール · 日次の濃淡はカレンダーに集約</div>
-            </div>
-            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(2, auto)', gap: '5px 13px', color: OPS.dim, fontFamily: OPS.mono, fontSize: 10.5 }}>
-              <span>計画あり</span><strong style={{ color: OPS.gold }}>{activePlanWeekCount}週</strong>
-              <span>実績あり</span><strong style={{ color: OPS.green }}>{resultWeekCount}週</strong>
-            </div>
-          </div>
-        </div>
-
         <div className="almanac-board-head">
           <div className="calendar-head">
-            <div style={{ color: OPS.blue, fontFamily: OPS.mono, fontSize: 9.5, letterSpacing: '.12em', padding: '0 8px 4px' }}>WEEK</div>
+            <div className="ops-latin" style={{ color: OPS.dim, fontSize: 10.5, padding: '0 8px 4px' }}>WEEK</div>
             <div className="almanac-days">
-              {['月', '火', '水', '木', '金', '土', '日'].map(day => (
-                <div key={day} style={{ color: OPS.sub, fontSize: 12, fontWeight: 700, textAlign: 'center', letterSpacing: '.12em', paddingBottom: 3 }}>{day}</div>
+              {['月', '火', '水', '木', '金', '土', '日'].map((day, i) => (
+                <div
+                  key={day}
+                  style={{
+                    fontFamily: OPS.display,
+                    color: i === 5 ? OPS.blue : i === 6 ? OPS.vermilion : OPS.sub,
+                    fontSize: 14,
+                    fontWeight: 600,
+                    textAlign: 'center',
+                    letterSpacing: '.14em',
+                    paddingBottom: 4,
+                  }}
+                >
+                  {day}
+                </div>
               ))}
             </div>
           </div>
           <div className="week-intel-head" aria-label="各週の計画と結果">
-            <div>PLAN · 週の目的と予算</div>
-            <div>RESULT · 週合計</div>
+            <div>WEEKLY PLAN · 今週の目的と予算</div>
+            <div>RESULT · 週次の結果</div>
           </div>
         </div>
 
-        {weeklyRows.map(({ week, trades, pnlRows }, weekIndex) => {
-          const isCurrent = week.startKey === dkey(currentWeekStart)
-          return (
-            <div key={week.startKey} className={`almanac-week-row${isCurrent ? ' is-current' : ''}`}>
-              <div className="calendar-week">
-                <WeekMeta week={week} current={isCurrent} today={today} />
-                <div className="almanac-days">
-                  {week.days.map((date, dayIndex) => {
-                    const key = dkey(date)
-                    return (
-                      <DayCell
-                        key={key}
-                        date={date}
-                        dateKey={key}
-                        today={today}
-                        events={eventsByDate.get(key) ?? []}
-                        trades={tradesByDate.get(key) ?? []}
-                        pnl={pnl[key]}
-                        maxAbsPnl={maxAbs}
-                        hovered={hovered === key}
-                        onHover={setHovered}
-                        animationIndex={weekIndex * 7 + dayIndex}
-                      />
-                    )
-                  })}
+        {/* 未来週の行は固定高。auto のままだと月次スタックの中身の高さが
+            4行に分配され、予定の無いカレンダーのマスまで間延びする。 */}
+        <div
+          className="almanac-board-body"
+          style={{
+            gridTemplateRows: weeklyRows
+              // 148px × 4行 + gap で月次スタック(約600px)がちょうど収まる。
+              // 過去週の行(126〜144px)ともほぼ揃うので暦が間延びしない。
+              .map((row, i) => (firstFutureIndex >= 0 && i >= firstFutureIndex ? '148px' : 'auto'))
+              .join(' '),
+          }}
+        >
+          {weeklyRows.map(({ week, trades, pnlRows }, weekIndex) => {
+            const isCurrent = week.startKey === dkey(currentWeekStart)
+            const isFuture = firstFutureIndex >= 0 && weekIndex >= firstFutureIndex
+            return (
+              <Fragment key={week.startKey}>
+                <div
+                  className={`calendar-week${isCurrent ? ' is-current' : ''}`}
+                  style={{ gridColumn: 1, gridRow: weekIndex + 1 }}
+                >
+                  <WeekMeta week={week} current={isCurrent} today={today} />
+                  <div className="almanac-days">
+                    {week.days.map((date, dayIndex) => {
+                      const key = dkey(date)
+                      return (
+                        <DayCell
+                          key={key}
+                          date={date}
+                          dateKey={key}
+                          today={today}
+                          events={eventsByDate.get(key) ?? []}
+                          trades={tradesByDate.get(key) ?? []}
+                          pnl={pnl[key]}
+                          maxAbsPnl={maxAbs}
+                          hovered={hovered === key}
+                          onHover={setHovered}
+                          animationIndex={weekIndex * 7 + dayIndex}
+                        />
+                      )
+                    })}
+                  </div>
                 </div>
-              </div>
-              <WeeklyIntelligenceCard
-                week={week}
-                plan={plan}
-                trades={trades}
-                pnlRows={pnlRows}
-                isCurrent={isCurrent}
-                today={today}
-                maxWeeklyAbs={maxWeeklyAbs}
-                onOpenPlan={onOpenPlan}
-              />
-            </div>
-          )
-        })}
+                {/* 未来週の右カラムは空の計画枠になるだけなので描かない。
+                    その領域は下の月次スタックがまとめて占める。 */}
+                {!isFuture && (
+                  <WeeklyIntelligenceCard
+                    week={week}
+                    plan={plan}
+                    trades={trades}
+                    pnlRows={pnlRows}
+                    isCurrent={isCurrent}
+                    today={today}
+                    maxWeeklyAbs={maxWeeklyAbs}
+                    onOpenPlan={onOpenPlan}
+                    style={{ gridColumn: 2, gridRow: weekIndex + 1 }}
+                  />
+                )}
+              </Fragment>
+            )
+          })}
+          {firstFutureIndex >= 0 && (
+            <MonthlyPlanStack
+              plan={plan}
+              today={today}
+              onOpenPlan={onOpenPlan}
+              style={{ gridColumn: 2, gridRow: `${firstFutureIndex + 1} / -1` }}
+            />
+          )}
+        </div>
 
         <div style={{ display: 'flex', alignItems: 'center', gap: 15, flexWrap: 'wrap', color: OPS.dim, fontSize: 11.5, fontFamily: OPS.mono, marginTop: 10 }}>
           <span>表示範囲 先々週〜4週先</span>
           <span><span style={{ color: OPS.green }}>▲</span> 買い <span style={{ color: OPS.vermilion }}>▼</span> 売り</span>
           <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>日次損益 <i style={{ width: 13, height: 9, background: 'rgba(224,72,60,.4)', borderRadius: 2 }} /><i style={{ width: 13, height: 9, background: 'rgba(87,190,146,.4)', borderRadius: 2 }} /></span>
           {(['earnings', 'nisa', 'policy', 'order'] as const).map(kind => <span key={kind}><span style={{ color: KIND_COLOR[kind] }}>●</span> {KIND_LABEL[kind]}</span>)}
-          <span style={{ marginLeft: 'auto' }}>月次枠 → 週次計画 → 日次イベント</span>
+          <span style={{ marginLeft: 'auto' }}>月次計画 → 今週の実行 → 週次結果</span>
         </div>
       </div>
     </div>
   )
 }
 
-function MonthPlanLane({ weeks, plan, today }: { weeks: WeekRow[]; plan?: ExecutionPlan; today: Date }) {
+/** スタック内の1区画。和名の見出し + 右端に英字コード。 */
+function MonthlySection({ jp, code, children }: { jp: string; code: string; children: React.ReactNode }) {
+  return (
+    <div className="monthly-sec">
+      <div className="monthly-sec-head">
+        <span style={{ fontFamily: OPS.display, color: OPS.text, fontSize: 14, fontWeight: 600, letterSpacing: '.1em' }}>{jp}</span>
+        <span className="ops-latin" style={{ marginLeft: 'auto', fontSize: 9.5, color: OPS.dim }}>{code}</span>
+      </div>
+      {children}
+    </div>
+  )
+}
+
+/**
+ * 月次計画スタック — 「今月の投資余力 / 現在の配分設計 / 優先配分キュー / リスク境界」。
+ *
+ * 置き場所の経緯: 元は4枚を未来週の行に1枚ずつ差し込んでいた（週に紐づいて見える）。
+ * かといって暦の外へ出すと、未来週の右カラムに「まだ策定されていない週次計画」の
+ * 空枠だけが残って無意味になる。そこで未来週の右カラムをまとめて1つの領域とし、
+ * そこへ月次の4項目を縦に積む。週次カードが尽きた先が月次の話、という読み順になる。
+ */
+function MonthlyPlanStack({ plan, today, onOpenPlan, style }: {
+  plan?: ExecutionPlan
+  today: Date
+  onOpenPlan: () => void
+  style?: CSSProperties
+}) {
   const activePlan = plan?.status === 'active'
+  const monthLabel = (plan?.horizon.month ?? monthKey(today)).replace('-', '.')
+
   const monthlyTotal = activePlan ? plan.budgets.monthly_total_jpy ?? 0 : 0
   const monthlyRemaining = activePlan
     ? plan.consumption.monthly_remaining_jpy ?? plan.budgets.monthly_remaining_jpy ?? monthlyTotal
@@ -764,67 +912,138 @@ function MonthPlanLane({ weeks, plan, today }: { weeks: WeekRow[]; plan?: Execut
   const weeklyOpportunity = activePlan ? plan.budgets.weekly_opportunity_reserve_jpy ?? 0 : 0
   const weeklyDefensive = activePlan ? plan.budgets.weekly_defensive_reserve_jpy ?? 0 : 0
   const weeklyTotal = weeklyNormal + weeklyOpportunity + weeklyDefensive
-  const weeklyPct = monthlyTotal > 0 ? Math.max(0, Math.min(100 - consumedPct, weeklyTotal / monthlyTotal * 100)) : 0
-  const normalShare = weeklyTotal > 0 ? weeklyNormal / weeklyTotal * 100 : 0
-  const month = plan?.horizon.month ?? monthKey(today)
-  const monthLabel = month.replace('-', '.')
   const unattributedCount = activePlan ? plan.consumption.unattributed_monthly_total_count ?? 0 : 0
   const unattributedNotional = activePlan ? plan.consumption.unattributed_monthly_total_notional_jpy ?? 0 : 0
   const attributionIncomplete = activePlan && (plan.consumption.monthly_attribution_incomplete === true || unattributedCount > 0)
-  const unavailableLabel = plan?.status === 'disabled' ? '計画レイヤー無効' : '月次計画は未策定'
-  const unavailableReason = plan?.today_decision.reason ?? '有効な計画が生成されるまで、予算は表示専用です。'
+  // スリーブ違いの建玉が計画予算を押さえている件。自動取消しない代わりに必ず見せる。
+  const scopeMismatch = activePlan ? scopeMismatchView(plan.consumption) : null
+
+  const statusLabel = activePlan ? 'ACTIVE' : plan?.status === 'disabled' ? 'DISABLED' : 'PENDING'
+  const statusColor = activePlan ? OPS.green : plan?.status === 'disabled' ? OPS.amber : OPS.dim
+  const allocation = [
+    { label: '通常', value: weeklyNormal, color: OPS.blue },
+    { label: '機会', value: weeklyOpportunity, color: OPS.vermilion },
+    { label: '防御', value: weeklyDefensive, color: OPS.gold },
+  ]
 
   return (
-    <div className="month-plan-lane" data-testid="monthly-plan-lane">
-      <div className="month-plan-top">
-        <div>
-          <div style={{ color: activePlan ? OPS.gold : OPS.amber, fontFamily: OPS.mono, fontSize: 10.5, letterSpacing: '.13em' }}>MONTHLY PLAN · {monthLabel}{activePlan ? '' : ' · DISABLED'}</div>
-          {activePlan ? (
-            <>
-              <div style={{ display: 'flex', alignItems: 'baseline', gap: 10, marginTop: 8 }}>
-                <strong style={{ color: OPS.text, fontFamily: OPS.mono, fontSize: 20 }}>{fmtJpy(monthlyTotal)}</strong>
-                <span style={{ color: OPS.dim, fontSize: 10.5 }}>月間枠</span>
-              </div>
-              <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap', marginTop: 5, color: OPS.dim, fontFamily: OPS.mono, fontSize: 10.5 }}>
-                <span>帰属済み <b style={{ color: OPS.green }}>{fmtJpy(monthlyConsumed)}</b></span>
-                <span>残 <b style={{ color: attributionIncomplete ? OPS.sub : OPS.gold }}>{fmtJpy(monthlyRemaining)}</b></span>
-              </div>
-              <div className="month-budget-meter" aria-label={`月次枠 ${fmtJpy(monthlyTotal)}、帰属済み ${fmtJpy(monthlyConsumed)}、今週配分 ${fmtJpy(weeklyTotal)}`}>
-                <i style={{ left: 0, width: `${consumedPct}%`, background: OPS.green }} />
-                <i style={{ left: `${consumedPct}%`, width: `${weeklyPct * normalShare / 100}%`, background: OPS.blue, opacity: .78 }} />
-                <i style={{ left: `${consumedPct + weeklyPct * normalShare / 100}%`, width: `${weeklyPct * (100 - normalShare) / 100}%`, background: OPS.vermilion, opacity: .76 }} />
-              </div>
-            </>
-          ) : (
-            <div style={{ marginTop: 9 }}>
-              <strong style={{ color: OPS.amber, fontSize: 14 }}>{unavailableLabel}</strong>
-              <div style={{ color: OPS.dim, fontSize: 10.5, lineHeight: 1.55, marginTop: 5 }}>{unavailableReason}</div>
-            </div>
-          )}
-        </div>
-
-        <div>
-          <div className="month-week-grid" aria-label="月間計画の週別状態">
-            {weeks.map(week => {
-              const planWeek = activePlan && isPlanWeek(week, plan)
-              const past = week.end < today
-              const outsideMonth = monthKey(week.start) > month
-              const status = planWeek ? `今週 ${fmtJpy(weeklyTotal)}` : !activePlan ? '無効' : past ? '履歴なし' : outsideMonth ? '次月' : '未策定'
-              return (
-                <div key={week.startKey} className={`month-week-segment${planWeek ? ' is-plan-week' : ''}`}>
-                  <div style={{ color: planWeek ? OPS.gold : OPS.blue, fontFamily: OPS.mono, fontSize: 9.5 }}>W{isoWeekNumber(week.start)}</div>
-                  <div style={{ color: planWeek ? OPS.text : OPS.dim, fontSize: 9.5, marginTop: 3, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{status}</div>
-                </div>
-              )
-            })}
-          </div>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 8, minHeight: 18, marginTop: 8, color: attributionIncomplete ? OPS.amber : OPS.dim, fontSize: 10.5 }}>
-            <span aria-hidden>{attributionIncomplete ? '▲' : '●'}</span>
-            <span>{!activePlan ? '有効な計画が生成されるまで、月次予算は利用しません。' : attributionIncomplete ? `月次帰属確認中 · 未帰属${unattributedCount}件 ${fmtJpy(unattributedNotional)} は月次枠に未算入` : `今週配分 通常 ${fmtJpy(weeklyNormal)} · 機会 ${fmtJpy(weeklyOpportunity)}`}</span>
-          </div>
-        </div>
+    <section className="monthly-stack" aria-label="今月の計画" style={style}>
+      <div className="monthly-stack-head">
+        <span style={{ fontFamily: OPS.display, color: OPS.gold, fontSize: 14, fontWeight: 600, letterSpacing: '.14em' }}>月次計画</span>
+        <span style={{ color: OPS.sub, fontFamily: OPS.mono, fontSize: 11.5 }}>{monthLabel}</span>
+        <span className="ops-latin" style={{ color: statusColor, fontSize: 9.5 }}>{statusLabel}</span>
+        {activePlan && (
+          <button type="button" className="ops-btn" onClick={onOpenPlan} style={{ marginLeft: 'auto', background: 'transparent', border: `1px solid ${OPS.border}`, color: OPS.gold, fontFamily: OPS.mono, fontSize: 10.5, padding: '3px 8px' }}>
+            計画詳細 →
+          </button>
+        )}
       </div>
-    </div>
+
+      {!activePlan ? (
+        <div className="monthly-sec" style={{ flex: 1 }}>
+          <div style={{ color: OPS.amber, fontSize: 13, fontWeight: 700 }}>月次計画を参照できません</div>
+          <div style={{ color: OPS.sub, fontSize: 12, marginTop: 6 }}>
+            {plan?.status === 'disabled' ? '計画レイヤー無効' : '月次計画は未策定'}
+          </div>
+          <div style={{ color: OPS.dim, fontSize: 11, lineHeight: 1.65, marginTop: 6 }}>
+            {plan?.today_decision.reason ?? '有効な計画が生成されるまで、予算は表示専用です。'}
+          </div>
+        </div>
+      ) : (
+        <>
+          <MonthlySection jp="今月の投資余力" code="CAPACITY">
+            <div style={{ display: 'flex', alignItems: 'baseline', gap: 8 }}>
+              <strong style={{ color: OPS.text, fontFamily: OPS.mono, fontSize: 22, fontWeight: 700 }}>{fmtJpy(monthlyTotal)}</strong>
+              <span style={{ color: OPS.dim, fontSize: 11 }}>月間枠</span>
+              <span style={{ marginLeft: 'auto', color: OPS.gold, fontFamily: OPS.mono, fontSize: 11.5 }}>残 {fmtJpy(monthlyRemaining)}</span>
+            </div>
+            <div className="month-budget-meter" aria-label={`月次枠 ${fmtJpy(monthlyTotal)}、帰属済み ${fmtJpy(monthlyConsumed)}`}>
+              <i className="ops-bar-fill" style={{ left: 0, width: `${consumedPct}%`, background: OPS.green }} />
+            </div>
+            <div style={{ color: OPS.dim, fontFamily: OPS.mono, fontSize: 10.5, marginTop: 6 }}>
+              帰属済み {fmtJpy(monthlyConsumed)} / {consumedPct.toFixed(0)}%
+            </div>
+            {attributionIncomplete && (
+              <div style={{ color: OPS.amber, fontSize: 10.5, lineHeight: 1.5, marginTop: 5 }}>
+                ▲ 未帰属 {unattributedCount}件 {fmtJpy(unattributedNotional)} は未算入
+              </div>
+            )}
+            {scopeMismatch && (
+              <div style={{ color: OPS.amber, fontSize: 10.5, lineHeight: 1.5, marginTop: 5 }}>
+                <div>▲ スコープ不一致 {scopeMismatch.count}件 {fmtJpy(scopeMismatch.notionalJpy)} を予約中・要確認</div>
+                {scopeMismatch.records.map((record, index) => (
+                  <div key={record.id ?? `${record.ticker}-${index}`}
+                    style={{ color: OPS.sub, marginTop: 2 }}>
+                    {scopeMismatchLine(record)}
+                  </div>
+                ))}
+              </div>
+            )}
+          </MonthlySection>
+
+          <MonthlySection jp="現在の配分設計" code="BUDGET MIX">
+            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, minmax(0, 1fr))', gap: 5 }}>
+              {allocation.map(row => (
+                <div key={row.label} className="monthly-kpi">
+                  <div style={{ ...panelEyebrow, color: row.color }}>{row.label}</div>
+                  <strong style={{ color: OPS.text, fontFamily: OPS.mono, fontSize: 11.5 }}>{fmtJpy(row.value)}</strong>
+                </div>
+              ))}
+            </div>
+            <div className="monthly-mix-bar" aria-label={`配分 通常 ${fmtJpy(weeklyNormal)}、機会 ${fmtJpy(weeklyOpportunity)}、防御 ${fmtJpy(weeklyDefensive)}`}>
+              {allocation.map(row => (
+                <i key={row.label} className="ops-bar-fill" style={{ width: `${weeklyTotal > 0 ? row.value / weeklyTotal * 100 : 0}%`, background: row.color }} />
+              ))}
+            </div>
+            <div style={{ color: OPS.dim, fontFamily: OPS.mono, fontSize: 10, marginTop: 5 }}>今週へ切り出した予算 · 計 {fmtJpy(weeklyTotal)}</div>
+          </MonthlySection>
+
+          <MonthlySection jp="優先配分キュー" code="PRIORITY QUEUE">
+            {plan.items.length > 0 ? (
+              <div className="monthly-priority-list">
+                {plan.items.slice(0, 3).map((item, index) => {
+                  const tone = item.status === 'covered' ? OPS.green : OPS.blue
+                  return (
+                    <div key={item.plan_item_id ?? `${item.priority}-${item.label}`} className="monthly-priority">
+                      <span style={{ color: tone, fontFamily: OPS.mono, fontSize: 10.5 }}>{item.priority ?? index + 1}.</span>
+                      <span style={{ color: OPS.sub, fontSize: 11.5, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{planItemLabel(item)}</span>
+                      <strong style={{ color: OPS.text, fontFamily: OPS.mono, fontSize: 11 }}>{fmtJpy(item.normal_budget_jpy ?? 0)}</strong>
+                    </div>
+                  )
+                })}
+              </div>
+            ) : (
+              <div style={{ color: OPS.dim, fontSize: 11.5 }}>優先配分はまだ登録されていません。</div>
+            )}
+          </MonthlySection>
+
+          <MonthlySection jp="リスク境界" code="RISK BOUNDARY">
+            <div style={{ display: 'flex', alignItems: 'baseline', gap: 9, marginBottom: 7 }}>
+              <span style={{ color: decisionColor(plan), fontSize: 12, fontWeight: 700 }}>{plan.today_decision.label}</span>
+              <span style={{ color: OPS.dim, fontFamily: OPS.mono, fontSize: 10.5 }}>候補 {plan.summary.board_count} · 除外 {plan.summary.plan_filtered_count}</span>
+            </div>
+            <div className="monthly-guard-grid">
+              {[
+                { label: '通常1件上限', value: plan.budgets.max_single_normal_action_jpy },
+                { label: '機会1件上限', value: plan.budgets.max_single_opportunity_action_jpy },
+                { label: 'H2上限', value: plan.budgets.h2_hard_cap_jpy },
+                { label: '積立残', value: plan.budgets.scheduled_contributions_remaining_jpy },
+              ].map(row => (
+                <div key={row.label} className="monthly-guard">
+                  <div style={panelEyebrow}>{row.label}</div>
+                  <strong style={{ color: row.value != null ? OPS.text : OPS.dim, fontFamily: OPS.mono, fontSize: 11.5 }}>{row.value != null ? fmtJpy(row.value) : '—'}</strong>
+                </div>
+              ))}
+            </div>
+            {plan.warnings.length > 0 && (
+              // 警告は scheduled_contributions_excluded_… のような長い snake_case が来る。
+              // anywhere を付けないと折り返せず枠端で切り落とされる。
+              <div style={{ color: OPS.amber, fontSize: 10, lineHeight: 1.5, marginTop: 6, overflowWrap: 'anywhere' }} title={plan.warnings[0]}>▲ {plan.warnings[0]}</div>
+            )}
+          </MonthlySection>
+        </>
+      )}
+    </section>
   )
 }
 
@@ -835,15 +1054,15 @@ function WeekMeta({ week, current, today }: { week: WeekRow; current: boolean; t
       <span className="week-node">W{isoWeekNumber(week.start)}</span>
       <div style={{ color: current ? OPS.gold : OPS.sub, fontFamily: OPS.mono, fontSize: 10.5 }}>{fmtRange(week.start, week.end)}</div>
       {current ? (
-        <div style={{ display: 'inline-flex', marginTop: 7, color: OPS.gold, border: `1px solid ${OPS.gold}55`, borderRadius: 9, padding: '2px 6px', fontFamily: OPS.mono, fontSize: 8.5 }}>THIS WEEK</div>
+        <div style={{ marginTop: 6, fontFamily: OPS.display, fontSize: 13, fontWeight: 600, color: OPS.gold, letterSpacing: '.16em' }}>今週</div>
       ) : (
-        <div style={{ color: OPS.blue, fontFamily: OPS.mono, fontSize: 8.5, marginTop: 8 }}>{status}</div>
+        <div className="ops-latin" style={{ color: OPS.dim, fontSize: 9, marginTop: 8 }}>{status}</div>
       )}
     </div>
   )
 }
 
-function WeeklyIntelligenceCard({ week, plan, trades, pnlRows, isCurrent, today, maxWeeklyAbs, onOpenPlan }: {
+function WeeklyIntelligenceCard({ week, plan, trades, pnlRows, isCurrent, today, maxWeeklyAbs, onOpenPlan, style }: {
   week: WeekRow
   plan?: ExecutionPlan
   trades: PastTrade[]
@@ -852,11 +1071,16 @@ function WeeklyIntelligenceCard({ week, plan, trades, pnlRows, isCurrent, today,
   today: Date
   maxWeeklyAbs: number
   onOpenPlan: () => void
+  style?: CSSProperties
 }) {
   return (
-    <div className="week-intelligence-card" aria-label={`${fmtRange(week.start, week.end)}の週次計画と結果`}>
+    <div
+      className={`week-intelligence-card${isCurrent ? ' is-current' : ''}`}
+      aria-label={`${fmtRange(week.start, week.end)}の週次計画と結果`}
+      style={style}
+    >
       <WeeklyPlanPanel week={week} plan={plan} today={today} onOpen={onOpenPlan} />
-      <WeeklyResultPanel week={week} trades={trades} pnlRows={pnlRows} isCurrent={isCurrent} today={today} maxWeeklyAbs={maxWeeklyAbs} />
+      <WeeklyResultPanel trades={trades} pnlRows={pnlRows} isCurrent={isCurrent} maxWeeklyAbs={maxWeeklyAbs} />
     </div>
   )
 }
@@ -965,11 +1189,17 @@ function DayCell({ date, dateKey, today, events, trades, pnl, maxAbsPnl, hovered
       }}
     >
       <div style={{ display: 'flex', alignItems: 'baseline', justifyContent: 'space-between', gap: 3 }}>
-        <span style={{ color: isToday ? OPS.gold : firstOfMonth ? OPS.text : OPS.sub, fontFamily: OPS.mono, fontSize: 11.5, fontWeight: isToday ? 700 : 500 }}>
-          {firstOfMonth ? `${date.getMonth() + 1}/1` : date.getDate()}{isToday && <span style={{ marginLeft: 3, fontSize: 9 }}>今日</span>}
+        <span style={{ color: isToday ? OPS.gold : firstOfMonth ? OPS.text : OPS.sub, fontFamily: OPS.mono, fontSize: isToday ? 15 : 11.5, fontWeight: isToday ? 700 : 500 }}>
+          {firstOfMonth ? `${date.getMonth() + 1}/1` : date.getDate()}
         </span>
         {pnl != null && <span style={{ color: pnl >= 0 ? OPS.green : OPS.redSoft, fontFamily: OPS.mono, fontSize: 9.5 }}>{pnl >= 0 ? '+' : '−'}{Math.abs(Math.round(pnl / 10000))}</span>}
       </div>
+      {/* 「今日」は朱印で捺す。和文書の現在地の示し方 */}
+      {isToday && (
+        <span style={{ position: 'absolute', right: 6, bottom: 6 }}>
+          <Seal label="今日" size={30} />
+        </span>
+      )}
       <div style={{ display: 'flex', flexDirection: 'column', gap: 1, marginTop: 3 }}>
         {trades.slice(0, 2).map((trade, index) => <div key={`trade-${index}`} style={cellLine(trade.side === 'buy' ? OPS.green : OPS.vermilion)}>{trade.side === 'buy' ? '▲' : '▼'}{trade.ticker}</div>)}
         {events.slice(0, trades.length ? 1 : 2).map((event, index) => <div key={`event-${index}`} style={cellLine(KIND_COLOR[event.kind] ?? OPS.sub)}>●{event.ticker ?? KIND_LABEL[event.kind] ?? event.kind}</div>)}
@@ -982,7 +1212,7 @@ function DayCell({ date, dateKey, today, events, trades, pnl, maxAbsPnl, hovered
 
 function DayPopover({ dateKey, pnl, trades, events }: { dateKey: string; pnl?: number; trades: PastTrade[]; events: AlmanacEvent[] }) {
   return (
-    <div style={{ position: 'absolute', top: '100%', left: '50%', transform: 'translateX(-50%)', marginTop: 4, minWidth: 245, background: 'rgba(14,17,23,.985)', border: `1px solid ${OPS.gold}66`, borderRadius: 8, padding: '10px 12px', zIndex: 30, pointerEvents: 'none', boxShadow: '0 12px 30px rgba(0,0,0,.58)' }}>
+    <div style={{ position: 'absolute', top: '100%', left: '50%', transform: 'translateX(-50%)', marginTop: 4, minWidth: 245, background: OPS.panelAlt, border: `1px solid ${OPS.border}`, borderRadius: 8, padding: '10px 12px', zIndex: 30, pointerEvents: 'none', boxShadow: OPS.shadowOverlay }}>
       <div style={{ display: 'flex', justifyContent: 'space-between', gap: 10, fontFamily: OPS.mono, fontSize: 11.5, marginBottom: 6 }}>
         <span style={{ color: OPS.gold }}>{dateKey.slice(5).replace('-', '/')}</span>
         {pnl != null && <span style={{ color: pnl >= 0 ? OPS.green : OPS.redSoft }}>日次 {pnl >= 0 ? '+' : '−'}{fmtJpy(Math.abs(pnl))}</span>}
@@ -993,15 +1223,12 @@ function DayPopover({ dateKey, pnl, trades, events }: { dateKey: string; pnl?: n
   )
 }
 
-function WeeklyResultPanel({ week, trades, pnlRows, isCurrent, today, maxWeeklyAbs }: {
-  week: WeekRow
+function WeeklyResultPanel({ trades, pnlRows, isCurrent, maxWeeklyAbs }: {
   trades: PastTrade[]
   pnlRows: Array<[string, number]>
   isCurrent: boolean
-  today: Date
   maxWeeklyAbs: number
 }) {
-  const isFuture = week.start > today
   const net = pnlRows.reduce((sum, [, value]) => sum + value, 0)
   const buyCount = trades.filter(trade => trade.side === 'buy').length
   const sellCount = trades.filter(trade => trade.side !== 'buy').length
@@ -1014,10 +1241,10 @@ function WeeklyResultPanel({ week, trades, pnlRows, isCurrent, today, maxWeeklyA
   const pnlColor = net > 0 ? OPS.green : net < 0 ? OPS.redSoft : OPS.sub
 
   return (
-    <div className="week-result-panel" style={{ opacity: isFuture ? .68 : 1 }}>
+    <div className="week-result-panel">
       <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 7 }}>
         <span style={panelEyebrow}>RESULT</span>
-        <span style={{ color: isCurrent ? OPS.gold : OPS.blue, fontFamily: OPS.mono, fontSize: 8.5 }}>{isCurrent ? 'LIVE' : isFuture ? 'WAITING' : 'CLOSED'}</span>
+        <span style={{ color: isCurrent ? OPS.gold : OPS.blue, fontFamily: OPS.mono, fontSize: 8.5 }}>{isCurrent ? 'LIVE' : 'CLOSED'}</span>
       </div>
       {hasPnl ? (
         <>
@@ -1041,11 +1268,11 @@ function WeeklyResultPanel({ week, trades, pnlRows, isCurrent, today, maxWeeklyA
         </>
       ) : (
         <>
-          <div style={{ color: OPS.sub, fontSize: 12, fontWeight: 700, marginTop: 9 }}>{isFuture ? '未集計' : '記録なし'}</div>
-          <div style={{ color: OPS.dim, fontSize: 10, lineHeight: 1.5, marginTop: 5 }}>{isFuture ? '週の進行後に週合計を表示します。' : 'この週の損益・売買記録はありません。'}</div>
+          <div style={{ color: OPS.sub, fontSize: 12, fontWeight: 700, marginTop: 9 }}>記録なし</div>
+          <div style={{ color: OPS.dim, fontSize: 10, lineHeight: 1.5, marginTop: 5 }}>この週の損益・売買記録はありません。</div>
         </>
       )}
-      {!isFuture && trades.length > 0 && <Link href="/executions" style={{ display: 'inline-flex', marginTop: 7, color: OPS.gold, textDecoration: 'none', fontFamily: OPS.mono, fontSize: 9 }}>台帳 →</Link>}
+      {trades.length > 0 && <Link href="/executions" style={{ display: 'inline-flex', marginTop: 7, color: OPS.gold, textDecoration: 'none', fontFamily: OPS.mono, fontSize: 9 }}>台帳 →</Link>}
     </div>
   )
 }
@@ -1060,6 +1287,6 @@ function cellLine(color: string): CSSProperties {
   return { color, fontFamily: OPS.mono, fontSize: 10.5, lineHeight: 1.4, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }
 }
 
-const eyebrow: CSSProperties = { color: OPS.dim, fontFamily: OPS.mono, fontSize: 9.5, letterSpacing: '.1em' }
-const panelEyebrow: CSSProperties = { color: OPS.blue, fontFamily: OPS.mono, fontSize: 8.5, letterSpacing: '.12em' }
-const popoverLine: CSSProperties = { color: OPS.sub, fontSize: 11.5, lineHeight: 1.7, whiteSpace: 'nowrap' }
+const eyebrow: CSSProperties = { color: OPS.dim, fontFamily: OPS.mono, fontSize: 10.5, letterSpacing: '.1em' }
+const panelEyebrow: CSSProperties = { color: OPS.blue, fontFamily: OPS.mono, fontSize: 10.5, letterSpacing: '.12em' }
+const popoverLine: CSSProperties = { color: OPS.sub, fontSize: 12, lineHeight: 1.75, whiteSpace: 'nowrap' }

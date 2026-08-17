@@ -1,4 +1,4 @@
-import { cleanup, render, screen } from '@testing-library/react'
+import { cleanup, fireEvent, render, screen, within } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import AlmanacStrip from '../AlmanacStrip'
@@ -8,10 +8,26 @@ const plan: ExecutionPlan = {
   status: 'active',
   age_hours: 3,
   horizon: { month: '2026-07', week_start: '2026-07-13', week_end: '2026-07-19' },
-  budgets: { monthly_total_jpy: 300_000 },
-  consumption: { normal_plan_budget_consumed_pct: 20, remaining_normal_jpy: 40_000 },
-  summary: { items_total: 0, active_items: 0, covered_items: 0, board_count: 0, plan_filtered_count: 0 },
-  items: [],
+  budgets: {
+    monthly_total_jpy: 300_000,
+    weekly_normal_jpy: 50_000,
+    weekly_opportunity_reserve_jpy: 20_000,
+    weekly_defensive_reserve_jpy: 10_000,
+    max_single_normal_action_jpy: 30_000,
+    max_single_opportunity_action_jpy: 20_000,
+    scheduled_contributions_remaining_jpy: 25_000,
+  },
+  consumption: {
+    monthly_consumed_jpy: 60_000,
+    monthly_remaining_jpy: 240_000,
+    normal_plan_budget_consumed_pct: 20,
+    remaining_normal_jpy: 40_000,
+  },
+  summary: { items_total: 2, active_items: 2, covered_items: 0, board_count: 3, plan_filtered_count: 1 },
+  items: [
+    { plan_item_id: 'wife-nisa', label: '妻NISAを優先', objective: 'wife_nisa_growth_capacity', status: 'active', priority: 1, normal_budget_jpy: 30_000, preferred_tickers: [], consumed_by_count: 0, source_reasons: [] },
+    { plan_item_id: 'usd', label: 'USD比率を補正', objective: 'add_currency_usd', status: 'active', priority: 2, normal_budget_jpy: 20_000, preferred_tickers: [], consumed_by_count: 0, source_reasons: [] },
+  ],
   today_decision: { code: 'wait_candidate', label: '候補待ち', reason: '条件待ちです。' },
   filtered_summary: {},
   filtered_examples: [],
@@ -37,6 +53,8 @@ const almanac: AlmanacData = {
   upcoming: [
     { date: '2026-07-01', label: '古い予定', kind: 'earnings', ticker: 'OLD.T' },
     { date: '2026-07-08', label: '先週の予定', kind: 'earnings', ticker: 'LAST.T' },
+    { date: '2026-07-20', label: 'NISA積立', kind: 'nisa' },
+    { date: '2026-07-23', label: 'RTX 決算', kind: 'earnings', ticker: 'RTX' },
   ],
   past: [{ date: '2026-07-08', kind: 'trade', ticker: '1489.T', side: 'buy', detail: '100株買付' }],
   pnl_by_date: { '2026-07-08': 20_000 },
@@ -56,19 +74,35 @@ describe('AlmanacStrip', () => {
     vi.useRealTimers()
   })
 
-  it('links the monthly lane and every weekly plan/result to calendar rows', () => {
+  it('fills the future-week plan column with one monthly stack', () => {
     render(<AlmanacStrip almanac={almanac} plan={plan} />)
+    fireEvent.click(screen.getByRole('button', { name: '複数週を詳しく見る' }))
 
     expect(screen.getByRole('button', { name: '7/13–7/19の計画詳細' })).toBeInTheDocument()
-    const monthlyLane = screen.getByTestId('monthly-plan-lane')
-    const monday = screen.getByText('月', { selector: 'div' })
-    expect(monthlyLane).toHaveTextContent('MONTHLY PLAN · 2026.07')
-    expect(monthlyLane.compareDocumentPosition(monday) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
     expect(screen.getByLabelText('各週の計画と結果')).toBeInTheDocument()
-    expect(screen.getAllByLabelText(/の週次計画と結果$/)).toHaveLength(7)
+    // 週次カードは「先々週・先週・今週」の3つだけ。未来4週分の空の計画枠は出さず、
+    // その領域は月次スタックが1ブロックで占める。
+    expect(screen.getAllByLabelText(/の週次計画と結果$/)).toHaveLength(3)
+    expect(screen.queryByLabelText(/に表示する月次計画$/)).not.toBeInTheDocument()
+    expect(screen.queryByText('週次計画は未策定')).not.toBeInTheDocument()
     expect(screen.queryByLabelText('週内の日次損益')).not.toBeInTheDocument()
+
+    // 4項目は右カラムの1ブロックに縦積みされる
+    const monthlyStack = screen.getByLabelText('今月の計画')
+    expect(within(monthlyStack).getByText('今月の投資余力')).toBeInTheDocument()
+    expect(within(monthlyStack).getByText('現在の配分設計')).toBeInTheDocument()
+    expect(within(monthlyStack).getByText('優先配分キュー')).toBeInTheDocument()
+    expect(within(monthlyStack).getByText('リスク境界')).toBeInTheDocument()
+    expect(within(monthlyStack).getByText('¥30万')).toBeInTheDocument()
+    expect(within(monthlyStack).getByText('残 ¥24万')).toBeInTheDocument()
+    expect(within(monthlyStack).getByText('2026.07')).toBeInTheDocument()
+    expect(screen.queryByText('PLAN PREVIEW')).not.toBeInTheDocument()
+    expect(screen.queryByText('WEEK OUTLOOK')).not.toBeInTheDocument()
+    expect(screen.queryByText('予定 2件')).not.toBeInTheDocument()
     expect(screen.getByText('●OLD.T')).toBeInTheDocument()
     expect(screen.getByText('●LAST.T')).toBeInTheDocument()
+    expect(screen.getByText('●NISA積立')).toBeInTheDocument()
+    expect(screen.getByText('●RTX')).toBeInTheDocument()
     expect(screen.getByText('表示範囲 先々週〜4週先')).toBeInTheDocument()
     expect(screen.getByText('1489.T')).toBeInTheDocument()
     expect(screen.getAllByText('+¥2万').length).toBeGreaterThan(0)
@@ -77,6 +111,7 @@ describe('AlmanacStrip', () => {
   it('shows the active cross-midnight US session instead of only Tokyo hours', () => {
     vi.setSystemTime(new Date('2026-07-15T23:15:00+09:00'))
     render(<AlmanacStrip almanac={almanac} plan={plan} />)
+    fireEvent.click(screen.getByRole('button', { name: '複数週を詳しく見る' }))
 
     expect(screen.getByText('米国 通常 取引中')).toBeInTheDocument()
     expect(screen.getByText('東証 前場')).toBeInTheDocument()
@@ -87,16 +122,17 @@ describe('AlmanacStrip', () => {
 
   it('does not present a disabled plan as active or actionable', () => {
     render(<AlmanacStrip almanac={almanac} plan={disabledPlan} />)
+    fireEvent.click(screen.getByRole('button', { name: '複数週を詳しく見る' }))
 
-    const monthlyLane = screen.getByTestId('monthly-plan-lane')
-    expect(monthlyLane).toHaveTextContent('MONTHLY PLAN · 2026.07 · DISABLED')
-    expect(monthlyLane).toHaveTextContent('計画レイヤー無効')
     expect(screen.queryByRole('button', { name: '7/13–7/19の計画詳細' })).not.toBeInTheDocument()
     expect(screen.getAllByText('計画レイヤー無効').length).toBeGreaterThan(1)
+    // 月次スタックは1つなので、参照不能の告知も1つ
+    expect(screen.getAllByText('月次計画を参照できません')).toHaveLength(1)
   })
 
   it('labels trade-only weeks as P&L pending', () => {
     render(<AlmanacStrip almanac={{ ...almanac, pnl_by_date: {} }} plan={plan} />)
+    fireEvent.click(screen.getByRole('button', { name: '複数週を詳しく見る' }))
 
     expect(screen.getByText('損益未集計')).toBeInTheDocument()
     expect(screen.queryByLabelText('週次損益 ¥0')).not.toBeInTheDocument()
