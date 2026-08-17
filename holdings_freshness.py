@@ -165,6 +165,39 @@ def effective_source_as_of(
     return best_at, best_label
 
 
+def holdings_divergence(*, base_dir: Path = BASE_DIR) -> dict:
+    """holdings が証券会社の事実から実際にズレている証拠を返す (副作用なし)。
+
+    鮮度の停止条件はこれ。壁時計ではない。
+
+    保有を狂わせるのは時間の経過ではなく「記録されたのに holdings へ
+    反映されていない約定」という出来事なので、それを掴んだときだけ
+    停止する。時間だけで止めると、何も起きていない凪の日に4日経った
+    という理由で全候補が review に落ちる (2026-08 の自己ロック)。
+
+    2種類を区別する:
+
+    ``unapplied``  broker確認済みで、数量差分に変換できる約定。
+                   ``rollforward`` を実行すれば解消する。
+    ``unresolved`` 差分に変換できなかった約定 (保有キー不明・数量不正・
+                   引くと負になる)。台帳と holdings が食い違っている
+                   ので、自動では触れず人間の再照合が要る。
+
+    どちらも「holdings は今の事実を表していない」ことの証拠なので
+    diverged=True にする。解消手段が違うだけ。
+    """
+    plan = plan_rollforward(base_dir=base_dir)
+    unapplied = list(plan.get("planned") or [])
+    unresolved = list(plan.get("skipped") or [])
+    return {
+        "diverged": bool(unapplied or unresolved),
+        "unapplied_count": len(unapplied),
+        "unresolved_count": len(unresolved),
+        "unapplied": unapplied,
+        "unresolved": unresolved,
+    }
+
+
 # ---------------------------------------------------------------------------
 # 旧現金rollforwardの隔離
 #

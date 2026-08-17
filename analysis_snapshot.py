@@ -223,6 +223,25 @@ def _freshness_status(as_of: Optional[datetime], *, now: datetime, max_age_hours
     return "fresh"
 
 
+def _holdings_diverged(base_dir: Path) -> bool:
+    """記録済みなのに holdings へ反映されていない約定があるか。
+
+    呼び出し側 (build_base_snapshot) が1回だけ評価して結果を配る。
+    モジュール変数に覚えさせると分析実行をまたいで残り、台帳が変わった
+    のに古い答えを返す。
+
+    検出できない場合 (台帳が読めない等) は False にする —— ここで例外を
+    投げると分析全体が落ちる。乖離判定は他の停止条件を置き換えるもの
+    ではなく足すものなので、分からないなら足さないのが正しい。
+    """
+    try:
+        from holdings_freshness import holdings_divergence
+
+        return bool(holdings_divergence(base_dir=base_dir).get("diverged"))
+    except Exception:
+        return False
+
+
 def _provenance_for_file(
     path: Path,
     *,
@@ -231,6 +250,7 @@ def _provenance_for_file(
     now: datetime,
     source_label: str,
     attestation_scope: Optional[str] = None,
+    diverged: bool = False,
     base_dir: Optional[Path] = None,
 ) -> SourceProvenance:
     """ファイル由来の as_of で鮮度を判定する。
@@ -238,9 +258,13 @@ def _provenance_for_file(
     ``attestation_scope`` を渡した場合、その対象について有効な
     「証券会社の内容と一致している」表明があれば as_of を表明時刻まで
     進める (2026-08-05)。holdings/account は楽天CSV取込でしか更新されず、
-    96h の壁時計だけで判定すると4日ごとに必ず stale 化して発注候補が
+    壁時計だけで判定すると一定期間ごとに必ず stale 化して発注候補が
     ready にならない自己ロックになるため。表明はその時点の内容ハッシュに
     紐づくので、内容が変われば自動的に失効する。
+
+    ``diverged`` が真なら、記録済みなのに holdings へ反映されていない約定が
+    あるということなので、経過時間に関係なく stale にする (2026-08-17)。
+    保有を狂わせるのは時間ではなく出来事なので、停止条件は出来事側に置く。
     """
     as_of = _extract_json_timestamp(path, ts_keys)
     label = source_label
@@ -254,11 +278,18 @@ def _provenance_for_file(
         )
         if origin == "attestation":
             label = f"{source_label}(attested)"
+    status = _freshness_status(as_of, now=now, max_age_hours=max_age_hours)
+    if diverged and status != "stale":
+        # 表明は「表明した時点の内容」を保証するだけで、その後に記録された
+        # 約定までは保証しない。ここで見ないと、attest 済みという理由で
+        # 未反映の約定を抱えたまま fresh を名乗ってしまう。
+        status = "stale"
+        label = f"{label}(diverged)"
     return SourceProvenance(
         source=label,
         source_as_of=as_of.isoformat() if as_of else None,
         retrieved_at=now.isoformat(),
-        freshness_status=_freshness_status(as_of, now=now, max_age_hours=max_age_hours),
+        freshness_status=status,
         max_age_policy_hours=max_age_hours,
         artifact_hash=_file_hash(path),
     )
@@ -277,18 +308,20 @@ def build_base_snapshot(*, base_dir: Path = BASE_DIR, now: Optional[datetime] = 
     ハッシュ化するだけ)。
     """
     now = now or datetime.now()
+    # 1スナップショット内で答えが変わってはいけないので、ここで1回だけ見る。
+    diverged = _holdings_diverged(base_dir)
 
     holdings = _provenance_for_file(
         base_dir / "holdings.json", ts_keys=("__mtime__",),
         max_age_hours=stale_after_hours("holdings"),
         now=now, source_label="holdings.json",
-        attestation_scope="holdings", base_dir=base_dir,
+        attestation_scope="holdings", diverged=diverged, base_dir=base_dir,
     )
     cash = _provenance_for_file(
         base_dir / "account.json", ts_keys=("last_updated",),
         max_age_hours=stale_after_hours("cash"),
         now=now, source_label="account.json",
-        attestation_scope="cash", base_dir=base_dir,
+        attestation_scope="cash", diverged=diverged, base_dir=base_dir,
     )
     prices = _provenance_for_file(
         base_dir / "technical_state.json", ts_keys=("cached_at",),

@@ -36,8 +36,17 @@ class FreshnessPolicy:
 
 
 SOURCE_FRESHNESS_POLICIES: dict[str, FreshnessPolicy] = {
-    "holdings": FreshnessPolicy(refresh_after_hours=None, stale_after_hours=96.0),
-    "cash": FreshnessPolicy(refresh_after_hours=None, stale_after_hours=96.0),
+    # holdings/cash には定期更新の生産者がいない (楽天CSV取込か本人の表明でしか
+    # 動かない)。そこに短い壁時計の失効を課すと、時間が経つこと自体が停止条件に
+    # なり、放置すれば必ず全候補が review に落ちる (2026-08: 6営業日連続0件)。
+    #
+    # 保有・現金を実際に狂わせるのは時間ではなく「記録されていない約定・入出金」
+    # という出来事なので、停止はその証拠 (未適用の broker確認済み約定) を掴んだ
+    # ときに掛ける — build_base_snapshot が holdings/cash に対して判定する。
+    # 壁時計は「そろそろ照合を」という助言 (refresh) に降格し、
+    # それでも何も分からない状態が続いた場合の最終防衛線として 30日を残す。
+    "holdings": FreshnessPolicy(refresh_after_hours=96.0, stale_after_hours=720.0),
+    "cash": FreshnessPolicy(refresh_after_hours=96.0, stale_after_hours=720.0),
     "technical": FreshnessPolicy(refresh_after_hours=4.0, stale_after_hours=8.0),
     "fx": FreshnessPolicy(refresh_after_hours=None, stale_after_hours=24.0),
     "macro": FreshnessPolicy(refresh_after_hours=12.0, stale_after_hours=24.0),
