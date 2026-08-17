@@ -982,7 +982,12 @@ def _snapshot_execution_plan_metadata(req: ExecutionRequest) -> dict:
 
 
 def _execution_strategy_class(req: ExecutionRequest) -> str:
-    """Persist the lane that owns this execution's daily-cap contract."""
+    """Persist the lane that owns this execution's daily-cap contract.
+
+    Historical rows without this field remain conservative normal buys.  New
+    rows must retain it because the allocator cannot reconstruct a Swing or
+    scenario exception from an immutable execution fact later.
+    """
     linked = _linked_ai_action(req)
     if str(linked.get("tier") or "").strip().lower() == "swing":
         return "swing"
@@ -1139,45 +1144,60 @@ def _execution_preflight_payload(req: ExecutionRequest) -> dict:
 
 
 def _enforce_execution_preflight(req: ExecutionRequest) -> dict | None:
-    """Enforce the reviewed envelope only for a new risk-increasing order.
+    """Measure the risk envelope for a new risk-increasing order without blocking it.
 
-    Filling a broker order is historical fact, so it must remain recordable;
-    the caller records that absence explicitly instead of rejecting it.
+    This used to reject the save unless the user had run the check by hand and
+    typed an acknowledgement.  The owner asked for the manual step to go: the
+    record button must work with no input.  So the envelope is now *measured*
+    at save time and written to the ledger, and never refuses the save.
+
+    That is a deliberate trade: an order is now recordable while the daily loss
+    limit or a drawdown stop is active.  What the state was at that moment stays
+    auditable through preflight_disposition / preflight_review_context.
+
+    Filling a broker order is historical fact and was always recordable; the
+    caller records that absence explicitly instead of rejecting it.
+
+    A pre-supplied token still wins when it is valid and bound to this exact
+    action, so an explicit acknowledgement keeps being recorded as one.
     """
     if req.status != Status.ordered or not _is_risk_increasing(req.direction):
         return None
-    from execution_preflight import action_digest, has_acknowledgement, validate_preflight_token
+    from execution_preflight import (
+        action_digest, evaluate_preflight, has_acknowledgement, validate_preflight_token,
+    )
 
-    digest = action_digest(_execution_preflight_payload(req))
-    try:
-        claims = validate_preflight_token(req.preflight_token, digest=digest)
-    except (ValueError, RuntimeError) as exc:
-        raise HTTPException(
-            status_code=409,
-            detail={
-                "code": "preflight_required_or_identity_mismatch",
-                "message": str(exc),
-            },
-        ) from exc
-    disposition = str(claims.get("disposition") or "")
-    if disposition == "hard_reject":
-        raise HTTPException(
-            status_code=409,
-            detail={"code": "preflight_hard_reject", "message": "絶対リスク上限により発注を記録できません"},
-        )
+    payload = _execution_preflight_payload(req)
+    digest = action_digest(payload)
+    claims: dict = {}
     acknowledged = False
-    if disposition == "confirmation_required":
-        acknowledged = has_acknowledgement(
-            base_dir=BASE_DIR, token=str(req.preflight_token), digest=digest,
-        )
-        if not acknowledged:
-            raise HTTPException(
-                status_code=409,
-                detail={
-                    "code": "preflight_human_acknowledgement_required",
-                    "message": "現在のリスク状態を確認し、明示承認してから発注を記録してください",
-                },
+    if req.preflight_token:
+        try:
+            claims = validate_preflight_token(req.preflight_token, digest=digest)
+            acknowledged = has_acknowledgement(
+                base_dir=BASE_DIR, token=str(req.preflight_token), digest=digest,
             )
+        except (ValueError, RuntimeError):
+            # 期限切れ・別アクション宛のトークンは「無かった」ものとして測り直す。
+            # 止めないのが目的なので、ここで例外を投げてはいけない。
+            claims = {}
+    if not claims:
+        try:
+            measured = evaluate_preflight(payload, base_dir=BASE_DIR)
+            # evaluate_preflight() は review_context をトークンの中にしか埋め込まない。
+            # 自分が今しがた発行したトークンを検証にかけて、トークン経路と同じ
+            # claims の形（review_context を含む）に揃える。ここを省くと、
+            # ゲートを通さない今の主経路（新規計測）だけ監査情報が空になる。
+            claims = validate_preflight_token(measured["preflight_token"], digest=digest)
+        except Exception as exc:
+            # 計測できなくても記録は止めない。測れなかったことを台帳に残す。
+            return {
+                "action_digest": digest,
+                "disposition": "unmeasured",
+                "acknowledged": False,
+                "review_context": {"measurement_error": str(exc)},
+            }
+    disposition = str(claims.get("disposition") or "")
     return {
         "action_digest": digest,
         "disposition": disposition,

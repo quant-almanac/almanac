@@ -397,10 +397,20 @@ def test_save_execution_records_to_execution_log(isolated) -> None:
     assert rec["execution_quote_snapshot"]["source_as_of"] == "2026-07-28T09:00:00+09:00"
     assert rec["decision_snapshot_id"] == "decision-1"
     assert rec["quote_as_of"] == "2026-07-28T09:00:00+09:00"
+    assert rec["strategy_class"] == "normal"
 
 
-def test_ordered_buy_requires_current_preflight_and_acknowledgement(isolated, monkeypatch) -> None:
-    """The actual order-record path enforces the same night-time risk result."""
+def test_execution_strategy_class_preserves_swing_and_scenario_lanes(monkeypatch):
+    swing = ExecutionRequest(ticker="V", direction="buy", quantity=1, price=1, currency="USD")
+    scenario = ExecutionRequest(ticker="V", direction="buy", quantity=1, price=1, currency="USD")
+    monkeypatch.setattr(actions, "_linked_ai_action", lambda req: {"tier": "Swing"})
+    assert actions._execution_strategy_class(swing) == "swing"
+    monkeypatch.setattr(actions, "_linked_ai_action", lambda req: {"source": "scenario_playbook"})
+    assert actions._execution_strategy_class(scenario) == "scenario"
+
+
+def _risk_shock_isolated(isolated, monkeypatch) -> dict:
+    """Set up account state whose risk envelope evaluates to confirmation_required."""
     import execution_preflight as preflight
 
     _write_json(isolated["holdings"], {})
@@ -415,23 +425,65 @@ def test_ordered_buy_requires_current_preflight_and_acknowledgement(isolated, mo
     )
     monkeypatch.setattr(preflight, "load_api_key", lambda: "test-preflight-key")
     monkeypatch.setattr(preflight, "_prospective_concentration", lambda payload, base_dir: 0.04)
-
-    request_values = {
+    return {
         "ticker": "7203.T", "direction": "buy", "quantity": 1, "price": 1000.0,
         "order_type": "limit", "limit_price": 990.0,
         "currency": "JPY", "account": "特定", "execution_owner": "husband",
         "execution_broker": "rakuten", "execution_position_keys": ["7203.T"],
     }
+
+
+def test_ordered_buy_saves_immediately_with_no_preflight_run_at_all(isolated, monkeypatch) -> None:
+    """The owner asked for the manual pre-order check to go: the record button
+    must work with no input.  A risk-increasing order now saves on the first
+    call, with no preflight/acknowledge round trip beforehand, even while the
+    daily loss guard is active — the envelope is measured and recorded, not
+    enforced."""
+    request_values = _risk_shock_isolated(isolated, monkeypatch)
+    ordered = ExecutionRequest(**request_values, status="ordered")
+
+    saved = asyncio.run(actions.save_execution(ordered))
+    assert saved["ok"] is True
+
+    record = _read(isolated["executions"])["executions"][0]
+    assert record["preflight_disposition"] == "confirmation_required"
+    assert record["preflight_acknowledged"] is False
+    assert "daily_loss_block" in record["preflight_review_context"]["reason_codes"]
+    # reported_without_preflight only applies to a reported fill (executed/partial);
+    # an "ordered" record's absence-of-review is expressed by disposition instead.
+    assert "reported_without_preflight" not in record
+
+
+def test_hard_reject_envelope_no_longer_blocks_the_save(isolated, monkeypatch) -> None:
+    """hard_reject used to return 409 and refuse the record entirely. It must
+    now save like any other disposition — the absolute cap becomes an audited
+    fact on the record, not a wall in front of it."""
+    import execution_preflight as preflight
+
+    request_values = _risk_shock_isolated(isolated, monkeypatch)
+    monkeypatch.setattr(
+        preflight, "classify_execution_risk",
+        lambda **kw: {"disposition": "hard_reject", "reasons": [], "hard_reasons": [
+            {"code": "absolute_var_cap", "message": "VaR超過"},
+        ]},
+    )
+    ordered = ExecutionRequest(**request_values, status="ordered")
+
+    saved = asyncio.run(actions.save_execution(ordered))
+    assert saved["ok"] is True
+    record = _read(isolated["executions"])["executions"][0]
+    assert record["preflight_disposition"] == "hard_reject"
+
+
+def test_a_valid_preexisting_token_still_records_as_an_explicit_acknowledgement(
+    isolated, monkeypatch,
+) -> None:
+    """A caller that still runs preflight + acknowledge by hand (or a future
+    UI that offers it optionally) must keep working exactly as before —
+    removing the requirement must not remove the capability."""
+    request_values = _risk_shock_isolated(isolated, monkeypatch)
     reviewed = asyncio.run(actions.preflight_execution(actions.PreflightRequest(**request_values)))
     assert reviewed["disposition"] == "confirmation_required"
-
-    ordered = ExecutionRequest(
-        **request_values, status="ordered", preflight_token=reviewed["preflight_token"],
-    )
-    with pytest.raises(HTTPException) as exc:
-        asyncio.run(actions.save_execution(ordered))
-    assert exc.value.status_code == 409
-    assert exc.value.detail["code"] == "preflight_human_acknowledgement_required"
 
     acknowledgement = asyncio.run(actions.acknowledge_preflight(actions.PreflightAcknowledgement(
         preflight_token=reviewed["preflight_token"],
@@ -439,6 +491,10 @@ def test_ordered_buy_requires_current_preflight_and_acknowledgement(isolated, mo
         acknowledgement_reason="daily shock reviewed after close",
     )))
     assert acknowledgement["ok"] is True
+
+    ordered = ExecutionRequest(
+        **request_values, status="ordered", preflight_token=reviewed["preflight_token"],
+    )
     saved = asyncio.run(actions.save_execution(ordered))
     assert saved["ok"] is True
     record = _read(isolated["executions"])["executions"][0]
@@ -451,6 +507,45 @@ def test_ordered_buy_requires_current_preflight_and_acknowledgement(isolated, mo
         .read_text(encoding="utf-8").splitlines()
     ]
     assert "daily_loss_block" in acknowledgement_rows[-1]["review_context"]["reason_codes"]
+
+
+def test_expired_or_mismatched_token_is_treated_as_absent_and_remeasured(
+    isolated, monkeypatch,
+) -> None:
+    """A stale token must not raise — it must fall back to measuring fresh,
+    the same as sending no token at all. Only evaluate_preflight() ever runs
+    in this path, so a bogus token can't smuggle a stale disposition through."""
+    request_values = _risk_shock_isolated(isolated, monkeypatch)
+    ordered = ExecutionRequest(
+        **request_values, status="ordered", preflight_token="not-a-real-token",
+    )
+    saved = asyncio.run(actions.save_execution(ordered))
+    assert saved["ok"] is True
+    record = _read(isolated["executions"])["executions"][0]
+    assert record["preflight_disposition"] == "confirmation_required"
+    assert record["preflight_acknowledged"] is False
+
+
+def test_measurement_failure_still_saves_and_records_unmeasured(isolated, monkeypatch) -> None:
+    """If the risk envelope itself can't be computed, the save must not be
+    the thing that fails — that would recreate the exact block being removed
+    here, just behind a different exception."""
+    import execution_preflight as preflight
+
+    request_values = _risk_shock_isolated(isolated, monkeypatch)
+
+    def _boom(payload, *, base_dir):
+        raise RuntimeError("guard_state.json unreadable")
+
+    # _enforce_execution_preflight does `from execution_preflight import evaluate_preflight`
+    # inside the function body, so patching the source module is what takes effect.
+    monkeypatch.setattr(preflight, "evaluate_preflight", _boom)
+    ordered = ExecutionRequest(**request_values, status="ordered")
+
+    saved = asyncio.run(actions.save_execution(ordered))
+    assert saved["ok"] is True
+    record = _read(isolated["executions"])["executions"][0]
+    assert record["preflight_disposition"] == "unmeasured"
 
 
 def test_reported_fill_is_recorded_without_preflight_not_rejected(isolated) -> None:
@@ -520,19 +615,27 @@ def test_duplicate_broker_execution_id_is_rejected_before_second_apply(isolated)
 
 def test_web_broker_confirmation_gets_server_side_evidence_hash(isolated) -> None:
     req = ExecutionRequest(
-        ticker="7203.T", direction="buy", quantity=1, price=1_000.0,
-        currency="JPY", account="特定", status="executed",
-        execution_owner="husband", execution_broker="rakuten",
+        ticker="7203.T",
+        direction="buy",
+        quantity=1,
+        price=1_000.0,
+        currency="JPY",
+        account="特定",
+        status="executed",
+        execution_owner="husband",
+        execution_broker="rakuten",
         broker_confirmed_filled=True,
         external_execution_id="rakuten-web-123",
         broker_source="web_manual_confirmation",
         broker_reported_at="2026-07-28T08:55:00+09:00",
-        filled_quantity=1, filled_price=1_000.0,
+        filled_quantity=1,
+        filled_price=1_000.0,
         reconciled_at="2026-07-28T09:00:00+09:00",
     )
 
     asyncio.run(actions.save_execution(req))
     record = _read(isolated["executions"])["executions"][0]
+
     assert record["broker_confirmed_filled"] is True
     assert record["broker_source"] == "web_manual_confirmation"
     assert record["reconciliation_snapshot_hash"].startswith("sha256:")
