@@ -29,6 +29,18 @@ def _isolate_llm_call_log(tmp_path, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _isolate_action_stage_log(tmp_path, monkeypatch):
+    """The stage ledger ignores ALMANAC_STATE_DIR, so isolate it explicitly."""
+    import action_stage_log
+    log = tmp_path / "action_stage_log.jsonl"
+    monkeypatch.setattr(action_stage_log, "LOG_PATH", log)
+    # 読み出しキャッシュは後から入った層。無い版でも fixture は成立させる。
+    cache = getattr(action_stage_log, "_read_analysis_entries_cached", None)
+    if cache is not None:
+        cache.cache_clear()
+    return log
+
+@pytest.fixture(autouse=True)
 def _isolate_yfinance_sqlite_cache(tmp_path, monkeypatch):
     """Keep yfinance SQLite/cache files out of production during tests."""
     cache_root = tmp_path / "yfinance-cache"

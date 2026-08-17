@@ -46,3 +46,50 @@ def test_funding_alternatives_offer_wallet_fx_and_no_trade_without_moving_cash()
     assert "cross_owner_transfer_then_current_route" in kinds
     assert "fx_then_taxable_wallet" in kinds
     assert kinds[-1] == "no_trade"
+
+
+def test_funding_workflow_links_required_transfer_to_reprice_then_buy():
+    cash_status = _build_cash_status({
+        "cash_info": {"wallets": [
+            {"wallet_key": "husband|sbi|broker_cash|JPY", "owner": "husband", "broker": "sbi",
+             "settlement_pool": "broker_cash", "currency": "JPY", "available_native": 195324, "resources": []},
+            {"wallet_key": "husband|rakuten|broker_cash|USD", "owner": "husband", "broker": "rakuten",
+             "settlement_pool": "broker_cash", "currency": "USD", "available_native": 54256, "resources": []},
+        ]},
+    }, {})
+    options = _build_funding_alternatives([
+        {
+            "ticker": "1489.T", "type": "buy", "currency": "JPY",
+            "execution_owner": "wife", "execution_broker": "sbi", "execution_account": "NISA成長投資枠",
+            "effective_cash": 146734, "original_quantity": 150, "original_notional_jpy": 524850,
+            "minimum_executable_quantity": 43, "minimum_executable_notional_jpy": 150457,
+            "capacity_shortfall_jpy": 3723,
+            "execution_block_reasons": [
+                {"code": "cash_balance_insufficient"},
+                {"code": "max_executable_quantity_below_minimum"},
+            ],
+        },
+    ], cash_status, fx_rate_usdjpy=159.0)
+
+    result = options[0]
+    assert result["funding_required"] is True
+    direct = next(
+        row for row in result["funding_workflows"]
+        if row["kind"] == "cross_owner_transfer_then_reprice_buy"
+        and row["requirement"]["kind"] == "minimum_executable"
+    )
+    assert direct["minimum_transfer_native"] == 3723
+    assert direct["can_fund"] is True
+    assert direct["steps"][-2:] == ["買付数量・現在値・NISA枠を再評価", "買付をpreflightして発注"]
+
+    fx = next(
+        row for row in result["funding_workflows"]
+        if row["kind"] == "fx_then_cross_owner_transfer_then_reprice_buy"
+        and row["requirement"]["kind"] == "original_quantity"
+    )
+    assert fx["minimum_transfer_native"] == 378116
+    assert fx["can_fund"] is True
+    assert fx["confirmation_endpoints"] == [
+        "/api/cash/fx-conversions/confirm",
+        "/api/cash/cross-owner-transfer/confirm",
+    ]

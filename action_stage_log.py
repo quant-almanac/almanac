@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import json
 import uuid
+from functools import lru_cache
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -369,3 +370,51 @@ def read_entries(
                 continue
             entries.append(entry)
     return entries
+
+
+@lru_cache(maxsize=3)
+def _read_analysis_entries_cached(
+    path_str: str,
+    analysis_id: str,
+    mtime_ns: int,
+    size: int,
+) -> tuple[dict, ...]:
+    """Read one analysis from the append-only log.
+
+    ``mtime_ns`` and ``size`` deliberately participate in the cache key: a
+    later append must be visible to Today, while its 120-second polling must
+    not repeatedly parse an unchanged ledger.
+    """
+    del mtime_ns, size  # cache invalidation inputs; the file is read below.
+    entries: list[dict] = []
+    try:
+        with open(path_str, encoding="utf-8") as f:
+            for line in f:
+                try:
+                    entry = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if entry.get("analysis_id") == analysis_id:
+                    entries.append(entry)
+    except OSError:
+        return ()
+    return tuple(entries)
+
+
+def read_analysis_entries(analysis_id: str, path: "Path | None" = None) -> list[dict]:
+    """Return a defensive copy of entries for one analysis ID.
+
+    The helper intentionally resolves ``LOG_PATH`` at call time so tests can
+    monkeypatch it and production callers never write to the ledger.
+    """
+    if not analysis_id:
+        return []
+    _path = path if path is not None else LOG_PATH
+    try:
+        stat = _path.stat()
+    except OSError:
+        return []
+    rows = _read_analysis_entries_cached(
+        str(_path.resolve()), str(analysis_id), stat.st_mtime_ns, stat.st_size,
+    )
+    return [dict(row) for row in rows]

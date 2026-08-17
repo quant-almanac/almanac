@@ -459,8 +459,9 @@ class TestDcaCashFix:
         sys.modules.setdefault("macro_fetcher", type(sys)("macro_fetcher"))
         sys.modules["macro_fetcher"].get_macro_context = lambda: {}
         sys.modules["macro_fetcher"].classify_panic = lambda x: {}
-        sys.modules.setdefault("vix_tracker", type(sys)("vix_tracker"))
-        sys.modules["vix_tracker"].get_vix_context = lambda: {}
+        fake_vix_tracker = type(sys)("vix_tracker")
+        fake_vix_tracker.get_vix_context = lambda: {}
+        monkeypatch.setitem(sys.modules, "vix_tracker", fake_vix_tracker)
         result = dca.generate_ladder_signals(
             cash_jpy=1000000.0,
             dry_run=True,
@@ -1168,9 +1169,10 @@ class TestR3DcaStateConsumption:
         sys.modules["macro_fetcher"].get_macro_context = lambda: {}
         sys.modules["macro_fetcher"].classify_panic = lambda x: {
             "fear_greed": 10, "hy_oas_bps": 600, "put_call": 1.5, "vix": 45}
-        sys.modules.setdefault("vix_tracker", type(sys)("vix_tracker"))
-        sys.modules["vix_tracker"].get_vix_context = lambda: {
+        fake_vix_tracker = type(sys)("vix_tracker")
+        fake_vix_tracker.get_vix_context = lambda: {
             "vix": {"level": 45, "decay_from_peak_5d_pct": -12}}
+        monkeypatch.setitem(sys.modules, "vix_tracker", fake_vix_tracker)
         # JPY/USD ともゼロ cash の breakdown
         cb = {"jpy": 0.0, "usd_jpy": 0.0, "total_jpy": 5000000.0}
         sig = dca.generate_ladder_signals(cash_jpy=5000000.0, dry_run=False, cash_breakdown=cb)
@@ -1319,9 +1321,10 @@ class TestR4DcaZeroYenTranche:
         sys.modules["macro_fetcher"].get_macro_context = lambda: {}
         sys.modules["macro_fetcher"].classify_panic = lambda x: {
             "fear_greed": 10, "hy_oas_bps": 600, "put_call": 1.5, "vix": 45}
-        sys.modules.setdefault("vix_tracker", type(sys)("vix_tracker"))
-        sys.modules["vix_tracker"].get_vix_context = lambda: {
+        fake_vix_tracker = type(sys)("vix_tracker")
+        fake_vix_tracker.get_vix_context = lambda: {
             "vix": {"level": 45, "decay_from_peak_5d_pct": -12}}
+        monkeypatch.setitem(sys.modules, "vix_tracker", fake_vix_tracker)
         cb = {"jpy": 0.0, "usd_jpy": 0.0, "total_jpy": 5000000.0}
         sig = dca.generate_ladder_signals(cash_jpy=5000000.0, dry_run=True, cash_breakdown=cb)
         # 条件成立だが投入0 → active_tranche=None, would_be_tranche に退避

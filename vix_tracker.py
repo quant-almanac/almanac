@@ -93,6 +93,33 @@ def _safe_pct_change(series, periods: int):
         return None
 
 
+def _safe_point_change(series, periods: int):
+    """periods 日前からの絶対差（ポイント）。利回りは比ではなくbpsで見るのが市場慣行
+    (spread_change_5d と同じ考え方)。失敗時 None。"""
+    try:
+        s = series.dropna()
+        if len(s) < periods + 1:
+            return None
+        return float(s.iloc[-1] - s.iloc[-(periods + 1)])
+    except Exception:
+        return None
+
+
+def _series_to_history(series) -> list:
+    """pandas Series（日付インデックス→終値）を日付昇順の履歴配列に変換。
+    NaN は除外し、終値は小数第2位に丸める。失敗時は空配列（合成せず「データなし」を維持）。"""
+    if series is None:
+        return []
+    try:
+        clean = series.dropna().sort_index()
+        return [
+            {"date": idx.strftime("%Y-%m-%d"), "close": round(float(value), 2)}
+            for idx, value in clean.items()
+        ]
+    except Exception:
+        return []
+
+
 def _compute_vix_decay_from_peak(series, window: int = 5) -> float | None:
     """
     直近 `window` 営業日の VIX ピークからの減衰率（%）。
@@ -185,6 +212,9 @@ def _fetch_all() -> dict | None:
         # 新規: ピーク減衰（例: -12.5 → 直近 5 日ピークから 12.5% 下がった）
         "decay_from_peak_5d_pct":  decay_from_peak_5d,
         "decay_from_peak_10d_pct": decay_from_peak_10d,
+        # 新規: 1mo バッチ取得で既に手元にある日次終値をそのまま保存(再取得なし)。
+        # 表示側(PulseLine)が「5日前・1日前・現在」の3点合成をやめて実系列を描くために使う。
+        "history_1mo": _series_to_history(vix_close),
     }
 
     # ── VIX ターム構造 ──
@@ -208,6 +238,8 @@ def _fetch_all() -> dict | None:
         "price": _round_or_none(_safe_last(oil_close)),
         "change_1d_pct": _round_or_none(_safe_pct_change(oil_close, 1)),
         "change_5d_pct": _round_or_none(_safe_pct_change(oil_close, 5)),
+        # VIX と同様、1mo バッチ取得で既に手元にある終値をそのまま保存(再取得なし)。
+        "history_1mo": _series_to_history(oil_close),
     }
 
     # ── 金利 & イールドカーブ ──
@@ -240,6 +272,11 @@ def _fetch_all() -> dict | None:
         "spread_10y_3m": round(spread, 3) if spread is not None else None,
         "yield_curve": "inverted" if (spread is not None and spread < 0) else "normal",
         "spread_change_5d": spread_change_5d,
+        # 10年債自体の1日/5日変化(pt)。比ではなく絶対差 — 利回りは%変化では読まない。
+        "us_10y_change_1d_pt": _round_or_none(_safe_point_change(tnx_close, 1)),
+        "us_10y_change_5d_pt": _round_or_none(_safe_point_change(tnx_close, 5)),
+        # 10年債の実系列(1mo)。米国株・VIXと並べて金利レジームの「鼓動」を見せるために使う。
+        "us_10y_history_1mo": _series_to_history(tnx_close),
     }
 
     # ── 30年債 & 30Y-10Y スプレッド ──
@@ -300,6 +337,9 @@ def _fetch_all() -> dict | None:
         "level": _round_or_none(_safe_last(dxy_close)),
         "change_1d_pct": _round_or_none(_safe_pct_change(dxy_close, 1)),
         "change_5d_pct": _round_or_none(_safe_pct_change(dxy_close, 5)),
+        # 円建て資産保有者にとってのFXレジーム。米国株(円換算)の変動のうちFX起因分を
+        # 切り分けて読めるようにする。
+        "history_1mo": _series_to_history(dxy_close),
     }
 
     # ── USD/CNY ──
@@ -526,7 +566,7 @@ def get_vix_context() -> dict:
 
     # 完全にデータなし
     return {
-        "vix": {"level": None, "classification": "UNKNOWN", "change_1d": None, "change_5d": None},
+        "vix": {"level": None, "classification": "UNKNOWN", "change_1d": None, "change_5d": None, "history_1mo": []},
         "vix_term_structure": {"vix3m": None, "ratio": None, "structure": "unknown"},
         "oil": {"price": None, "change_1d_pct": None, "change_5d_pct": None},
         "yields": {"us_10y": None, "us_3m": None, "spread_10y_3m": None, "yield_curve": "unknown", "spread_change_5d": None, "us_30y": None, "spread_30y_10y": None},

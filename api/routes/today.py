@@ -81,8 +81,181 @@ def _build_cash_status(execution_plan_state: dict, holdings: dict) -> list[dict]
     return rows
 
 
-def _build_funding_alternatives(actions: list[dict], cash_status: list[dict]) -> list[dict]:
-    """Show routes that are possible to compare; never infer or move cash."""
+def _as_positive_number(value: object) -> float | None:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed > 0 else None
+
+
+def _funding_requirements(action: dict, *, currency: str) -> list[dict]:
+    """Derive explicitly blocked buy-funding choices without changing the order.
+
+    A cash movement is never an order instruction.  It only becomes useful when
+    the action already contains structured capacity diagnostics, after which the
+    caller must reprice and run preflight again.  This keeps a transfer and an
+    order as dependent human-confirmed steps rather than pretending that they
+    can settle atomically.
+    """
+    reasons = action.get("execution_block_reasons") or []
+    codes = {
+        str(reason.get("code") or "")
+        for reason in reasons if isinstance(reason, dict)
+    }
+    if "cash_balance_insufficient" not in codes and "max_executable_quantity_below_minimum" not in codes:
+        return []
+
+    # Capacity resizing currently produces deterministic JPY diagnostics.  Do
+    # not invent a foreign-currency amount from a stale/free-text price.
+    if currency != "JPY":
+        return []
+
+    resize_reason = next(
+        (reason for reason in reasons if isinstance(reason, dict)
+         and str(reason.get("code") or "") == "max_executable_quantity_below_minimum"),
+        {},
+    )
+    cash_reason = next(
+        (reason for reason in reasons if isinstance(reason, dict)
+         and str(reason.get("code") or "") == "cash_balance_insufficient"),
+        {},
+    )
+    effective_cash = _as_positive_number(
+        action.get("effective_cash")
+        or ((action.get("cash_capacity_observation") or {}).get("effective_cash"))
+        or cash_reason.get("available_cash")
+    ) or 0.0
+    original_notional = _as_positive_number(action.get("original_notional_jpy")) or _as_positive_number(
+        action.get("estimated_notional_jpy")
+    )
+    requirements: list[dict] = []
+
+    minimum_quantity = _as_positive_number(
+        action.get("minimum_executable_quantity") or resize_reason.get("minimum_executable_quantity")
+    )
+    minimum_notional = _as_positive_number(
+        action.get("minimum_executable_notional_jpy") or resize_reason.get("minimum_executable_notional_jpy")
+    )
+    minimum_shortfall = _as_positive_number(
+        action.get("capacity_shortfall_jpy") or resize_reason.get("capacity_shortfall_jpy")
+    )
+    if minimum_quantity and minimum_notional and minimum_shortfall:
+        requirements.append({
+            "kind": "minimum_executable",
+            "target_quantity": int(minimum_quantity) if minimum_quantity.is_integer() else minimum_quantity,
+            "target_notional_jpy": round(minimum_notional),
+            "minimum_funding_jpy": round(minimum_shortfall),
+            "description": "最小取引額を満たす数量へ縮小して買付",
+        })
+
+    if original_notional:
+        original_shortfall = max(original_notional - effective_cash, 0.0)
+        if original_shortfall > 0:
+            requirements.append({
+                "kind": "original_quantity",
+                "target_quantity": action.get("original_quantity"),
+                "target_notional_jpy": round(original_notional),
+                "minimum_funding_jpy": round(original_shortfall),
+                "description": "AI提案の元数量を維持して買付",
+            })
+    return requirements
+
+
+def _funding_workflows(
+    *,
+    action: dict,
+    wallets: list[dict],
+    requirements: list[dict],
+    currency: str,
+    fx_rate_usdjpy: float | None,
+) -> list[dict]:
+    """Return confirmation -> reprice -> buy workflows; never write cash."""
+    owner = str(action.get("execution_owner") or "")
+    broker = str(action.get("execution_broker") or "")
+    account = action.get("execution_account")
+    if not owner or not broker or not requirements:
+        return []
+
+    workflows: list[dict] = []
+    for requirement in requirements:
+        required_jpy = float(requirement["minimum_funding_jpy"])
+        for wallet in wallets:
+            available = _as_positive_number(wallet.get("available_for_new_buy")) or 0.0
+            wallet_owner = str(wallet.get("owner") or "")
+            wallet_broker = str(wallet.get("broker") or "")
+            wallet_currency = str(wallet.get("currency") or "").upper()
+            if (
+                wallet_currency == currency
+                and not (wallet_owner == owner and wallet_broker == broker)
+                and wallet_owner != owner
+            ):
+                workflows.append({
+                    "kind": "cross_owner_transfer_then_reprice_buy",
+                    "requirement": requirement,
+                    "source_wallet_key": wallet.get("wallet_key"),
+                    "source_owner": wallet_owner,
+                    "source_broker": wallet_broker,
+                    "source_currency": wallet_currency,
+                    "source_available_native": available,
+                    "minimum_transfer_native": round(required_jpy),
+                    "can_fund": available >= required_jpy,
+                    "confirmation_endpoint": "/api/cash/cross-owner-transfer/confirm",
+                    "tax_notice": "税務確認の必要性を記録するだけで、非課税判定・税務助言はしません。",
+                    "steps": [
+                        "資金移動を実行し、実績を確認して記録",
+                        "買付数量・現在値・NISA枠を再評価",
+                        "買付をpreflightして発注",
+                    ],
+                    "target_route": {"owner": owner, "broker": broker, "account": account, "currency": currency},
+                })
+
+            # USD -> JPY -> spouse transfer is deliberately two confirmations.
+            # It is offered only for the concrete husband/Rakuten FX route that
+            # has a matching confirmation API; other routes remain visible as
+            # alternatives but are never guessed into a cash movement.
+            if (
+                wallet_owner == "husband" and wallet_broker == "rakuten"
+                and wallet_currency == "USD" and currency == "JPY"
+                and fx_rate_usdjpy and fx_rate_usdjpy > 0
+            ):
+                required_usd = required_jpy / fx_rate_usdjpy
+                workflows.append({
+                    "kind": "fx_then_cross_owner_transfer_then_reprice_buy",
+                    "requirement": requirement,
+                    "source_wallet_key": wallet.get("wallet_key"),
+                    "source_owner": wallet_owner,
+                    "source_broker": wallet_broker,
+                    "source_currency": "USD",
+                    "source_available_native": available,
+                    "minimum_fx_native": round(required_usd, 2),
+                    "minimum_transfer_native": round(required_jpy),
+                    "target_currency": "JPY",
+                    "fx_rate_usdjpy": fx_rate_usdjpy,
+                    "can_fund": available >= required_usd,
+                    "confirmation_endpoints": [
+                        "/api/cash/fx-conversions/confirm",
+                        "/api/cash/cross-owner-transfer/confirm",
+                    ],
+                    "tax_notice": "税務確認の必要性を記録するだけで、非課税判定・税務助言はしません。",
+                    "steps": [
+                        "楽天USDを円へ両替し、実績を確認して記録",
+                        "妻SBIへ資金移動し、実績を確認して記録",
+                        "買付数量・現在値・NISA枠を再評価",
+                        "買付をpreflightして発注",
+                    ],
+                    "target_route": {"owner": owner, "broker": broker, "account": account, "currency": currency},
+                })
+    return workflows
+
+
+def _build_funding_alternatives(
+    actions: list[dict],
+    cash_status: list[dict],
+    *,
+    fx_rate_usdjpy: float | None = None,
+) -> list[dict]:
+    """Show routes and dependent funding workflows; never infer or move cash."""
     wallets = [row for row in cash_status if isinstance(row, dict)]
     out: list[dict] = []
     for action in actions:
@@ -122,19 +295,6 @@ def _build_funding_alternatives(actions: list[dict], cash_status: list[dict]) ->
                     "confirmation_endpoint": "/api/cash/cross-owner-transfer/confirm",
                     "tax_notice": "税務確認の必要性を記録するだけで、非課税判定・税務助言はしません。",
                 })
-            if action.get("execution_owner") == "wife" and wallet.get("owner") == "husband":
-                alternatives.append({
-                    "kind": "cross_owner_transfer_then_current_route",
-                    "from_owner": "husband",
-                    "from_broker": wallet.get("broker"),
-                    "to_owner": "wife",
-                    "to_broker": action.get("execution_broker"),
-                    "currency": currency,
-                    "wallet_key": wallet.get("wallet_key"),
-                    "available_native": wallet.get("available_for_new_buy"),
-                    "confirmation_endpoint": "/api/cash/cross-owner-transfer/confirm",
-                    "tax_notice": "税務確認の必要性を記録するだけで、非課税判定・税務助言はしません。",
-                })
         opposite_currency = "USD" if currency == "JPY" else "JPY"
         for wallet in wallets:
             if (wallet.get("owner"), wallet.get("broker"), str(wallet.get("currency") or "").upper()) == (
@@ -152,7 +312,20 @@ def _build_funding_alternatives(actions: list[dict], cash_status: list[dict]) ->
                     "confirmation_endpoint": "/api/cash/fx-conversions/confirm",
                 })
         alternatives.append({"kind": "no_trade", "label": "見送り"})
-        out.append({"ticker": action.get("ticker"), "action_type": action.get("type"), "alternatives": alternatives})
+        requirements = _funding_requirements(action, currency=currency)
+        out.append({
+            "ticker": action.get("ticker"),
+            "action_type": action.get("type"),
+            "alternatives": alternatives,
+            "funding_required": bool(requirements),
+            "funding_workflows": _funding_workflows(
+                action=action,
+                wallets=wallets,
+                requirements=requirements,
+                currency=currency,
+                fx_rate_usdjpy=fx_rate_usdjpy,
+            ),
+        })
     return out
 
 
@@ -587,6 +760,36 @@ def _market_sessions(now: datetime) -> list[dict]:
     ]
 
 
+def _cash_flow_by_date(date_from: datetime, date_to: datetime) -> dict[str, float]:
+    """event_ledger の cash_flow を日付ごとに合計する（入金は正・出金は負）。
+
+    相場暦の日次損益から同日の入出金を差し引き、「市場で勝ったか負けたか」だけを
+    残すために使う。台帳が読めない場合は空 dict を返し、呼び出し側は
+    差し引きなし（従来どおり）で動く — ここで失敗しても表示は止めない。
+    """
+    try:
+        import event_ledger
+        events = event_ledger.query_events(
+            types=["cash_flow"],
+            date_from=date_from.strftime("%Y-%m-%d"),
+            date_to=date_to.strftime("%Y-%m-%d"),
+        )
+    except Exception:
+        return {}
+
+    by_date: dict[str, float] = {}
+    for event in events or []:
+        day = str(event.get("occurred_at") or "")[:10]
+        if not day:
+            continue
+        try:
+            amount = float(event.get("amount_jpy") or 0)
+        except (TypeError, ValueError):
+            continue
+        by_date[day] = by_date.get(day, 0.0) + amount
+    return by_date
+
+
 def _build_almanac(board: list[dict], analysis: dict, currency: dict, nisa: dict, now: datetime, guard: dict) -> dict:
     is_weekday = now.weekday() < 5
 
@@ -685,11 +888,20 @@ def _build_almanac(board: list[dict], analysis: dict, currency: dict, nisa: dict
         })
 
     # 日次損益（guard pnl_history）→ {date: pnl_jpy}
+    #
+    # guard の daily_pnl_jpy は behavioral_guard.snapshot_portfolio_pnl() が書く
+    # 「総評価額の前日差分」で、総評価額には現金が含まれる (portfolio_manager:403)。
+    # つまり ¥100,000 を入金しただけの日が +¥100,000 の「利益」に見える。
+    # 定期積立 (クレカ¥100,000/月・妻SBI¥23,076/週) が毎月20万円ほどあるため、
+    # そのまま出すと相場暦が実力を大きく過大表示する。
+    # event_ledger の cash_flow を同日分だけ差し引き、純粋な売買損益に直す。
+    flow_by_date = _cash_flow_by_date(past_cutoff, now)
     pnl_by_date: dict[str, float] = {}
     for row in guard.get("pnl_history") or []:
         dt = _parse_dt(row.get("date"))
         if dt and dt >= past_cutoff:
-            pnl_by_date[dt.strftime("%Y-%m-%d")] = row.get("pnl_jpy") or 0
+            key = dt.strftime("%Y-%m-%d")
+            pnl_by_date[key] = round((row.get("pnl_jpy") or 0) - flow_by_date.get(key, 0.0))
 
     return {
         "today": today_events,
@@ -1212,14 +1424,384 @@ def _build_execution_plan_view(plan: dict, board: list[dict], synthesis: dict, n
     }
 
 
+_FLOW_LOG_STAGES = {
+    "tier_generated", "opus_raw", "policy_accepted", "policy_rejected",
+    "post_filter_final", "post_filter_rejected", "post_filter_deferred", "executed",
+}
+
+
+def _flow_identity(item: dict, analysis_id: str) -> tuple[str, tuple[str, str], bool]:
+    """Return stable full/base identities for a flow action without inventing data."""
+    ticker = str(item.get("ticker") or "").strip().upper()
+    action_type = str(item.get("canonical_action_type") or item.get("type") or item.get("action_type") or "").strip().lower()
+    account = str(item.get("execution_account") or item.get("account") or "").strip()
+    base = (ticker, action_type)
+    full = "|".join((str(analysis_id or ""), ticker, action_type, account or "∅"))
+    return full, base, bool(ticker and action_type and account)
+
+
+def _unselected_candidates(entries: list[dict]) -> list[dict]:
+    """AI合成で採用されなかった候補を、束ねずに1件ずつ返す。
+
+    tier_generated（生成された全候補）と opus_raw（合成が採った候補）を
+    (銘柄, 手口, tier) で突き合わせる。
+
+    account を識別子に混ぜてはいけない。口座が決まるのは opus_raw 以降で
+    tier_generated 側は常に空なので、account を含めると採用された候補が
+    別人格になり「採用された」と「採用されなかった」の両方に現れる。
+
+    tier を含めるのも必須で、XLF は Long と Medium の両レーンから
+    別々に上がってくる。tier を落とすと2件が1件に潰れ、
+    Medium が採られた時に Long の不採用が消える。
+
+    突き合わせは (銘柄, 手口, tier) → (銘柄, 手口) → (銘柄) の順に緩める。
+    合成はレーンも手口も乗り換えることがあり、実データでは Long/add と
+    MarginLong/margin_buy で上がった V が Medium/buy として採用された。
+    厳密キーだけだと相殺できず、V が採用側と不採用側の両方に出て
+    件数がファネルの脱落数と食い違った。
+
+    採用1件につき生成1件だけを相殺する（多重集合）。
+    """
+    def ident(e: dict) -> tuple[str, str, str]:
+        return (
+            str(e.get("ticker") or "").strip().upper(),
+            str(e.get("canonical_action_type") or e.get("type") or "").strip().lower(),
+            str(e.get("tier") or "").strip(),
+        )
+
+    generated = [e for e in entries if e.get("stage") == "tier_generated"]
+    picked = [ident(e) for e in entries if e.get("stage") == "opus_raw"]
+    cancelled: set[int] = set()
+
+    # 採用ごとに緩めていくのではなく、全採用について厳密一致を先に済ませる。
+    # 1件ずつ緩めると、緩い規則の採用が別の採用の厳密一致行を先に食う。
+    pending = list(picked)
+    for narrow in (3, 2, 1):
+        carry = []
+        for want in pending:
+            hit = next(
+                (i for i, g in enumerate(generated)
+                 if i not in cancelled and ident(g)[:narrow] == want[:narrow]),
+                None,
+            )
+            if hit is None:
+                carry.append(want)
+            else:
+                cancelled.add(hit)
+        pending = carry
+
+    out: list[dict] = []
+    for i, e in enumerate(generated):
+        if i in cancelled:
+            continue
+        out.append({
+            "ticker": e.get("ticker"),
+            "type": e.get("canonical_action_type") or e.get("type"),
+            "tier": e.get("tier"),
+            "confidence_pct": e.get("confidence_pct"),
+            "estimated_notional_jpy": e.get("estimated_notional_jpy"),
+            "urgency": e.get("urgency"),
+        })
+    return out
+
+
+def _flow_lifecycle_status(row: dict, *, executed: bool) -> tuple[str, str]:
+    """Project current lifecycle state without letting a stale log approve an order."""
+    lifecycle = str((row.get("lifecycle") or {}).get("status") or "proposed").lower()
+    if lifecycle in {"cancelled", "expired"}:
+        return "closed", lifecycle
+    if lifecycle == "reprice_required":
+        return "review", lifecycle
+    # A matching execution record is a later state than a still-visible
+    # pending/placed/filled lifecycle entry.  Terminal lifecycle states above
+    # remain authoritative because they describe a subsequent cancellation or
+    # required re-evaluation.
+    if executed:
+        return "ready", "executed"
+    if lifecycle == "placed":
+        return "ready", "ordered"
+    if lifecycle == "filled":
+        return "ready", "filled"
+    if lifecycle in {"pending", "proposed"}:
+        return "ready", "not_started"
+    return "review", "not_started"
+
+
+def _build_decision_flow(
+    *,
+    analysis_id: str | None,
+    synthesis: dict,
+    board: list[dict],
+    review_board: list[dict],
+    execution_plan: dict | None,
+    decision_summary: dict | None,
+) -> dict:
+    """Build a read-only, fail-closed projection for the Today decision graph.
+
+    The audit log explains how a candidate moved through analysis.  The board
+    and review board remain the source of truth for its *current* executable
+    position, because invalidation/expiry overlays happen after the log was
+    written.
+    """
+    base = {
+        "version": 1,
+        "analysis_id": analysis_id,
+        "status": "unavailable",
+        "stages": [],
+        "actions": [],
+        "unselected": [],
+        "detail_coverage": {
+            "status": "unavailable", "filtered_total": 0,
+            "filtered_materialized": 0, "sample_limit": None,
+        },
+        "integrity": {
+            "status": "unavailable", "scope": "analysis_id", "unit": "mixed",
+            "account_branch_count": 0,
+        },
+    }
+    if not analysis_id:
+        return base
+
+    try:
+        from action_stage_log import read_analysis_entries
+        entries = [e for e in read_analysis_entries(analysis_id) if e.get("stage") in _FLOW_LOG_STAGES]
+    except Exception:
+        entries = []
+
+    # Full filtered actions are the reliable detail source.  The execution-plan
+    # endpoint intentionally exposes only five examples, so it must never make
+    # an otherwise normal sixth rejection look untraceable.
+    filtered_actions = [a for a in (synthesis.get("_filtered_actions") or []) if isinstance(a, dict)]
+    deferred_actions = [a for a in (synthesis.get("order_intent_deferred_actions") or []) if isinstance(a, dict)]
+    plan_examples = (execution_plan or {}).get("filtered_examples") or []
+    plan_summary = (execution_plan or {}).get("filtered_summary") or {}
+    plan_filtered_total = sum(v for v in plan_summary.values() if isinstance(v, int))
+    filtered_total = max(len(filtered_actions), plan_filtered_total)
+    if filtered_actions:
+        detail_coverage = {"status": "complete", "filtered_total": filtered_total,
+                           "filtered_materialized": len(filtered_actions), "sample_limit": None}
+    elif filtered_total:
+        detail_coverage = {"status": "sampled", "filtered_total": filtered_total,
+                           "filtered_materialized": len(plan_examples), "sample_limit": 5}
+    else:
+        detail_coverage = {"status": "complete", "filtered_total": 0,
+                           "filtered_materialized": 0, "sample_limit": None}
+
+    records: dict[str, dict] = {}
+    base_keys: dict[tuple[str, str], list[str]] = {}
+
+    def ensure(item: dict, *, from_log: bool = False) -> dict:
+        full, pair, exact = _flow_identity(item, analysis_id)
+        key = full
+        if not exact:
+            existing = base_keys.get(pair, [])
+            if len(existing) == 1:
+                key = existing[0]
+            elif len(existing) > 1:
+                key = f"{full}|ambiguous:{len(records)}"
+        record = records.get(key)
+        if record is None:
+            record = {
+                "key": key,
+                "ticker": item.get("ticker"), "type": item.get("canonical_action_type") or item.get("type"),
+                "account": item.get("account") or item.get("execution_account"),
+                "identity_quality": "exact" if exact else "fallback_unique",
+                "stage_states": {}, "log_reasons": [], "overlay_reasons": [],
+                "from_log": from_log, "board": None, "review": None,
+                "filtered": False, "deferred": False, "executed": False,
+                "confidence_pct": item.get("confidence_pct"),
+                "estimated_notional_jpy": item.get("estimated_notional_jpy"),
+            }
+            records[key] = record
+            base_keys.setdefault(pair, []).append(key)
+        elif not exact and len(base_keys.get(pair, [])) > 1:
+            record["identity_quality"] = "ambiguous"
+        return record
+
+    stage_state = {
+        "tier_generated": "generated", "opus_raw": "passed",
+        "policy_accepted": "passed", "policy_rejected": "rejected",
+        "post_filter_final": "passed", "post_filter_rejected": "rejected",
+        "post_filter_deferred": "deferred", "executed": "executed",
+    }
+    for entry in entries:
+        record = ensure(entry, from_log=True)
+        stage = str(entry.get("stage"))
+        record["stage_states"][stage] = stage_state[stage]
+        if stage == "executed":
+            record["executed"] = True
+        for code in entry.get("execution_block_reason_codes") or []:
+            if code:
+                record["log_reasons"].append({"code": str(code), "provenance": "action_stage_log"})
+        if entry.get("filter_rule"):
+            record["log_reasons"].append({"code": str(entry["filter_rule"]), "message": entry.get("filtered_reason"), "provenance": "action_stage_log"})
+
+    for action in filtered_actions:
+        record = ensure(action)
+        record["filtered"] = True
+        record["stage_states"].setdefault("post_filter_rejected", "rejected")
+        code = action.get("execution_plan_decision") or str(action.get("filtered_reason") or "filtered").split(":", 1)[0]
+        record["log_reasons"].append({"code": str(code), "message": action.get("filtered_reason"), "provenance": "action_stage_log"})
+    for action in deferred_actions:
+        record = ensure(action)
+        record["deferred"] = True
+        record["stage_states"].setdefault("post_filter_deferred", "deferred")
+
+    board_keys: set[str] = set()
+    review_keys: set[str] = set()
+    for row in board:
+        record = ensure(row)
+        record["board"] = row
+        row["decision_flow_key"] = record["key"]
+        board_keys.add(record["key"])
+    for row in review_board:
+        record = ensure(row)
+        record["review"] = row
+        row["decision_flow_key"] = record["key"]
+        review_keys.add(record["key"])
+        for reason in row.get("execution_block_reasons") or []:
+            if isinstance(reason, dict) and reason.get("code"):
+                record["overlay_reasons"].append({
+                    "code": str(reason["code"]), "message": reason.get("message"),
+                    "provenance": "today_overlay",
+                })
+
+    overlap = board_keys & review_keys
+    actions_view = []
+    ambiguous_count = 0
+    for record in records.values():
+        # The graph stages carry all tier candidates.  Individual cards are
+        # reserved for candidates that reached a terminal/current decision;
+        # otherwise a large tier can drown out the actual trade explanation.
+        has_terminal_state = (
+            record["board"] is not None or record["review"] is not None
+            or record["filtered"] or record["deferred"] or record["executed"]
+            or any(name in record["stage_states"] for name in (
+                "policy_rejected", "post_filter_final", "post_filter_rejected", "post_filter_deferred",
+            ))
+        )
+        if not has_terminal_state:
+            continue
+        if record["identity_quality"] == "ambiguous":
+            ambiguous_count += 1
+        key = record["key"]
+        if key in overlap:
+            decision_status, execution_status = "review", "not_started"
+        elif record["review"] is not None:
+            lifecycle = str((record["review"].get("lifecycle") or {}).get("status") or "")
+            decision_status = "review"
+            execution_status = "reprice_required" if lifecycle == "reprice_required" else "not_started"
+        elif record["board"] is not None:
+            decision_status, execution_status = _flow_lifecycle_status(record["board"], executed=record["executed"])
+        elif record["deferred"]:
+            decision_status, execution_status = "deferred", "not_started"
+        elif record["filtered"] or record["stage_states"].get("post_filter_rejected") == "rejected":
+            decision_status, execution_status = "filtered", "not_started"
+        else:
+            decision_status, execution_status = "review", "not_started"
+
+        # Codes retain their log provenance, but current Today overlay wording
+        # takes precedence when both sources explain the same code.
+        reasons_by_code: dict[str, dict] = {}
+        for reason in record["log_reasons"]:
+            code = reason["code"]
+            existing = reasons_by_code.get(code)
+            if existing is None or (reason.get("message") and not existing.get("message")):
+                reasons_by_code[code] = dict(reason)
+        for reason in record["overlay_reasons"]:
+            code = reason["code"]
+            existing = reasons_by_code.get(code)
+            if existing is None:
+                reasons_by_code[code] = dict(reason)
+            elif reason.get("message"):
+                existing["message"] = reason["message"]
+                existing["provenance"] = "today_overlay"
+        reasons = list(reasons_by_code.values())
+        code_order = list(reasons_by_code)
+        actions_view.append({
+            "key": key, "ticker": record["ticker"], "type": record["type"], "account": record["account"],
+            "identity_quality": record["identity_quality"],
+            "decision_status": decision_status, "execution_status": execution_status,
+            "stage_states": record["stage_states"], "reason_codes": code_order, "reasons": reasons,
+            "confidence_pct": record["confidence_pct"], "estimated_notional_jpy": record["estimated_notional_jpy"],
+        })
+
+    stage_count = lambda stage: sum(1 for e in entries if e.get("stage") == stage)
+    ready_count = sum(1 for action in actions_view if action["decision_status"] == "ready")
+    review_count = sum(1 for action in actions_view if action["decision_status"] == "review")
+    deferred_count = sum(1 for action in actions_view if action["decision_status"] == "deferred")
+    rejected_count = sum(1 for action in actions_view if action["decision_status"] == "filtered")
+    stages = [
+        {"key": "candidate_generation", "provenance": "action_stage_log", "source_stage_keys": ["tier_generated"], "entered": stage_count("tier_generated"), "passed": stage_count("tier_generated"), "review": 0, "rejected": 0, "deferred": 0, "executed": 0},
+        {"key": "synthesis", "provenance": "action_stage_log", "source_stage_keys": ["opus_raw"], "entered": stage_count("tier_generated"), "passed": stage_count("opus_raw"), "review": 0, "rejected": 0, "deferred": 0, "executed": 0},
+        {"key": "policy", "provenance": "action_stage_log", "source_stage_keys": ["policy_accepted", "policy_rejected"], "entered": stage_count("opus_raw"), "passed": stage_count("policy_accepted"), "review": 0, "rejected": stage_count("policy_rejected"), "deferred": 0, "executed": 0},
+        {"key": "post_filter", "provenance": "action_stage_log", "source_stage_keys": ["post_filter_final", "post_filter_rejected", "post_filter_deferred"], "entered": stage_count("policy_accepted"), "passed": stage_count("post_filter_final"), "review": 0, "rejected": max(stage_count("post_filter_rejected"), filtered_total), "deferred": max(stage_count("post_filter_deferred"), len(deferred_actions)), "executed": 0},
+        {"key": "execution_readiness", "provenance": "today_projection", "source_stage_keys": [], "entered": stage_count("post_filter_final"), "passed": ready_count, "review": review_count, "rejected": rejected_count, "deferred": deferred_count, "executed": 0},
+        {"key": "execution", "provenance": "mixed", "source_stage_keys": ["executed"], "entered": ready_count, "passed": sum(1 for a in actions_view if a["execution_status"] in {"not_started", "ordered", "filled"}), "review": 0, "rejected": sum(1 for a in actions_view if a["decision_status"] == "closed"), "deferred": 0, "executed": sum(1 for a in actions_view if a["execution_status"] == "executed")},
+    ]
+    expected = decision_summary or {}
+    summary_mismatch = bool(expected) and any([
+        expected.get("executable_count") not in {None, len(board)},
+        expected.get("review_count") not in {None, len(review_board)},
+        expected.get("deferred_count") not in {None, len(deferred_actions)},
+    ])
+    account_branch_count = sum(max(0, len(keys) - 1) for keys in base_keys.values())
+    integrity = "mismatch" if overlap or summary_mismatch else ("partial" if ambiguous_count else "ok")
+    status = "complete" if entries and integrity == "ok" else ("partial" if entries else "unavailable")
+    return {
+        "version": 1, "analysis_id": analysis_id, "status": status, "stages": stages,
+        "actions": actions_view, "unselected": _unselected_candidates(entries),
+        "detail_coverage": detail_coverage,
+        "integrity": {"status": integrity, "scope": "analysis_id", "unit": "account_action", "account_branch_count": account_branch_count},
+    }
+
+
+def _build_pulse(macro: dict, vix_state: dict) -> dict:
+    """PulseLine (市場の鼓動) が使う pulse ブロックを組み立てる。
+
+    VIX は「市場の鼓動」の一例に過ぎない。原油・米10年債・ドル指数(DXY)も
+    vix_tracker.py の同じ1moバッチ取得で既に手元にあり、再取得なしで
+    history_1mo を素通しできる。各 *_history_1mo は vix_tracker.py が
+    _series_to_history() で保存した実系列で、旧キャッシュには無いことが
+    あるため既定値は空配列にし、フロント側の「履歴準備中」フォールバックへ
+    委ねる(ここで過去分を合成・逆算することはしない)。
+    """
+    vix = vix_state.get("vix") or {}
+    oil = vix_state.get("oil") or {}
+    yields = vix_state.get("yields") or {}
+    dxy = vix_state.get("dxy") or {}
+    return {
+        "vix": macro.get("vix"),
+        "vix_change_1d": vix.get("change_1d"),
+        "vix_change_5d": vix.get("change_5d"),
+        "vix_decay_from_peak_10d_pct": vix.get("decay_from_peak_10d_pct"),
+        "as_of": vix_state.get("cached_at"),
+        "vix_history_1mo": vix.get("history_1mo") or [],
+        "oil_price": oil.get("price"),
+        "oil_change_1d_pct": oil.get("change_1d_pct"),
+        "oil_change_5d_pct": oil.get("change_5d_pct"),
+        "oil_history_1mo": oil.get("history_1mo") or [],
+        "us_10y": yields.get("us_10y"),
+        "us_10y_change_1d_pt": yields.get("us_10y_change_1d_pt"),
+        "us_10y_change_5d_pt": yields.get("us_10y_change_5d_pt"),
+        "us_10y_history_1mo": yields.get("us_10y_history_1mo") or [],
+        "dxy_level": dxy.get("level"),
+        "dxy_change_1d_pct": dxy.get("change_1d_pct"),
+        "dxy_change_5d_pct": dxy.get("change_5d_pct"),
+        "dxy_history_1mo": dxy.get("history_1mo") or [],
+    }
+
+
 def _build_today() -> dict:
     analysis = _load("ai_portfolio_analysis.json")
     action_state = _load("action_state.json").get("actions", {})
     reliability = _load("agent_reliability.json")
     macro = _load("macro_state.json")
+    vix_state = _load("vix_state.json")
     currency = _load("currency_policy_state.json")
     guard = _load("guard_state.json")
     nisa = _load("nisa_portfolio.json")
+    holdings = _load("holdings.json")
     execution_log = _load_effective_execution_log()
     execution_plan_state = _load("execution_plan_state.json")
     scenario_state = _load("scenario_state.json")
@@ -1237,7 +1819,7 @@ def _build_today() -> dict:
     except Exception:
         data_health = {"ok": False, "sources": {}, "stale_sources": [], "missing_sources": []}
 
-    # Render a corrected deep-copy. The persisted analysis remains immutable
+    # Render a corrected deep-copy.  The persisted analysis remains immutable
     # audit evidence while legacy numeric prose is reconciled to structured
     # policy/risk fields for the current Today response.
     from analysis_output_validation import (
@@ -1350,6 +1932,9 @@ def _build_today() -> dict:
                 "plan_remaining_before_jpy", "plan_remaining_after_jpy",
                 "override_reason", "budget_impact_jpy", "ai_bounded_gate",
                 "order_intent_decision", "filter_rule", "minimum_executable_quantity",
+                "minimum_executable_notional_jpy", "capacity_shortfall_jpy",
+                "original_quantity", "original_notional_jpy", "effective_cash",
+                "cash_capacity_observation", "execution_capacity_mode",
                 "execution_owner", "execution_broker", "execution_account",
                 "execution_investment_type", "execution_position_keys",
                 "execution_advisories", "market_quote_confirmation_required",
@@ -1628,6 +2213,16 @@ def _build_today() -> dict:
         "margin_health": synthesis.get("margin_health") or long_a.get("margin_health"),
         "margin_summary": synthesis.get("margin_summary") or long_a.get("margin_summary"),
     }
+    try:
+        from nisa_position_integrity import build_nisa_position_integrity
+        allocation["nisa"]["position_integrity"] = build_nisa_position_integrity(nisa, holdings)
+    except Exception as exc:
+        allocation["nisa"]["position_integrity"] = {
+            "status": "unavailable",
+            "authority": "broker_synced_holdings",
+            "mismatches": [],
+            "error": type(exc).__name__,
+        }
 
     # ── コマンドバー ──
     focus = board[0] if board else None
@@ -1653,12 +2248,17 @@ def _build_today() -> dict:
     }
 
     # ── v7: charts / almanac / delta ──
+    # 相場暦と同じく入出金を差し引く。guard の pnl_jpy は総評価額の前日差分で、
+    # 総評価額には現金が含まれる (portfolio_manager:403)。積立だけの日が
+    # 「利益」として累積すると、TWR(入出金調整済み) と並べたとき数字が食い違う。
     pnl_hist = guard.get("pnl_history") or []
+    _pnl_flows = _cash_flow_by_date(now - timedelta(days=400), now)
     cum = 0.0
     pnl_series = []
     for row in pnl_hist:
-        cum += row.get("pnl_jpy") or 0
-        pnl_series.append({"d": (row.get("date") or "")[5:], "v": round(cum)})
+        day = str(row.get("date") or "")[:10]
+        cum += (row.get("pnl_jpy") or 0) - _pnl_flows.get(day, 0.0)
+        pnl_series.append({"d": day[5:], "v": round(cum)})
 
     ticker_series = {}
     for b in board + review_board:
@@ -1688,6 +2288,25 @@ def _build_today() -> dict:
     delta = _build_delta(analysis, board)
     benchmark = _build_benchmark(guard)
     execution_plan = _build_execution_plan_view(execution_plan_state, board, synthesis, now)
+    analysis_id = synthesis.get("analysis_id") or analysis.get("analysis_id")
+    decision_summary = synthesis.get("decision_summary") or {
+        "candidate_count": len(actions) + len(synthesis.get("_filtered_actions") or []) + len(synthesis.get("order_intent_deferred_actions") or []),
+        "executable_count": len(board),
+        "review_count": len(review_board),
+        "filtered_count": len(synthesis.get("_filtered_actions") or []),
+        "deferred_count": len(synthesis.get("order_intent_deferred_actions") or []),
+        "no_action_classification": "system_constraints" if actions and not board else None,
+        "reason_counts": {},
+        "count_conservation_ok": None,
+    }
+    decision_flow = _build_decision_flow(
+        analysis_id=analysis_id,
+        synthesis=synthesis,
+        board=board,
+        review_board=review_board,
+        execution_plan=execution_plan,
+        decision_summary=decision_summary,
+    )
     scenario_summary = build_scenario_summary(scenario_state)
     pending_portfolio_applications = [
         {
@@ -1712,13 +2331,20 @@ def _build_today() -> dict:
         )
     ]
     cash_status = _build_cash_status(execution_plan_state, holdings_raw)
-    funding_alternatives = _build_funding_alternatives(board + review_board, cash_status)
+    cash_info = execution_plan_state.get("cash_info") if isinstance(execution_plan_state, dict) else {}
+    fx_rate_usdjpy = _as_positive_number(cash_info.get("fx_rate_usdjpy")) if isinstance(cash_info, dict) else None
+    funding_alternatives = _build_funding_alternatives(
+        board + review_board,
+        cash_status,
+        fx_rate_usdjpy=fx_rate_usdjpy,
+    )
     optimizer_state = _load("portfolio_optimization.json")
     optimizer_health = (optimizer_state.get("allocation_health") if isinstance(optimizer_state, dict) else {}) or {}
     allocator_comparisons = _load("capital_allocator_comparisons.json")
 
     return {
         "as_of": as_of_str,
+        "analysis_id": analysis_id,
         "generated_at": now.isoformat(timespec="seconds"),
         "portfolio_total": portfolio_total,
         "portfolio_snapshot": portfolio_snapshot,
@@ -1736,20 +2362,7 @@ def _build_today() -> dict:
         "focus": focus,
         "board": board,
         "review_board": review_board,
-        "decision_summary": synthesis.get("decision_summary") or {
-            "candidate_count": (
-                len(actions)
-                + len(synthesis.get("_filtered_actions") or [])
-                + len(synthesis.get("order_intent_deferred_actions") or [])
-            ),
-            "executable_count": len(board),
-            "review_count": len(review_board),
-            "filtered_count": len(synthesis.get("_filtered_actions") or []),
-            "deferred_count": len(synthesis.get("order_intent_deferred_actions") or []),
-            "no_action_classification": "system_constraints" if actions and not board else None,
-            "reason_counts": {},
-            "count_conservation_ok": None,
-        },
+        "decision_summary": decision_summary,
         "candidate_funnel": synthesis.get("candidate_funnel") or {},
         "fallback_attempt": synthesis.get("fallback_attempt") or {},
         "capital_allocator": synthesis.get("capital_allocator") or {},
@@ -1757,6 +2370,7 @@ def _build_today() -> dict:
         "capital_allocator_comparisons": allocator_comparisons,
         "optimizer_health": optimizer_health,
         "suppressed_reproposals": synthesis.get("suppressed_reproposals") or [],
+        "decision_flow": decision_flow,
         "board_notes": board_notes,
         "backlog": backlog,
         "pending_portfolio_applications": pending_portfolio_applications,
@@ -1782,7 +2396,7 @@ def _build_today() -> dict:
             }
         ),
         "holdings_intel": holdings_intel,
-        "pulse": {"vix": macro.get("vix")},
+        "pulse": _build_pulse(macro, vix_state),
     }
 
 
