@@ -977,6 +977,22 @@ def classify_execution_readiness(
             ),
             plan_item_ids=action.get("execution_plan_conflict_item_ids") or [],
         )
+    if action.get("execution_plan_scope_mismatch"):
+        details = action.get("execution_plan_scope_mismatch_items") or []
+        summary = []
+        for row in details:
+            if not isinstance(row, dict):
+                continue
+            required = "/".join(str(value) for value in row.get("required_investment_types") or [])
+            candidate = str(row.get("candidate_investment_type") or "unresolved")
+            summary.append(f"{row.get('objective') or row.get('plan_item_id')}: {required} vs {candidate}")
+        add(
+            "review",
+            "rebalance_scope_mismatch",
+            "Long限定のリバランス目標を別運用ティアの買付根拠には使えません"
+            + (f"（{' ; '.join(summary[:2])}）" if summary else ""),
+            items=details,
+        )
     recent_opposite = action.get("recent_opposite_execution_guard")
     if isinstance(recent_opposite, dict):
         level = str(recent_opposite.get("level") or "review")

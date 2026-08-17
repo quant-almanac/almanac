@@ -663,12 +663,55 @@ def test_build_execution_plan_view_reports_missing_state():
         "buy_attribution_incomplete": False,
         "sell_attribution_incomplete": False,
         "unpriced_attribution_incomplete": False,
+        "scope_mismatched_open_order_count": 0,
+        "scope_mismatched_open_order_notional_jpy": 0,
+        "scope_mismatched_consumption_records": [],
         "unattributed_monthly_buy_total_notional_jpy": None,
         "unattributed_monthly_sell_total_notional_jpy": None,
         "unattributed_monthly_unpriced_count": 0,
     }
     assert view["order_intent_review"] == {"count": 0, "summary": {}, "items": []}
     assert view["gate_observation"] == {}
+
+
+def test_build_execution_plan_view_exposes_scope_mismatched_open_order() -> None:
+    mismatch_record = {
+        "source": "action_state",
+        "id": "state-v",
+        "ticker": "V",
+        "status": "placed",
+        "notional_jpy": 229_599,
+        "plan_item_id": "2026-08-w34-add-sector-financial-services-003",
+        "required_investment_types": ["long"],
+        "candidate_investment_type": "medium",
+    }
+    plan = {
+        "status": "active",
+        "as_of": "2026-08-17T06:00:00+09:00",
+        "budgets": {},
+        "consumption_summary": {
+            "scope_mismatched_open_order_count": 1,
+            "scope_mismatched_open_order_notional_jpy": 229_599,
+            "scope_mismatched_consumption_records": [mismatch_record],
+        },
+        "items": [],
+        "warnings": [
+            "scope_mismatched_open_order_requires_confirmation:"
+            "count=1:notional_jpy=229599:ids=state-v"
+        ],
+    }
+
+    view = today._build_execution_plan_view(
+        plan,
+        board=[],
+        synthesis={},
+        now=datetime(2026, 8, 17, 7, 0, 0),
+    )
+
+    assert view["consumption"]["scope_mismatched_open_order_count"] == 1
+    assert view["consumption"]["scope_mismatched_open_order_notional_jpy"] == 229_599
+    assert view["consumption"]["scope_mismatched_consumption_records"] == [mismatch_record]
+    assert view["warnings"] == plan["warnings"]
 
 
 def test_build_execution_plan_view_keeps_opportunity_out_of_normal_contract():

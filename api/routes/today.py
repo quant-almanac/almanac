@@ -857,6 +857,9 @@ def _build_execution_plan_view(plan: dict, board: list[dict], synthesis: dict, n
                 "buy_attribution_incomplete": False,
                 "sell_attribution_incomplete": False,
                 "unpriced_attribution_incomplete": False,
+                "scope_mismatched_open_order_count": 0,
+                "scope_mismatched_open_order_notional_jpy": 0,
+                "scope_mismatched_consumption_records": [],
                 "unattributed_monthly_buy_total_notional_jpy": None,
                 "unattributed_monthly_sell_total_notional_jpy": None,
                 "unattributed_monthly_unpriced_count": 0,
@@ -1173,6 +1176,15 @@ def _build_execution_plan_view(plan: dict, board: list[dict], synthesis: dict, n
             "buy_attribution_incomplete": buy_attribution_incomplete,
             "sell_attribution_incomplete": sell_attribution_incomplete,
             "unpriced_attribution_incomplete": unpriced_attribution_incomplete,
+            "scope_mismatched_open_order_count": consumption.get(
+                "scope_mismatched_open_order_count", 0
+            ),
+            "scope_mismatched_open_order_notional_jpy": consumption.get(
+                "scope_mismatched_open_order_notional_jpy", 0
+            ),
+            "scope_mismatched_consumption_records": consumption.get(
+                "scope_mismatched_consumption_records"
+            ) or [],
         },
         "summary": {
             "items_total": len([i for i in raw_items if isinstance(i, dict)]),

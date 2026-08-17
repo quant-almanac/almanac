@@ -78,6 +78,15 @@ def _load_nisa_data() -> dict:
 # これらには build_core_snapshot() の出力ではなく元の snapshot を渡すこと。
 CORE_REBALANCE_TIER = 'long'
 
+# 通貨・セクターの配分差分は ``CORE_REBALANCE_TIER`` だけから算出する。
+# このスコープは report を消費する execution plan まで伝播させなければならない。
+# 伝播しないと、long の不足セクター目標が medium/swing の売却判断と衝突し、
+# 同一銘柄を「買い」と「売り」に誤って結び付けてしまう。
+CORE_REBALANCE_SCOPE = {
+    'basis': 'investment_type',
+    'investment_types': [CORE_REBALANCE_TIER],
+}
+
 # 持株会 (勤務先) 銘柄: settlement window 5〜10営業日で売買自由度が低く、月次積立で
 # 自動的に増え続けるため、通貨/セクター配分・リバランス目標の「母数」から除外する
 # (2026-07-07)。除外は配分計算上のみで、集中度リスク・地理的集中・NISA保護など
@@ -429,6 +438,7 @@ def calculate_rebalance_actions(
             'total_jpy':             total,
             'core_total_jpy':        core_total,
             'core_position_count':   len(core_snap.get('positions', [])),
+            'rebalance_scope':       dict(CORE_REBALANCE_SCOPE),
         },
         'currency_result':    cur,
         'sector_result':      sec,

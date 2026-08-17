@@ -68,6 +68,68 @@ def test_open_order_consumes_plan_budget() -> None:
     assert summary["remaining_normal_jpy"] == 80_000
 
 
+def test_explicit_scope_mismatched_order_remains_reserved_and_is_reported_once() -> None:
+    item = _plan_item(
+        plan_item_id="2026-08-w34-add-financials-003",
+        budget=250_000,
+        ticker="V",
+    )
+    item["objective"] = "add_sector_financial-services"
+    item["constraints"] = {
+        "investment_types": ["long"],
+        "rebalance_scope": {
+            "basis": "investment_type",
+            "investment_types": ["long"],
+            "source": "rebalance_report",
+        },
+    }
+    state = {
+        "id": "V_buy_20260814062600",
+        "ticker": "V",
+        "action_type": "buy",
+        "status": "placed",
+        "estimated_notional_jpy": 120_000,
+        "plan_item_id": item["plan_item_id"],
+        "execution_investment_type": "medium",
+    }
+    ordered = {
+        "id": "exec-v-ordered",
+        "action_state_id": state["id"],
+        "ticker": "V",
+        "action_type": "buy",
+        "status": "ordered",
+        "estimated_notional_jpy": 120_000,
+        "plan_item_id": item["plan_item_id"],
+        "investment_type": "medium",
+    }
+
+    items, summary = epe.compute_consumption(
+        [item],
+        action_state={"actions": {state["id"]: state}},
+        executions={"executions": [ordered]},
+    )
+
+    assert items[0]["open_order_consumed_jpy"] == 120_000
+    assert items[0]["remaining_jpy"] == 130_000
+    assert len(items[0]["consumed_by"]) == 1
+    assert items[0]["consumed_by"][0]["requires_confirmation"] is True
+    assert summary["scope_mismatched_open_order_count"] == 1
+    assert summary["scope_mismatched_open_order_notional_jpy"] == 120_000
+    assert summary["scope_mismatched_consumption_records"] == [{
+        "source": "action_state",
+        "id": state["id"],
+        "action_state_id": None,
+        "ticker": "V",
+        "status": "placed",
+        "consumption_type": "open",
+        "notional_jpy": 120_000,
+        "plan_item_id": item["plan_item_id"],
+        "objective": "add_sector_financial-services",
+        "required_investment_types": ["long"],
+        "candidate_investment_type": "medium",
+    }]
+
+
 def test_pending_recommendation_does_not_consume_plan_budget() -> None:
     items, summary = epe.compute_consumption(
         [_plan_item(budget=200_000, ticker="META")],
@@ -533,6 +595,145 @@ def test_exit_named_by_active_buy_plan_requires_review_but_remains_executable() 
     assert decision["execution_plan_requires_review"] is True
     assert decision["execution_plan_conflict_item_ids"] == [item["plan_item_id"]]
     assert decision["executable"] is True
+
+
+def test_long_rebalance_plan_does_not_authorize_medium_buy_or_conflict_with_medium_exit() -> None:
+    """A long-only report must not create the XLF/V cross-sleeve false conflict."""
+    item = _plan_item(
+        plan_item_id="2026-08-w34-add-financials-003",
+        budget=250_000,
+        ticker="XLF",
+    )
+    item["objective"] = "add_sector_financial-services"
+    item["preferred_tickers"] = ["XLF", "V"]
+    item["constraints"] = {
+        "investment_types": ["long"],
+        "rebalance_scope": {
+            "basis": "investment_type",
+            "investment_types": ["long"],
+            "source": "rebalance_report",
+        },
+    }
+    plan = {"items": [item], "consumption_summary": {"remaining_opportunity_jpy": 250_000}}
+
+    medium_buy = epe.classify_candidate_against_plan(
+        {
+            "ticker": "V", "type": "add", "plan_item_id": item["plan_item_id"],
+            "execution_investment_type": "medium",
+            "estimated_notional_jpy": 230_000, "confidence_pct": 90, "rank": 1,
+            "urgency": "high",
+        },
+        plan,
+    )
+    assert medium_buy["execution_plan_decision"] == "rebalance_scope_mismatch"
+    assert medium_buy["execution_plan_scope_mismatch"] is True
+    assert medium_buy["executable"] is False
+    assert medium_buy["execution_plan_scope_mismatch_items"] == [{
+        "plan_item_id": item["plan_item_id"],
+        "objective": "add_sector_financial-services",
+        "required_investment_types": ["long"],
+        "candidate_investment_type": "medium",
+    }]
+
+    medium_exit = epe.classify_candidate_against_plan(
+        {
+            "ticker": "XLF", "type": "trim", "execution_investment_type": "medium",
+            "estimated_notional_jpy": 493_299, "confidence_pct": 50, "rank": 1,
+            "urgency": "medium",
+        },
+        plan,
+    )
+    assert medium_exit == {
+        "execution_plan_decision": "defensive_or_exit_outside_plan",
+        "execution_plan_override": "defensive",
+        "executable": True,
+    }
+
+    long_buy = epe.classify_candidate_against_plan(
+        {
+            "ticker": "V", "type": "add", "execution_investment_type": "long",
+            "estimated_notional_jpy": 230_000, "confidence_pct": 90, "rank": 1,
+            "urgency": "high",
+        },
+        plan,
+    )
+    assert long_buy["execution_plan_decision"] == "plan_new_order"
+    assert long_buy["execution_plan_match_kind"] == "preferred_ticker"
+
+
+def test_scope_mismatch_does_not_override_independent_unscoped_dca_match() -> None:
+    scoped_item = _plan_item(
+        plan_item_id="2026-08-w34-add-financials-003",
+        budget=250_000,
+        ticker="V",
+    )
+    scoped_item["objective"] = "add_sector_financial-services"
+    scoped_item["constraints"] = {
+        "investment_types": ["long"],
+        "rebalance_scope": {
+            "basis": "investment_type",
+            "investment_types": ["long"],
+            "source": "rebalance_report",
+        },
+    }
+    dca_item = _plan_item(
+        plan_item_id="2026-08-w34-dca-v-004",
+        budget=200_000,
+        ticker="V",
+    )
+    dca_item["objective"] = "dca_v"
+    plan = {
+        "items": [scoped_item, dca_item],
+        "consumption_summary": {
+            "remaining_opportunity_jpy": 0,
+            "monthly_remaining_jpy": 500_000,
+        },
+    }
+
+    decision = epe.classify_candidate_against_plan(
+        {
+            "ticker": "V",
+            "type": "add",
+            "execution_investment_type": "medium",
+            "estimated_notional_jpy": 180_000,
+            "confidence_pct": 90,
+            "rank": 1,
+            "urgency": "high",
+        },
+        plan,
+    )
+
+    assert decision["execution_plan_decision"] == "plan_new_order"
+    assert decision["plan_item_id"] == dca_item["plan_item_id"]
+    assert decision["execution_plan_match_kind"] == "preferred_ticker"
+
+
+def test_legacy_core_rebalance_report_scopes_plan_items_to_long() -> None:
+    """Existing reports carry core summary fields even before explicit scope."""
+    items = epe.build_plan_items(
+        rebalance_report={
+            "summary": {"core_total_jpy": 10_000_000, "core_position_count": 4},
+            "buy_candidates": {
+                "currencies": [{"currency": "USD", "gap_jpy": 300_000}],
+                "sectors": [{"sector": "Financial Services", "gap_jpy": 300_000}],
+            },
+        },
+        bottom_fishing={},
+        nisa={},
+        budgets={"weekly_normal_jpy": 300_000, "max_single_normal_action_jpy": 250_000},
+        horizon={"month": "2026-08", "iso_week": 34},
+        trusted_sector_catalog={"Financial Services": ["V", "XLF"]},
+    )
+
+    assert items
+    assert all(
+        row["constraints"]["investment_types"] == ["long"]
+        for row in items
+    )
+    assert all(
+        row["constraints"]["rebalance_scope"]["source"] == "inferred_legacy_core_summary"
+        for row in items
+    )
 
 
 def test_monthly_cap_blocks_exact_candidate_even_when_weekly_item_has_room() -> None:

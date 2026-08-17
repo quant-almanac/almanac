@@ -841,6 +841,119 @@ def _nisa_growth_remaining(owner: dict[str, Any] | None) -> int:
     return max(0, _jpy(owner.get("growth_limit_annual")) - _jpy(owner.get("growth_used_this_year")))
 
 
+def _normalized_investment_type(value: Any) -> str:
+    """Return the small, stable tier vocabulary used by routed actions."""
+    text = str(value or "").strip().lower().replace("-", "_")
+    aliases = {
+        "longterm": "long",
+        "long_term": "long",
+        "mediumterm": "medium",
+        "medium_term": "medium",
+    }
+    return aliases.get(text, text)
+
+
+def _rebalance_scope_from_report(report: dict[str, Any]) -> dict[str, Any] | None:
+    """Extract the explicit core-report scope without guessing a portfolio scope.
+
+    Reports written before the explicit field was introduced already expose a
+    ``core_total_jpy`` / ``core_position_count`` pair.  Those reports were
+    calculated by the long-only core engine, so retain that *narrow* scope for
+    compatibility.  A report with no such evidence remains unscoped rather
+    than silently being treated as all-portfolio.
+    """
+    summary = report.get("summary") if isinstance(report, dict) else None
+    summary = summary if isinstance(summary, dict) else {}
+    raw_scope = summary.get("rebalance_scope")
+    if isinstance(raw_scope, dict):
+        values = raw_scope.get("investment_types")
+        if isinstance(values, list):
+            types = sorted({
+                _normalized_investment_type(value)
+                for value in values
+                if _normalized_investment_type(value)
+            })
+            if types:
+                return {
+                    "basis": "investment_type",
+                    "investment_types": types,
+                    "source": "rebalance_report",
+                }
+    if "core_total_jpy" in summary and "core_position_count" in summary:
+        return {
+            "basis": "investment_type",
+            "investment_types": ["long"],
+            "source": "inferred_legacy_core_summary",
+        }
+    return None
+
+
+def _item_investment_scope(item: dict[str, Any], record: dict[str, Any]) -> tuple[bool, str | None, list[str]]:
+    """Return ``(compatible, actual_tier, required_tiers)`` for a plan item.
+
+    Only rebalance-derived objectives carry this constraint.  An unscoped
+    legacy/NISA/DCA item keeps its previous matching semantics.  Missing action
+    tier is deliberately incompatible for a scoped item: a long-only report
+    must never authorise an order whose investment sleeve cannot be proven.
+    """
+    constraints = item.get("constraints") if isinstance(item, dict) else None
+    constraints = constraints if isinstance(constraints, dict) else {}
+    raw_required = constraints.get("investment_types")
+    if not isinstance(raw_required, list):
+        return True, None, []
+    required = sorted({
+        _normalized_investment_type(value)
+        for value in raw_required
+        if _normalized_investment_type(value)
+    })
+    if not required:
+        return True, None, []
+    actual = _normalized_investment_type(
+        record.get("execution_investment_type")
+        or record.get("investment_type")
+        or record.get("tier")
+    )
+    return actual in set(required), actual or None, required
+
+
+def _item_names_candidate(item: dict[str, Any], record: dict[str, Any]) -> bool:
+    """Whether an active item explicitly names this ticker and direction."""
+    direction = _record_direction(record)
+    allowed = {_record_direction({"type": value}) for value in item.get("allowed_action_types") or []}
+    ticker = canonical_ticker(record.get("ticker"))
+    preferred = {
+        canonical_ticker(value) for value in item.get("preferred_tickers") or []
+    }
+    return bool(direction and direction in allowed and ticker and ticker in preferred)
+
+
+def _explicit_item_scope_mismatch(
+    item: dict[str, Any],
+    record: dict[str, Any],
+) -> dict[str, Any] | None:
+    """Describe an explicitly linked record whose investment sleeve changed.
+
+    Existing placed/ordered records must not disappear from plan reservation
+    merely because a newly regenerated item now carries an explicit scope.
+    Only a persisted, exact plan-item link is accepted here; ticker-only
+    inference would be too broad for lifecycle accounting.
+    """
+    plan_item_id = str(record.get("plan_item_id") or "")
+    if not plan_item_id or plan_item_id != str(item.get("plan_item_id") or ""):
+        return None
+    if not _item_names_candidate(item, record):
+        return None
+    compatible, actual_tier, required_tiers = _item_investment_scope(item, record)
+    if compatible:
+        return None
+    return {
+        "plan_item_id": plan_item_id,
+        "objective": str(item.get("objective") or ""),
+        "required_investment_types": required_tiers,
+        "candidate_investment_type": actual_tier,
+    }
+
+
 def _candidate_objectives(
     *,
     rebalance_report: dict[str, Any] | None,
@@ -865,6 +978,15 @@ def _candidate_objectives(
         })
 
     report = rebalance_report if isinstance(rebalance_report, dict) else {}
+    rebalance_scope = _rebalance_scope_from_report(report)
+
+    def _rebalance_constraints(extra: dict[str, Any] | None = None) -> dict[str, Any]:
+        constraints = dict(extra or {})
+        if rebalance_scope:
+            constraints["investment_types"] = list(rebalance_scope["investment_types"])
+            constraints["rebalance_scope"] = dict(rebalance_scope)
+        return constraints
+
     for c in ((report.get("buy_candidates") or {}).get("currencies") or [])[:2]:
         currency = str(c.get("currency") or "")
         gap = _jpy(c.get("gap_jpy"))
@@ -874,10 +996,10 @@ def _candidate_objectives(
             "objective": f"add_currency_{currency.lower()}",
             "priority": 2,
             "requested_jpy": gap,
-            "constraints": {
+            "constraints": _rebalance_constraints({
                 "currency": currency,
                 "min_confidence_pct": 70,
-            },
+            }),
             "source_reasons": [f"rebalance_report: {currency} under target"],
         })
 
@@ -896,10 +1018,10 @@ def _candidate_objectives(
             "objective": f"add_sector_{_slug(name)}",
             "priority": 2 + idx,
             "requested_jpy": gap,
-            "constraints": {
+            "constraints": _rebalance_constraints({
                 "sector_preference": [name],
                 "min_confidence_pct": 70,
-            },
+            }),
             "preferred_tickers": preferred_tickers,
             "source_reasons": [
                 f"rebalance_report: {name} sector under target",
@@ -1175,6 +1297,9 @@ def _item_exact_match_kind(item: dict[str, Any], record: dict[str, Any], record_
     required_currency = str(constraints.get("currency") or "").upper()
     if required_currency and _record_currency(record) != required_currency:
         return None
+    scope_matches, _actual_tier, _required_tiers = _item_investment_scope(item, record)
+    if not scope_matches:
+        return None
 
     ticker = canonical_ticker(record.get("ticker"))
     preferred_tickers = {
@@ -1229,10 +1354,11 @@ def _apply_consumption_record(
     source: str,
     consumption_type: str,
     notional_jpy: int,
+    scope_mismatch: dict[str, Any] | None = None,
 ) -> None:
     if notional_jpy <= 0:
         return
-    item["consumed_by"].append({
+    consumed_record = {
         "source": source,
         "id": record.get("id") or record.get("action_state_id"),
         "ticker": record.get("ticker"),
@@ -1240,7 +1366,11 @@ def _apply_consumption_record(
         "notional_jpy": notional_jpy,
         "consumption_type": consumption_type,
         "dedup_key": _record_dedup_key(record),
-    })
+    }
+    if scope_mismatch:
+        consumed_record["scope_mismatch"] = dict(scope_mismatch)
+        consumed_record["requires_confirmation"] = True
+    item["consumed_by"].append(consumed_record)
     if consumption_type == "filled":
         item["filled_consumed_jpy"] = _jpy(item.get("filled_consumed_jpy")) + notional_jpy
     else:
@@ -1291,13 +1421,48 @@ def compute_consumption(
         and _within_period(record, "filled", period_start, period_end)
     }
     state_consumption_ids: set[str] = set()
+    scope_mismatched_records: list[dict[str, Any]] = []
+    scope_mismatched_record_ids: set[str] = set()
 
-    def _match(record: dict[str, Any]) -> dict[str, Any] | None:
+    def _match(record: dict[str, Any]) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
         key = _record_dedup_key(record)
+        # An explicit lifecycle link takes precedence.  When its scope no
+        # longer matches, reserve the plan amount conservatively and surface
+        # the mismatch instead of silently re-attributing it to another item.
+        for item in next_items:
+            mismatch = _explicit_item_scope_mismatch(item, record)
+            if mismatch:
+                return item, mismatch
         for item in next_items:
             if _item_matches_record(item, record, key):
-                return item
-        return None
+                return item, None
+        return None, None
+
+    def _record_scope_mismatch(
+        record: dict[str, Any],
+        *,
+        source: str,
+        consumption_type: str,
+        notional_jpy: int,
+        mismatch: dict[str, Any] | None,
+    ) -> None:
+        if not mismatch:
+            return
+        record_id = str(record.get("id") or record.get("action_state_id") or "")
+        stable_id = record_id or f"{source}:{record.get('ticker')}:{record.get('plan_item_id')}"
+        if stable_id in scope_mismatched_record_ids:
+            return
+        scope_mismatched_record_ids.add(stable_id)
+        scope_mismatched_records.append({
+            "source": source,
+            "id": record_id or None,
+            "action_state_id": record.get("action_state_id"),
+            "ticker": record.get("ticker"),
+            "status": record.get("status"),
+            "consumption_type": consumption_type,
+            "notional_jpy": _jpy(notional_jpy),
+            **dict(mismatch),
+        })
 
     if isinstance(state_actions, dict):
         for action_id, entry in state_actions.items():
@@ -1323,19 +1488,27 @@ def compute_consumption(
                 # The linked execution will be processed below.  This gives
                 # terminal execution data precedence over stale state status.
                 continue
-            item = _match(entry)
+            item, scope_mismatch = _match(entry)
             if not item:
                 continue
             record = {**entry, "id": entry.get("id") or action_id}
             notional = _estimate_notional_jpy(record, fx_rate=fx_rate)
             if notional <= 0:
                 continue
+            _record_scope_mismatch(
+                record,
+                source="action_state",
+                consumption_type=consumption_type,
+                notional_jpy=notional,
+                mismatch=scope_mismatch,
+            )
             _apply_consumption_record(
                 item,
                 record,
                 source="action_state",
                 consumption_type=consumption_type,
                 notional_jpy=notional,
+                scope_mismatch=scope_mismatch,
             )
             state_consumption_ids.add(str(action_id))
 
@@ -1354,15 +1527,24 @@ def compute_consumption(
                 continue
             if consumption_type == "open" and action_state_id in terminal_execution_state_ids:
                 continue
-        item = _match(record)
+        item, scope_mismatch = _match(record)
         if not item:
             continue
+        notional_jpy = _estimate_notional_jpy(record, fx_rate=fx_rate)
+        _record_scope_mismatch(
+            record,
+            source="action_executions",
+            consumption_type=consumption_type,
+            notional_jpy=notional_jpy,
+            mismatch=scope_mismatch,
+        )
         _apply_consumption_record(
             item,
             record,
             source="action_executions",
             consumption_type=consumption_type,
-            notional_jpy=_estimate_notional_jpy(record, fx_rate=fx_rate),
+            notional_jpy=notional_jpy,
+            scope_mismatch=scope_mismatch,
         )
 
     summary = {
@@ -1374,6 +1556,15 @@ def compute_consumption(
         "pending_recommendation_count": pending_count,
         "pending_recommendation_notional_jpy": _jpy(pending_notional_jpy),
         "pending_unpriced_count": pending_unpriced_count,
+        "scope_mismatched_open_order_count": sum(
+            1 for row in scope_mismatched_records if row.get("consumption_type") == "open"
+        ),
+        "scope_mismatched_open_order_notional_jpy": sum(
+            _jpy(row.get("notional_jpy"))
+            for row in scope_mismatched_records
+            if row.get("consumption_type") == "open"
+        ),
+        "scope_mismatched_consumption_records": scope_mismatched_records[:10],
     }
     return next_items, summary
 
@@ -1798,17 +1989,36 @@ def classify_candidate_against_plan(
     supplied_plan_item_id = str(action.get("plan_item_id") or "")
     supplied_plan_item_known = False
     supplied_plan_item_mismatch = False
+    supplied_scope_mismatch = False
+    scope_mismatch_items: list[dict[str, Any]] = []
     for item in plan_state.get("items") or []:
         if not isinstance(item, dict):
             continue
-        if supplied_plan_item_id and supplied_plan_item_id == str(item.get("plan_item_id") or ""):
+        is_supplied_item = (
+            bool(supplied_plan_item_id)
+            and supplied_plan_item_id == str(item.get("plan_item_id") or "")
+        )
+        if is_supplied_item:
             supplied_plan_item_known = True
+        scope_matches, actual_tier, required_tiers = _item_investment_scope(item, action)
+        if not scope_matches and _item_names_candidate(item, action):
+            scope_mismatch_items.append({
+                "plan_item_id": str(item.get("plan_item_id") or ""),
+                "objective": str(item.get("objective") or ""),
+                "required_investment_types": required_tiers,
+                "candidate_investment_type": actual_tier,
+            })
+            # The supplied item id is real; the failure is the explicit
+            # investment-sleeve mismatch, not corrupted plan metadata.
+            if is_supplied_item:
+                supplied_scope_mismatch = True
+            continue
         match_kind = _item_exact_match_kind(item, action, record_key)
         if match_kind:
             matched_item = item
             matched_kind = match_kind
             break
-        if supplied_plan_item_known:
+        if is_supplied_item:
             supplied_plan_item_mismatch = True
         if _item_advisory_match(item, action):
             item_id = str(item.get("plan_item_id") or "")
@@ -1821,6 +2031,20 @@ def classify_candidate_against_plan(
             "metadata_mismatch": "unknown_plan_item_id" if not supplied_plan_item_known else "direction_account_currency_or_ticker",
             "executable": False,
         }
+    def _scope_mismatch_decision() -> dict[str, Any]:
+        # This is distinct from an ordinary unmatched candidate: the plan
+        # explicitly names the ticker, but its long-only source cannot authorise
+        # a medium/swing order.  Do not let opportunistic override turn this
+        # scope error into an executable purchase.
+        return {
+            "execution_plan_decision": "rebalance_scope_mismatch",
+            "execution_plan_scope_mismatch": True,
+            "execution_plan_scope_mismatch_items": scope_mismatch_items[:3],
+            "execution_plan_requires_review": True,
+            "executable": False,
+        }
+    if supplied_scope_mismatch and direction in {"buy", "add"}:
+        return _scope_mismatch_decision()
     if matched_item:
         remaining = (
             shared_normal
@@ -1873,6 +2097,11 @@ def classify_candidate_against_plan(
             "executable": True,
         }
 
+    if scope_mismatch_items and direction in {"buy", "add"}:
+        # No independent objective matched.  The only plan relationship is a
+        # cross-sleeve one, so retain the explicit review result.
+        return _scope_mismatch_decision()
+
     opportunity = _opportunity()
     if opportunity:
         return opportunity
@@ -1887,6 +2116,12 @@ def classify_candidate_against_plan(
             if str(item.get("status") or "active").lower() not in {"active", "open"}:
                 continue
             if _jpy(item.get("remaining_jpy")) <= 0:
+                continue
+            scope_matches, _actual_tier, _required_tiers = _item_investment_scope(item, action)
+            if not scope_matches:
+                # A long-only accumulation objective has no authority over a
+                # separate medium/swing exit.  Treating the two as opposing
+                # intent was the XLF false conflict.
                 continue
             allowed = {
                 str(value or "").lower()
@@ -2307,6 +2542,24 @@ def build_execution_plan(
     consumption_summary["remaining_opportunity_jpy"] = opportunity_pool
     consumption_summary["normal_pool_available_jpy"] = normal_pool
     consumption_summary["opportunity_pool_available_jpy"] = opportunity_pool
+    scope_mismatch_warnings: list[str] = []
+    scope_mismatch_count = _jpy(
+        consumption_summary.get("scope_mismatched_open_order_count")
+    )
+    if scope_mismatch_count > 0:
+        mismatch_notional = _jpy(
+            consumption_summary.get("scope_mismatched_open_order_notional_jpy")
+        )
+        mismatch_ids = [
+            str(row.get("id") or row.get("action_state_id") or "unknown")
+            for row in consumption_summary.get("scope_mismatched_consumption_records") or []
+            if isinstance(row, dict)
+        ]
+        scope_mismatch_warnings.append(
+            "scope_mismatched_open_order_requires_confirmation:"
+            f"count={scope_mismatch_count}:notional_jpy={mismatch_notional}:"
+            f"ids={','.join(mismatch_ids[:5]) or 'unknown'}"
+        )
     rationale = no_action_rationale(items, consumption_summary)
     if normal_pool <= 0 and opportunity_pool <= 0:
         if (
@@ -2355,7 +2608,13 @@ def build_execution_plan(
         "contribution_summary": contribution_summary,
         "items": items,
         "no_action_rationale": rationale,
-        "warnings": cash_warnings + budget_warnings + list(sector_catalog_warnings or []) + sector_objective_warnings,
+        "warnings": (
+            cash_warnings
+            + budget_warnings
+            + list(sector_catalog_warnings or [])
+            + sector_objective_warnings
+            + scope_mismatch_warnings
+        ),
         "sector_mapping": {
             **(sector_catalog_summary or {}),
             "requested_sector_objectives": requested_sector_names,

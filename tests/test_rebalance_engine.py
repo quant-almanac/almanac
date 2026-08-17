@@ -89,6 +89,10 @@ def test_core_total_is_long_only_while_total_jpy_stays_portfolio_wide():
     assert result_b["summary"]["core_total_jpy"] == _LONG_TOTAL
     assert result_a["summary"]["core_position_count"] == 3
     assert result_b["summary"]["core_position_count"] == 3
+    assert result_b["summary"]["rebalance_scope"] == {
+        "basis": "investment_type",
+        "investment_types": ["long"],
+    }
 
     # total_jpy(全体総額)はtier構成が違えば legitimately 異なる
     assert result_a["summary"]["total_jpy"] == _LONG_TOTAL
