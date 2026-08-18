@@ -37,9 +37,65 @@ function interpolate(value: number, anchors: Array<[number, number]>): number {
 }
 
 /** 市場側の張り詰め具合 0..100。VIX が主。 */
-export function marketRiskScore(vix: number | null | undefined): number | null {
-  if (vix == null || !Number.isFinite(vix)) return null
-  return round1(clamp(interpolate(vix, VIX_ANCHORS), 0, 100))
+/**
+ * 日次終値から年率換算の実現ボラティリティ(%)を出す。
+ *
+ * VIX は年率換算のインプライドボラティリティ(%)なので、実現ボラを同じ
+ * 年率%に直せば同一のアンカーで採点できる。日本株には VIX に相当する
+ * 指数が手元のデータに無いため、価格系列から測るのが唯一の正直な手段。
+ * 予測(implied)と実績(realized)は別物だが、単位と桁は揃う。
+ */
+export function realizedVolAnnualized(
+  history: Array<{ close?: number | null }> | null | undefined,
+): number | null {
+  const closes = (history ?? [])
+    .map(row => Number(row?.close))
+    .filter(n => Number.isFinite(n) && n > 0)
+  if (closes.length < 6) return null // 標本が少なすぎる推定は出さない
+  const returns: number[] = []
+  for (let i = 1; i < closes.length; i += 1) returns.push(Math.log(closes[i] / closes[i - 1]))
+  const mean = returns.reduce((a, b) => a + b, 0) / returns.length
+  const variance = returns.reduce((a, r) => a + (r - mean) ** 2, 0) / (returns.length - 1)
+  return round1(Math.sqrt(variance) * Math.sqrt(252) * 100)
+}
+
+export type MarketInputs = {
+  /** 日本株の年率実現ボラ(%)。取れなければ null。 */
+  japanVol?: number | null
+  /** ポートフォリオの日本株比率 0..1。市場の重みづけに使う。 */
+  japanWeight?: number | null
+}
+
+/**
+ * 市場側の危険度 0..100。
+ *
+ * VIX だけで採点していたが、ポートフォリオの約3割は日本株で、その値動きが
+ * 一切入っていなかった (2026-08-19)。「市場」は自分が晒されている市場の
+ * ことなので、日米それぞれのボラを保有比率で重みづけて混ぜる。
+ * 日本株データが無い日は従来どおり VIX だけで採点する —— 欠測を0として
+ * 混ぜると、日本株が静かだったことにされてしまう。
+ */
+export function marketRiskScore(
+  vix: number | null | undefined,
+  inputs: MarketInputs = {},
+): number | null {
+  const usScore = vix != null && Number.isFinite(vix)
+    ? clamp(interpolate(vix, VIX_ANCHORS), 0, 100)
+    : null
+  const jpVol = inputs.japanVol
+  const jpScore = jpVol != null && Number.isFinite(jpVol)
+    ? clamp(interpolate(jpVol, VIX_ANCHORS), 0, 100)
+    : null
+
+  if (usScore == null && jpScore == null) return null
+  if (jpScore == null) return round1(usScore as number)
+  if (usScore == null) return round1(jpScore)
+
+  const rawWeight = inputs.japanWeight
+  const jpWeight = rawWeight != null && Number.isFinite(rawWeight)
+    ? clamp(rawWeight, 0, 1)
+    : 0.5
+  return round1(usScore * (1 - jpWeight) + jpScore * jpWeight)
 }
 
 export type GuardState = {

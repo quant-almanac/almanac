@@ -1,7 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import {
-  BPM_MAX, BPM_MIN, beatSeconds, bpmFor, computeVitals, ecgCyclePath,
-  ecgTileDataUri, flatlinePath, marketRiskScore, ownRiskScore,
+  BPM_MAX, BPM_MIN, beatSeconds, bpmFor, computeVitals, ecgCyclePath, ecgTileDataUri, flatlinePath, marketRiskScore, ownRiskScore, realizedVolAnnualized,
 } from '../pulseVitals'
 
 describe('marketRiskScore', () => {
@@ -139,5 +138,70 @@ describe('ecgTileDataUri', () => {
     const flat = decodeURIComponent(ecgTileDataUri({ width: 100, height: 40, color: '#fff', flat: true }))
     expect(flat).toContain('M0,20 L100,20')
     expect(flat).not.toContain('L39,')
+  })
+})
+
+describe('realizedVolAnnualized', () => {
+  it('returns null on a sample too small to estimate from', () => {
+    expect(realizedVolAnnualized([{ close: 100 }, { close: 101 }])).toBeNull()
+    expect(realizedVolAnnualized([])).toBeNull()
+    expect(realizedVolAnnualized(null)).toBeNull()
+  })
+
+  it('reports a flat series as zero volatility', () => {
+    const flat = Array.from({ length: 12 }, () => ({ close: 100 }))
+    expect(realizedVolAnnualized(flat)).toBe(0)
+  })
+
+  it('scores a choppy series above a calm one', () => {
+    const calm = Array.from({ length: 21 }, (_, i) => ({ close: 100 + i * 0.05 }))
+    const choppy = Array.from({ length: 21 }, (_, i) => ({ close: 100 + (i % 2 ? 4 : -4) }))
+    expect(realizedVolAnnualized(choppy)!).toBeGreaterThan(realizedVolAnnualized(calm)!)
+  })
+
+  it('ignores malformed points instead of producing NaN', () => {
+    const rows = Array.from({ length: 12 }, () => ({ close: 100 }))
+    const dirty = [...rows, { close: null }, { close: 0 }, {}] as Array<{ close?: number | null }>
+    expect(realizedVolAnnualized(dirty)).toBe(0)
+  })
+})
+
+describe('marketRiskScore with Japan', () => {
+  // 日経の1mo系列から実現ボラを出し、VIXと同じアンカーで採点して混ぜる。
+  const vixOnly = marketRiskScore(20)
+
+  it('keeps scoring on VIX alone when Japan data is absent', () => {
+    expect(marketRiskScore(20, { japanVol: null, japanWeight: 0.3 })).toBe(vixOnly)
+    expect(marketRiskScore(20)).toBe(vixOnly)
+  })
+
+  it('pulls the score toward Japan when Japanese volatility is higher', () => {
+    const blended = marketRiskScore(20, { japanVol: 40, japanWeight: 0.3 })
+    expect(blended!).toBeGreaterThan(vixOnly!)
+  })
+
+  it('weights by how much of the portfolio is actually Japanese', () => {
+    const light = marketRiskScore(20, { japanVol: 40, japanWeight: 0.1 })
+    const heavy = marketRiskScore(20, { japanVol: 40, japanWeight: 0.6 })
+    expect(heavy!).toBeGreaterThan(light!)
+  })
+
+  it('does not treat a missing weight as zero Japanese exposure', () => {
+    // 重み不明を0にすると、日本株の荒れが黙って消える。
+    const unknown = marketRiskScore(20, { japanVol: 40 })
+    expect(unknown!).toBeGreaterThan(vixOnly!)
+  })
+
+  it('scores on Japan alone when VIX is unavailable', () => {
+    expect(marketRiskScore(null, { japanVol: 40, japanWeight: 0.3 })).not.toBeNull()
+  })
+
+  it('returns null when neither market can be measured', () => {
+    expect(marketRiskScore(null, { japanVol: null })).toBeNull()
+  })
+
+  it('clamps an out-of-range weight rather than extrapolating', () => {
+    expect(marketRiskScore(20, { japanVol: 40, japanWeight: 5 }))
+      .toBe(marketRiskScore(20, { japanVol: 40, japanWeight: 1 }))
   })
 })

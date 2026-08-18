@@ -595,6 +595,16 @@ export interface TodayOps {
     dxy_change_1d_pct?: number | null
     dxy_change_5d_pct?: number | null
     dxy_history_1mo?: Array<{ date: string; close: number }>
+    // 日本株。ポートフォリオの約3割が日本株なので、市場側を米国指標だけで
+    // 語ると自分が晒されている市場の3割が抜ける (2026-08-19)。
+    japan_level?: number | null
+    japan_change_1d_pct?: number | null
+    japan_change_5d_pct?: number | null
+    /** '^N225' か、指数が取れない日の代替 '1306.T'。別物なので区別する。 */
+    japan_source?: string | null
+    japan_history_1mo?: Array<{ date: string; close: number }>
+    /** 保有に占める日本株比率 0..1。市場ボラの重みづけに使う。 */
+    japan_exposure_weight?: number | null
   }
 }
 

@@ -4,7 +4,8 @@ import { useEffect, useMemo, useState } from 'react'
 import { OPS, STANCE_LABEL } from './tokens'
 import type { BenchmarkData, Command, TodayOps } from './types'
 import {
-  beatSeconds, computeVitals, ecgTileDataUri, marketRiskScore, ownRiskScore, relationVerdict,
+  beatSeconds, computeVitals, ecgTileDataUri, marketRiskScore, ownRiskScore,
+  realizedVolAnnualized, relationVerdict,
 } from './pulseVitals'
 
 /**
@@ -22,8 +23,8 @@ import {
  * この波形は体感用の表示で、売買判断には使わない(停止判断は behavioral_guard が権威)。
  */
 
-const CYCLE_W = 108
-const LANE_H = 46
+const CYCLE_W = 88
+const LANE_H = 34
 
 function prefersReducedMotion(): boolean {
   return typeof window !== 'undefined' && !!window.matchMedia
@@ -127,7 +128,15 @@ export default function PulseLine({
 
   const guard = command?.guard
   const vix = pulse?.vix ?? command?.vix ?? null
-  const market = useMemo(() => marketRiskScore(vix), [vix])
+  // 市場側は VIX だけだった。ポートフォリオの約3割が日本株なので、
+  // 日経の実現ボラを保有比率で混ぜる (2026-08-19)。
+  const japanVol = useMemo(
+    () => realizedVolAnnualized(pulse?.japan_history_1mo), [pulse?.japan_history_1mo])
+  const market = useMemo(
+    () => marketRiskScore(vix, {
+      japanVol, japanWeight: pulse?.japan_exposure_weight ?? null,
+    }),
+    [vix, japanVol, pulse?.japan_exposure_weight])
   const own = useMemo(() => ownRiskScore(guard), [guard])
   // 総合レーンは置かない。2つを平均すると「市場だけ荒れている」と
   // 「自分だけ痛んでいる」が同じ数字に潰れ、一番知りたい違いが消えるため。
@@ -147,7 +156,15 @@ export default function PulseLine({
   const ownDetail = own == null
     ? 'ガード情報なし'
     : `月間 ${monthly == null ? '—' : signed(monthly * 100)}・ガード ${guardOpen ? '開' : '締'}`
-  const marketDetail = vix == null ? 'VIX不明' : `VIX ${vix.toFixed(1)}・${signed(pulse?.vix_change_1d)}`
+  const jpWeightPct = pulse?.japan_exposure_weight == null
+    ? null : Math.round(pulse.japan_exposure_weight * 100)
+  const marketDetail = vix == null && japanVol == null
+    ? '市場指標なし'
+    : [
+        vix == null ? null : `VIX ${vix.toFixed(1)}`,
+        japanVol == null ? null : `日経ボラ ${japanVol.toFixed(1)}`,
+        jpWeightPct == null ? null : `日本株 ${jpWeightPct}%`,
+      ].filter(Boolean).join('・')
   const relationTone = !relation ? OPS.dim
     : relation.key === 'both_tense' ? OPS.vermilion
     : relation.key === 'own_led' ? OPS.amber
@@ -163,7 +180,9 @@ export default function PulseLine({
       .pulse-state-chips i { color:${OPS.dim}; font-family:${OPS.brand}; font-size:8.5px; font-style:normal; letter-spacing:.12em; }
 
       .pulse-lanes { display:flex; flex-direction:column; gap:5px; margin-top:6px; }
-      .pulse-lane { display:grid; grid-template-columns:66px minmax(0,1fr) 178px; gap:10px; align-items:center; }
+      /* 波形は固定幅。1fr にすると画面幅いっぱいまで伸びて、
+         読む情報が増えないまま横に間延びする (2026-08-19)。 */
+      .pulse-lane { display:grid; grid-template-columns:58px 176px minmax(0,1fr); gap:10px; align-items:center; }
       .pulse-lane.is-total { padding-top:6px; border-top:1px solid ${OPS.hairline}; }
 
       .pulse-lane-id { display:flex; flex-direction:column; gap:1px; }
@@ -237,6 +256,11 @@ export default function PulseLine({
       <span>原油 <b>{pulse?.oil_price == null ? '—' : pulse.oil_price.toFixed(1)}</b> {signed(pulse?.oil_change_1d_pct)}</span>
       <span>米10年 <b>{pulse?.us_10y == null ? '—' : pulse.us_10y.toFixed(2)}</b> {signed(pulse?.us_10y_change_1d_pt, 'pt')}</span>
       <span>ドル指数 <b>{pulse?.dxy_level == null ? '—' : pulse.dxy_level.toFixed(1)}</b> {signed(pulse?.dxy_change_1d_pct)}</span>
+      <span>
+        {pulse?.japan_source === '1306.T' ? 'TOPIX投' : '日経225'}{' '}
+        <b>{pulse?.japan_level == null ? '—' : Math.round(pulse.japan_level).toLocaleString('ja-JP')}</b>{' '}
+        {signed(pulse?.japan_change_1d_pct)}
+      </span>
       <span>日本株 <b>{signed(japanChange)}</b></span>
       <span>米国株 <b>{signed(usChange)}</b></span>
     </div>
