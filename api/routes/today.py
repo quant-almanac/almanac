@@ -1756,7 +1756,35 @@ def _build_decision_flow(
     }
 
 
-def _build_pulse(macro: dict, vix_state: dict) -> dict:
+def _japan_exposure_weight(holdings: dict) -> float | None:
+    """保有のうち日本株が占める比率 0..1。市場の鼓動の重みづけに使う。
+
+    「市場」とは自分が晒されている市場のことなので、日米のボラを
+    実際の保有比率で混ぜる。評価額が1件も取れなければ None を返し、
+    呼び出し側は VIX だけの採点に落とす —— 0 を返すと「日本株を
+    持っていない」という別の意味になる。
+    """
+    jp = 0.0
+    total = 0.0
+    for key, row in (holdings or {}).items():
+        if not isinstance(row, dict):
+            continue
+        try:
+            value = float(row.get("broker_position_value_jpy") or 0.0)
+        except (TypeError, ValueError):
+            continue
+        if value <= 0:
+            continue
+        total += value
+        ticker = str(row.get("ticker") or key)
+        if ticker.endswith(".T") or str(row.get("currency") or "") == "JPY":
+            jp += value
+    if total <= 0:
+        return None
+    return round(jp / total, 4)
+
+
+def _build_pulse(macro: dict, vix_state: dict, holdings: dict | None = None) -> dict:
     """PulseLine (市場の鼓動) が使う pulse ブロックを組み立てる。
 
     VIX は「市場の鼓動」の一例に過ぎない。原油・米10年債・ドル指数(DXY)も
@@ -1770,6 +1798,7 @@ def _build_pulse(macro: dict, vix_state: dict) -> dict:
     oil = vix_state.get("oil") or {}
     yields = vix_state.get("yields") or {}
     dxy = vix_state.get("dxy") or {}
+    japan = vix_state.get("japan") or {}
     return {
         "vix": macro.get("vix"),
         "vix_change_1d": vix.get("change_1d"),
@@ -1789,6 +1818,14 @@ def _build_pulse(macro: dict, vix_state: dict) -> dict:
         "dxy_change_1d_pct": dxy.get("change_1d_pct"),
         "dxy_change_5d_pct": dxy.get("change_5d_pct"),
         "dxy_history_1mo": dxy.get("history_1mo") or [],
+        # 日本株。ポートフォリオの約3割が日本株なので、市場側をVIX等の
+        # 米国指標だけで語ると半分が抜ける (2026-08-19)。
+        "japan_level": japan.get("level"),
+        "japan_change_1d_pct": japan.get("change_1d_pct"),
+        "japan_change_5d_pct": japan.get("change_5d_pct"),
+        "japan_source": japan.get("source"),
+        "japan_history_1mo": japan.get("history_1mo") or [],
+        "japan_exposure_weight": _japan_exposure_weight(holdings or {}),
     }
 
 
@@ -2396,7 +2433,7 @@ def _build_today() -> dict:
             }
         ),
         "holdings_intel": holdings_intel,
-        "pulse": _build_pulse(macro, vix_state),
+        "pulse": _build_pulse(macro, vix_state, holdings_raw),
     }
 
 

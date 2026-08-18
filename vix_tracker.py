@@ -31,6 +31,11 @@ USDCNY_TICKER = "USDCNY=X" # 人民元
 HG_TICKER = "HG=F"         # 銅先物
 CPC_TICKER = "^CPC"        # Put/Callレシオ
 HYG_TICKER = "HYG"         # HYG (HYスプレッドプロキシ)
+# 日本株。ポートフォリオの約3割が日本株なのに、市場側の指標が
+# VIX/SPY/米金利と全部米国だった (2026-08-19)。円建ての値動きを
+# 見ないと「市場」の半分が欠ける。
+N225_TICKER = "^N225"      # 日経225
+TOPIX_ETF_TICKER = "1306.T"  # TOPIX連動ETF (指数の代替。^TPX は yfinance で不安定)
 
 SECTOR_ETFS = ["XLK", "XLE", "XLF", "XLV", "XLI", "XLP", "XLU"]
 
@@ -39,6 +44,7 @@ BATCH_TICKERS_1MO = [
     VIX_TICKER, VIX3M_TICKER, OIL_TICKER,
     TNX_TICKER, IRX_TICKER, SPY_TICKER,
     TYX_TICKER, DXY_TICKER, USDCNY_TICKER, HG_TICKER, HYG_TICKER,
+    N225_TICKER, TOPIX_ETF_TICKER,
 ] + SECTOR_ETFS
 
 # Fear & Greed スコアの重み
@@ -342,6 +348,22 @@ def _fetch_all() -> dict | None:
         "history_1mo": _series_to_history(dxy_close),
     }
 
+    # 日経225。ポートフォリオの約3割が日本株なので、市場の鼓動を米国指標
+    # だけで語ると半分が抜ける。指数そのものが取れない日は TOPIX ETF を
+    # 代替に使う —— 別物だが「日本株が上げたか下げたか」は答えられる。
+    n225_close = _get_close(df_1mo, N225_TICKER)
+    jp_source = "^N225"
+    if _safe_last(n225_close) is None:
+        n225_close = _get_close(df_1mo, TOPIX_ETF_TICKER)
+        jp_source = "1306.T"
+    result["japan"] = {
+        "level": _round_or_none(_safe_last(n225_close)),
+        "change_1d_pct": _round_or_none(_safe_pct_change(n225_close, 1)),
+        "change_5d_pct": _round_or_none(_safe_pct_change(n225_close, 5)),
+        "source": jp_source if _safe_last(n225_close) is not None else None,
+        "history_1mo": _series_to_history(n225_close),
+    }
+
     # ── USD/CNY ──
     usdcny_close = _get_close(df_1mo, USDCNY_TICKER)
     result["usdcny"] = {
@@ -575,6 +597,8 @@ def get_vix_context() -> dict:
         "sector_dispersion": None,
         "fear_greed": {"score": None, "label": "UNKNOWN", "components": {}},
         "dxy": {"level": None, "change_1d_pct": None, "change_5d_pct": None},
+        "japan": {"level": None, "change_1d_pct": None, "change_5d_pct": None,
+                  "source": None, "history_1mo": []},
         "usdcny": {"level": None, "change_5d_pct": None},
         "copper": {"price": None, "change_5d_pct": None},
         "put_call_ratio": None,
