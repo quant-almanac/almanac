@@ -54,6 +54,7 @@
 | live | `risk_policy.py`, `risk_engine.py`, `portfolio_risk_returns.py`, `risk_model_validation.py` | 版管理された固定上限、VaR/CVaR、保有based return、Kupiec |
 | optional | `portfolio_optimizer.py`, `optimize.py`, `bl_alpha_sources.py` | allocation objectiveと独立BL view |
 | live | `capital_allocator.py` | 既存安全gate通過後の通常risk-increasing actionを決定論的に最終選抜 |
+| live/advisory | `capital_deployment.py` | 現金予約、DD pacing、action-bound scheduled broad permissionの契約 |
 | live/advisory | `market_regime_v2.py`, `regime_params.py`, `vix_classification.py`, `vix_tracker.py` | regime/rate/shock policy、volatility state |
 | shadow/manual-promote | `drawdown_state_machine.py`, `drawdown_enforcement.py` | flow調整DDのhysteresisと明示的enforcement昇格 |
 | live | `drawdown_dca_engine.py`, `leveraged_decay_monitor.py` | DCA ladderとleveraged decay |

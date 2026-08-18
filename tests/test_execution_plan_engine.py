@@ -1349,10 +1349,11 @@ def test_confirmed_surplus_cash_creates_paced_monthly_budget() -> None:
     assert plan["cash_info"]["total_cash_jpy"] == 3_911_286
     assert budgets["confirmed_cash_jpy"] == 3_911_286
     assert budgets["tactical_cash_reserve_jpy"] == 2_100_000
-    assert budgets["surplus_cash_above_targets_jpy"] == 1_811_286
+    assert budgets["protected_crisis_reserve_jpy"] == 1_500_000
+    assert budgets["surplus_cash_above_targets_jpy"] == 311_286
     assert budgets["deployment_months"] == 3
-    assert budgets["monthly_discretionary_budget_jpy"] == 603_762
-    assert budgets["normal_pool_available_jpy"] == 603_762
+    assert budgets["monthly_discretionary_budget_jpy"] == 103_762
+    assert budgets["normal_pool_available_jpy"] == 103_762
     assert budgets["budget_source"] == "confirmed_surplus_cash"
     assert plan["items"]
 
@@ -1442,8 +1443,8 @@ def test_dynamic_budget_adds_fills_back_once_and_removes_sell_proceeds() -> None
 
     assert warnings == []
     assert budgets["deployment_basis_cash_jpy"] == 9_450_000
-    assert budgets["deployment_basis_surplus_jpy"] == 7_350_000
-    assert budgets["monthly_discretionary_budget_jpy"] == 2_450_000
+    assert budgets["deployment_basis_surplus_jpy"] == 5_850_000
+    assert budgets["monthly_discretionary_budget_jpy"] == 1_950_000
     assert budgets["deployment_basis_method"] == (
         "confirmed_cash_plus_base_filled_buys_minus_filled_sell_proceeds"
     )
@@ -1452,10 +1453,10 @@ def test_dynamic_budget_adds_fills_back_once_and_removes_sell_proceeds() -> None
 @pytest.mark.parametrize(
     ("level", "label", "months", "expected"),
     [
-        (2, "strong_bull", 2, 3_950_000),
-        (1, "mild_bull", 3, 2_633_333),
-        (0, "neutral", 6, 1_316_667),
-        (-1, "mild_bear", 12, 658_333),
+        (2, "strong_bull", 2, 3_200_000),
+        (1, "mild_bull", 3, 2_133_333),
+        (0, "neutral", 6, 1_066_667),
+        (-1, "mild_bear", 12, 533_333),
         (-2, "strong_bear", None, 0),
     ],
 )

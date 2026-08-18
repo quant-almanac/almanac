@@ -455,6 +455,8 @@ def derive_budgets(
     contribution_summary: dict[str, Any] | None = None,
     cash_target_policy: dict[str, Any] | None = None,
     monthly_consumption: dict[str, Any] | None = None,
+    operational_reservations: list[dict[str, Any]] | None = None,
+    drawdown_pacing: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], list[str]]:
     """Derive a paced budget from confirmed cash above the tactical target.
 
@@ -494,6 +496,17 @@ def derive_budgets(
         }
     all_cash_is_surplus = bool(deployment_policy.get("all_system_cash_is_surplus"))
     protected_reserve = _jpy(deployment_policy.get("protected_cash_reserve_jpy"))
+    try:
+        crisis_reserve_pct = float(deployment_policy.get("protected_crisis_reserve_pct") or 0)
+    except (TypeError, ValueError):
+        crisis_reserve_pct = 0.0
+    if not math.isfinite(crisis_reserve_pct) or not 0 <= crisis_reserve_pct <= 1:
+        crisis_reserve_pct = 0.0
+    try:
+        from capital_deployment import operational_reserve_summary
+        operational_summary = operational_reserve_summary(operational_reservations)
+    except Exception:
+        operational_summary = {"operational_reservations": [], "operational_reserve_jpy": 0, "operational_reserve_by_wallet_jpy": {}, "reservation_count": 0}
     if (
         deployment_horizon.get("resolved")
         and not deployment_horizon.get("ordinary_deployment_allowed")
@@ -516,9 +529,11 @@ def derive_budgets(
         _jpy(portfolio_total * cash_target_pct / 100)
         if portfolio_total > 0 and cash_target_pct is not None else None
     )
+    protected_crisis_reserve = _jpy(portfolio_total * crisis_reserve_pct)
+    operational_reserve = _jpy(operational_summary.get("operational_reserve_jpy"))
     required_reserve = (
-        max(protected_reserve, tactical_reserve)
-        if tactical_reserve is not None else protected_reserve
+        protected_reserve + (tactical_reserve if tactical_reserve is not None else 0)
+        + protected_crisis_reserve + operational_reserve
     )
     surplus_cash = 0
     surplus_monthly_capacity = 0
@@ -536,7 +551,7 @@ def derive_budgets(
         monthly_consumption.get("unattributed_monthly_sell_filled_notional_jpy")
     )
     deployment_basis_cash = max(0, confirmed_cash + base_filled_buys - filled_sells)
-    deployment_basis_surplus = 0
+    ordinary_deployable_surplus = 0
     deployment_months = deployment_horizon.get("deployment_months")
     if all_cash_is_surplus and cash_info.get("valid_for_budget"):
         if tactical_reserve is None:
@@ -545,11 +560,16 @@ def derive_budgets(
             warnings.append("deployment_horizon_unresolved: ordinary deployment budget disabled")
         else:
             surplus_cash = max(0, confirmed_cash - required_reserve)
-            deployment_basis_surplus = max(0, deployment_basis_cash - required_reserve)
+            ordinary_deployable_surplus = max(0, deployment_basis_cash - required_reserve)
             if deployment_months is not None and int(deployment_months) > 0:
-                surplus_monthly_capacity = _jpy(
-                    deployment_basis_surplus / int(deployment_months)
-                )
+                try:
+                    multiplier = float((drawdown_pacing or {}).get("dd_pacing_multiplier", 1.0))
+                except (TypeError, ValueError):
+                    multiplier = 0.0
+                if not math.isfinite(multiplier) or not 0 <= multiplier <= 1:
+                    multiplier = 0.0
+                effective_months = float(deployment_months) / multiplier if multiplier > 0 else None
+                surplus_monthly_capacity = _jpy(ordinary_deployable_surplus / effective_months) if effective_months else 0
             else:
                 warnings.append(
                     "ordinary_deployment_disabled_for_regime: use active DCA/playbook only"
@@ -574,12 +594,6 @@ def derive_budgets(
     if _guard_blocks_new_deployment(guard):
         deployment_multiplier = 0.0
         warnings.append("budget_guard_block: trading/new entry guard blocks normal deployment")
-    else:
-        multiplier = _guard_caution_multiplier(guard)
-        if multiplier < 1.0:
-            deployment_multiplier = multiplier
-            warnings.append(f"budget_guard_scaled: normal deployment scaled by {multiplier:.2f}")
-
     base_monthly = _jpy(base_monthly * deployment_multiplier)
     released_normal = _jpy(released_normal * deployment_multiplier)
     released_opportunity = _jpy(released_opportunity * deployment_multiplier)
@@ -624,16 +638,24 @@ def derive_budgets(
         "cash_target_policy_version": cash_target_policy.get("policy_version"),
         "tactical_cash_reserve_jpy": tactical_reserve,
         "protected_cash_reserve_jpy": protected_reserve,
+        "protected_crisis_reserve_jpy": protected_crisis_reserve,
+        "operational_reserve_jpy": operational_reserve,
+        "operational_reservations": operational_summary.get("operational_reservations", []),
+        "operational_reserve_by_wallet_jpy": operational_summary.get("operational_reserve_by_wallet_jpy", {}),
         "required_cash_reserve_jpy": required_reserve,
         "surplus_cash_above_targets_jpy": surplus_cash,
         "deployment_basis_cash_jpy": deployment_basis_cash,
-        "deployment_basis_surplus_jpy": deployment_basis_surplus,
+        "deployment_basis_surplus_jpy": ordinary_deployable_surplus,
+        "ordinary_deployable_surplus_jpy": ordinary_deployable_surplus,
         "deployment_basis_filled_buys_added_back_jpy": base_filled_buys,
         "deployment_basis_sell_proceeds_removed_jpy": filled_sells,
         "deployment_basis_method": (
             "confirmed_cash_plus_base_filled_buys_minus_filled_sell_proceeds"
         ),
         "deployment_months": deployment_months,
+        "canonical_dd_stage": (drawdown_pacing or {}).get("dd_stage", "data_confidence_caution"),
+        "dd_pacing_multiplier": (drawdown_pacing or {}).get("dd_pacing_multiplier", 1.0),
+        "dd_pacing_source": (drawdown_pacing or {}).get("dd_pacing_source", "prepromotion"),
         "deployment_regime_level": deployment_horizon.get("portfolio_level"),
         "deployment_regime_label": deployment_horizon.get("portfolio_label"),
         "deployment_policy_version": deployment_horizon.get("policy_version"),
@@ -2207,11 +2229,17 @@ def allocate_candidate_batch_against_plan(
     monthly_remaining: int | None = _jpy(monthly_raw) if monthly_raw is not None else None
     cash_info = plan_state.get("cash_info") or {}
     wallet_contract_active = cash_info.get("wallet_contract_version") == 1
+    wallet_rows = cash_info.get("wallets_after_operational_reservations")
+    if not isinstance(wallet_rows, list):
+        wallet_rows = cash_info.get("wallets") or []
     wallet_remaining = {
         str(row.get("wallet_key")): _jpy(row.get("available_jpy"))
-        for row in cash_info.get("wallets") or []
+        for row in wallet_rows
         if isinstance(row, dict) and row.get("wallet_key")
     }
+    for row in wallet_rows:
+        if isinstance(row, dict) and row.get("wallet_key") and "available_after_operational_reservations_jpy" in row:
+            wallet_remaining[str(row["wallet_key"])] = _jpy(row.get("available_after_operational_reservations_jpy"))
 
     def _wallet_key(action: dict[str, Any]) -> str | None:
         try:
@@ -2398,6 +2426,8 @@ def build_execution_plan(
     now: datetime | None = None,
     contribution_occurrences: list[tuple[date, dict[str, Any]]] | None = None,
     contribution_ledger: dict[str, Any] | None = None,
+    operational_reservations: list[dict[str, Any]] | None = None,
+    drawdown_pacing: dict[str, Any] | None = None,
     trusted_sector_catalog: dict[str, Any] | None = None,
     sector_catalog_summary: dict[str, Any] | None = None,
     sector_catalog_warnings: list[str] | None = None,
@@ -2425,6 +2455,12 @@ def build_execution_plan(
         except Exception:
             contribution_occurrences = []
     scheduled_jpy = scheduled_contribution_amount(contribution_occurrences)
+    if operational_reservations is None:
+        try:
+            from contribution_schedule import broker_cash_reservations
+            operational_reservations = broker_cash_reservations(contribution_occurrences)
+        except Exception:
+            operational_reservations = []
     try:
         from contribution_ledger import summarize_contributions
 
@@ -2453,6 +2489,13 @@ def build_execution_plan(
         executions=executions,
         fx_rate=float(cash_info.get("fx_rate_usdjpy") or 150.0),
     )
+    try:
+        from capital_deployment import wallet_available_after_reservations
+        cash_info["wallets_after_operational_reservations"] = wallet_available_after_reservations(
+            cash_info.get("wallets") or [], operational_reservations or [],
+        )
+    except Exception:
+        cash_info["wallets_after_operational_reservations"] = []
     budgets, budget_warnings = derive_budgets(
         cash_info=cash_info,
         guard=guard,
@@ -2462,6 +2505,8 @@ def build_execution_plan(
         contribution_summary=contribution_summary,
         cash_target_policy=cash_target_policy,
         monthly_consumption=monthly_consumption,
+        operational_reservations=operational_reservations,
+        drawdown_pacing=drawdown_pacing,
     )
     # Existing unlinked buys are shown and consume a recurring policy amount,
     # but can never be guessed against a newly approved salary/bonus source.
@@ -2637,6 +2682,15 @@ def generate_execution_plan(*, base_dir: Path = BASE_DIR, now: datetime | None =
         }
     except Exception:
         effective_executions = {"executions": []}
+    try:
+        from capital_deployment import resolve_drawdown_pacing
+        drawdown_pacing = resolve_drawdown_pacing(base_dir=base_dir)
+    except Exception:
+        drawdown_pacing = {
+            "dd_stage": "controller_fault", "dd_pacing_multiplier": 0.0,
+            "dd_pacing_source": "controller_fault", "dd_enforcement_active": False,
+            "requires_human_acknowledgement": True, "promotion_history_status": "resolver_error",
+        }
     plan = build_execution_plan(
         account=load_json(base_dir / "account.json", {}),
         holdings=load_json(base_dir / "holdings.json", []),
@@ -2649,6 +2703,7 @@ def generate_execution_plan(*, base_dir: Path = BASE_DIR, now: datetime | None =
         ai_analysis=load_json(base_dir / "ai_portfolio_analysis.json", {}),
         market_regime=load_json(base_dir / "market_regime_v2_state.json", {}),
         contribution_ledger=load_json(base_dir / "contribution_ledger.json", {"contributions": []}),
+        drawdown_pacing=drawdown_pacing,
         now=now,
         trusted_sector_catalog=sector_catalog,
         sector_catalog_summary=sector_summary,

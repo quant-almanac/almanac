@@ -127,6 +127,9 @@ VALID_EVENT_TYPES = {
     "internal_transfer",  # 管理対象口座内移動 (SBI→楽天 等)。audit のみ、TWR には影響させない
     "cross_owner_transfer",  # 名義間資金移動。税務確認記録を伴うが税務判定はしない
     "reconcile",          # ブローカー残高に合わせた内部補正。audit のみ、TWR には影響させない
+    # Policy event, not a cash movement.  Kept append-only so a missing
+    # controller cannot be mistaken for a never-promoted controller.
+    "drawdown_controller_promoted",
 }
 
 VALID_DIRECTIONS = {"buy", "sell", "margin_buy", "short", "cover", "in", "out"}

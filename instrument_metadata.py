@@ -21,6 +21,18 @@ JPX_ALPHANUMERIC_CODES = {"285A"}
 JPX_TRADING_UNITS: dict[str, int] = {
     "1489.T": 1,
     "1306.T": 10,
+    "1321.T": 1,
+}
+
+# Explicit metadata is required before a scheduled broad route can use a new
+# instrument.  This is separate from illustrative/public portfolio holdings.
+BROAD_EXECUTION_ALLOWLIST: dict[str, dict[str, object]] = {
+    "VT": {"asset_class": "etf", "listing_currency": "USD", "broad_family": "global_all_country", "trading_unit": 1, "price_provider": "market_data"},
+    "VTI": {"asset_class": "etf", "listing_currency": "USD", "broad_family": "us_broad", "trading_unit": 1, "price_provider": "market_data"},
+    "VOO": {"asset_class": "etf", "listing_currency": "USD", "broad_family": "us_broad", "trading_unit": 1, "price_provider": "market_data"},
+    "SPY": {"asset_class": "etf", "listing_currency": "USD", "broad_family": "us_broad", "trading_unit": 1, "price_provider": "market_data"},
+    "1306.T": {"asset_class": "etf", "listing_currency": "JPY", "broad_family": "japan_broad", "trading_unit": 10, "price_provider": "market_data"},
+    "1321.T": {"asset_class": "etf", "listing_currency": "JPY", "broad_family": "japan_broad", "trading_unit": 1, "price_provider": "market_data"},
 }
 
 
@@ -54,6 +66,26 @@ def trading_unit_for_ticker(value: object) -> int:
     if ticker.endswith(".T"):
         return 100
     return 1
+
+
+def broad_execution_metadata(value: object) -> dict[str, object] | None:
+    row = BROAD_EXECUTION_ALLOWLIST.get(canonical_ticker(value))
+    return dict(row) if isinstance(row, dict) else None
+
+
+def validate_broad_execution_allowlist(*, price_available: set[str] | None = None) -> list[dict[str, object]]:
+    """Return completeness issues; callers must fail closed on any issue."""
+    issues: list[dict[str, object]] = []
+    required = {"asset_class", "listing_currency", "broad_family", "trading_unit", "price_provider"}
+    for ticker, row in sorted(BROAD_EXECUTION_ALLOWLIST.items()):
+        missing = sorted(key for key in required if not row.get(key))
+        if missing:
+            issues.append({"ticker": ticker, "code": "metadata_missing", "fields": missing})
+        elif ticker.endswith(".T") and trading_unit_for_ticker(ticker) != row["trading_unit"]:
+            issues.append({"ticker": ticker, "code": "trading_unit_mismatch"})
+        elif price_available is not None and ticker not in price_available:
+            issues.append({"ticker": ticker, "code": "price_provider_unavailable"})
+    return issues
 
 
 def quantity_label_for_ticker(value: object) -> str:

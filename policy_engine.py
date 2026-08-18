@@ -230,7 +230,14 @@ def _rule_dd_stage(action: dict, ctx: PolicyContext):
     if ctx.loss_guard_stage and ctx.loss_guard_stage != "ok":
         return ("reject", f"loss_guard_stage={ctx.loss_guard_stage}（日次/30日P&Lショック制御）により新規リスク停止。")
     dd_stage = ctx.canonical_drawdown_stage or classify_drawdown(ctx.current_dd).get("dd_stage")
+    try:
+        from capital_deployment import validate_scheduled_broad_permission
+        scheduled_broad_permission = validate_scheduled_broad_permission(action, canonical_dd_stage=str(dd_stage))
+    except Exception:
+        scheduled_broad_permission = False
     if dd_stage in {"objective_breach", "freeze", "derisk_review", "block"}:
+        if scheduled_broad_permission:
+            return None
         return ("reject", f"canonical_drawdown_stage={dd_stage} により新規リスクは人間レビュー待ち。")
     # Before Slice 3 promotion a missing canonical DD is a visible data-quality
     # caution at execution preflight, not a morning-analysis hard block.

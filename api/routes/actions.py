@@ -991,7 +991,10 @@ def _execution_strategy_class(req: ExecutionRequest) -> str:
     linked = _linked_ai_action(req)
     if str(linked.get("tier") or "").strip().lower() == "swing":
         return "swing"
-    if str(linked.get("source") or "").strip().lower().startswith("scenario"):
+    source = str(linked.get("source") or "").strip().lower()
+    if source == "scheduled_broad_deployment":
+        return "scheduled_broad_deployment"
+    if source.startswith("scenario"):
         return "scenario"
     return "normal"
 

@@ -400,13 +400,15 @@ def test_save_execution_records_to_execution_log(isolated) -> None:
     assert rec["strategy_class"] == "normal"
 
 
-def test_execution_strategy_class_preserves_swing_and_scenario_lanes(monkeypatch):
+def test_execution_strategy_class_preserves_swing_scenario_and_scheduled_broad_lanes(monkeypatch):
     swing = ExecutionRequest(ticker="V", direction="buy", quantity=1, price=1, currency="USD")
     scenario = ExecutionRequest(ticker="V", direction="buy", quantity=1, price=1, currency="USD")
     monkeypatch.setattr(actions, "_linked_ai_action", lambda req: {"tier": "Swing"})
     assert actions._execution_strategy_class(swing) == "swing"
     monkeypatch.setattr(actions, "_linked_ai_action", lambda req: {"source": "scenario_playbook"})
     assert actions._execution_strategy_class(scenario) == "scenario"
+    monkeypatch.setattr(actions, "_linked_ai_action", lambda req: {"source": "scheduled_broad_deployment"})
+    assert actions._execution_strategy_class(scenario) == "scheduled_broad_deployment"
 
 
 def _risk_shock_isolated(isolated, monkeypatch) -> dict:

@@ -10381,7 +10381,7 @@ def _apply_capital_allocator(
     if not isinstance(synthesis, dict) or not isinstance(synthesis.get("priority_actions"), list):
         return
     try:
-        from capital_allocator import allocate_actions, build_comparison, record_comparison
+        from capital_allocator import allocate_actions, allocate_scheduled_broad_actions, build_comparison, record_comparison
         from tunable_params import get as _tp_get
 
         configured_mode = str(_tp_get("capital_allocator_mode", "enforce") or "enforce").lower()
@@ -10394,25 +10394,46 @@ def _apply_capital_allocator(
             minimum_notional = 150_000.0
 
         prior_normal_buys = 0
+        prior_scheduled_actions_this_week = 0
+        prior_scheduled_notional_jpy = 0
         try:
             from execution_reconciliation import load_effective_execution_records
 
             analysis_day = str(as_of)[:10]
+            analysis_week = datetime.fromisoformat(str(as_of).replace("Z", "+00:00")).isocalendar()[:2]
             for execution in load_effective_execution_records(base_dir=BASE_DIR):
                 if not isinstance(execution, dict):
                     continue
                 if str(execution.get("status") or "").lower() not in {"executed", "partial", "filled"}:
                     continue
-                if str(execution.get("saved_at") or execution.get("executed_at_time") or "")[:10] != analysis_day:
-                    continue
+                execution_time = str(execution.get("saved_at") or execution.get("executed_at_time") or "")
+                same_day = execution_time[:10] == analysis_day
+                try:
+                    execution_week = analysis_week if same_day else datetime.fromisoformat(execution_time.replace("Z", "+00:00")).isocalendar()[:2]
+                except (TypeError, ValueError):
+                    execution_week = None
                 strategy_class = str(execution.get("strategy_class") or "").lower()
                 if strategy_class in {"scenario", "swing"}:
+                    continue
+                if strategy_class == "scheduled_broad_deployment":
+                    if same_day:
+                        prior_normal_buys = 1
+                    if execution_week == analysis_week:
+                        prior_scheduled_actions_this_week += 1
+                        try:
+                            prior_scheduled_notional_jpy += int(round(float(execution.get("executed_amount_jpy") or execution.get("estimated_notional_jpy") or execution.get("notional_jpy") or 0)))
+                        except (TypeError, ValueError):
+                            prior_scheduled_notional_jpy = 1_000_000
+                    continue
+                if not same_day:
                     continue
                 if _direction_of(execution.get("direction") or execution.get("action_type") or execution.get("type")) == "buy":
                     prior_normal_buys += 1
         except Exception:
             # Read failure must not create additional buying capacity.
             prior_normal_buys = 1
+            prior_scheduled_actions_this_week = 2
+            prior_scheduled_notional_jpy = 1_000_000
 
         original_actions = copy.deepcopy(synthesis.get("priority_actions") or [])
         original_summary = copy.deepcopy(synthesis.get("decision_summary"))
@@ -10423,6 +10444,12 @@ def _apply_capital_allocator(
             min_trade_jpy=minimum_notional,
             prior_normal_buys_today=prior_normal_buys,
         )
+        allocated, scheduled_report = allocate_scheduled_broad_actions(
+            allocated, mode=mode, fx_rate=float(fx_rate), min_trade_jpy=minimum_notional,
+            prior_scheduled_actions_this_week=prior_scheduled_actions_this_week,
+            prior_scheduled_notional_jpy=prior_scheduled_notional_jpy,
+        )
+        report["scheduled_broad"] = scheduled_report
         report["minimum_notional_jpy"] = round(minimum_notional)
         report["run_id"] = analysis_id or str(as_of)
 

@@ -20,7 +20,7 @@ import hashlib
 import json
 import os
 from datetime import date, timedelta
-from typing import List, Tuple
+from typing import Any, List, Tuple
 
 def _load_contributions() -> list[dict]:
     raw = os.getenv("ALMANAC_CONTRIBUTION_SCHEDULE_JSON", "")
@@ -110,6 +110,36 @@ def cash_route_outflows(
             and str(contribution.get("currency") or "").upper() == currency
         )
     ]
+
+
+def broker_cash_reservations(occurrences_rows: List[Tuple[date, dict]]) -> list[dict[str, Any]]:
+    """Build deterministic reservations only for explicit broker-cash debits."""
+    out: list[dict[str, Any]] = []
+    for when, contribution in occurrences_rows or []:
+        if not isinstance(contribution, dict) or str(contribution.get("funding_source") or "") != "broker_cash":
+            continue
+        route = str(contribution.get("cash_route") or "").strip()
+        owner = str(contribution.get("owner") or "").strip().lower()
+        broker = str(contribution.get("broker") or "").strip().lower()
+        currency = str(contribution.get("currency") or "JPY").upper()
+        schedule_id = str(contribution.get("id") or "").strip()
+        try:
+            amount = int(round(float(contribution.get("amount") or 0)))
+        except (TypeError, ValueError):
+            amount = 0
+        if not (route and owner and broker and schedule_id and amount > 0):
+            continue
+        reservation_key = f"{schedule_id}|{when.isoformat()}|{route}"
+        out.append({
+            "reservation_id": hashlib.sha256(reservation_key.encode("utf-8")).hexdigest()[:24],
+            "reservation_key": reservation_key, "schedule_id": schedule_id,
+            "due_date": when.isoformat(), "wallet_key": f"{owner}|{broker}|broker_cash|{currency}",
+            "cash_route": route, "owner": owner, "broker": broker, "currency": currency,
+            "amount_jpy": amount if currency == "JPY" else None, "amount_native": amount,
+            "reservation_type": "scheduled_broker_cash_contribution", "status": "active",
+            "reflected_in_confirmed_cash": False, "deployment_assignment_id": None,
+        })
+    return sorted(out, key=lambda row: (row["due_date"], row["reservation_id"]))
 
 
 def generate_transactions(date_from: str, date_to: str) -> List[dict]:

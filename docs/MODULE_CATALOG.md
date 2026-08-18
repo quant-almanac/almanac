@@ -54,6 +54,7 @@ The large orchestration implementation lives in the `analyst/` package; see §15
 | live | `risk_policy.py`, `risk_engine.py`, `portfolio_risk_returns.py`, `risk_model_validation.py` | Versioned fixed limits, VaR/CVaR, holding-based returns and Kupiec validation |
 | optional | `portfolio_optimizer.py`, `optimize.py`, `bl_alpha_sources.py` | Allocation objectives and independent Black-Litterman views |
 | live | `capital_allocator.py` | Deterministic final selection for ordinary risk-increasing actions after existing safety gates |
+| live/advisory | `capital_deployment.py` | Cash-reservation accounting, drawdown-paced deployment and action-bound scheduled-broad permissions |
 | live/advisory | `market_regime_v2.py`, `regime_params.py`, `vix_classification.py`, `vix_tracker.py` | Regime/rate/shock policy and volatility-state inputs |
 | shadow/manual-promote | `drawdown_state_machine.py`, `drawdown_enforcement.py` | Flow-adjusted DD hysteresis and explicit enforcement promotion |
 | live | `drawdown_dca_engine.py`, `leveraged_decay_monitor.py` | DCA ladder and leveraged-product decay |

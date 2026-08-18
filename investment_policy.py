@@ -20,6 +20,8 @@ POSITION_CAPS_BY_TIER = {
 }
 EMPLOYER_POSITION_CAP = 0.10
 PROTECTED_CASH_RESERVE_JPY = 0
+# Tactical crisis budget, separate from any living-expense reserve.
+PROTECTED_CRISIS_RESERVE_PCT = 0.05
 CASH_DEPLOYMENT_POLICY_VERSION = "regime_horizon_v1"
 CASH_DEPLOYMENT_MONTHS_BY_LEVEL = {
     2: 2,   # strong bull
@@ -41,6 +43,7 @@ def cash_deployment_policy() -> dict:
     return {
         "all_system_cash_is_surplus": True,
         "protected_cash_reserve_jpy": PROTECTED_CASH_RESERVE_JPY,
+        "protected_crisis_reserve_pct": PROTECTED_CRISIS_RESERVE_PCT,
         "tactical_cash_retention_allowed": True,
         "operational_reservations_still_required": True,
         "monthly_budget_method": "deployable_surplus_divided_by_regime_horizon",

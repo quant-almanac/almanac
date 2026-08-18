@@ -8,12 +8,14 @@ both present.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from drawdown_state_machine import advance_state, enforcement_eligibility, initial_state
+from almanac.runtime_config import resolve_db_path
 from utils import atomic_write_json
 
 
@@ -66,11 +68,30 @@ def promote(*, base_dir: Path, manual_reconciliation_reference: str) -> dict[str
     state = advance_state(
         initial_state(), drawdown_decimal=float(dd), effective_nav_date=str(end_date),
     )
+    evidence = {
+        "controller_version": "flow_adjusted_dd_v1",
+        "policy_version": "2026-08-v2",
+        "manual_reconciliation_reference": reference,
+        "eligibility": eligibility,
+        "initial_dd_state": state.get("dd_state"),
+        "initial_drawdown_decimal": float(dd),
+        "effective_nav_date": str(end_date),
+    }
+    evidence_hash = hashlib.sha256(json.dumps(evidence, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
+    from event_ledger import append_event
+    event = append_event(
+        event_type="drawdown_controller_promoted", occurred_at=datetime.now(timezone.utc).isoformat(),
+        source="manual", note="flow-adjusted DD controller promotion",
+        raw_payload={**evidence, "eligibility_snapshot_hash": evidence_hash},
+        event_id=f"drawdown-controller-promotion:{evidence_hash}", db_path=resolve_db_path(base_dir),
+    )
     state.update({
         "enforcement_enabled": True,
         "promoted_at": datetime.now(timezone.utc).isoformat(),
         "manual_reconciliation_reference": reference,
         "promotion_eligibility": eligibility,
+        "promotion_event_id": event["event_id"],
+        "promotion_eligibility_snapshot_hash": evidence_hash,
     })
     atomic_write_json(state_path, state)
     return state

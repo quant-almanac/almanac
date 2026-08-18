@@ -10,7 +10,7 @@ from dataclasses import asdict, dataclass
 from typing import Any, Iterable
 
 
-RISK_POLICY_VERSION = "2026-08-v1"
+RISK_POLICY_VERSION = "2026-08-v2"
 
 # These historical tunable keys remain readable for audit only.  Neither the
 # tuning advisor nor an auto-tuning run may produce a new recommendation for
@@ -50,6 +50,24 @@ class RiskPolicy:
 
 
 POLICY = RiskPolicy()
+
+
+def concentration_limits(*, broad_family: str | None = None, investment_type: str | None = None, employer_stock: bool = False) -> dict[str, Any]:
+    """Return versioned prospective concentration limits.
+
+    Broad treatment is allowed only for explicitly classified long exposure;
+    missing classifications retain the historic 10% hard cap.
+    """
+    tier = str(investment_type or "").lower()
+    if employer_stock:
+        return {"classification": "employer", "caution_decimal": 0.08, "cap_decimal": 0.10, "family_cap_decimal": None}
+    if broad_family and tier == "long":
+        return {"classification": "broad_long", "broad_family": str(broad_family), "caution_decimal": 0.20, "cap_decimal": 0.25, "family_cap_decimal": 0.40}
+    if tier == "medium":
+        return {"classification": "medium", "caution_decimal": 0.04, "cap_decimal": 0.05, "family_cap_decimal": None}
+    if tier == "swing":
+        return {"classification": "swing", "caution_decimal": 0.016, "cap_decimal": 0.02, "family_cap_decimal": None}
+    return {"classification": "legacy_or_long", "caution_decimal": POLICY.concentration_caution_decimal, "cap_decimal": POLICY.concentration_cap_decimal, "family_cap_decimal": None}
 
 
 def loss_guard_state(
@@ -170,6 +188,10 @@ def classify_execution_risk(
     risk_increasing: bool,
     action_direction: str | None = None,
     current_short_positions: int | None = None,
+    concentration_caution_decimal: float | None = None,
+    concentration_cap_decimal: float | None = None,
+    family_concentration_decimal: float | None = None,
+    family_concentration_cap_decimal: float | None = None,
 ) -> dict[str, Any]:
     """Return the deterministic preflight disposition.
 
@@ -233,12 +255,19 @@ def classify_execution_risk(
             f"VaRがレジーム別リスク予算{var_threshold * 100:.1f}%を超えています",
         )
 
+    concentration_caution = float(concentration_caution_decimal) if concentration_caution_decimal is not None else POLICY.concentration_caution_decimal
+    concentration_cap = float(concentration_cap_decimal) if concentration_cap_decimal is not None else POLICY.concentration_cap_decimal
     if concentration_decimal is None:
         add("concentration_unavailable", "注文後の集中度を確認できません。人間の明示確認が必要です")
-    elif float(concentration_decimal) >= POLICY.concentration_cap_decimal:
-        add("concentration_cap", "注文後の単一銘柄集中度が10%上限に達します", hard=True)
-    elif float(concentration_decimal) >= POLICY.concentration_caution_decimal:
-        add("concentration_caution", "注文後の単一銘柄集中度が8%注意水準です")
+    elif float(concentration_decimal) >= concentration_cap:
+        add("concentration_cap", f"注文後の単一銘柄集中度が{concentration_cap * 100:.0f}%上限に達します", hard=True)
+    elif float(concentration_decimal) >= concentration_caution:
+        add("concentration_caution", f"注文後の単一銘柄集中度が{concentration_caution * 100:.1f}%注意水準です")
+    if family_concentration_cap_decimal is not None:
+        if family_concentration_decimal is None:
+            add("concentration_family_unavailable", "注文後のfamily集中度を確認できません。人間の明示確認が必要です")
+        elif float(family_concentration_decimal) >= float(family_concentration_cap_decimal):
+            add("concentration_family_cap", f"注文後のfamily集中度が{float(family_concentration_cap_decimal) * 100:.0f}%上限に達します", hard=True)
 
     if loss["loss_guard_stage"] != "ok":
         loss_message = (

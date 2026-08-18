@@ -20,6 +20,7 @@ def test_jpx_aliases_are_canonicalized_without_touching_us_symbols() -> None:
 def test_held_jpx_etfs_use_official_trading_units() -> None:
     assert trading_unit_for_ticker("1489.T") == 1
     assert trading_unit_for_ticker("1306") == 10
+    assert trading_unit_for_ticker("1321.T") == 1
     assert trading_unit_for_ticker("9999.T") == 100
     assert quantity_label_for_ticker("1489") == "口"
     assert quantity_label_for_ticker("9999.T") == "株"

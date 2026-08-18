@@ -19,12 +19,13 @@ from risk_policy import (
     POLICY,
     RISK_POLICY_VERSION,
     classify_execution_risk,
+    concentration_limits,
     loss_guard_state,
     var_threshold_decimal,
 )
 
 
-PREFLIGHT_VERSION = "2026-08-v1"
+PREFLIGHT_VERSION = "2026-08-v2"
 PREFLIGHT_TTL_MINUTES = 60
 PREFLIGHT_ACK_LOG = "execution_preflight_acknowledgements.jsonl"
 
@@ -268,6 +269,55 @@ def _prospective_concentration(payload: dict[str, Any], base_dir: Path) -> float
         return None
 
 
+def _broad_concentration_context(payload: dict[str, Any], base_dir: Path) -> dict[str, Any]:
+    """Resolve broad limits only with complete long-family evidence."""
+    try:
+        from instrument_metadata import broad_execution_metadata, canonical_ticker
+
+        ticker = canonical_ticker(payload.get("ticker"))
+        metadata = broad_execution_metadata(ticker)
+        tier = str(payload.get("execution_investment_type") or payload.get("investment_type") or payload.get("tier") or "").lower()
+        if not metadata or tier != "long":
+            return concentration_limits(investment_type=tier)
+        holdings = json.loads((base_dir / "holdings.json").read_text(encoding="utf-8"))
+        guard = json.loads((base_dir / "guard_state.json").read_text(encoding="utf-8"))
+        account = json.loads((base_dir / "account.json").read_text(encoding="utf-8"))
+        if not isinstance(holdings, dict) or not isinstance(guard, dict) or not isinstance(account, dict):
+            return concentration_limits()
+        matches = [row for key, row in holdings.items() if isinstance(row, dict) and canonical_ticker(row.get("ticker") or key) == ticker]
+        if any(str(row.get("investment_type") or row.get("tier") or "long").lower() != "long" for row in matches):
+            return concentration_limits(investment_type="medium")
+        total = _as_decimal(guard.get("portfolio_value"))
+        quantity = _as_decimal(payload.get("quantity"))
+        price = _as_decimal(payload.get("price") or payload.get("decision_price") or payload.get("limit_price"))
+        if total is None or total <= 0 or quantity is None or quantity <= 0 or price is None or price < 0:
+            return concentration_limits()
+        notional = quantity * price
+        currency = str(payload.get("currency") or "").upper()
+        if currency == "USD":
+            fx = _as_decimal(account.get("fx_rate_usdjpy"))
+            if fx is None or not 50 < fx < 500:
+                return concentration_limits()
+            notional *= fx
+        elif currency != "JPY":
+            return concentration_limits()
+        family = str(metadata["broad_family"])
+        family_value = 0.0
+        for key, row in holdings.items():
+            if not isinstance(row, dict):
+                continue
+            row_meta = broad_execution_metadata(row.get("ticker") or key)
+            if not row_meta or row_meta.get("broad_family") != family:
+                continue
+            value = _as_decimal(row.get("current_value_jpy")) or _as_decimal(row.get("broker_position_value_jpy"))
+            if value is None:
+                return concentration_limits()
+            family_value += value
+        return {**concentration_limits(broad_family=family, investment_type="long"), "family_concentration_decimal": (family_value + notional) / total}
+    except Exception:
+        return concentration_limits()
+
+
 def evaluate_preflight(payload: dict[str, Any], *, base_dir: Path) -> dict[str, Any]:
     """Compute an execution-time decision without writing state."""
     daily, rolling = _guard_metrics(base_dir)
@@ -281,6 +331,7 @@ def evaluate_preflight(payload: dict[str, Any], *, base_dir: Path) -> dict[str, 
         base_dir, loss_guard_stage=str(loss.get("loss_guard_stage") or ""),
     )
     concentration = _prospective_concentration(payload, base_dir)
+    concentration_context = _broad_concentration_context(payload, base_dir)
     direction = str(payload.get("direction") or "").lower()
     risk_increasing = direction in {"buy", "margin_buy", "short"}
     short_positions = _current_short_positions(base_dir)
@@ -295,6 +346,10 @@ def evaluate_preflight(payload: dict[str, Any], *, base_dir: Path) -> dict[str, 
         risk_increasing=risk_increasing,
         action_direction=direction,
         current_short_positions=short_positions,
+        concentration_caution_decimal=concentration_context.get("caution_decimal"),
+        concentration_cap_decimal=concentration_context.get("cap_decimal"),
+        family_concentration_decimal=concentration_context.get("family_concentration_decimal"),
+        family_concentration_cap_decimal=concentration_context.get("family_cap_decimal"),
     )
     digest = action_digest(payload)
     metrics = {
@@ -305,6 +360,7 @@ def evaluate_preflight(payload: dict[str, Any], *, base_dir: Path) -> dict[str, 
         "var_source": var_source,
         "var_snapshot_as_of": var_snapshot_as_of,
         "prospective_concentration_decimal": concentration,
+        "concentration_assessment": concentration_context,
         "canonical_drawdown_decimal": drawdown,
         "canonical_drawdown_stage": drawdown_stage,
         "current_short_positions": short_positions,

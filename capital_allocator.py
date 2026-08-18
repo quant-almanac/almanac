@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from action_amounts import synchronize_resized_action_prose
-from instrument_metadata import canonical_ticker, quantity_label_for_ticker, trading_unit_for_ticker
+from instrument_metadata import broad_execution_metadata, canonical_ticker, quantity_label_for_ticker, trading_unit_for_ticker
 from utils import atomic_write_json, load_json
 
 BASE_DIR = Path(__file__).parent
@@ -49,7 +49,11 @@ def _normal_buy(action: dict[str, Any]) -> bool:
         return False
     source = str(action.get("source") or "").lower()
     tier = str(action.get("tier") or "").lower()
-    return not source.startswith("scenario") and tier != "swing"
+    return not source.startswith("scenario") and source != "scheduled_broad_deployment" and tier != "swing"
+
+
+def _scheduled_broad_buy(action: dict[str, Any]) -> bool:
+    return str(action.get("source") or "").lower() == "scheduled_broad_deployment" and str(action.get("type") or "").lower() in NORMAL_BUY_TYPES
 
 
 def _estimated_notional_jpy(action: dict[str, Any], *, fx_rate: float) -> float:
@@ -238,6 +242,51 @@ def allocate_actions(
         "exclusions": exclusions,
         "explainability": "structured_route_cap_nisa_concentration_objective",
     }
+
+
+def allocate_scheduled_broad_actions(
+    actions: list[dict[str, Any]], *, mode: str = "enforce", fx_rate: float = 150.0,
+    min_trade_jpy: float = 150_000, max_actions_per_week: int = 2,
+    max_single_jpy: int = 500_000, weekly_cap_jpy: int = 1_000_000,
+    weekly_paced_remaining_jpy: int | None = None,
+    prior_scheduled_actions_this_week: int = 0, prior_scheduled_notional_jpy: int = 0,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Apply an independent, human-executed scheduled broad batch contract."""
+    copied = [dict(action) for action in actions if isinstance(action, dict)]
+    enabled = str(mode).lower() == "enforce"
+    candidates = [action for action in copied if _scheduled_broad_buy(action) and action.get("execution_readiness") == "ready"]
+    candidates.sort(key=_ranking_key)
+    weekly_cap = min(max(0, int(weekly_cap_jpy)), max(0, int(weekly_paced_remaining_jpy)) if weekly_paced_remaining_jpy is not None else max(0, int(weekly_cap_jpy)))
+    weekly_cap = max(0, weekly_cap - max(0, int(prior_scheduled_notional_jpy)))
+    selected: list[str] = []
+    remaining, exclusions = weekly_cap, []
+    if enabled:
+        for candidate in candidates:
+            if broad_execution_metadata(candidate.get("ticker")) is None:
+                candidate["execution_readiness"] = "review"
+                _append_reason(candidate, "scheduled_broad_metadata_unregistered", "scheduled broad対象は登録済みallowlistに限定します")
+                exclusions.append({"ticker": candidate.get("ticker"), "reason": "scheduled_broad_metadata_unregistered"})
+                continue
+            if int(prior_scheduled_actions_this_week) + len(selected) >= max(0, int(max_actions_per_week)) or remaining <= 0:
+                candidate["execution_readiness"] = "review"
+                _append_reason(candidate, "scheduled_broad_weekly_limit", "今週のscheduled broad配備枠を使い切りました")
+                exclusions.append({"ticker": candidate.get("ticker"), "reason": "scheduled_broad_weekly_limit"})
+                continue
+            cap = min(int(max_single_jpy), remaining)
+            resized, failure = _cap_quantity(candidate, cap_jpy=cap, min_trade_jpy=float(min_trade_jpy), fx_rate=float(fx_rate))
+            if failure:
+                candidate.update(resized)
+                candidate["execution_readiness"] = "review"
+                _append_reason(candidate, failure, "scheduled broad枠では最低取引額またはlotを満たせません")
+                exclusions.append({"ticker": candidate.get("ticker"), "reason": failure})
+                continue
+            candidate.update(resized)
+            candidate["scheduled_broad_selected"] = True
+            candidate["human_execution_only"] = True
+            candidate["scheduled_broad_max_single_jpy"] = cap
+            selected.append(str(candidate.get("ticker") or ""))
+            remaining -= int(round(_estimated_notional_jpy(candidate, fx_rate=float(fx_rate))))
+    return copied, {"mode": "enforce" if enabled else "legacy", "strategy_class": "scheduled_broad_deployment", "max_actions_per_week": int(max_actions_per_week), "prior_scheduled_actions_this_week": int(prior_scheduled_actions_this_week), "prior_scheduled_notional_jpy": int(prior_scheduled_notional_jpy), "max_single_jpy": int(max_single_jpy), "weekly_cap_jpy": weekly_cap, "weekly_remaining_jpy": max(0, remaining), "selected_tickers": selected, "selected_count": len(selected), "exclusions": exclusions}
 
 
 def comparison_path(base_dir: Path = BASE_DIR) -> Path:
