@@ -1,10 +1,12 @@
 'use client'
+import { useState } from 'react'
 import { OPS, TYPE_META, STANCE_LABEL } from './tokens'
 import { SectionHead } from './Shell'
 import PerformanceChart from './PerformanceChart'
 import ScenarioStrip from './ScenarioStrip'
+import { buildConsideredRows, buildRebuttals, type ConsideredRow, type VerdictKind } from './consideredRows'
 import type {
-  BoardRow, Engine, RedTeamVerdict, ChartsData, DeltaData, BenchmarkData,
+  BoardRow, DecisionFlowUnselected, Engine, RedTeamVerdict, ChartsData, DeltaData, BenchmarkData,
 } from './types'
 
 /**
@@ -17,13 +19,19 @@ export default function SignalMap({
   charts,
   delta,
   benchmark,
+  unselected,
 }: {
   engine: Engine
   board: BoardRow[]
   charts?: ChartsData
   delta?: DeltaData | null
   benchmark?: BenchmarkData | null
+  /** AI合成で採用されなかった候補。見送り一覧に統合する。 */
+  unselected?: DecisionFlowUnselected[]
 }) {
+  const rebuttals = buildRebuttals(engine.attacks, engine.red_team)
+  const considered = buildConsideredRows(unselected, rebuttals, engine.lanes)
+
   return (
     <section>
       <SectionHead
@@ -76,10 +84,12 @@ export default function SignalMap({
         </p>
       </div>
 
-      {/* 反論・情報レーンの内訳は DECISION FLOW の表に統合した (2026-08-19)。
-          同じ engine.red_team / engine.lanes を、ここでは3列カードとして、
-          DECISION FLOW では銘柄ごとの停止点と同じ表として、別々に描いていた。
-          結論(何件採用・何件棄却)はこの上の RationaleSummary カードに残す。 */}
+      {/* 今日動いた候補(board/review_board)は 02 発注 が理由つきで表示済みなので
+          ここでは繰り返さない。ここに載せる理由があるのは「動かなかったもの」
+          だけ (2026-08-19)。かつては工程(対案検証→安全→執行)のゲート表に
+          載せていたが、実データで測るとゲート枠の79%が空で、フローと呼べる
+          工程はそもそも存在しなかった。 */}
+      <ConsideredList rows={considered} />
 
       </div>
 
@@ -200,3 +210,71 @@ function redTeamItem(r: RedTeamVerdict, i: number): VerdictItem {
   }
 }
 
+
+/* ── 今日動かなかったもの ─────────────────────────────── */
+
+function verdictTone(kind: VerdictKind): string {
+  if (kind === 'pass') return OPS.green
+  if (kind === 'reject') return OPS.redSoft
+  return OPS.blue
+}
+
+function ConsideredList({ rows }: { rows: ConsideredRow[] }) {
+  const [openId, setOpenId] = useState<string | null>(null)
+  const [showAll, setShowAll] = useState(false)
+  if (rows.length === 0) return null
+  const visible = showAll ? rows : rows.slice(0, 8)
+
+  return (
+    <div style={{ marginTop: 18 }}>
+      <h3 style={{ fontSize: 13.5, fontWeight: 600, color: OPS.text, margin: '0 0 10px', letterSpacing: '0.06em' }}>
+        今日動かなかったもの
+        <span style={{ fontFamily: OPS.mono, fontSize: 12, color: OPS.dim, marginLeft: 8, fontWeight: 400 }}>
+          {rows.length}
+        </span>
+      </h3>
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 1 }}>
+        {visible.map(row => {
+          const tone = verdictTone(row.verdict)
+          const open = openId === row.id
+          return (
+            <button key={row.id} type="button" onClick={() => setOpenId(open ? null : row.id)}
+              style={{
+                display: 'grid', gridTemplateColumns: 'minmax(140px,1fr) auto auto', gap: 10,
+                alignItems: 'baseline', width: '100%', padding: '7px 4px', borderRadius: 5,
+                border: 'none', borderBottom: `1px solid ${OPS.hairline}`, background: 'transparent',
+                color: 'inherit', textAlign: 'left', cursor: 'pointer',
+              }}>
+              <span style={{ minWidth: 0, overflow: 'hidden' }}>
+                <span style={{ fontFamily: OPS.mono, fontSize: 12.5, color: OPS.text, marginRight: 8 }}>{row.ticker}</span>
+                <span style={{ fontSize: 11, color: OPS.dim }}>{row.subtitle}</span>
+              </span>
+              <span style={{ fontFamily: OPS.brand, fontSize: 10, letterSpacing: '.04em', color: tone, whiteSpace: 'nowrap' }}>
+                {row.outcomeLabel}
+              </span>
+              <span style={{ color: OPS.dim, fontSize: 9 }}>{open ? '▾' : '▸'}</span>
+              {!open && row.headline && (
+                <span style={{ gridColumn: '1 / -1', color: OPS.sub, fontSize: 10.5, lineHeight: 1.4, marginTop: 1 }}>
+                  {row.headline}
+                </span>
+              )}
+              {open && (
+                <div style={{ gridColumn: '1 / -1', marginTop: 4 }}>
+                  {row.detail.split('\n').filter(Boolean).map((line, i) => (
+                    <p key={i} style={{ color: OPS.sub, fontSize: 11, lineHeight: 1.55, margin: '0 0 3px' }}>{line}</p>
+                  ))}
+                </div>
+              )}
+            </button>
+          )
+        })}
+      </div>
+      {rows.length > 8 && (
+        <button onClick={() => setShowAll(!showAll)}
+          style={{ background: 'none', border: 'none', padding: '8px 0 0', cursor: 'pointer', fontSize: 12, color: OPS.gold, fontFamily: OPS.sans }}>
+          {showAll ? '折りたたむ' : `残り ${rows.length - 8} 件`}
+        </button>
+      )}
+    </div>
+  )
+}

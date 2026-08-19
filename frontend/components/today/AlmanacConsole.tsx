@@ -14,7 +14,6 @@ import AlmanacStrip from './ops/AlmanacStrip'
 import ActionSection from './ops/ActionSection'
 import SignalMap from './ops/SignalMap'
 import CommandDeck from './ops/CommandDeck'
-import DecisionFlow from './ops/DecisionFlow'
 import PulseLine from './ops/PulseLine'
 import type { RejectedDecision } from './ops/OrderMap'
 import { ContentShell, SHELL_CSS } from './ops/Shell'
@@ -125,10 +124,11 @@ export default function AlmanacConsole() {
             <div className="ops-sec" style={{ animationDelay: '70ms' }}>
               <PulseLine command={data.command} pulse={data.pulse} benchmark={data.benchmark} />
             </div>
-            <div className="ops-sec" style={{ animationDelay: '140ms' }}>
-              <DecisionFlow flow={data.decision_flow} engine={data.engine}
-                selectedKey={selectedKey} onSelect={setSelectedKey} />
-            </div>
+            {/* 旧 DECISION FLOW は削除した (2026-08-19)。工程(対案検証→安全→執行)を
+                表す3列ゲート表だったが、実データでは枠の79%が空——フローと
+                呼べる工程が無かった。今日動く候補は 02 発注 が理由つきで
+                既に表示しており、動かなかったものは 03 判断の根拠 の
+                「今日動かなかったもの」に一覧として統合した。 */}
             {/* 旧 WeekSummaryStrip(今週の市場カレンダー)は AlmanacStrip に統合した。
                 同じ日付の予定を2箇所で見ることになっていたため。 */}
             <div className="ops-sec" style={{ animationDelay: '180ms' }}>
@@ -159,6 +159,7 @@ export default function AlmanacConsole() {
                 charts={data.charts}
                 delta={data.delta}
                 benchmark={data.benchmark}
+                unselected={data.decision_flow?.unselected}
               />
             </div>
             <div className="ops-sec console-links" style={{ animationDelay: '320ms', display: 'grid', gridTemplateColumns: 'repeat(auto-fit,minmax(180px,1fr))', gap: 10 }}>

@@ -5,7 +5,7 @@ import { OPS } from './tokens'
 
 /**
  * 選択ハイライトの共有アニメーション。発注行・レビュー行・判断地図の点・
- * DecisionFlow のレーンで同じ視覚言語(金のリングが一度だけ広がって消える)を使う。
+ * ActionSection/OrderMap のレーンで同じ視覚言語(金のリングが一度だけ広がって消える)を使う。
  *
  * active が true になった瞬間だけ再生し、true のまま留まっても再生し続けない
  * (旧 OrderMap の SMIL `repeatCount="indefinite"` のような常時ループを避ける)。

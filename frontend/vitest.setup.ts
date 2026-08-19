@@ -7,7 +7,7 @@ afterEach(() => {
 })
 
 // jsdom はレイアウトエンジンを持たないため ResizeObserver が未実装。
-// コンテナ幅の実測(DecisionFlow 等)に使うコンポーネントが素通りできるよう、
+// コンテナ幅の実測に使うコンポーネントが素通りできるよう、
 // 最小限の no-op を用意する。座標を伴う検証は各テストで個別にモックし直す。
 class ResizeObserverStub {
   observe() {}
