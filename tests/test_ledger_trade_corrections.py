@@ -398,6 +398,16 @@ def test_corrects_avgo_price_and_rebuilds_account_lots(tmp_path):
     assert corrected_first_sell["amount_jpy"] == pytest.approx(744_767.23)
     assert _event_by_id(db_path, "manual_missing_AVGO_sell_20260507_3sh") is not None
 
+    # Owner/broker attribution targets the append-only output of the price
+    # correction, so a from-scratch ledger needs another pass before tax-lot
+    # reconstruction.  Production migrations are likewise run to convergence.
+    for _ in range(5):
+        again = ltc.correct_known_trade_events(apply=True, db_path=db_path)
+        if again["planned"] == 0:
+            break
+    else:
+        raise AssertionError("corrections did not converge")
+
     import tax_lot as tl
 
     state = tl.build_lots("AVGO", db_path=db_path)
@@ -405,9 +415,12 @@ def test_corrects_avgo_price_and_rebuilds_account_lots(tmp_path):
     for lot in state.open_lots:
         if lot.is_open:
             open_by_account[lot.account] = open_by_account.get(lot.account, 0.0) + lot.remaining_qty
-    assert open_by_account == {"特定": pytest.approx(3.0), "一般": pytest.approx(27.0)}
+    # The converged ledger also includes the primary-source 2026-07-10 AVGO
+    # taxable buy (2 shares), added after this older price-correction fixture
+    # was first written: prior remainder 3 + new buy 2 = 5.
+    assert open_by_account == {"特定": pytest.approx(5.0), "一般": pytest.approx(27.0)}
     first_realized = state.realized_trades[0]
-    assert first_realized.lot_id == "manual_opening_AVGO_toku_20260301_50sh"
+    assert first_realized.lot_id == "manual_opening_AVGO_toku_20260301_50sh:tradecorr:v1"
     assert first_realized.proceeds_jpy == pytest.approx(744_767.23)
 
 
@@ -562,6 +575,13 @@ def test_adds_known_missing_ewg_opening_lot_with_price_correction(tmp_path):
     assert corrected is not None
     assert corrected["price"] == pytest.approx(48.153)
     assert _event_by_id(db_path, "manual_opening_EWG_20260301_490sh") is not None
+
+    for _ in range(5):
+        again = ltc.correct_known_trade_events(apply=True, db_path=db_path)
+        if again["planned"] == 0:
+            break
+    else:
+        raise AssertionError("corrections did not converge")
 
     import tax_lot as tl
 
@@ -860,6 +880,13 @@ def test_corrects_nvda_account_and_rebuilds_open_general_lot(tmp_path):
     assert corrected is not None
     assert corrected["account"] == "一般"
     assert _event_by_id(db_path, "manual_missing_NVDA_sell_20260507_25sh") is not None
+
+    for _ in range(5):
+        again = ltc.correct_known_trade_events(apply=True, db_path=db_path)
+        if again["planned"] == 0:
+            break
+    else:
+        raise AssertionError("corrections did not converge")
 
     import tax_lot as tl
 

@@ -150,7 +150,7 @@ def test_concentration_annotation_downgrades_caution_before_ranking():
     )
 
 
-def test_legacy_mode_preserves_existing_ready_actions_and_swing_is_outside_normal_cap():
+def test_legacy_mode_preserves_existing_ready_actions_across_lanes():
     normal = _buy("V", 4)
     swing = _buy("SWING", 10)
     swing["tier"] = "Swing"
@@ -158,7 +158,18 @@ def test_legacy_mode_preserves_existing_ready_actions_and_swing_is_outside_norma
 
     assert report["mode"] == "legacy"
     assert all(row["execution_readiness"] == "ready" for row in actions)
-    assert report["candidate_count"] == 1
+    assert report["candidate_count"] == 2
+
+
+def test_enforce_uses_one_household_buy_slot_across_swing_and_long():
+    normal = _buy("V", 4)
+    swing = _buy("SWING", 10)
+    swing["tier"] = "Swing"
+    actions, report = allocate_actions([normal, swing], mode="enforce")
+
+    assert report["selected_count"] == 1
+    assert sum(row["execution_readiness"] == "ready" for row in actions) == 1
+    assert sum(row["execution_readiness"] == "review" for row in actions) == 1
 
 
 def test_allocator_comparison_review_is_explicit_and_side_effect_free(tmp_path):
@@ -230,6 +241,36 @@ def test_scheduled_broad_execution_same_day_blocks_ordinary_allocator(monkeypatc
     analyst._apply_capital_allocator(
         synthesis, _allocator_data(), fx_rate=159.452,
         analysis_id="scheduled-broad-same-day", as_of="2026-08-14T12:00:00",
+    )
+    assert synthesis["priority_actions"][0]["execution_readiness"] == "review"
+    assert synthesis["capital_allocator"]["prior_normal_buys_today"] == 1
+
+
+def test_scenario_buy_execution_same_day_consumes_household_buy_slot(monkeypatch, tmp_path):
+    import analyst
+    import execution_reconciliation
+
+    monkeypatch.setattr(analyst, "BASE_DIR", tmp_path)
+    monkeypatch.setattr(
+        execution_reconciliation,
+        "load_effective_execution_records",
+        lambda **_kwargs: [{
+            "status": "filled", "saved_at": "2026-08-14T09:00:00",
+            "strategy_class": "scenario", "direction": "buy",
+            "executed_amount_jpy": 200_000,
+        }],
+    )
+    synthesis = {
+        "priority_actions": [_buy("V", 4)],
+        "decision_summary": {
+            "candidate_count": 1, "executable_count": 1, "review_count": 0,
+            "deferred_count": 0, "reason_counts": {}, "count_conservation_ok": True,
+        },
+        "overall_stance": "neutral",
+    }
+    analyst._apply_capital_allocator(
+        synthesis, _allocator_data(), fx_rate=159.452,
+        analysis_id="scenario-same-day", as_of="2026-08-14T12:00:00",
     )
     assert synthesis["priority_actions"][0]["execution_readiness"] == "review"
     assert synthesis["capital_allocator"]["prior_normal_buys_today"] == 1

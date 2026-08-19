@@ -636,6 +636,110 @@ def _effective_clean_nav_rows(
     return effective
 
 
+def replay_flow_adjusted_drawdown_points(
+    *,
+    db_path: Optional[Path] = None,
+    clean_since: Optional[str] = None,
+) -> dict:
+    """Rebuild the canonical shadow path for manual controller recovery.
+
+    Unlike the compact shadow artifact, this result retains every effective
+    NAV date and drawdown point so the hysteretic state machine can be replayed
+    exactly.  It is read-only and refuses to call missing flows "zero".
+    """
+    try:
+        from event_ledger import query_events
+        from config_clean_baseline import clean_nav_since_iso
+
+        since = clean_since or clean_nav_since_iso()
+        rows = _effective_clean_nav_rows(db_path=db_path, clean_since=since)
+        if len(rows) < 2:
+            return {
+                "status": "insufficient_effective_nav_rows",
+                "points": [],
+                "effective_nav_days": len(rows),
+                "clean_since": since,
+            }
+        events = query_events(
+            date_from=rows[0][0],
+            date_to=rows[-1][0] + "T23:59:59",
+            types=["cash_flow"],
+            db_path=db_path,
+        )
+        flows_by_day: dict[str, float] = {}
+        for event in events:
+            day = str(event.get("occurred_at") or "")[:10]
+            try:
+                flows_by_day[day] = flows_by_day.get(day, 0.0) + float(event.get("amount_jpy") or 0.0)
+            except (TypeError, ValueError):
+                return {
+                    "status": "invalid_cash_flow_amount",
+                    "points": [],
+                    "event_id": event.get("event_id"),
+                }
+        index = 1.0
+        peak = 1.0
+        max_dd = 0.0
+        invalid_days: list[str] = []
+        points = [{
+            "effective_nav_date": rows[0][0],
+            "return_index": 1.0,
+            "drawdown_decimal": 0.0,
+        }]
+        for (_, prev_nav), (day, nav) in zip(rows, rows[1:]):
+            adjusted_end = nav - flows_by_day.get(day, 0.0)
+            if prev_nav <= 0 or adjusted_end <= 0:
+                invalid_days.append(day)
+                continue
+            index *= adjusted_end / prev_nav
+            peak = max(peak, index)
+            drawdown = index / peak - 1.0
+            max_dd = min(max_dd, drawdown)
+            points.append({
+                "effective_nav_date": day,
+                "return_index": round(index, 10),
+                "drawdown_decimal": round(drawdown, 10),
+            })
+        coverage = cash_flow_ledger_status(
+            date_from=rows[0][0], date_to=rows[-1][0], db_path=db_path,
+        )
+        expected = coverage.get("expected_count")
+        matched = coverage.get("matched_count")
+        flow_coverage = (
+            float(matched) / float(expected)
+            if isinstance(expected, int) and expected > 0 and isinstance(matched, int)
+            else (1.0 if expected == 0 else 0.0)
+        )
+        status = "ok"
+        if invalid_days:
+            status = "invalid_nav_or_flow_days"
+        elif coverage.get("ok") is not True or flow_coverage < 0.95:
+            status = "cash_flow_coverage_below_95pct"
+        return {
+            "status": status,
+            "points": points,
+            "effective_nav_days": len(rows),
+            "start_date": rows[0][0],
+            "end_date": rows[-1][0],
+            "clean_since": since,
+            "cash_flow_count": len(events),
+            "flow_coverage": round(flow_coverage, 4),
+            "flow_coverage_detail": coverage,
+            "invalid_days": invalid_days,
+            "current_drawdown_decimal": points[-1]["drawdown_decimal"] if points else None,
+            "max_drawdown_decimal": round(max_dd, 10),
+            "estimated_rows_excluded": True,
+            "weekend_rows_excluded": True,
+            "flow_timing_convention": "end_of_day",
+        }
+    except Exception as exc:
+        return {
+            "status": f"unavailable:{type(exc).__name__}",
+            "points": [],
+            "error": str(exc),
+        }
+
+
 def compute_flow_adjusted_drawdown_shadow(
     *,
     db_path: Optional[Path] = None,

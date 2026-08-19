@@ -10887,11 +10887,12 @@ def _apply_capital_allocator(
     analysis_id: str | None,
     as_of: str,
 ) -> None:
-    """Apply the final normal-buy allocator after every existing safety gate.
+    """Apply the final household-buy allocator after every existing safety gate.
 
     The allocator is not another candidate generator: it only ranks already
-    ``ready`` actions and can only downgrade a normal risk-increasing buy.
-    Sell/trim, scenario, and Swing contracts retain their own policy paths.
+    ``ready`` buy actions and can only downgrade a risk-increasing buy.
+    Scenario, Swing, and margin sizing remain owned by their policy paths;
+    sell/trim/cover do not consume the household buy slot.
     """
     if not isinstance(synthesis, dict) or not isinstance(synthesis.get("priority_actions"), list):
         return
@@ -10927,14 +10928,20 @@ def _apply_capital_allocator(
                 if str(execution.get("status") or "").lower() not in {"executed", "partial", "filled"}:
                     continue
                 execution_time = str(execution.get("saved_at") or execution.get("executed_at_time") or "")
-                same_day = execution_time[:10] == analysis_day
-                try:
-                    execution_week = analysis_week if same_day else datetime.fromisoformat(execution_time.replace("Z", "+00:00")).isocalendar()[:2]
-                except (TypeError, ValueError):
-                    execution_week = None
+                if execution_time[:10] != analysis_day:
+                    try:
+                        execution_week = datetime.fromisoformat(execution_time.replace("Z", "+00:00")).isocalendar()[:2]
+                    except (TypeError, ValueError):
+                        execution_week = None
+                else:
+                    execution_week = analysis_week
+                if execution_time[:10] != analysis_day:
+                    same_day = False
+                else:
+                    same_day = True
+                # Strategy lanes retain independent size caps, but every buy
+                # consumes the one household buy slot for its execution day.
                 strategy_class = str(execution.get("strategy_class") or "").lower()
-                if strategy_class in {"scenario", "swing"}:
-                    continue
                 if strategy_class == "scheduled_broad_deployment":
                     if same_day:
                         prior_normal_buys = 1
@@ -13086,6 +13093,33 @@ def run_analysis(force: bool = False) -> dict:
         )
     if isinstance(synthesis, dict):
         _rebuild_readiness_narrative(synthesis)
+    if isinstance(synthesis, dict):
+        try:
+            from deployment_rollout import quarantine_analysis_if_needed
+
+            _rollout_gate = (
+                ((synthesis.get("post_filter") or {}).get("execution_plan_gate") or {}).get("mode")
+            )
+            _rollout_validation = quarantine_analysis_if_needed(
+                synthesis,
+                base_dir=BASE_DIR,
+                effective_gate_mode=str(_rollout_gate or "observe"),
+            )
+            if (
+                _rollout_validation.get("status") != "ok"
+                and str(_rollout_gate or "") == "enforce"
+            ):
+                # Quarantine changed executable state; rebuild every user-facing
+                # count and narrative before persistence/notification.
+                _rebuild_readiness_narrative(synthesis)
+                synthesis["deployment_rollout_validation"] = _rollout_validation
+        except Exception as _rollout_error:
+            synthesis["deployment_rollout_validation"] = {
+                "schema_version": 1,
+                "status": "validation_error",
+                "error": type(_rollout_error).__name__,
+            }
+            print(f"  ⚠️ deployment rollout 検証エラー: {type(_rollout_error).__name__}")
     if isinstance(synthesis, dict):
         try:
             from execution_plan_observer import record_observation as _record_plan_observation

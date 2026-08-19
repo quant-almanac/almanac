@@ -68,6 +68,8 @@ TARGETS = [
     'execution_preflight_acknowledgements.jsonl',
     'flow_adjusted_dd_shadow.json',
     'drawdown_state.json',
+    'deployment_rollout_state.json',
+    'deployment_rollout_audit.jsonl',
     'feature_control_state.json',
     'decision_snapshot_state.json',
     'trade_history.csv',

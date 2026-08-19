@@ -2427,6 +2427,7 @@ def _build_today() -> dict:
         "broad_deployment_generation": synthesis.get("broad_deployment_generation") or {},
         "executable_plan_summary": synthesis.get("executable_plan_summary") or {},
         "selection_consistency": synthesis.get("selection_consistency") or {},
+        "deployment_rollout_validation": synthesis.get("deployment_rollout_validation") or {},
         "analytical_summary": synthesis.get("analytical_summary") or synthesis.get("weekly_theme_analytical"),
         "optimizer_health": optimizer_health,
         "suppressed_reproposals": synthesis.get("suppressed_reproposals") or [],

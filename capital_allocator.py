@@ -1,9 +1,10 @@
-"""Deterministic final allocator for ordinary risk-increasing actions.
+"""Deterministic final allocator for household risk-increasing buy actions.
 
 The analyst produces candidates and evidence.  This module is deliberately
-small and deterministic: it selects at most one normal buy per run, enforces
-the normal ¥250k ceiling, and records why every ready candidate was or was
-not selected.  It never creates a new candidate, wallet, or account route.
+small and deterministic: it selects at most one buy per run across strategy
+lanes, preserves each lane's existing size contract, and records why every
+ready candidate was or was not selected.  It never creates a new candidate,
+wallet, or account route.
 """
 from __future__ import annotations
 
@@ -59,6 +60,17 @@ def _normal_buy(action: dict[str, Any]) -> bool:
         not source.startswith("scenario")
         and tier != "swing"
     )
+
+
+def _household_buy(action: dict[str, Any]) -> bool:
+    """All buy directions share one final household slot.
+
+    Scenario, Swing, and margin lanes retain their own sizing/risk policies,
+    but they must not coexist as a second ready buy in the same analysis.
+    """
+    return str(action.get("type") or "").strip().lower() in {
+        "buy", "add", "dca", "margin_buy",
+    }
 
 
 def _scheduled_broad_buy(action: dict[str, Any]) -> bool:
@@ -121,7 +133,7 @@ def annotate_post_trade_concentration(
     denominator = _number(observation.get("denominator_jpy"))
     positions = [row for row in observation.get("positions") or [] if isinstance(row, dict)]
     for action in copied:
-        if not _normal_buy(action) or action.get("execution_readiness") != "ready":
+        if not _household_buy(action) or action.get("execution_readiness") != "ready":
             continue
         ticker = canonical_ticker(action.get("ticker"))
         notional = _estimated_notional_jpy(action, fx_rate=fx_rate)
@@ -298,7 +310,7 @@ def allocate_actions(
     enabled = str(mode).lower() == "enforce"
     candidates = [
         action for action in copied
-        if _normal_buy(action) and action.get("execution_readiness") == "ready"
+        if _household_buy(action) and action.get("execution_readiness") == "ready"
     ]
     candidates.sort(key=_ranking_key)
     selected_ticker: str | None = None
@@ -333,16 +345,22 @@ def allocate_actions(
                 _append_reason(candidate, "scheduled_broad_weekly_limit", "今週の広域配備枠を使い切りました")
                 exclusions.append({"ticker": candidate.get("ticker"), "reason": "scheduled_broad_weekly_limit"})
                 continue
-            cap_jpy = (
-                min(int(scheduled_max_single_jpy), scheduled_weekly_remaining)
-                if scheduled else int(normal_action_cap_jpy)
-            )
-            resized, failure = _cap_quantity(
-                candidate,
-                cap_jpy=cap_jpy,
-                min_trade_jpy=float(min_trade_jpy),
-                fx_rate=float(fx_rate),
-            )
+            cap_jpy = None
+            if scheduled:
+                cap_jpy = min(int(scheduled_max_single_jpy), scheduled_weekly_remaining)
+            elif _normal_buy(candidate):
+                cap_jpy = int(normal_action_cap_jpy)
+            if cap_jpy is None:
+                resized, failure = dict(candidate), None
+                if _estimated_notional_jpy(candidate, fx_rate=float(fx_rate)) <= 0:
+                    failure = "capital_allocator_notional_unresolved"
+            else:
+                resized, failure = _cap_quantity(
+                    candidate,
+                    cap_jpy=cap_jpy,
+                    min_trade_jpy=float(min_trade_jpy),
+                    fx_rate=float(fx_rate),
+                )
             if failure:
                 candidate.update(resized)
                 candidate["execution_readiness"] = "review"
@@ -362,7 +380,7 @@ def allocate_actions(
             if scheduled:
                 candidate["scheduled_broad_selected"] = True
                 candidate["human_execution_only"] = True
-                candidate["scheduled_broad_max_single_jpy"] = cap_jpy
+                candidate["scheduled_broad_max_single_jpy"] = int(cap_jpy or 0)
                 scheduled_weekly_remaining = max(
                     0,
                     scheduled_weekly_remaining

@@ -145,6 +145,137 @@ def advance_enforced_state(
     return next_state
 
 
+def recover(
+    *,
+    base_dir: Path,
+    approval_actor: str,
+    approval_reason: str,
+    approval_reference: str,
+) -> dict[str, Any]:
+    """Rebuild a missing/corrupt promoted controller from immutable history."""
+    actor = str(approval_actor or "").strip()
+    reason = str(approval_reason or "").strip()
+    reference = str(approval_reference or "").strip()
+    if not actor or not reason or not reference:
+        raise ValueError("recovery requires approval actor, reason, and reference")
+    _, state_path = _paths(base_dir)
+    current = _read_json(state_path)
+    if current.get("enforcement_enabled") is True:
+        raise ValueError("drawdown controller is already enabled; recovery is not applicable")
+
+    db_path = resolve_db_path(base_dir)
+    from event_ledger import append_event, query_events
+
+    promotions = query_events(types=["drawdown_controller_promoted"], db_path=db_path)
+    if not promotions:
+        raise ValueError("no append-only drawdown promotion event exists")
+    promotion = promotions[-1]
+    raw_evidence = promotion.get("raw_payload")
+    if isinstance(raw_evidence, str):
+        try:
+            raw_evidence = json.loads(raw_evidence)
+        except json.JSONDecodeError:
+            raw_evidence = None
+    evidence = raw_evidence if isinstance(raw_evidence, dict) else {}
+    stored_promotion_hash = str(evidence.get("eligibility_snapshot_hash") or "")
+    hash_basis = {
+        key: value for key, value in evidence.items()
+        if key != "eligibility_snapshot_hash"
+    }
+    calculated_promotion_hash = hashlib.sha256(
+        json.dumps(hash_basis, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    ).hexdigest()
+    if not stored_promotion_hash or stored_promotion_hash != calculated_promotion_hash:
+        raise ValueError("promotion evidence hash mismatch")
+    promotion_date = str(evidence.get("effective_nav_date") or "")[:10]
+    try:
+        promotion_dd = float(evidence.get("initial_drawdown_decimal"))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("promotion evidence has no valid initial drawdown") from exc
+    if not promotion_date:
+        raise ValueError("promotion evidence has no effective NAV date")
+
+    from nav_recorder import replay_flow_adjusted_drawdown_points
+
+    replay = replay_flow_adjusted_drawdown_points(db_path=db_path)
+    if replay.get("status") != "ok":
+        raise ValueError(f"drawdown replay is not recoverable: {replay.get('status')}")
+    if float(replay.get("flow_coverage") or 0.0) < 0.95 or replay.get("invalid_days"):
+        raise ValueError("drawdown replay failed coverage or validity requirements")
+    points = [row for row in replay.get("points") or [] if isinstance(row, dict)]
+    replay_dates = {str(point.get("effective_nav_date") or "")[:10] for point in points}
+    if not points or promotion_date not in replay_dates:
+        raise ValueError("replay series does not cover the promotion effective date")
+
+    rebuilt = advance_state(
+        initial_state(),
+        drawdown_decimal=promotion_dd,
+        effective_nav_date=promotion_date,
+    )
+    for point in points:
+        day = str(point.get("effective_nav_date") or "")[:10]
+        if not day or day <= promotion_date:
+            continue
+        try:
+            drawdown = float(point.get("drawdown_decimal"))
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"invalid replay drawdown at {day}") from exc
+        rebuilt = advance_state(
+            rebuilt,
+            drawdown_decimal=drawdown,
+            effective_nav_date=day,
+        )
+
+    replay_evidence = {
+        "promotion_event_id": promotion.get("event_id"),
+        "promotion_effective_nav_date": promotion_date,
+        "promotion_initial_drawdown_decimal": promotion_dd,
+        "replay_start_date": replay.get("start_date"),
+        "replay_end_date": replay.get("end_date"),
+        "replay_effective_nav_days": replay.get("effective_nav_days"),
+        "replay_flow_coverage": replay.get("flow_coverage"),
+        "replay_current_drawdown_decimal": replay.get("current_drawdown_decimal"),
+        "recovered_dd_state": rebuilt.get("dd_state"),
+        "approval_actor": actor,
+        "approval_reason": reason,
+        "approval_reference": reference,
+    }
+    replay_hash = hashlib.sha256(
+        json.dumps(
+            {"evidence": replay_evidence, "points": points},
+            ensure_ascii=False,
+            sort_keys=True,
+        ).encode("utf-8")
+    ).hexdigest()
+    event = append_event(
+        event_type="drawdown_controller_recovered",
+        occurred_at=datetime.now(timezone.utc).isoformat(),
+        source="manual",
+        note="flow-adjusted DD controller recovery",
+        raw_payload={**replay_evidence, "replay_snapshot_hash": replay_hash},
+        event_id=f"drawdown-controller-recovery:{replay_hash}",
+        db_path=db_path,
+    )
+    rebuilt.update({
+        "enforcement_enabled": True,
+        "promoted_at": promotion.get("occurred_at"),
+        "manual_reconciliation_reference": evidence.get("manual_reconciliation_reference"),
+        "promotion_event_id": promotion.get("event_id"),
+        "recovered_at": datetime.now(timezone.utc).isoformat(),
+        "recovery_event_id": event.get("event_id"),
+        "recovery_approval": {
+            "actor": actor,
+            "reason": reason,
+            "reference": reference,
+        },
+        "replay_snapshot_hash": replay_hash,
+    })
+    # As with promotion, the append-only proof is committed before mutable
+    # state.  A failed JSON write therefore remains a visible controller fault.
+    atomic_write_json(state_path, rebuilt)
+    return rebuilt
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="ALMANAC flow-adjusted DD enforcement")
     parser.add_argument("--base-dir", default=str(Path(__file__).parent))
@@ -156,16 +287,27 @@ def main(argv: list[str] | None = None) -> int:
     release_parser.add_argument("--actor", required=True)
     release_parser.add_argument("--reason", required=True)
     release_parser.add_argument("--reference", required=True)
+    recover_parser = sub.add_parser("recover")
+    recover_parser.add_argument("--actor", required=True)
+    recover_parser.add_argument("--reason", required=True)
+    recover_parser.add_argument("--reference", required=True)
     args = parser.parse_args(argv)
     base_dir = Path(args.base_dir)
     if args.command == "status":
         output = status(base_dir=base_dir)
     elif args.command == "promote":
         output = promote(base_dir=base_dir, manual_reconciliation_reference=args.manual_reconciliation_reference)
-    else:
+    elif args.command == "approve-freeze-release":
         output = advance_enforced_state(
             base_dir=base_dir,
             freeze_release_approved=True,
+            approval_actor=args.actor,
+            approval_reason=args.reason,
+            approval_reference=args.reference,
+        )
+    else:
+        output = recover(
+            base_dir=base_dir,
             approval_actor=args.actor,
             approval_reason=args.reason,
             approval_reference=args.reference,

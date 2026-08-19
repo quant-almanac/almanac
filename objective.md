@@ -36,6 +36,14 @@
   VTとする。instrument caution 20%では人間review、cap 25%では不採用とし、別familyへ自動迂回しない。
 - 個別候補と広域候補は同じallocatorで比較し、異なるowner・brokerを含めても、1回の分析から
   `ready`に残せるrisk-increasing buyはhousehold全体で最大1件とする。
+- execution-plan gate のenforce昇格は、隔離した5サイクルの時点再生、production observe
+  canary 1回、既存observer readinessの全条件を満たした後に明示操作で行う。enforce後に
+  件数・金額・wallet・表示整合の不変条件が崩れた場合は、買付・新規shortのみreviewへ
+  隔離して即時observeへ戻し、売却・trim・coverは維持する。
+- DD controllerの昇格後にmutable stateが欠損・破損した場合、prepromotion 100%へ戻しては
+  ならない。append-only promotion eventと日次NAV・cash-flow台帳を再生する
+  `drawdown_enforcement.py recover`を唯一の復旧経路とし、coverage 95%未満または不正日が
+  あれば0%のまま人間reviewとする。
 
 ## 2. ベンチマーク
 

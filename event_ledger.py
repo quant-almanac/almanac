@@ -130,6 +130,9 @@ VALID_EVENT_TYPES = {
     # Policy event, not a cash movement.  Kept append-only so a missing
     # controller cannot be mistaken for a never-promoted controller.
     "drawdown_controller_promoted",
+    # Manual recovery replays immutable NAV/flow history after promotion.  It
+    # is distinct from promotion so a repaired mutable state remains auditable.
+    "drawdown_controller_recovered",
 }
 
 VALID_DIRECTIONS = {"buy", "sell", "margin_buy", "short", "cover", "in", "out"}
