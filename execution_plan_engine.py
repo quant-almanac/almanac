@@ -530,10 +530,27 @@ def derive_budgets(
         if portfolio_total > 0 and cash_target_pct is not None else None
     )
     protected_crisis_reserve = _jpy(portfolio_total * crisis_reserve_pct)
-    operational_reserve = _jpy(operational_summary.get("operational_reserve_jpy"))
+    wallet_timeline = cash_info.get("wallet_capacity_timeline")
+    wallet_timeline = wallet_timeline if isinstance(wallet_timeline, dict) else {}
+    unreflected_wallet_outflows = _jpy(
+        wallet_timeline.get("unreflected_wallet_outflows_jpy")
+    )
+    # The timeline and operational summary describe the same future schedule
+    # ids.  Prefer the unified wallet projection when present; never add both.
+    operational_reserve = _jpy(
+        wallet_timeline.get("future_operational_reservations_jpy")
+        if wallet_timeline
+        else operational_summary.get("operational_reserve_jpy")
+    )
+    open_order_wallet_reserve = _jpy(
+        wallet_timeline.get("open_order_reservations_jpy")
+    )
     required_reserve = (
-        protected_reserve + (tactical_reserve if tactical_reserve is not None else 0)
-        + protected_crisis_reserve + operational_reserve
+        protected_reserve
+        + (tactical_reserve if tactical_reserve is not None else 0)
+        + protected_crisis_reserve
+        + unreflected_wallet_outflows
+        + operational_reserve
     )
     surplus_cash = 0
     surplus_monthly_capacity = 0
@@ -639,6 +656,9 @@ def derive_budgets(
         "tactical_cash_reserve_jpy": tactical_reserve,
         "protected_cash_reserve_jpy": protected_reserve,
         "protected_crisis_reserve_jpy": protected_crisis_reserve,
+        "unreflected_wallet_outflows_jpy": unreflected_wallet_outflows,
+        "future_operational_reservations_jpy": operational_reserve,
+        "open_order_wallet_reservations_jpy": open_order_wallet_reserve,
         "operational_reserve_jpy": operational_reserve,
         "operational_reservations": operational_summary.get("operational_reservations", []),
         "operational_reserve_by_wallet_jpy": operational_summary.get("operational_reserve_by_wallet_jpy", {}),
@@ -1449,8 +1469,9 @@ def compute_consumption(
     def _match(record: dict[str, Any]) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
         key = _record_dedup_key(record)
         # An explicit lifecycle link takes precedence.  When its scope no
-        # longer matches, reserve the plan amount conservatively and surface
-        # the mismatch instead of silently re-attributing it to another item.
+        # longer matches, surface the mismatch instead of silently
+        # re-attributing it to another item.  Monthly/global accounting still
+        # charges the order, but the mismatched objective remains unfulfilled.
         for item in next_items:
             mismatch = _explicit_item_scope_mismatch(item, record)
             if mismatch:
@@ -1524,14 +1545,18 @@ def compute_consumption(
                 notional_jpy=notional,
                 mismatch=scope_mismatch,
             )
-            _apply_consumption_record(
-                item,
-                record,
-                source="action_state",
-                consumption_type=consumption_type,
-                notional_jpy=notional,
-                scope_mismatch=scope_mismatch,
-            )
+            # A scope-mismatched order still consumes the household/monthly
+            # pool through compute_monthly_consumption, but it cannot satisfy
+            # this exact objective.  Keeping it out of item consumption avoids
+            # the V-Medium fill erasing a long-only Financial objective.
+            if not scope_mismatch:
+                _apply_consumption_record(
+                    item,
+                    record,
+                    source="action_state",
+                    consumption_type=consumption_type,
+                    notional_jpy=notional,
+                )
             state_consumption_ids.add(str(action_id))
 
     for record in exec_items:
@@ -1560,14 +1585,14 @@ def compute_consumption(
             notional_jpy=notional_jpy,
             mismatch=scope_mismatch,
         )
-        _apply_consumption_record(
-            item,
-            record,
-            source="action_executions",
-            consumption_type=consumption_type,
-            notional_jpy=notional_jpy,
-            scope_mismatch=scope_mismatch,
-        )
+        if not scope_mismatch:
+            _apply_consumption_record(
+                item,
+                record,
+                source="action_executions",
+                consumption_type=consumption_type,
+                notional_jpy=notional_jpy,
+            )
 
     summary = {
         "normal_consumed_jpy": sum(_jpy(i.get("consumed_jpy")) for i in next_items if i.get("budget_bucket") == "normal"),
@@ -2447,6 +2472,7 @@ def build_execution_plan(
         market_regime=market_regime,
     )
 
+    contribution_occurrences_were_implicit = contribution_occurrences is None
     if contribution_occurrences is None:
         try:
             from contribution_schedule import occurrences
@@ -2490,11 +2516,36 @@ def build_execution_plan(
         fx_rate=float(cash_info.get("fx_rate_usdjpy") or 150.0),
     )
     try:
-        from capital_deployment import wallet_available_after_reservations
-        cash_info["wallets_after_operational_reservations"] = wallet_available_after_reservations(
-            cash_info.get("wallets") or [], operational_reservations or [],
+        from capital_deployment import (
+            build_wallet_capacity_timeline,
+            reachable_future_nisa_wait,
         )
+
+        wallet_timeline = build_wallet_capacity_timeline(
+            cash_info.get("wallets") or [],
+            now=now,
+            month_end=month_end,
+            fx_rate_usdjpy=float(cash_info.get("fx_rate_usdjpy") or 150.0),
+            executions=_execution_items(executions),
+            schedule_reservations=operational_reservations or [],
+            generate_schedule_reservations=contribution_occurrences_were_implicit,
+        )
+        cash_info["wallet_capacity_timeline"] = wallet_timeline
+        cash_info["wallets_after_operational_reservations"] = wallet_timeline["wallets"]
+        nisa_wait_resolution = reachable_future_nisa_wait(
+            preferences=nisa_wait_preferences,
+            nisa=nisa,
+            wallets_after_reservations=cash_info["wallets_after_operational_reservations"],
+        )
+        if nisa_wait_preferences is not None:
+            approved_nisa_wait_jpy = nisa_wait_resolution["approved_nisa_wait_jpy"]
     except Exception:
+        cash_info["wallet_capacity_timeline"] = {
+            "schema_version": 2,
+            "wallets": [],
+            "all_wallets_resolved": False,
+            "status": "resolution_error",
+        }
         cash_info["wallets_after_operational_reservations"] = []
     budgets, budget_warnings = derive_budgets(
         cash_info=cash_info,

@@ -150,6 +150,51 @@ def test_wife_sbi_estimated_cash_is_not_buying_power(tmp_path):
     assert result["reasons"][0]["cash_route"] == "CASH_JPY_SBI_WIFE"
 
 
+def test_configured_broker_cash_schedule_reduces_effective_wallet_once(tmp_path, monkeypatch):
+    import contribution_schedule
+
+    monkeypatch.setattr(contribution_schedule, "CONTRIBUTIONS", [{
+        "id": "example_weekly_broker_cash",
+        "label": "Example weekly broker-cash contribution",
+        "amount": 10_000,
+        "currency": "JPY",
+        "cadence": "weekly",
+        "weekday": 0,
+        "calendar_rule": "weekday",
+        "owner": "wife",
+        "broker": "sbi",
+        "funding_source": "broker_cash",
+        "cash_route": "CASH_JPY_SBI_WIFE",
+    }])
+    now = datetime(2026, 8, 19, 16, 0, tzinfo=JST)
+    (tmp_path / "holdings.json").write_text(json.dumps({
+        "CASH_JPY_SBI_WIFE": {
+            "ticker": "CASH_JPY_SBI_WIFE",
+            "shares": 100_000,
+            "available_to_trade_jpy": 100_000,
+            "currency": "JPY",
+            "balance_status": "confirmed",
+            "reconciliation_required": False,
+            "source_as_of": "2026-08-07T00:00:00+09:00",
+        },
+    }), encoding="utf-8")
+
+    result = evaluate_cash_buying_power({
+        "ticker": "1489.T",
+        "type": "buy",
+        "quantity": 20,
+        "limit_price": 3_500,
+        "execution_owner": "wife",
+        "execution_broker": "sbi",
+        "execution_account": "NISA成長投資枠",
+    }, base_dir=tmp_path, now=now)
+
+    assert result["readiness"] == "blocked"
+    capacity = result["reasons"][0]["cash_capacity_observation"]
+    assert capacity["scheduled_outflows"]["amount"] == 40_000
+    assert capacity["effective_cash"] == 60_000
+
+
 def test_confirmed_wife_sbi_cash_must_cover_requested_notional(tmp_path):
     (tmp_path / "holdings.json").write_text(json.dumps({
         "CASH_JPY_SBI_WIFE": {
@@ -632,6 +677,7 @@ def test_execution_plan_would_filter_is_advisory_in_observe_mode(tmp_path):
     _write_base(tmp_path, now)
     (tmp_path / "account.json").write_text(json.dumps({
         "last_updated": now.isoformat(), "usd_balance": 10_000,
+        "fx_rate_usdjpy": 150,
     }), encoding="utf-8")
     (tmp_path / "holdings.json").write_text(json.dumps({
         "XLF_fixture": {
@@ -1064,8 +1110,8 @@ def test_capacity_resolution_reserves_explicit_wallet_schedule(tmp_path, monkeyp
     assert normal["readiness"] == "blocked"
     assert normal["reasons"][0]["code"] == "cash_balance_insufficient"
     assert capacity["readiness"] == "ready"
-    assert capacity["effective_cash"] == 175_000
-    assert capacity["cash_capacity_observation"]["scheduled_outflows"]["amount"] == 25_000
+    assert capacity["effective_cash"] == 100_000
+    assert capacity["cash_capacity_observation"]["scheduled_outflows"]["amount"] == 100_000
 
 
 def test_reason_scope_distinguishes_candidate_and_analysis_failures():

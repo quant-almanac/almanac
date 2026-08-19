@@ -10,6 +10,7 @@ import base64
 import hashlib
 import hmac
 import json
+import math
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -208,7 +209,44 @@ def _current_var_threshold(base_dir: Path, *, loss_guard_stage: str) -> float:
     return var_threshold_decimal(bull=bull, vix=vix, stressed=stressed)
 
 
-def _prospective_concentration(payload: dict[str, Any], base_dir: Path) -> float | None:
+def _investment_policy_snapshot(
+    payload: dict[str, Any], base_dir: Path,
+) -> dict[str, Any] | None:
+    try:
+        analysis = json.loads((base_dir / "ai_portfolio_analysis.json").read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    if not isinstance(analysis, dict):
+        return None
+    synthesis = analysis.get("synthesis")
+    if not isinstance(synthesis, dict):
+        return None
+    requested_analysis_id = str(payload.get("analysis_id") or "").strip()
+    snapshot_analysis_id = str(synthesis.get("analysis_id") or "").strip()
+    if requested_analysis_id and requested_analysis_id != snapshot_analysis_id:
+        return None
+    observation = synthesis.get("investment_policy_observation")
+    if not isinstance(observation, dict):
+        return None
+    try:
+        denominator = float(observation.get("denominator_jpy"))
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(denominator) or denominator <= 0:
+        return None
+    canonical = _canonical_json(observation)
+    return {
+        "analysis_id": snapshot_analysis_id or None,
+        "as_of": analysis.get("as_of"),
+        "denominator_jpy": denominator,
+        "observation": observation,
+        "snapshot_hash": "sha256:" + hashlib.sha256(canonical.encode("utf-8")).hexdigest(),
+    }
+
+
+def _prospective_concentration_observation(
+    payload: dict[str, Any], base_dir: Path,
+) -> dict[str, Any]:
     """Estimate concentration from persisted facts without refreshing prices/FX.
 
     This intentionally returns ``None`` for missing inputs rather than guessing
@@ -221,52 +259,67 @@ def _prospective_concentration(payload: dict[str, Any], base_dir: Path) -> float
     quantity = _as_decimal(payload.get("quantity"))
     price = _as_decimal(payload.get("price"))
     if quantity is None or price is None or quantity <= 0 or price < 0:
-        return None
+        return {"ratio": None, "status": "quantity_or_price_unresolved"}
     try:
-        guard = json.loads((base_dir / "guard_state.json").read_text(encoding="utf-8"))
-        analysis = json.loads((base_dir / "ai_portfolio_analysis.json").read_text(encoding="utf-8"))
         holdings = json.loads((base_dir / "holdings.json").read_text(encoding="utf-8"))
         account = json.loads((base_dir / "account.json").read_text(encoding="utf-8"))
-        if not all(isinstance(item, dict) for item in (guard, analysis, holdings, account)):
-            return None
-        total = _as_decimal(guard.get("portfolio_value")) or _as_decimal(analysis.get("portfolio_total"))
-        if total is None or total <= 0:
-            return None
-        ticker = str(payload.get("ticker") or "")
+        snapshot = _investment_policy_snapshot(payload, base_dir)
+        if not isinstance(holdings, dict) or not isinstance(account, dict) or snapshot is None:
+            return {"ratio": None, "status": "current_policy_snapshot_unavailable"}
+        total = float(snapshot["denominator_jpy"])
+        from instrument_metadata import canonical_ticker
+
+        ticker = canonical_ticker(payload.get("ticker"))
         matching = [
             row for key, row in holdings.items()
-            if isinstance(row, dict) and str(row.get("ticker") or key) == ticker
+            if isinstance(row, dict) and canonical_ticker(row.get("ticker") or key) == ticker
         ]
-        existing = 0.0
+        shares = 0.0
         for row in matching:
-            value = _as_decimal(row.get("current_value_jpy"))
+            value = _as_decimal(row.get("shares"))
             if value is None:
-                value = _as_decimal(row.get("broker_position_value_jpy"))
-            if value is None:
-                return None
-            existing += value
+                value = _as_decimal(row.get("broker_quantity"))
+            if value is None or value < 0:
+                return {"ratio": None, "status": "holding_quantity_unavailable"}
+            shares += value
         currency = str(payload.get("currency") or "").upper()
-        notional = quantity * price
+        multiplier = 1.0
         if currency == "USD":
             fx = _as_decimal(account.get("fx_rate_usdjpy"))
             if fx is None or not (50 < fx < 500):
-                return None
-            notional *= fx
+                return {"ratio": None, "status": "fx_unavailable"}
+            multiplier = fx
         elif currency != "JPY":
-            return None
+            return {"ratio": None, "status": "currency_unresolved"}
+        existing = shares * price * multiplier
+        notional = quantity * price * multiplier
         direction = str(payload.get("direction") or "").lower()
         if direction in {"buy", "margin_buy"}:
             value = existing + notional
-            denominator = total
         elif direction == "short":
             # Gross exposure increases even if the short-sale cash is held.
             value = existing + notional
-            denominator = total
         else:
-            return existing / total
-        return value / denominator if denominator > 0 else None
+            value = max(0.0, existing - notional)
+        return {
+            "ratio": value / total,
+            "status": "ok",
+            "valuation_source": "household_quantity_x_execution_price_x_current_fx",
+            "existing_quantity": shares,
+            "existing_value_jpy": round(existing),
+            "proposed_notional_jpy": round(notional),
+            "denominator_jpy": round(total),
+            "analysis_id": snapshot.get("analysis_id"),
+            "as_of": snapshot.get("as_of"),
+            "snapshot_hash": snapshot.get("snapshot_hash"),
+        }
     except Exception:
-        return None
+        return {"ratio": None, "status": "valuation_error"}
+
+
+def _prospective_concentration(payload: dict[str, Any], base_dir: Path) -> float | None:
+    observation = _prospective_concentration_observation(payload, base_dir)
+    return _as_decimal(observation.get("ratio"))
 
 
 def _broad_concentration_context(payload: dict[str, Any], base_dir: Path) -> dict[str, Any]:
@@ -279,15 +332,19 @@ def _broad_concentration_context(payload: dict[str, Any], base_dir: Path) -> dic
         tier = str(payload.get("execution_investment_type") or payload.get("investment_type") or payload.get("tier") or "").lower()
         if not metadata or tier != "long":
             return concentration_limits(investment_type=tier)
-        holdings = json.loads((base_dir / "holdings.json").read_text(encoding="utf-8"))
-        guard = json.loads((base_dir / "guard_state.json").read_text(encoding="utf-8"))
-        account = json.loads((base_dir / "account.json").read_text(encoding="utf-8"))
-        if not isinstance(holdings, dict) or not isinstance(guard, dict) or not isinstance(account, dict):
-            return concentration_limits()
-        matches = [row for key, row in holdings.items() if isinstance(row, dict) and canonical_ticker(row.get("ticker") or key) == ticker]
-        if any(str(row.get("investment_type") or row.get("tier") or "long").lower() != "long" for row in matches):
+        snapshot = _investment_policy_snapshot(payload, base_dir)
+        if snapshot is None:
+            return concentration_limits(investment_type=None)
+        family = str(metadata["broad_family"])
+        positions = (snapshot["observation"].get("positions") or [])
+        matching = [row for row in positions if isinstance(row, dict) and canonical_ticker(row.get("canonical_instrument_id")) == ticker]
+        # A mixed tier must retain the strictest ordinary cap.
+        if any(str(row.get("cap_basis_tier") or row.get("dominant_tier") or "long").lower() != "long" for row in matching):
             return concentration_limits(investment_type="medium")
-        total = _as_decimal(guard.get("portfolio_value"))
+        total = _as_decimal(snapshot.get("denominator_jpy"))
+        if total is None or total <= 0:
+            return concentration_limits(investment_type=None)
+        currency = str(payload.get("currency") or "").upper()
         quantity = _as_decimal(payload.get("quantity"))
         price = _as_decimal(payload.get("price") or payload.get("decision_price") or payload.get("limit_price"))
         if total is None or total <= 0 or quantity is None or quantity <= 0 or price is None or price < 0:
@@ -295,7 +352,8 @@ def _broad_concentration_context(payload: dict[str, Any], base_dir: Path) -> dic
         notional = quantity * price
         currency = str(payload.get("currency") or "").upper()
         if currency == "USD":
-            fx = _as_decimal(account.get("fx_rate_usdjpy"))
+            account = json.loads((base_dir / "account.json").read_text(encoding="utf-8"))
+            fx = _as_decimal(account.get("fx_rate_usdjpy")) if isinstance(account, dict) else None
             if fx is None or not 50 < fx < 500:
                 return concentration_limits()
             notional *= fx
@@ -303,17 +361,24 @@ def _broad_concentration_context(payload: dict[str, Any], base_dir: Path) -> dic
             return concentration_limits()
         family = str(metadata["broad_family"])
         family_value = 0.0
-        for key, row in holdings.items():
+        for row in positions:
             if not isinstance(row, dict):
                 continue
-            row_meta = broad_execution_metadata(row.get("ticker") or key)
+            row_meta = broad_execution_metadata(row.get("canonical_instrument_id"))
             if not row_meta or row_meta.get("broad_family") != family:
                 continue
-            value = _as_decimal(row.get("current_value_jpy")) or _as_decimal(row.get("broker_position_value_jpy"))
+            value = _as_decimal(row.get("value_jpy"))
             if value is None:
                 return concentration_limits()
             family_value += value
-        return {**concentration_limits(broad_family=family, investment_type="long"), "family_concentration_decimal": (family_value + notional) / total}
+        limits = concentration_limits(broad_family=family, investment_type="long")
+        return {
+            **limits,
+            "family_concentration_decimal": (family_value + notional) / total,
+            "family_valuation_source": "current_investment_policy_observation",
+            "valuation_as_of": snapshot.get("as_of"),
+            "valuation_snapshot_hash": snapshot.get("snapshot_hash"),
+        }
     except Exception:
         return concentration_limits()
 
@@ -330,7 +395,17 @@ def evaluate_preflight(payload: dict[str, Any], *, base_dir: Path) -> dict[str, 
     var_threshold = _current_var_threshold(
         base_dir, loss_guard_stage=str(loss.get("loss_guard_stage") or ""),
     )
+    # Keep the scalar helper as the decision seam.  Besides preserving the
+    # long-standing test/consumer contract, this lets an operator replace the
+    # calculator without silently changing the audit metadata schema.
     concentration = _prospective_concentration(payload, base_dir)
+    concentration_observation = _prospective_concentration_observation(payload, base_dir)
+    if concentration != _as_decimal(concentration_observation.get("ratio")):
+        concentration_observation = {
+            **concentration_observation,
+            "ratio": concentration,
+            "status": "decision_seam_override",
+        }
     concentration_context = _broad_concentration_context(payload, base_dir)
     direction = str(payload.get("direction") or "").lower()
     risk_increasing = direction in {"buy", "margin_buy", "short"}
@@ -360,6 +435,7 @@ def evaluate_preflight(payload: dict[str, Any], *, base_dir: Path) -> dict[str, 
         "var_source": var_source,
         "var_snapshot_as_of": var_snapshot_as_of,
         "prospective_concentration_decimal": concentration,
+        "concentration_valuation": concentration_observation,
         "concentration_assessment": concentration_context,
         "canonical_drawdown_decimal": drawdown,
         "canonical_drawdown_stage": drawdown_stage,

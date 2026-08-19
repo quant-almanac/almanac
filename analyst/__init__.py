@@ -4572,6 +4572,17 @@ _SELL_LIKE  = {"sell", "trim", "reduce", "take_profit", "stop_loss"}
 _SHORT_LIKE = {"short", "short_sell"}
 _COVER_LIKE = {"cover", "buy_to_cover"}
 
+# Only executable-action fields participate in cross-tier direction checks.
+# Research collections remain visible for audit, but do not become orders
+# unless the same ticker/direction is promoted to priority_actions.
+_TIER_DIRECTION_SOURCE_SPECS = (
+    ("Long", "priority_actions", None),
+    ("Medium", "priority_actions", None),
+    ("Swing", "priority_actions", None),
+    ("MarginLong", "margin_long_picks", "margin_buy"),
+    ("ShortSell", "short_opportunities", "short"),
+)
+
 
 def _direction_of(action_type) -> str:
     t = str(action_type or "").lower()
@@ -4604,6 +4615,391 @@ def _action_scope_for_direction_conflict(action: dict) -> dict[str, str]:
             action.get("execution_investment_type") or action.get("tier")
         ),
     }
+
+
+def _scopes_are_explicitly_distinct(left: dict[str, str], right: dict[str, str]) -> bool:
+    """Whether two routes prove that the actions operate in distinct scopes."""
+    if not all((left.get("owner"), left.get("broker"), right.get("owner"), right.get("broker"))):
+        return False
+    if left["owner"] != right["owner"] or left["broker"] != right["broker"]:
+        return True
+    if left.get("account") and right.get("account") and left["account"] != right["account"]:
+        return True
+    return bool(
+        left.get("investment_type")
+        and right.get("investment_type")
+        and left["investment_type"] != right["investment_type"]
+    )
+
+
+def _tier_candidate_disposition(
+    *,
+    tier_name: str,
+    source_key: str,
+    raw_action: dict,
+    result: dict,
+) -> tuple[str, dict | None]:
+    """Classify whether an upstream row is an executable order intent.
+
+    ``margin_long_picks`` and ``short_opportunities`` are research collections.
+    They become order intents only when the same ticker/direction is promoted
+    into that tier's ``priority_actions``.  Keeping the non-promoted rows in
+    the audit context while excluding them from conflict gates prevents an
+    observe-only XLF idea from blocking an accepted XLF trim.
+    """
+    if source_key == "priority_actions":
+        return "actionable", raw_action
+
+    ticker = canonical_ticker(raw_action.get("ticker"))
+    candidate_direction = _direction_of(
+        raw_action.get("type")
+        or ("margin_buy" if tier_name == "MarginLong" else "short" if tier_name == "ShortSell" else None)
+    )
+    for promoted in result.get("priority_actions") or []:
+        if not isinstance(promoted, dict):
+            continue
+        if canonical_ticker(promoted.get("ticker")) != ticker:
+            continue
+        if _direction_of(promoted.get("type")) == candidate_direction:
+            return "actionable", promoted
+
+    rejected_values = {"rejected", "policy_rejected", "hard_reject", "ineligible"}
+    for record in (raw_action, result):
+        if record.get("policy_accepted") is False or record.get("policy_rejected") is True:
+            return "policy_rejected", None
+        if record.get("rejected_by_policy") is True:
+            return "policy_rejected", None
+        status = str(record.get("policy_status") or record.get("policy_disposition") or "").lower()
+        if status in rejected_values:
+            return "policy_rejected", None
+
+    disabled_flags = ("observe_only", "lane_disabled")
+    false_flags = ("executable", "execution_enabled", "enabled_for_decision")
+    for record in (raw_action, result):
+        if any(record.get(flag) is True for flag in disabled_flags):
+            return "lane_disabled", None
+        if any(record.get(flag) is False for flag in false_flags):
+            return "lane_disabled", None
+    if tier_name == "ShortSell" and result.get("short_not_recommended"):
+        return "lane_disabled", None
+    return "unrouted", None
+
+
+def _build_tier_direction_context(
+    tier_results: dict[str, object],
+    *,
+    base_dir: Path = BASE_DIR,
+) -> dict:
+    """Collect routed tier order intents for fail-closed opposite-direction checks.
+
+    A valid empty tier is not an error.  In contrast, a malformed tier or a
+    routing exception remains visible in the context so a converted margin buy
+    cannot silently become ready when the input evidence is incomplete.
+    """
+    context: dict = {
+        "complete": True,
+        "by_ticker": {},
+        "errors": [],
+        "candidate_count": 0,
+        "directional_candidate_count": 0,
+        "sources": [],
+    }
+    try:
+        from execution_safety import enrich_action_routing
+    except Exception as exc:
+        context["complete"] = False
+        context["errors"].append({
+            "code": "tier_direction_routing_import_error",
+            "message": f"{type(exc).__name__}: {str(exc)[:160]}",
+        })
+        return context
+
+    for tier_name, primary_key, default_type in _TIER_DIRECTION_SOURCE_SPECS:
+        result = tier_results.get(tier_name)
+        source = {
+            "tier": tier_name,
+            "primary_key": primary_key,
+            "candidate_count": 0,
+            "directional_candidate_count": 0,
+            "disposition_counts": {},
+        }
+        if not isinstance(result, dict):
+            context["complete"] = False
+            source["complete"] = False
+            context["errors"].append({
+                "code": "tier_direction_result_invalid",
+                "tier": tier_name,
+                "message": "tier result is not an object",
+            })
+            context["sources"].append(source)
+            continue
+        if result.get("error"):
+            context["complete"] = False
+            source["complete"] = False
+            context["errors"].append({
+                "code": "tier_direction_source_error",
+                "tier": tier_name,
+                "message": str(result.get("error"))[:160],
+            })
+
+        raw_actions = result.get(primary_key)
+        source_key = primary_key
+        if raw_actions is None and primary_key != "priority_actions":
+            raw_actions = result.get("priority_actions")
+            source_key = "priority_actions"
+        source["source_key"] = source_key
+        if not isinstance(raw_actions, list):
+            context["complete"] = False
+            source["complete"] = False
+            context["errors"].append({
+                "code": "tier_direction_actions_invalid",
+                "tier": tier_name,
+                "field": source_key,
+                "message": "tier action field is not a list",
+            })
+            context["sources"].append(source)
+            continue
+
+        source.setdefault("complete", True)
+        for raw_action in raw_actions:
+            if not isinstance(raw_action, dict):
+                continue
+            context["candidate_count"] += 1
+            source["candidate_count"] += 1
+            action = dict(raw_action)
+            if default_type and not action.get("type"):
+                action["type"] = default_type
+            action.setdefault("tier", tier_name)
+            disposition, promoted_action = _tier_candidate_disposition(
+                tier_name=tier_name,
+                source_key=source_key,
+                raw_action=action,
+                result=result,
+            )
+            routing_action = dict(promoted_action or action)
+            routing_action.setdefault("tier", tier_name)
+            try:
+                routing_action = enrich_action_routing(routing_action, base_dir=base_dir)
+            except Exception as exc:
+                context["complete"] = False
+                source["complete"] = False
+                context["errors"].append({
+                    "code": "tier_direction_routing_error",
+                    "tier": tier_name,
+                    "message": f"{type(exc).__name__}: {str(exc)[:160]}",
+                })
+                continue
+            ticker = canonical_ticker(routing_action.get("ticker") or action.get("ticker"))
+            direction = _direction_of(routing_action.get("type") or action.get("type"))
+            if not ticker or direction == "other":
+                continue
+            scope = _action_scope_for_direction_conflict(routing_action)
+            row = {
+                "tier": tier_name,
+                "source_key": source_key,
+                "ticker": ticker,
+                "direction": direction,
+                "action_type": str(routing_action.get("type") or action.get("type") or "").lower(),
+                "scope": scope,
+                "disposition": disposition,
+            }
+            context["by_ticker"].setdefault(ticker, []).append(row)
+            context["directional_candidate_count"] += 1
+            source["directional_candidate_count"] += 1
+            counts = source["disposition_counts"]
+            counts[disposition] = int(counts.get(disposition) or 0) + 1
+        context["sources"].append(source)
+    return context
+
+
+def _remove_tier_internal_direction_conflicts(
+    tier_results: dict[str, object],
+    context: dict,
+) -> dict:
+    """Remove self-contradictory order intents from a single tier.
+
+    A tier that emits both a buy and a trim for the same instrument has not
+    expressed an executable rotation.  Keeping either leg would let the final
+    synthesiser turn an upstream contradiction into an order.  This is a
+    semantic conflict, not a transport failure: ``complete`` remains true and
+    the explicit observation is kept for audit/UI purposes.
+    """
+    conflicts: dict[tuple[str, str], set[str]] = {}
+    by_ticker = context.get("by_ticker") if isinstance(context, dict) else {}
+    for ticker, rows in (by_ticker or {}).items():
+        by_tier: dict[str, set[str]] = {}
+        for row in rows if isinstance(rows, list) else []:
+            if not isinstance(row, dict):
+                continue
+            if str(row.get("disposition") or "actionable") != "actionable":
+                continue
+            by_tier.setdefault(str(row.get("tier") or ""), set()).add(
+                str(row.get("direction") or "other")
+            )
+        for tier, directions in by_tier.items():
+            if {"buy", "sell"}.issubset(directions) or {"short", "cover"}.issubset(directions):
+                conflicts[(tier, str(ticker))] = directions
+
+    report = {
+        "semantic_status": "conflicted" if conflicts else "ok",
+        "conflicts": [],
+        "removed_candidate_count": 0,
+    }
+    if not conflicts:
+        return report
+
+    source_specs = {tier: (primary, default) for tier, primary, default in _TIER_DIRECTION_SOURCE_SPECS}
+    for (tier, ticker), directions in sorted(conflicts.items()):
+        result = tier_results.get(tier)
+        if not isinstance(result, dict):
+            continue
+        primary_key, default_type = source_specs[tier]
+        source_key = primary_key
+        raw_actions = result.get(primary_key)
+        if raw_actions is None and primary_key != "priority_actions":
+            source_key = "priority_actions"
+            raw_actions = result.get(source_key)
+        if not isinstance(raw_actions, list):
+            continue
+        kept: list[object] = []
+        removed: list[dict] = []
+        for raw_action in raw_actions:
+            if not isinstance(raw_action, dict):
+                kept.append(raw_action)
+                continue
+            action_type = raw_action.get("type") or default_type
+            direction = _direction_of(action_type)
+            if canonical_ticker(raw_action.get("ticker")) == ticker and direction in directions:
+                removed.append({
+                    "ticker": ticker,
+                    "direction": direction,
+                    "action_type": str(action_type or "").lower(),
+                })
+                continue
+            kept.append(raw_action)
+        result[source_key] = kept
+        if not removed:
+            continue
+        record = {
+            "tier": tier,
+            "ticker": ticker,
+            "directions": sorted(directions),
+            "source_key": source_key,
+            "removed": removed,
+            "removed_count": len(removed),
+        }
+        result.setdefault("tier_direction_semantic_conflicts", []).append(record)
+        result["tier_direction_semantic_status"] = "conflicted"
+        report["conflicts"].append(record)
+        report["removed_candidate_count"] += len(removed)
+    return report
+
+
+def _apply_tier_direction_context(action: dict, context: dict | None) -> dict:
+    """Attach existing readiness markers from tier-level opposite intents."""
+    if not isinstance(context, dict):
+        return action
+    action = dict(action)
+    observation = {
+        "complete": bool(context.get("complete")),
+        "candidate_count": int(context.get("candidate_count") or 0),
+        "directional_candidate_count": int(context.get("directional_candidate_count") or 0),
+        "errors": list(context.get("errors") or []),
+        "sources": list(context.get("sources") or []),
+        "semantic_status": str(context.get("semantic_status") or "ok"),
+        "semantic_conflicts": list(context.get("semantic_conflicts") or []),
+    }
+    action["tier_direction_observation"] = observation
+    direction = _direction_of(action.get("type"))
+    ticker = canonical_ticker(action.get("ticker"))
+    if not ticker or direction == "other":
+        return action
+    action_tier = str(action.get("tier") or "")
+    semantic_conflicts = [
+        row for row in observation["semantic_conflicts"]
+        if (
+            isinstance(row, dict)
+            and row.get("ticker") == ticker
+            # A named Medium/Swing action must not inherit a contradiction
+            # found solely inside Long.  Conversely an unlabelled final action
+            # cannot prove a distinct origin, so it remains fail-closed.
+            and (not action_tier or str(row.get("tier") or "") == action_tier)
+        )
+    ]
+    if semantic_conflicts:
+        action["tier_direction_semantic_conflict"] = semantic_conflicts
+        action["tier_direction_semantic_conflict_reason"] = (
+            f"{ticker} は同一tier内で反対方向の候補が併存したため、再分析が必要"
+        )
+        return action
+    if (
+        not observation["complete"]
+        and action.get("margin_buy_converted_to_buy") is True
+        and direction == "buy"
+    ):
+        action["tier_direction_source_unavailable"] = True
+        action["tier_direction_source_errors"] = observation["errors"]
+        return action
+
+    opposite = {"buy": "sell", "sell": "buy", "short": "cover", "cover": "short"}.get(direction)
+    if not opposite:
+        return action
+    opposing_observations = [
+        row for row in (context.get("by_ticker", {}).get(ticker) or [])
+        if isinstance(row, dict) and row.get("direction") == opposite
+    ]
+    if not opposing_observations:
+        return action
+
+    opposing = [
+        row for row in opposing_observations
+        if str(row.get("disposition") or "actionable") == "actionable"
+    ]
+    ignored = [row for row in opposing_observations if row not in opposing]
+    if ignored:
+        action["nonblocking_opposite_observations"] = [
+            {
+                "tier": row.get("tier"),
+                "direction": row.get("direction"),
+                "action_type": row.get("action_type"),
+                "scope": row.get("scope") if isinstance(row.get("scope"), dict) else {},
+                "disposition": row.get("disposition"),
+            }
+            for row in ignored
+        ]
+    if not opposing:
+        return action
+
+    own_scope = _action_scope_for_direction_conflict(action)
+    details: list[dict] = []
+    has_unproven_scope = False
+    has_explicit_cross_scope = False
+    for row in opposing:
+        other_scope = row.get("scope") if isinstance(row.get("scope"), dict) else {}
+        detail = {
+            "tier": row.get("tier"),
+            "direction": row.get("direction"),
+            "action_type": row.get("action_type"),
+            "count": 1,
+            "scope": other_scope,
+        }
+        details.append(detail)
+        if _scopes_are_explicitly_distinct(own_scope, other_scope):
+            has_explicit_cross_scope = True
+        else:
+            has_unproven_scope = True
+    action["conflicting_tiers"] = details
+    if has_unproven_scope:
+        action["opposite_intent_conflict"] = True
+        action["opposite_intent_conflict_reason"] = (
+            f"{ticker} はtier候補に反対方向の提案があり、同一scopeでないことを確定できません"
+        )
+    elif has_explicit_cross_scope:
+        action["cross_scope_opposite_action"] = True
+        action["cross_scope_opposite_tier_reason"] = (
+            f"{ticker} は明示的に別scopeのtier候補に反対方向の提案があります"
+        )
+    return action
 
 
 def _load_recent_recommendations(days: int = 14) -> list:
@@ -7285,6 +7681,7 @@ def _phase1_post_filter(
     execution_plan: dict | None = None,
     rebalance_medium: dict | None = None,
     base_dir: Path | None = None,
+    tier_direction_context: dict | None = None,
     now: datetime | None = None,
     side_effects: bool = True,
 ) -> dict:
@@ -7300,6 +7697,21 @@ def _phase1_post_filter(
     if not isinstance(synthesis, dict):
         return synthesis
     state_dir = Path(base_dir) if base_dir is not None else BASE_DIR
+    if isinstance(tier_direction_context, dict):
+        synthesis["tier_direction_observation"] = {
+            "complete": bool(tier_direction_context.get("complete")),
+            "candidate_count": int(tier_direction_context.get("candidate_count") or 0),
+            "directional_candidate_count": int(
+                tier_direction_context.get("directional_candidate_count") or 0
+            ),
+            "errors": list(tier_direction_context.get("errors") or []),
+            "sources": list(tier_direction_context.get("sources") or []),
+            "semantic_status": str(tier_direction_context.get("semantic_status") or "ok"),
+            "semantic_conflicts": list(tier_direction_context.get("semantic_conflicts") or []),
+            "semantic_removed_candidate_count": int(
+                tier_direction_context.get("semantic_removed_candidate_count") or 0
+            ),
+        }
     analysis_now = now or datetime.now(ZoneInfo("Asia/Tokyo"))
     if analysis_now.tzinfo is None:
         analysis_now = analysis_now.replace(tzinfo=ZoneInfo("Asia/Tokyo"))
@@ -8556,6 +8968,7 @@ def _phase1_post_filter(
             a["opposite_intent_conflict_reason"] = (
                 f"{ticker} は同一分析のフィルタ前候補に反対方向の売買意図が併存"
             )
+        a = _apply_tier_direction_context(a, tier_direction_context)
 
         try:
             recent_opposite_guard = classify_recent_opposite_execution(
@@ -11210,6 +11623,27 @@ def run_analysis(force: bool = False) -> dict:
         "MarginLong": margin_long_analysis,
         "ShortSell": short_selling_analysis,
     }
+    _tier_direction_initial = _build_tier_direction_context(_tier_results_for_funnel)
+    _tier_direction_semantic = _remove_tier_internal_direction_conflicts(
+        _tier_results_for_funnel,
+        _tier_direction_initial,
+    )
+    _tier_direction_context = _build_tier_direction_context(_tier_results_for_funnel)
+    _tier_direction_context["semantic_status"] = _tier_direction_semantic["semantic_status"]
+    _tier_direction_context["semantic_conflicts"] = _tier_direction_semantic["conflicts"]
+    _tier_direction_context["semantic_removed_candidate_count"] = (
+        _tier_direction_semantic["removed_candidate_count"]
+    )
+    if _tier_direction_semantic["semantic_status"] == "conflicted":
+        print(
+            "  ⚠️ tier internal direction conflicts removed: "
+            f"{_tier_direction_semantic['removed_candidate_count']} candidate(s)"
+        )
+    if not _tier_direction_context.get("complete"):
+        print(
+            "  ⚠️ tier direction context incomplete: "
+            f"{len(_tier_direction_context.get('errors') or [])} error(s)"
+        )
     _candidate_funnel = _build_candidate_funnel(_tier_results_for_funnel, data)
 
     print("  ✅ Sonnet×3 + book-aware×2 + Red Team 分析完了")
@@ -12141,6 +12575,7 @@ def run_analysis(force: bool = False) -> dict:
                         cash_info=data.get("cash_info"),
                         execution_plan=data.get("execution_plan"),
                         rebalance_medium=data.get("rebalance_medium"),
+                        tier_direction_context=_tier_direction_context,
                         now=_analysis_now,
                         side_effects=False,
                     ),
@@ -12260,6 +12695,7 @@ def run_analysis(force: bool = False) -> dict:
             cash_info=data.get("cash_info"),
             execution_plan=data.get("execution_plan"),
             rebalance_medium=data.get("rebalance_medium"),
+            tier_direction_context=_tier_direction_context,
             now=_analysis_now,
         )
     except Exception as _pe:
@@ -12351,6 +12787,7 @@ def run_analysis(force: bool = False) -> dict:
                     cash_info=data.get("cash_info"),
                     execution_plan=data.get("execution_plan"),
                     rebalance_medium=data.get("rebalance_medium"),
+                    tier_direction_context=_tier_direction_context,
                     now=_analysis_now,
                     side_effects=False,
                 )
@@ -12384,6 +12821,7 @@ def run_analysis(force: bool = False) -> dict:
                     cash_info=data.get("cash_info"),
                     execution_plan=data.get("execution_plan"),
                     rebalance_medium=data.get("rebalance_medium"),
+                    tier_direction_context=_tier_direction_context,
                     now=_analysis_now,
                     side_effects=False,
                 )

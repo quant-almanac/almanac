@@ -222,10 +222,26 @@ def test_analysis_cache_risk_snapshot_is_unit_explicit_and_position_free():
 def test_concentration_check_is_strictly_read_only(tmp_path):
     files = {
         "guard_state.json": {"portfolio_value": 1_000_000},
-        "ai_portfolio_analysis.json": {"portfolio_total": 900_000},
+        "ai_portfolio_analysis.json": {
+            "as_of": "2026-08-19T07:00:00+09:00",
+            "synthesis": {
+                "analysis_id": "analysis-current",
+                "investment_policy_observation": {
+                    "denominator_jpy": 1_000_000,
+                    "positions": [{
+                        "canonical_instrument_id": "TEST",
+                        "value_jpy": 70_000,
+                        "cap_basis_tier": "long",
+                    }],
+                },
+            },
+        },
         "holdings.json": {
-            "TEST_taxable": {"ticker": "TEST", "current_value_jpy": 50_000},
-            "TEST_nisa": {"ticker": "TEST", "broker_position_value_jpy": 20_000},
+            # These persisted values are deliberately stale.  The preflight
+            # must revalue the authoritative quantities at the execution
+            # price instead of trusting either amount.
+            "TEST_taxable": {"ticker": "TEST", "shares": 50, "current_value_jpy": 5_000},
+            "TEST_nisa": {"ticker": "TEST", "shares": 20, "broker_position_value_jpy": 2_000},
         },
         "account.json": {"fx_rate_usdjpy": 150.0},
     }
@@ -236,7 +252,10 @@ def test_concentration_check_is_strictly_read_only(tmp_path):
         for name in files
     }
     concentration = ep._prospective_concentration(
-        {"ticker": "TEST", "direction": "buy", "quantity": 10, "price": 1_000, "currency": "JPY"},
+        {
+            "analysis_id": "analysis-current", "ticker": "TEST", "direction": "buy",
+            "quantity": 10, "price": 1_000, "currency": "JPY",
+        },
         tmp_path,
     )
     after = {

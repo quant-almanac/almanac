@@ -724,51 +724,101 @@ def evaluate_cash_buying_power(
                 **details,
             }],
         }
-    scheduled = _scheduled_cash_outflows(
-        owner=owner,
-        broker=broker,
-        currency=currency,
-        cash_route=route,
-        resource_as_of=effective_resource_as_of,
-        capacity_valid_until=capacity_valid_until,
-    )
-    reservations = _open_cash_order_reservations(
-        base_dir=base_dir,
-        owner=owner,
-        broker=broker,
-        currency=currency,
-        now=now,
-    )
+    try:
+        from calendar import monthrange
+        from capital_deployment import build_wallet_capacity_timeline
+        from execution_reconciliation import load_effective_execution_records
+
+        account = _load_json_object(base_dir / "account.json") or {}
+        fx_rate = float(account.get("fx_rate_usdjpy") or 0)
+        if currency == "USD" and not 50 < fx_rate < 500:
+            raise ValueError("USDJPY unavailable")
+        if currency == "JPY":
+            fx_rate = fx_rate if 50 < fx_rate < 500 else 1.0
+        month_end = now.date().replace(
+            day=monthrange(now.year, now.month)[1]
+        )
+        timeline = build_wallet_capacity_timeline(
+            [{
+                "wallet_key": f"{owner}|{broker}|broker_cash|{currency}",
+                "owner": owner,
+                "broker": broker,
+                "settlement_pool": "broker_cash",
+                "currency": currency,
+                "available_native": balance,
+                "available_jpy": round(balance * fx_rate) if currency == "USD" else round(balance),
+                "resources": [route],
+                "source_as_of": effective_resource_as_of.isoformat(),
+            }],
+            now=now,
+            month_end=month_end,
+            fx_rate_usdjpy=fx_rate,
+            executions=load_effective_execution_records(base_dir=base_dir),
+        )
+        wallet_capacity = timeline["wallets"][0]
+    except Exception as exc:
+        wallet_capacity = None
+        timeline = {"status": "unresolved", "error": type(exc).__name__}
     capacity_observation = {
         "cash_route": route,
         "snapshot_balance": round(balance, 2),
         "capacity_valid_until": capacity_valid_until.isoformat(),
-        "scheduled_outflows": scheduled,
-        "active_order_reservations": reservations,
+        "wallet_capacity_timeline": timeline,
     }
-    if scheduled.get("status") != "ok":
+    if not isinstance(wallet_capacity, dict) or wallet_capacity.get("reservation_status") != "ok":
         return {
             "required": True,
             "readiness": "blocked",
             "reasons": [{
-                "code": "cash_scheduled_outflow_unresolved",
-                "message": "現金スナップショット当日の定期引落を帰属できないため、買付余力を確定できません",
+                "code": "cash_reservation_timeline_unresolved",
+                "message": "積立・未約定注文を含むwallet時系列を確定できないため、買付余力を確定できません",
                 "cash_capacity_observation": capacity_observation,
                 **details,
             }],
         }
-    if reservations.get("status") != "ok":
-        return {
-            "required": True,
-            "readiness": "blocked",
-            "reasons": [{
-                "code": "cash_order_reservation_unresolved",
-                "message": "未約定買い注文の予約額を確定できないため、買付余力を確定できません",
-                "cash_capacity_observation": capacity_observation,
-                **details,
-            }],
-        }
-    effective_cash = balance - float(scheduled["amount"] or 0) - float(reservations["reserved_cash"] or 0)
+    effective_cash = float(wallet_capacity.get("available_after_all_reservations_native") or 0)
+    capacity_observation.update({
+        "unreflected_wallet_outflows": wallet_capacity.get("unreflected_wallet_outflows") or [],
+        "future_operational_reservations": wallet_capacity.get("future_operational_reservations") or [],
+        "scheduled_outflows": {
+            "status": "ok",
+            "amount": round(
+                float(wallet_capacity.get("unreflected_wallet_outflows_jpy") or 0)
+                + float(wallet_capacity.get("future_operational_reservations_jpy") or 0),
+                2,
+            ),
+            "unreflected_amount": wallet_capacity.get("unreflected_wallet_outflows_jpy") or 0,
+            "future_amount": wallet_capacity.get("future_operational_reservations_jpy") or 0,
+            "rows": [
+                *(wallet_capacity.get("unreflected_wallet_outflows") or []),
+                *(wallet_capacity.get("future_operational_reservations") or []),
+            ],
+        },
+        "active_order_reservations": {
+            "status": "unresolved" if wallet_capacity.get("unresolved_open_order_ids") else "ok",
+            "reserved_cash": round(sum(
+                float(row.get("amount_native") or 0)
+                for row in (wallet_capacity.get("open_order_reservations") or [])
+                if isinstance(row, dict)
+            ), 2),
+            "reservation_count": len(wallet_capacity.get("open_order_reservations") or []),
+            "oldest_ordered_at": min(
+                (
+                    row.get("ordered_at")
+                    for row in (wallet_capacity.get("open_order_reservations") or [])
+                    if isinstance(row, dict) and row.get("ordered_at")
+                ),
+                default=None,
+            ),
+            "stale_reservation_count": sum(
+                1
+                for row in (wallet_capacity.get("open_order_reservations") or [])
+                if isinstance(row, dict) and row.get("stale_requires_confirmation")
+            ),
+            "unresolved_execution_ids": wallet_capacity.get("unresolved_open_order_ids") or [],
+            "reservations": wallet_capacity.get("open_order_reservations") or [],
+        },
+    })
     capacity_observation["effective_cash"] = round(effective_cash, 2)
     details["cash_capacity_observation"] = capacity_observation
     details["available_cash"] = round(effective_cash, 2)

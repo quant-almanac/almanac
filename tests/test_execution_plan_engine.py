@@ -109,10 +109,9 @@ def test_explicit_scope_mismatched_order_remains_reserved_and_is_reported_once()
         executions={"executions": [ordered]},
     )
 
-    assert items[0]["open_order_consumed_jpy"] == 120_000
-    assert items[0]["remaining_jpy"] == 130_000
-    assert len(items[0]["consumed_by"]) == 1
-    assert items[0]["consumed_by"][0]["requires_confirmation"] is True
+    assert items[0]["open_order_consumed_jpy"] == 0
+    assert items[0]["remaining_jpy"] == 250_000
+    assert items[0]["consumed_by"] == []
     assert summary["scope_mismatched_open_order_count"] == 1
     assert summary["scope_mismatched_open_order_notional_jpy"] == 120_000
     assert summary["scope_mismatched_consumption_records"] == [{

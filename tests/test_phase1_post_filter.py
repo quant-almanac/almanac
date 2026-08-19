@@ -1134,7 +1134,156 @@ def test_raw_opposite_intent_marker_survives_when_one_side_is_filtered(monkeypat
     )
 
 
-def test_unsynced_live_opposite_order_in_execution_log_blocks_new_action(monkeypatch):
+def test_tier_direction_context_uses_only_executable_action_fields(monkeypatch, tmp_path):
+    import execution_safety
+
+    monkeypatch.setattr(execution_safety, "enrich_action_routing", lambda action, **kwargs: dict(action))
+    context = analyst._build_tier_direction_context({
+        "Long": {"priority_actions": [{"ticker": "LLY", "type": "buy"}], "new_candidates": [{"ticker": "XLF"}]},
+        "Medium": {"priority_actions": []},
+        "Swing": {"priority_actions": []},
+        "MarginLong": {"priority_actions": [{"ticker": "META"}]},
+        "ShortSell": {"short_opportunities": [{"ticker": "TSLA"}]},
+    }, base_dir=tmp_path)
+
+    assert context["complete"] is True
+    assert context["candidate_count"] == 3
+    assert context["by_ticker"]["META"][0]["action_type"] == "margin_buy"
+    assert context["by_ticker"]["TSLA"][0]["action_type"] == "short"
+    assert context["by_ticker"]["META"][0]["disposition"] == "actionable"
+    assert context["by_ticker"]["TSLA"][0]["disposition"] == "unrouted"
+    assert "XLF" not in context["by_ticker"]
+
+
+def test_unrouted_margin_pick_is_audited_but_does_not_block_trim(monkeypatch, tmp_path):
+    import execution_safety
+
+    monkeypatch.setattr(execution_safety, "enrich_action_routing", lambda action, **kwargs: dict(action))
+    context = analyst._build_tier_direction_context({
+        "Long": {"priority_actions": []},
+        "Medium": {"priority_actions": [{"ticker": "XLF", "type": "trim", "tier": "Medium"}]},
+        "Swing": {"priority_actions": []},
+        "MarginLong": {
+            "margin_long_picks": [
+                {"ticker": "V", "score": 110},
+                {"ticker": "XLF", "score": 103},
+            ],
+            "priority_actions": [{"ticker": "V", "type": "buy", "tier": "Medium"}],
+        },
+        "ShortSell": {"short_opportunities": [], "priority_actions": []},
+    }, base_dir=tmp_path)
+
+    xlf_buy = next(
+        row for row in context["by_ticker"]["XLF"] if row["direction"] == "buy"
+    )
+    assert xlf_buy["disposition"] == "unrouted"
+    action = analyst._apply_tier_direction_context(
+        {"ticker": "XLF", "type": "trim", "tier": "Medium"}, context,
+    )
+    assert "opposite_intent_conflict" not in action
+    assert action["nonblocking_opposite_observations"][0]["disposition"] == "unrouted"
+
+
+def test_tier_direction_context_accepts_empty_tier_results(monkeypatch, tmp_path):
+    import execution_safety
+
+    monkeypatch.setattr(execution_safety, "enrich_action_routing", lambda action, **kwargs: dict(action))
+    context = analyst._build_tier_direction_context({
+        "Long": {"priority_actions": []},
+        "Medium": {"priority_actions": []},
+        "Swing": {"priority_actions": []},
+        "MarginLong": {"margin_long_picks": []},
+        "ShortSell": {"short_opportunities": []},
+    }, base_dir=tmp_path)
+
+    assert context["complete"] is True
+    assert context["errors"] == []
+    assert context["candidate_count"] == 0
+    assert context["by_ticker"] == {}
+
+
+def test_same_tier_buy_and_trim_are_removed_as_semantic_conflict(monkeypatch, tmp_path):
+    import execution_safety
+
+    monkeypatch.setattr(execution_safety, "enrich_action_routing", lambda action, **kwargs: dict(action))
+    tiers = {
+        "Long": {"priority_actions": [
+            {"ticker": "XLF", "type": "buy"},
+            {"ticker": "XLF", "type": "trim"},
+            {"ticker": "MSFT", "type": "buy"},
+        ]},
+        "Medium": {"priority_actions": []},
+        "Swing": {"priority_actions": []},
+        "MarginLong": {"margin_long_picks": []},
+        "ShortSell": {"short_opportunities": []},
+    }
+
+    initial = analyst._build_tier_direction_context(tiers, base_dir=tmp_path)
+    resolution = analyst._remove_tier_internal_direction_conflicts(tiers, initial)
+    context = analyst._build_tier_direction_context(tiers, base_dir=tmp_path)
+
+    assert initial["complete"] is True
+    assert resolution["semantic_status"] == "conflicted"
+    assert resolution["removed_candidate_count"] == 2
+    assert context["complete"] is True
+    assert [row["ticker"] for row in tiers["Long"]["priority_actions"]] == ["MSFT"]
+    assert tiers["Long"]["tier_direction_semantic_conflicts"][0]["ticker"] == "XLF"
+
+
+def test_semantic_tier_conflict_blocks_reintroduced_buy(monkeypatch):
+    _silence_external_filters(monkeypatch)
+    monkeypatch.setattr(tunable_params, "get", _tp_get)
+    synthesis = {"overall_stance": "neutral", "priority_actions": [{
+        "ticker": "XLF", "tier": "Long", "type": "buy", "amount_jpy": 200_000,
+        "action": "XLFを買付", "reason": "buy",
+    }]}
+    tier_context = {
+        "complete": True, "candidate_count": 0, "directional_candidate_count": 0,
+        "errors": [], "sources": [], "by_ticker": {}, "semantic_status": "conflicted",
+        "semantic_conflicts": [{"tier": "Long", "ticker": "XLF", "directions": ["buy", "sell"]}],
+    }
+
+    result = analyst._phase1_post_filter(synthesis, 30_000_000, tier_direction_context=tier_context)
+    action = result["priority_actions"][0]
+    assert action["tier_direction_semantic_conflict"][0]["tier"] == "Long"
+
+
+def test_semantic_conflict_does_not_poison_explicitly_different_tier(monkeypatch):
+    _silence_external_filters(monkeypatch)
+    monkeypatch.setattr(tunable_params, "get", _tp_get)
+    synthesis = {"overall_stance": "neutral", "priority_actions": [{
+        "ticker": "XLF", "tier": "Medium", "type": "trim", "amount_hint": "1株",
+        "amount_jpy": 200_000,
+        "action": "XLFを縮小", "reason": "rebalance",
+        "holding_shares_before": 10, "requested_sell_quantity": 1,
+    }]}
+    tier_context = {
+        "complete": True, "candidate_count": 0, "directional_candidate_count": 0,
+        "errors": [], "sources": [], "by_ticker": {}, "semantic_status": "conflicted",
+        "semantic_conflicts": [{"tier": "Long", "ticker": "XLF", "directions": ["buy", "sell"]}],
+    }
+
+    result = analyst._phase1_post_filter(synthesis, 30_000_000, tier_direction_context=tier_context)
+    assert "tier_direction_semantic_conflict" not in result["priority_actions"][0]
+
+
+def test_tier_direction_context_marks_malformed_source_incomplete(monkeypatch, tmp_path):
+    import execution_safety
+
+    monkeypatch.setattr(execution_safety, "enrich_action_routing", lambda action, **kwargs: dict(action))
+    context = analyst._build_tier_direction_context({
+        "Long": {"priority_actions": []},
+        "Medium": {"priority_actions": []},
+        "Swing": {"priority_actions": []},
+        "MarginLong": {"margin_long_picks": {"ticker": "LLY"}},
+        "ShortSell": {"short_opportunities": []},
+    }, base_dir=tmp_path)
+
+    assert context["complete"] is False
+    assert any(row["code"] == "tier_direction_actions_invalid" for row in context["errors"])
+
+
+def test_converted_margin_buy_is_kept_but_blocked_for_unresolved_tier_opposite(monkeypatch):
     _silence_external_filters(monkeypatch)
     monkeypatch.setattr(tunable_params, "get", _tp_get)
     monkeypatch.setattr(analyst, "_load_recent_executions", lambda days=14, now=None: [{
