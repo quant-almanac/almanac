@@ -200,9 +200,14 @@ def build_wallet_capacity_timeline(
     try:
         from execution_safety import canonical_broker, canonical_owner, economic_direction
     except Exception:
-        canonical_owner = lambda value: str(value or "").strip().lower()  # type: ignore[assignment]
-        canonical_broker = lambda value: str(value or "").strip().lower()  # type: ignore[assignment]
-        economic_direction = lambda value: str(value or "").strip().lower()  # type: ignore[assignment]
+        def canonical_owner(value: Any) -> str:
+            return str(value or "").strip().lower()
+
+        def canonical_broker(value: Any) -> str:
+            return str(value or "").strip().lower()
+
+        def economic_direction(value: Any) -> str:
+            return str(value or "").strip().lower()
 
     open_by_wallet: dict[str, list[dict[str, Any]]] = {}
     unresolved_open_by_wallet: dict[str, list[str]] = {}
