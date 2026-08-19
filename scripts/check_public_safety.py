@@ -28,6 +28,9 @@ PRIVATE_BASENAMES = {
     "holdings_attestation.json",
     "flow_adjusted_dd_shadow.json",
     "short_candidates.json",
+    "broad_execution_routes.json",
+    "deployment_rollout_state.json",
+    "deployment_rollout_audit.jsonl",
 }
 FORBIDDEN_TEXT = {
     "former employer name": "ク" + "ボタ",
@@ -107,6 +110,26 @@ def _scan_history(ref: str, failures: list[str], skipped: list[str]) -> None:
         _scan_text(label, text, failures)
 
 
+def _scan_history_identities(ref: str, failures: list[str]) -> None:
+    """Catch private author metadata even when every committed blob is safe."""
+    raw = _git(
+        "log",
+        "--format=%H%x00%an%x00%ae%x00%cn%x00%ce",
+        ref,
+    ).decode("utf-8", errors="strict")
+    for row in raw.splitlines():
+        fields = row.split("\0")
+        if len(fields) != 5:
+            continue
+        sha, author_name, author_email, committer_name, committer_email = fields
+        _scan_text(f"history-commit:{sha[:12]}:author", f"{author_name} <{author_email}>", failures)
+        _scan_text(
+            f"history-commit:{sha[:12]}:committer",
+            f"{committer_name} <{committer_email}>",
+            failures,
+        )
+
+
 def _validate_short_defaults(failures: list[str]) -> None:
     short_config_path = ROOT / "disclosure_shadow_config.json"
     try:
@@ -117,6 +140,33 @@ def _validate_short_defaults(failures: list[str]) -> None:
     for key in ("us_short_enabled", "jp_short_enabled"):
         if short_config.get(key) is not False:
             failures.append(f"{short_config_path.name}: {key} must be false in the public default")
+
+
+def _validate_broad_route_example(failures: list[str]) -> None:
+    path = ROOT / "examples" / "private_state" / "broad_execution_routes.example.json"
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        failures.append(f"{path.relative_to(ROOT)}: cannot validate public example ({exc})")
+        return
+    if payload.get("example_only") is not True:
+        failures.append(f"{path.relative_to(ROOT)}: example_only must be true")
+    routes = payload.get("routes")
+    if not isinstance(routes, list) or not routes:
+        failures.append(f"{path.relative_to(ROOT)}: routes must contain a disabled placeholder")
+        return
+    for index, route in enumerate(routes):
+        label = f"{path.relative_to(ROOT)}:routes[{index}]"
+        if not isinstance(route, dict):
+            failures.append(f"{label}: route must be an object")
+            continue
+        if route.get("active") is not False:
+            failures.append(f"{label}: active must be false")
+        for key in ("owner", "broker", "account", "cash_route"):
+            if not str(route.get(key) or "").startswith("example_"):
+                failures.append(f"{label}: {key} must be an example_ placeholder")
+        if route.get("wallet_key"):
+            failures.append(f"{label}: wallet_key must not be embedded in the public example")
 
 
 def main() -> int:
@@ -136,6 +186,7 @@ def main() -> int:
     failures: list[str] = []
     skipped: list[str] = []
     _validate_short_defaults(failures)
+    _validate_broad_route_example(failures)
     for path in tracked_files():
         rel = str(path.relative_to(ROOT))
         _scan_path(rel, rel, failures)
@@ -150,6 +201,7 @@ def main() -> int:
         _scan_text(rel, text, failures)
     if args.history:
         _scan_history(args.history, failures, skipped)
+        _scan_history_identities(args.history, failures)
     if args.strict_unreadable and skipped:
         failures.extend("unreadable: " + item for item in skipped)
 

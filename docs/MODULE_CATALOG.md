@@ -45,6 +45,7 @@ The large orchestration implementation lives in the `analyst/` package; see §15
 | live | `feature_controls.py` | Runtime feature switches, effective-state reasons and fail-closed UI contract |
 | live | `order_intent_resolver.py`, `exit_sizing.py`, `execution_explanation.py`, `action_amounts.py` | Idempotent intent, deterministic quantity and structured amount display |
 | observe | `execution_plan_engine.py`, `execution_plan_observer.py`, `execution_quality.py` | Plan budgets, enforce-readiness evidence and implementation shortfall |
+| observe/manual-promote | `deployment_rollout.py` | Audited replay/canary evidence, explicit promotion and conservative rollback for deployment enforcement |
 | live | `behavioral_guard.py`, `margin_manager.py` | Realized-P&L shock guard and margin-position controls |
 
 ## 5. Risk, allocation and quantitative research
@@ -55,6 +56,7 @@ The large orchestration implementation lives in the `analyst/` package; see §15
 | optional | `portfolio_optimizer.py`, `optimize.py`, `bl_alpha_sources.py` | Allocation objectives and independent Black-Litterman views |
 | live | `capital_allocator.py` | Deterministic final selection for ordinary risk-increasing actions after existing safety gates |
 | live/advisory | `capital_deployment.py` | Cash-reservation accounting, drawdown-paced deployment and action-bound scheduled-broad permissions |
+| observe/human-only | `broad_deployment.py` | Deterministic broad-core candidate generation from an active gap and an explicitly configured private route |
 | live/advisory | `market_regime_v2.py`, `regime_params.py`, `vix_classification.py`, `vix_tracker.py` | Regime/rate/shock policy and volatility-state inputs |
 | shadow/manual-promote | `drawdown_state_machine.py`, `drawdown_enforcement.py` | Flow-adjusted DD hysteresis and explicit enforcement promotion |
 | live | `drawdown_dca_engine.py`, `leveraged_decay_monitor.py` | DCA ladder and leveraged-product decay |

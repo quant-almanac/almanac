@@ -457,6 +457,7 @@ def derive_budgets(
     monthly_consumption: dict[str, Any] | None = None,
     operational_reservations: list[dict[str, Any]] | None = None,
     drawdown_pacing: dict[str, Any] | None = None,
+    approved_nisa_wait_jpy: int | float | None = None,
 ) -> tuple[dict[str, Any], list[str]]:
     """Derive a paced budget from confirmed cash above the tactical target.
 
@@ -569,7 +570,11 @@ def derive_budgets(
     )
     deployment_basis_cash = max(0, confirmed_cash + base_filled_buys - filled_sells)
     ordinary_deployable_surplus = 0
+    market_deployment_target = 0
+    approved_nisa_wait = max(0, _jpy(approved_nisa_wait_jpy))
     deployment_months = deployment_horizon.get("deployment_months")
+    effective_deployment_months: float | None = None
+    dd_pacing_multiplier = 1.0
     if all_cash_is_surplus and cash_info.get("valid_for_budget"):
         if tactical_reserve is None:
             warnings.append("cash_target_unresolved: confirmed cash not converted into deployment budget")
@@ -578,6 +583,11 @@ def derive_budgets(
         else:
             surplus_cash = max(0, confirmed_cash - required_reserve)
             ordinary_deployable_surplus = max(0, deployment_basis_cash - required_reserve)
+            market_deployment_target = max(0, ordinary_deployable_surplus - approved_nisa_wait)
+            if approved_nisa_wait > ordinary_deployable_surplus:
+                warnings.append("approved_nisa_wait_exceeds_ordinary_deployable_surplus_clamped")
+                approved_nisa_wait = ordinary_deployable_surplus
+                market_deployment_target = 0
             if deployment_months is not None and int(deployment_months) > 0:
                 try:
                     multiplier = float((drawdown_pacing or {}).get("dd_pacing_multiplier", 1.0))
@@ -585,8 +595,15 @@ def derive_budgets(
                     multiplier = 0.0
                 if not math.isfinite(multiplier) or not 0 <= multiplier <= 1:
                     multiplier = 0.0
-                effective_months = float(deployment_months) / multiplier if multiplier > 0 else None
-                surplus_monthly_capacity = _jpy(ordinary_deployable_surplus / effective_months) if effective_months else 0
+                dd_pacing_multiplier = multiplier
+                effective_deployment_months = (
+                    float(deployment_months) / multiplier if multiplier > 0 else None
+                )
+                surplus_monthly_capacity = (
+                    _jpy(market_deployment_target / effective_deployment_months)
+                    if effective_deployment_months
+                    else 0
+                )
             else:
                 warnings.append(
                     "ordinary_deployment_disabled_for_regime: use active DCA/playbook only"
@@ -667,15 +684,26 @@ def derive_budgets(
         "deployment_basis_cash_jpy": deployment_basis_cash,
         "deployment_basis_surplus_jpy": ordinary_deployable_surplus,
         "ordinary_deployable_surplus_jpy": ordinary_deployable_surplus,
+        "approved_nisa_wait_jpy": approved_nisa_wait,
+        "market_deployment_target_jpy": market_deployment_target,
         "deployment_basis_filled_buys_added_back_jpy": base_filled_buys,
         "deployment_basis_sell_proceeds_removed_jpy": filled_sells,
         "deployment_basis_method": (
             "confirmed_cash_plus_base_filled_buys_minus_filled_sell_proceeds"
         ),
         "deployment_months": deployment_months,
+        "base_deployment_months": deployment_months,
+        "effective_deployment_months": effective_deployment_months,
         "canonical_dd_stage": (drawdown_pacing or {}).get("dd_stage", "data_confidence_caution"),
-        "dd_pacing_multiplier": (drawdown_pacing or {}).get("dd_pacing_multiplier", 1.0),
+        "dd_pacing_multiplier": dd_pacing_multiplier,
         "dd_pacing_source": (drawdown_pacing or {}).get("dd_pacing_source", "prepromotion"),
+        "dd_enforcement_active": bool((drawdown_pacing or {}).get("dd_enforcement_active")),
+        "dd_pacing_requires_human_acknowledgement": bool(
+            (drawdown_pacing or {}).get("requires_human_acknowledgement", True)
+        ),
+        "dd_promotion_history_status": (drawdown_pacing or {}).get(
+            "promotion_history_status", "never_promoted"
+        ),
         "deployment_regime_level": deployment_horizon.get("portfolio_level"),
         "deployment_regime_label": deployment_horizon.get("portfolio_label"),
         "deployment_policy_version": deployment_horizon.get("policy_version"),
@@ -2477,6 +2505,8 @@ def build_execution_plan(
     contribution_ledger: dict[str, Any] | None = None,
     operational_reservations: list[dict[str, Any]] | None = None,
     drawdown_pacing: dict[str, Any] | None = None,
+    approved_nisa_wait_jpy: int | float | None = None,
+    nisa_wait_preferences: dict[str, Any] | None = None,
     trusted_sector_catalog: dict[str, Any] | None = None,
     sector_catalog_summary: dict[str, Any] | None = None,
     sector_catalog_warnings: list[str] | None = None,
@@ -2571,6 +2601,9 @@ def build_execution_plan(
             "status": "resolution_error",
         }
         cash_info["wallets_after_operational_reservations"] = []
+        nisa_wait_resolution = {"approved_nisa_wait_jpy": 0, "status": "resolution_error"}
+        if nisa_wait_preferences is not None:
+            approved_nisa_wait_jpy = 0
     budgets, budget_warnings = derive_budgets(
         cash_info=cash_info,
         guard=guard,
@@ -2582,7 +2615,9 @@ def build_execution_plan(
         monthly_consumption=monthly_consumption,
         operational_reservations=operational_reservations,
         drawdown_pacing=drawdown_pacing,
+        approved_nisa_wait_jpy=approved_nisa_wait_jpy,
     )
+    budgets["nisa_wait_resolution"] = nisa_wait_resolution
     # Existing unlinked buys are shown and consume a recurring policy amount,
     # but can never be guessed against a newly approved salary/bonus source.
     # Otherwise an old manual fill could silently erase newly approved money.
@@ -2766,6 +2801,10 @@ def generate_execution_plan(*, base_dir: Path = BASE_DIR, now: datetime | None =
             "dd_pacing_source": "controller_fault", "dd_enforcement_active": False,
             "requires_human_acknowledgement": True, "promotion_history_status": "resolver_error",
         }
+    preferences = load_json(base_dir / "capital_deployment_preferences.json", {})
+    approved_nisa_wait_jpy = _jpy(
+        (preferences or {}).get("approved_future_nisa_wait_jpy")
+    )
     plan = build_execution_plan(
         account=load_json(base_dir / "account.json", {}),
         holdings=load_json(base_dir / "holdings.json", []),
@@ -2779,6 +2818,8 @@ def generate_execution_plan(*, base_dir: Path = BASE_DIR, now: datetime | None =
         market_regime=load_json(base_dir / "market_regime_v2_state.json", {}),
         contribution_ledger=load_json(base_dir / "contribution_ledger.json", {"contributions": []}),
         drawdown_pacing=drawdown_pacing,
+        approved_nisa_wait_jpy=approved_nisa_wait_jpy,
+        nisa_wait_preferences=preferences,
         now=now,
         trusted_sector_catalog=sector_catalog,
         sector_catalog_summary=sector_summary,

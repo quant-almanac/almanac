@@ -45,6 +45,7 @@
 | live | `feature_controls.py` | runtime機能switch、実効状態の理由、fail-closed UI contract |
 | live | `order_intent_resolver.py`, `exit_sizing.py`, `execution_explanation.py`, `action_amounts.py` | 冪等intent、決定論的数量、構造化金額表示 |
 | observe | `execution_plan_engine.py`, `execution_plan_observer.py`, `execution_quality.py` | plan budget、enforce readiness、shortfall |
+| observe/manual-promote | `deployment_rollout.py` | deployment enforceのreplay/canary証拠、明示昇格、保守的rollback |
 | live | `behavioral_guard.py`, `margin_manager.py` | 実損益P&L shock guardと信用管理 |
 
 ## 5. Risk・allocation・quant研究
@@ -55,6 +56,7 @@
 | optional | `portfolio_optimizer.py`, `optimize.py`, `bl_alpha_sources.py` | allocation objectiveと独立BL view |
 | live | `capital_allocator.py` | 既存安全gate通過後の通常risk-increasing actionを決定論的に最終選抜 |
 | live/advisory | `capital_deployment.py` | 現金予約、DD pacing、action-bound scheduled broad permissionの契約 |
+| observe/human-only | `broad_deployment.py` | active gapと明示private routeからの決定論的broad-core候補生成 |
 | live/advisory | `market_regime_v2.py`, `regime_params.py`, `vix_classification.py`, `vix_tracker.py` | regime/rate/shock policy、volatility state |
 | shadow/manual-promote | `drawdown_state_machine.py`, `drawdown_enforcement.py` | flow調整DDのhysteresisと明示的enforcement昇格 |
 | live | `drawdown_dca_engine.py`, `leveraged_decay_monitor.py` | DCA ladderとleveraged decay |

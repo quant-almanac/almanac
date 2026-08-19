@@ -11740,19 +11740,19 @@ def run_analysis(force: bool = False) -> dict:
         print(f"  ⚠️ 自動補完エラー（スキップ）: {_e}")
     # ────────────────────────────────────────────────────────────────
 
-    _tier_results_for_funnel = {
+    _tier_results_for_direction = {
         "Long": long_analysis,
         "Medium": medium_analysis,
         "Swing": short_positions_analysis,
         "MarginLong": margin_long_analysis,
         "ShortSell": short_selling_analysis,
     }
-    _tier_direction_initial = _build_tier_direction_context(_tier_results_for_funnel)
+    _tier_direction_initial = _build_tier_direction_context(_tier_results_for_direction)
     _tier_direction_semantic = _remove_tier_internal_direction_conflicts(
-        _tier_results_for_funnel,
+        _tier_results_for_direction,
         _tier_direction_initial,
     )
-    _tier_direction_context = _build_tier_direction_context(_tier_results_for_funnel)
+    _tier_direction_context = _build_tier_direction_context(_tier_results_for_direction)
     _tier_direction_context["semantic_status"] = _tier_direction_semantic["semantic_status"]
     _tier_direction_context["semantic_conflicts"] = _tier_direction_semantic["conflicts"]
     _tier_direction_context["semantic_removed_candidate_count"] = (

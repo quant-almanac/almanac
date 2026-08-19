@@ -1550,6 +1550,50 @@ def test_strong_bear_disables_legacy_explicit_ordinary_budget() -> None:
     assert budgets["monthly_discretionary_budget_jpy"] == 0
 
 
+def test_future_nisa_wait_is_removed_from_the_paced_market_target() -> None:
+    budgets, warnings = epe.derive_budgets(
+        cash_info={"total_cash_jpy": 4_000_000, "valid_for_budget": True},
+        guard={
+            "portfolio_value": 10_000_000,
+            "new_entry_allowed": True,
+            "trading_allowed": True,
+        },
+        params={
+            "monthly_discretionary_budget_jpy": 0,
+            "max_single_normal_jpy": 250_000,
+            "max_single_opportunity_jpy": 300_000,
+            "max_single_action_pct_of_portfolio": 0.05,
+        },
+        scheduled_contributions_jpy=100_000,
+        operational_reservations=[{
+            "reservation_id": "example-broker-cash-reservation",
+            "wallet_key": "example-owner|example-broker|broker_cash|JPY",
+            "amount_jpy": 100_000,
+            "status": "active",
+            "reflected_in_confirmed_cash": False,
+        }],
+        approved_nisa_wait_jpy=1_000_000,
+        drawdown_pacing={
+            "dd_stage": "data_confidence_caution",
+            "dd_pacing_multiplier": 1.0,
+            "dd_pacing_source": "prepromotion",
+            "dd_enforcement_active": False,
+        },
+        horizon=epe.horizon_for(date(2026, 8, 7)),
+        cash_target_policy={
+            "cash_target_pct": 3.0,
+            "portfolio_level": 2,
+            "portfolio_label": "strong_bull",
+        },
+    )
+
+    assert warnings == ["scheduled_contributions_excluded_from_discretionary_budget"]
+    assert budgets["ordinary_deployable_surplus_jpy"] == 3_100_000
+    assert budgets["approved_nisa_wait_jpy"] == 1_000_000
+    assert budgets["market_deployment_target_jpy"] == 2_100_000
+    assert budgets["monthly_discretionary_budget_jpy"] == 1_050_000
+
+
 def test_approved_contribution_creates_one_common_pool_without_priority_wallet_splitting() -> None:
     plan = epe.build_execution_plan(
         account={"balance": 0, "usd_balance": 0, "fx_rate_usdjpy": 150, "last_updated": "2026-07-10T07:00:00"},
