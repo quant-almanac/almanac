@@ -17,7 +17,7 @@ def test_system_status_uses_live_sources(monkeypatch):
     assert result["schedules"]["auto_tune"]["times"] == ["06:30"]
     assert result["heartbeat_statuses"] == []
     assert any(row["role"] == "final_synthesis" for row in result["model_routes"])
-    assert result["guards"]["risk_policy_version"] == "2026-08-v1"
+    assert result["guards"]["risk_policy_version"] == "2026-08-v2"
     assert result["guards"]["daily_loss_limit_pct_points"] == -3.0
     assert result["guards"]["rolling_30_stage_pct_points"] == [-6.0, -9.0, -12.0]
 

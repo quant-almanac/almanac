@@ -8,6 +8,286 @@ from zoneinfo import ZoneInfo
 import pytest
 
 
+def test_candidate_funnel_keeps_non_action_entries_separate_from_tier_direction_inputs():
+    funnel = analyst._build_candidate_funnel(
+        {
+            "Long": {"new_candidates": [{"ticker": "V", "score": 122.4}]},
+            "Medium": {"new_entries": [{"ticker": "XLF", "score": 90}]},
+        },
+        {"screening": {"long_term": {
+            "as_of": "2026-08-18T07:00:00+09:00",
+            "passed": [
+                {"ticker": "V", "score": 122.4, "price": 355, "currency": "USD", "confidence_pct": 75},
+            ],
+        }}},
+        now=datetime(2026, 8, 19, 7, 0, tzinfo=ZoneInfo("Asia/Tokyo")),
+        earnings_blackout_tickers=set(),
+    )
+
+    by_ticker = {row["ticker"]: row for row in funnel["candidates"]}
+    assert funnel["complete"] is True
+    assert funnel["generated_candidate_count"] == 2
+    assert by_ticker["V"]["screen_passed"] is True
+    assert by_ticker["V"]["eligible_for_fallback"] is True
+    assert by_ticker["XLF"]["eligible_for_fallback"] is False
+
+
+def test_candidate_funnel_marks_invalid_source_incomplete():
+    funnel = analyst._build_candidate_funnel(
+        {"Long": {"new_candidates": {}}, "Medium": {"new_entries": []}},
+        {"screening": {"long_term": {"passed": []}}},
+    )
+
+    assert funnel["complete"] is False
+    assert funnel["candidates"] == []
+    assert funnel["errors"][0]["code"] == "candidate_field_invalid"
+
+
+def test_fallback_candidate_respects_v_single_action_cap_fixture():
+    action = analyst._fallback_action_from_candidate(
+        {
+            "ticker": "V", "screen_passed": True, "price": 355,
+            "currency": "USD", "source_score": 122.4,
+            "fallback_confidence_pct": 75,
+            "sources": [{"tier": "Long", "field": "new_candidates"}],
+        },
+        positions=[{
+            "ticker": "V", "owner": "husband", "broker": "rakuten",
+            "account": "特定", "investment_type": "medium", "currency": "USD",
+        }],
+        fx_rate=159.452,
+        single_action_cap_jpy=250_000,
+    )
+
+    assert action is not None
+    assert action["quantity"] == 4
+    assert 4 * 355 * 159.452 == pytest.approx(226_421.84)
+    assert 5 * 355 * 159.452 > 250_000
+
+
+def test_execution_plan_normal_cap_is_authoritative_for_fallback():
+    plan = {"budgets": {
+        "max_single_normal_action_jpy": 250_000,
+        "max_single_opportunity_action_jpy": 300_000,
+    }}
+
+    assert analyst._execution_plan_action_cap_jpy(
+        {"type": "add", "source": "candidate_funnel_fallback"}, plan,
+    ) == 250_000
+
+
+def test_fallback_candidate_respects_jpx_trading_unit():
+    action = analyst._fallback_action_from_candidate(
+        {
+            "ticker": "7203.T", "screen_passed": True, "price": 2_500,
+            "currency": "JPY", "source_score": 100, "fallback_confidence_pct": 72,
+        },
+        positions=[{
+            "ticker": "7203.T", "owner": "husband", "broker": "rakuten",
+            "account": "特定", "investment_type": "medium", "currency": "JPY",
+        }],
+        fx_rate=159.452,
+        single_action_cap_jpy=250_000,
+    )
+
+    assert action is not None
+    assert action["quantity"] == 100
+
+
+def test_candidate_funnel_suppresses_stale_unconfident_and_earnings_rows():
+    funnel = analyst._build_candidate_funnel(
+        {"Long": {"new_candidates": []}, "Medium": {"new_entries": []}},
+        {"screening": {"long_term": {
+            "as_of": "2026-08-15T06:00:00+09:00",
+            "passed": [
+                {"ticker": "STALE", "price": 10, "confidence_pct": 80},
+                {"ticker": "NO_CONF", "price": 10},
+                {"ticker": "EARN", "price": 10, "confidence_pct": 80},
+            ],
+        }}},
+        now=datetime(2026, 8, 19, 7, 0, tzinfo=ZoneInfo("Asia/Tokyo")),
+        earnings_blackout_tickers={"EARN"},
+    )
+    rows = {row["ticker"]: row for row in funnel["candidates"]}
+    assert "screen_stale_over_72h" in rows["STALE"]["fallback_suppression_reasons"]
+    assert "calibrated_confidence_unavailable" in rows["NO_CONF"]["fallback_suppression_reasons"]
+    assert "earnings_within_7_business_days" in rows["EARN"]["fallback_suppression_reasons"]
+    assert not any(row["eligible_for_fallback"] for row in rows.values())
+
+
+def test_wallet_capacity_downsizes_buy_before_readiness(monkeypatch):
+    _silence_external_filters(monkeypatch)
+    monkeypatch.setattr(tunable_params, "get", _tp_get)
+    import execution_readiness
+    import execution_safety
+
+    monkeypatch.setattr(
+        execution_readiness,
+        "resolve_cash_buying_capacity",
+        lambda *args, **kwargs: {
+            "readiness": "ready",
+            "effective_cash": 169_810,
+            "currency": "JPY",
+            "cash_capacity_observation": {
+                "capacity_valid_until": "2026-08-13T15:30:00+09:00",
+                "effective_cash": 169_810,
+            },
+        },
+    )
+    monkeypatch.setattr(execution_safety, "is_nisa_account", lambda value: True)
+    monkeypatch.setattr(
+        execution_safety,
+        "evaluate_nisa_capacity",
+        lambda *args, **kwargs: {
+            "readiness": "ready",
+            "reasons": [],
+            "nisa_capacity_remaining_jpy": 1_138_600,
+            "nisa_capacity_identity": "wife|sbi|nisa_growth",
+            "nisa_capacity_baseline": {"as_of": "2026-07-29"},
+            "nisa_capacity_baseline_source": "fixture",
+        },
+    )
+    synthesis = {
+        "overall_stance": "neutral",
+        "priority_actions": [{
+            "ticker": "1489.T", "type": "buy", "tier": "Long",
+            "quantity": 150, "amount_hint": "150口", "decision_price": 3_509,
+            "limit_price": 3_509, "order_type": "limit",
+            "execution_owner": "wife", "execution_broker": "sbi",
+            "execution_account": "NISA成長投資枠", "action": "1489.Tを150口買い",
+        }],
+    }
+
+    result = analyst._phase1_post_filter(
+        synthesis, 30_000_000, fx_rate=159.452, positions=[],
+        cash_info={"total_cash_jpy": 1_000_000}, side_effects=False,
+    )
+
+    action = result["priority_actions"][0]
+    assert action["execution_capacity_mode"] == "downsized"
+    assert action["original_quantity"] == 150
+    assert action["quantity"] == 48
+    assert action["estimated_notional_jpy"] == 168_432
+
+
+def test_wallet_resize_uses_execution_plan_normal_cap(monkeypatch):
+    _silence_external_filters(monkeypatch)
+    monkeypatch.setattr(tunable_params, "get", _tp_get)
+    import execution_readiness
+
+    monkeypatch.setattr(
+        execution_readiness,
+        "resolve_cash_buying_capacity",
+        lambda *args, **kwargs: {
+            "readiness": "ready",
+            "effective_cash": 54_256,
+            "currency": "USD",
+            "cash_capacity_observation": {
+                "capacity_valid_until": "2026-08-14T16:00:00-04:00",
+                "effective_cash": 54_256,
+            },
+        },
+    )
+    synthesis = {
+        "overall_stance": "neutral",
+        "priority_actions": [{
+            "ticker": "V", "type": "add", "tier": "Long",
+            "quantity": 13, "amount_hint": "13株", "decision_price": 355,
+            "limit_price": 355, "order_type": "limit", "currency": "USD",
+            "execution_owner": "husband", "execution_broker": "rakuten",
+            "execution_account": "特定", "action": "Vを13株買い増し",
+        }],
+    }
+    plan = {
+        "status": "disabled",
+        "budgets": {
+            "max_single_normal_action_jpy": 250_000,
+            "max_single_opportunity_action_jpy": 300_000,
+        },
+    }
+
+    result = analyst._phase1_post_filter(
+        synthesis, 30_000_000, fx_rate=159.452,
+        positions=[{
+            "ticker": "V", "current_price": 355, "shares": 7,
+            "currency": "USD", "owner": "husband", "broker": "rakuten",
+            "account": "特定", "investment_type": "medium",
+        }],
+        cash_info={"total_cash_jpy": 9_000_000},
+        execution_plan=plan,
+        side_effects=False,
+    )
+
+    action = result["priority_actions"][0]
+    assert action["quantity"] == 4
+    assert action["estimated_notional_jpy"] == 226_422
+    assert action["execution_capacity_mode"] == "downsized"
+
+
+def test_reproposal_suppression_starts_only_after_versioned_prior_day(tmp_path):
+    yesterday = "2026-08-13T06:15:00+09:00"
+    (tmp_path / "ai_recommendation_log.json").write_text(json.dumps([{
+        "as_of": yesterday,
+        "ticker": "1489.T",
+        "type": "buy",
+        "execution_readiness": "blocked",
+        "reproposal_policy_version": "candidate_retry_v1",
+        "reproposal_reason_fingerprint": ["cash_balance_insufficient", "wallet:wife|sbi|nisa_growth|JPY|cash"],
+        "execution_scope_key": "wife|sbi|NISA成長投資枠|long",
+    }]), encoding="utf-8")
+    actions, suppressed = analyst._suppress_repeated_candidate_failures(
+        [{
+            "ticker": "1489.T", "type": "buy", "execution_readiness": "blocked",
+            "execution_owner": "wife", "execution_broker": "sbi",
+            "execution_account": "NISA成長投資枠", "execution_investment_type": "long",
+            "execution_block_reasons": [{
+                "code": "cash_balance_insufficient", "reason_scope": "wallet",
+                "scope_key": "wallet:wife|sbi|nisa_growth|JPY|cash",
+            }],
+        }],
+        base_dir=tmp_path,
+        now=datetime(2026, 8, 14, 6, 15, tzinfo=ZoneInfo("Asia/Tokyo")),
+    )
+
+    assert actions == []
+    assert suppressed[0]["reproposal_suppressed"] is True
+    assert suppressed[0]["reproposal_recheck_after"] == "2026-08-19"
+
+
+def test_reproposal_suppression_reopens_on_scheduled_session(tmp_path):
+    (tmp_path / "ai_recommendation_log.json").write_text(json.dumps([{
+        "as_of": "2026-08-18T06:15:00+09:00",
+        "ticker": "1489.T",
+        "type": "buy",
+        "execution_readiness": "blocked",
+        "reproposal_policy_version": "candidate_retry_v1",
+        "reproposal_reason_fingerprint": [
+            "cash_balance_insufficient", "wallet:wife|sbi|nisa_growth|JPY|cash",
+        ],
+        "execution_scope_key": "wife|sbi|NISA成長投資枠|long",
+        "reproposal_suppressed": True,
+        "reproposal_recheck_after": "2026-08-19",
+    }]), encoding="utf-8")
+    action = {
+        "ticker": "1489.T", "type": "buy", "execution_readiness": "blocked",
+        "execution_owner": "wife", "execution_broker": "sbi",
+        "execution_account": "NISA成長投資枠", "execution_investment_type": "long",
+        "execution_block_reasons": [{
+            "code": "cash_balance_insufficient", "reason_scope": "wallet",
+            "scope_key": "wallet:wife|sbi|nisa_growth|JPY|cash",
+        }],
+    }
+
+    actions, suppressed = analyst._suppress_repeated_candidate_failures(
+        [action],
+        base_dir=tmp_path,
+        now=datetime(2026, 8, 19, 6, 15, tzinfo=ZoneInfo("Asia/Tokyo")),
+    )
+
+    assert actions == [action]
+    assert suppressed == []
+
+
 def _silence_external_filters(monkeypatch):
     import execution_readiness
 
@@ -3823,7 +4103,15 @@ def test_candidate_funnel_uses_long_and_medium_discovery_contracts():
             "Long": {"new_candidates": [{"ticker": "AAPL", "score": 120, "price": 200, "currency": "USD"}]},
             "Medium": {"new_entries": [{"ticker": "JPM", "score": 90, "price": 150, "currency": "USD"}]},
         },
-        {"screening": {"long_term": {"passed": [{"ticker": "AAPL", "score": 120, "price": 200, "currency": "USD"}]}}},
+        {"screening": {"long_term": {
+            "as_of": "2026-08-18T07:00:00+09:00",
+            "passed": [{
+                "ticker": "AAPL", "score": 120, "price": 200,
+                "currency": "USD", "confidence_pct": 75,
+            }],
+        }}},
+        now=datetime(2026, 8, 19, 7, 0, tzinfo=ZoneInfo("Asia/Tokyo")),
+        earnings_blackout_tickers=set(),
     )
 
     assert result["complete"] is True
@@ -3854,7 +4142,8 @@ def test_fallback_candidate_is_limited_by_active_plan_cap():
     action = analyst._fallback_action_from_candidate(
         {
             "ticker": "AAPL", "price": 200, "currency": "USD",
-            "screen_passed": True, "source_score": 120, "sources": [],
+            "screen_passed": True, "source_score": 120,
+            "fallback_confidence_pct": 75, "sources": [],
         },
         positions=[{
             "ticker": "AAPL", "current_price": 200, "currency": "USD",
@@ -3876,7 +4165,8 @@ def test_fallback_jpx_candidate_respects_board_lot():
     action = analyst._fallback_action_from_candidate(
         {
             "ticker": "7203.T", "price": 2_500, "currency": "JPY",
-            "screen_passed": True, "source_score": 100, "sources": [],
+            "screen_passed": True, "source_score": 100,
+            "fallback_confidence_pct": 72, "sources": [],
         },
         positions=[{
             "ticker": "7203.T", "current_price": 2_500, "currency": "JPY",

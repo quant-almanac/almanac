@@ -1209,6 +1209,30 @@ def build_plan_items(
         nisa=nisa,
         trusted_sector_catalog=trusted_sector_catalog,
     )
+    market_target = _jpy(budgets.get("market_deployment_target_jpy"))
+    if budgets.get("ordinary_deployment_allowed") is True and market_target > 0:
+        # This exact objective is the only authority for the deterministic VT
+        # generator.  No active global-all-country gap means no default broad
+        # candidate, and a concentration review never falls through to a
+        # different family without another explicit objective and route.
+        objectives.insert(0, {
+            "objective": "deploy_surplus_broad_core",
+            "priority": 1,
+            "requested_jpy": market_target,
+            "preferred_tickers": ["VT"],
+            "allowed_action_types": ["buy", "add"],
+            "constraints": {
+                "source": "scheduled_broad_deployment",
+                "broad_family": "global_all_country",
+                "investment_types": ["long"],
+                "deterministic_candidate": True,
+                "min_confidence_pct": 0,
+            },
+            "source_reasons": [
+                "market_deployment_target: approved surplus requires a broad-core candidate",
+                "default_family: global_all_country",
+            ],
+        })
     return allocate_plan_items(
         objectives=objectives,
         budgets=budgets,

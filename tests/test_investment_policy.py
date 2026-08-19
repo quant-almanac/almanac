@@ -109,6 +109,7 @@ def test_all_confirmed_system_cash_is_surplus_but_operational_reservations_remai
     assert policy == {
         "all_system_cash_is_surplus": True,
         "protected_cash_reserve_jpy": 0,
+        "protected_crisis_reserve_pct": 0.05,
         "tactical_cash_retention_allowed": True,
         "operational_reservations_still_required": True,
         "monthly_budget_method": "deployable_surplus_divided_by_regime_horizon",

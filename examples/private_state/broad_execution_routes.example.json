@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "example_only": true,
+  "routes": [
+    {
+      "route_id": "example-owner-example-broker-taxable-usd-vt",
+      "active": false,
+      "ticker": "VT",
+      "owner": "example_owner",
+      "broker": "example_broker",
+      "account": "example_taxable",
+      "investment_type": "long",
+      "settlement_pool": "broker_cash",
+      "currency": "USD",
+      "cash_route": "example_cash_resource"
+    }
+  ]
+}

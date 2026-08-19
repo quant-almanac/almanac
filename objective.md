@@ -27,8 +27,15 @@
   維持できる。`protected_cash_reserve_jpy=0` は、未受渡・open order・税・手数料・
   必要保証金、鮮度、口座別買付余力を検証する既存の実行関門を無効化しない。
 - 戦術現金目標を超える確認済み余剰現金の通常配備は、固定円上限ではなく committed
-  regime で配分する。強い強気／弱い強気／中立／弱い弱気は 2／3／6／12か月、
-  強い弱気または shock 中は通常配備0とし、別関門の active DCA だけを許す。
+  regime とcanonical DD pacingで配分する。強い強気／弱い強気／中立／弱い弱気は
+  2／3／6／12か月、強い弱気または shock 中は通常配備0とする。DD controller未昇格中は
+  100% pacingとbatchごとの人間確認、昇格後のblock/derisk_reviewはallowlist済み広域longの
+  permission付きscheduled batchのみ25%、freeze以深は通常配備0とする。
+- 通常配備の決定論的defaultは、activeな`global_all_country` gap、allowlist済み商品、
+  owner別の明示route、月末までの予約控除後wallet、現在価格、集中度余力がすべて揃う場合の
+  VTとする。instrument caution 20%では人間review、cap 25%では不採用とし、別familyへ自動迂回しない。
+- 個別候補と広域候補は同じallocatorで比較し、異なるowner・brokerを含めても、1回の分析から
+  `ready`に残せるrisk-increasing buyはhousehold全体で最大1件とする。
 
 ## 2. ベンチマーク
 
@@ -111,6 +118,10 @@ priority_actions = []  は valid な出力。
 件数ノルマは設けない。
 期待 alpha が手数料・税後で 50bps を下回る候補は採用しない (alpha hurdle)。
 ```
+
+合成後fallbackは、72時間以内のscreen、明示されたcalibrated confidence、決算7営業日外、
+既存の一意route、exact `plan_new_order`、token-free preflight=`ready`をすべて満たす場合だけ候補化する。
+固定confidenceを補完してアクションを作らない。
 
 これは下記との明示的整合性を保つために定めた:
 - `analyst/__init__.py` プロンプト (2351 行ほか): 件数ノルマ廃止済み (P0-4)

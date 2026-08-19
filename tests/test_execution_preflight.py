@@ -193,6 +193,30 @@ def test_preflight_reads_risk_snapshot_and_live_promoted_drawdown(tmp_path, monk
     assert "drawdown_block" in {r["code"] for r in result["reasons"]}
 
 
+def test_token_free_preflight_decision_never_loads_signing_key(tmp_path, monkeypatch):
+    (tmp_path / "guard_state.json").write_text(
+        '{"daily_pnl_pct": 0.0, "monthly_pnl_pct": 0.0}', encoding="utf-8",
+    )
+    (tmp_path / "ai_portfolio_analysis.json").write_text(
+        '{"as_of": "2026-08-19T06:00:00+09:00", "risk_snapshot": '
+        '{"source": "test", "var_95_decimal": 0.01}}', encoding="utf-8",
+    )
+    (tmp_path / "drawdown_state.json").write_text(
+        '{"enforcement_enabled": true, "last_drawdown_decimal": -0.02, "dd_state": "ok"}',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(ep, "_prospective_concentration", lambda payload, base_dir: 0.04)
+    monkeypatch.setattr(ep, "load_api_key", lambda: (_ for _ in ()).throw(AssertionError("key must not load")))
+
+    result = ep.evaluate_preflight_decision(
+        {"ticker": "TEST", "direction": "buy", "quantity": 1, "price": 100},
+        base_dir=tmp_path,
+    )
+
+    assert result["disposition"] == "ready"
+    assert "preflight_token" not in result
+
+
 def test_current_var_threshold_uses_fixed_regime_budgets(tmp_path):
     (tmp_path / "regime_state.json").write_text('{"regime": "A_強気"}', encoding="utf-8")
     (tmp_path / "vix_state.json").write_text('{"vix": {"level": 20}}', encoding="utf-8")

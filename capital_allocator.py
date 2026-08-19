@@ -14,7 +14,13 @@ from pathlib import Path
 from typing import Any
 
 from action_amounts import synchronize_resized_action_prose
-from instrument_metadata import broad_execution_metadata, canonical_ticker, quantity_label_for_ticker, trading_unit_for_ticker
+from instrument_metadata import (
+    broad_execution_metadata,
+    canonical_ticker,
+    quantity_label_for_ticker,
+    trading_unit_for_ticker,
+)
+from risk_policy import concentration_limits
 from utils import atomic_write_json, load_json
 
 BASE_DIR = Path(__file__).parent
@@ -49,7 +55,10 @@ def _normal_buy(action: dict[str, Any]) -> bool:
         return False
     source = str(action.get("source") or "").lower()
     tier = str(action.get("tier") or "").lower()
-    return not source.startswith("scenario") and source != "scheduled_broad_deployment" and tier != "swing"
+    return (
+        not source.startswith("scenario")
+        and tier != "swing"
+    )
 
 
 def _scheduled_broad_buy(action: dict[str, Any]) -> bool:
@@ -70,7 +79,12 @@ def _estimated_notional_jpy(action: dict[str, Any], *, fx_rate: float) -> float:
 
 def _ranking_key(action: dict[str, Any]) -> tuple:
     """Fixed ranking order; uncalibrated return claims are intentionally absent."""
-    objective_match = int(bool(action.get("execution_plan_item_id") or action.get("execution_plan_objective_match")))
+    objective_match = int(bool(
+        action.get("plan_item_id")
+        or action.get("execution_plan_item_id")
+        or action.get("execution_plan_objective_match")
+    ))
+    objective_gap_closure = _number(action.get("objective_gap_closure_jpy"), default=0.0)
     calibrated_excess = _number(action.get("calibrated_after_cost_excess_return_bps"), default=0.0)
     concentration = _number(action.get("concentration_improvement_score"), default=0.0)
     sector = _number(action.get("sector_improvement_score"), default=0.0)
@@ -84,6 +98,7 @@ def _ranking_key(action: dict[str, Any]) -> tuple:
     ticker = str(action.get("ticker") or "")
     return (
         -objective_match,
+        -objective_gap_closure,
         -calibrated_excess,
         -(concentration + sector + currency + correlation),
         marginal_cvar,
@@ -92,6 +107,98 @@ def _ranking_key(action: dict[str, Any]) -> tuple:
         -confidence,
         ticker,
     )
+
+
+def annotate_post_trade_concentration(
+    actions: list[dict[str, Any]],
+    *,
+    policy_observation: dict[str, Any] | None,
+    fx_rate: float,
+) -> list[dict[str, Any]]:
+    """Attach one current-snapshot concentration contract to every ready buy."""
+    copied = [dict(action) for action in actions if isinstance(action, dict)]
+    observation = policy_observation if isinstance(policy_observation, dict) else {}
+    denominator = _number(observation.get("denominator_jpy"))
+    positions = [row for row in observation.get("positions") or [] if isinstance(row, dict)]
+    for action in copied:
+        if not _normal_buy(action) or action.get("execution_readiness") != "ready":
+            continue
+        ticker = canonical_ticker(action.get("ticker"))
+        notional = _estimated_notional_jpy(action, fx_rate=fx_rate)
+        if not ticker or denominator <= 0 or notional <= 0:
+            action["execution_readiness"] = "review"
+            _append_reason(
+                action,
+                "capital_allocator_concentration_unresolved",
+                "統一allocator用の現在価値・総資産・発注額を確定できません",
+            )
+            continue
+        matches = [
+            row for row in positions
+            if canonical_ticker(row.get("canonical_instrument_id")) == ticker
+        ]
+        existing_values = [_number(row.get("value_jpy"), default=-1) for row in matches]
+        if any(value < 0 for value in existing_values):
+            action["execution_readiness"] = "review"
+            _append_reason(
+                action,
+                "capital_allocator_concentration_unresolved",
+                "保有数量を現在snapshot価値へ再評価できません",
+            )
+            continue
+        existing = sum(existing_values)
+        metadata = broad_execution_metadata(ticker)
+        action_tier = str(
+            action.get("execution_investment_type") or action.get("tier") or "long"
+        ).lower()
+        existing_tiers = {
+            str(row.get("cap_basis_tier") or row.get("dominant_tier") or "long").lower()
+            for row in matches
+        }
+        limit_tier = "medium" if any(value != "long" for value in existing_tiers) else action_tier
+        family = str((metadata or {}).get("broad_family") or "") or None
+        limits = concentration_limits(
+            broad_family=family if limit_tier == "long" else None,
+            investment_type=limit_tier,
+        )
+        post_trade = (existing + notional) / denominator
+        action["post_trade_concentration_decimal"] = post_trade
+        action["concentration_caution_decimal"] = limits.get("caution_decimal")
+        action["concentration_cap_decimal"] = limits.get("cap_decimal")
+        action["concentration_snapshot_source"] = "investment_policy_observation"
+        action["concentration_denominator_jpy"] = round(denominator)
+        if family:
+            family_value = 0.0
+            for row in positions:
+                row_meta = broad_execution_metadata(row.get("canonical_instrument_id"))
+                if row_meta and row_meta.get("broad_family") == family:
+                    family_value += _number(row.get("value_jpy"))
+            action["post_trade_family_concentration_decimal"] = (family_value + notional) / denominator
+            action["family_concentration_cap_decimal"] = limits.get("family_cap_decimal")
+        cap = _number(limits.get("cap_decimal"), default=0.0)
+        caution = _number(limits.get("caution_decimal"), default=0.0)
+        family_cap = _number(limits.get("family_cap_decimal"), default=0.0)
+        if (
+            (cap > 0 and post_trade >= cap)
+            or (
+                family_cap > 0
+                and _number(action.get("post_trade_family_concentration_decimal")) >= family_cap
+            )
+        ):
+            action["execution_readiness"] = "review"
+            _append_reason(
+                action,
+                "capital_allocator_concentration_cap",
+                "発注後集中度がhard cap以上になるため統一allocatorでは選択しません",
+            )
+        elif caution > 0 and post_trade >= caution:
+            action["execution_readiness"] = "review"
+            _append_reason(
+                action,
+                "capital_allocator_concentration_caution",
+                "発注後集中度がcaution以上になるため人間確認が必要です",
+            )
+    return copied
 
 
 def _append_reason(action: dict[str, Any], code: str, message: str) -> None:
@@ -179,8 +286,14 @@ def allocate_actions(
     min_trade_jpy: float = 150_000,
     normal_action_cap_jpy: int = NORMAL_ACTION_CAP_JPY,
     prior_normal_buys_today: int = 0,
+    prior_scheduled_actions_this_week: int = 0,
+    prior_scheduled_notional_jpy: int = 0,
+    scheduled_max_actions_per_week: int = 2,
+    scheduled_max_single_jpy: int = 500_000,
+    scheduled_weekly_cap_jpy: int = 1_000_000,
+    weekly_paced_remaining_jpy: int | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    """Allocate final ordinary-buy capacity without bypassing existing gates."""
+    """Select at most one household-wide ready risk-increasing cash buy."""
     copied = [dict(action) for action in actions if isinstance(action, dict)]
     enabled = str(mode).lower() == "enforce"
     candidates = [
@@ -191,12 +304,42 @@ def allocate_actions(
     selected_ticker: str | None = None
     selected: dict[str, Any] | None = None
     exclusions: list[dict[str, Any]] = []
+    scheduled_weekly_remaining = min(
+        max(0, int(scheduled_weekly_cap_jpy)),
+        max(0, int(weekly_paced_remaining_jpy))
+        if weekly_paced_remaining_jpy is not None else max(0, int(scheduled_weekly_cap_jpy)),
+    )
+    scheduled_weekly_remaining = max(
+        0, scheduled_weekly_remaining - max(0, int(prior_scheduled_notional_jpy)),
+    )
 
     if enabled and prior_normal_buys_today < 1:
         for candidate in candidates:
+            scheduled = _scheduled_broad_buy(candidate)
+            if scheduled and broad_execution_metadata(candidate.get("ticker")) is None:
+                candidate["execution_readiness"] = "review"
+                _append_reason(
+                    candidate,
+                    "scheduled_broad_metadata_unregistered",
+                    "広域配備は売買単位・価格・商品分類を登録したallowlistに限定します",
+                )
+                exclusions.append({"ticker": candidate.get("ticker"), "reason": "scheduled_broad_metadata_unregistered"})
+                continue
+            if scheduled and (
+                int(prior_scheduled_actions_this_week) >= max(0, int(scheduled_max_actions_per_week))
+                or scheduled_weekly_remaining <= 0
+            ):
+                candidate["execution_readiness"] = "review"
+                _append_reason(candidate, "scheduled_broad_weekly_limit", "今週の広域配備枠を使い切りました")
+                exclusions.append({"ticker": candidate.get("ticker"), "reason": "scheduled_broad_weekly_limit"})
+                continue
+            cap_jpy = (
+                min(int(scheduled_max_single_jpy), scheduled_weekly_remaining)
+                if scheduled else int(normal_action_cap_jpy)
+            )
             resized, failure = _cap_quantity(
                 candidate,
-                cap_jpy=int(normal_action_cap_jpy),
+                cap_jpy=cap_jpy,
                 min_trade_jpy=float(min_trade_jpy),
                 fx_rate=float(fx_rate),
             )
@@ -215,11 +358,21 @@ def allocate_actions(
             selected = candidate
             selected_ticker = str(candidate.get("ticker") or "")
             candidate["capital_allocator_selected"] = True
+            candidate["household_ready_buy_slot"] = 1
+            if scheduled:
+                candidate["scheduled_broad_selected"] = True
+                candidate["human_execution_only"] = True
+                candidate["scheduled_broad_max_single_jpy"] = cap_jpy
+                scheduled_weekly_remaining = max(
+                    0,
+                    scheduled_weekly_remaining
+                    - int(round(_estimated_notional_jpy(candidate, fx_rate=float(fx_rate)))),
+                )
             break
     elif enabled and candidates:
         for candidate in candidates:
             candidate["execution_readiness"] = "review"
-            _append_reason(candidate, "capital_allocator_daily_buy_limit", "通常買付は1日1件までです")
+            _append_reason(candidate, "capital_allocator_daily_buy_limit", "risk-increasing買付は世帯全体で1日1件までです")
             exclusions.append({"ticker": candidate.get("ticker"), "reason": "capital_allocator_daily_buy_limit"})
 
     if enabled:
@@ -227,7 +380,7 @@ def allocate_actions(
             if candidate is selected or candidate.get("execution_readiness") != "ready":
                 continue
             candidate["execution_readiness"] = "review"
-            _append_reason(candidate, "capital_allocator_daily_buy_limit", "本日の通常買付枠は上位候補に配分しました")
+            _append_reason(candidate, "capital_allocator_daily_buy_limit", "本日の世帯買付枠は上位候補に配分しました")
             exclusions.append({"ticker": candidate.get("ticker"), "reason": "capital_allocator_daily_buy_limit"})
 
     legacy_ready = [str(action.get("ticker") or "") for action in candidates]
@@ -239,6 +392,11 @@ def allocate_actions(
         "legacy_ready_tickers": legacy_ready,
         "selected_ticker": selected_ticker,
         "selected_count": 1 if selected is not None else 0,
+        "selected_strategy_class": selected.get("strategy_class") if selected else None,
+        "household_ready_risk_buy_limit": 1,
+        "prior_scheduled_actions_this_week": int(prior_scheduled_actions_this_week),
+        "prior_scheduled_notional_jpy": int(prior_scheduled_notional_jpy),
+        "scheduled_weekly_remaining_jpy": scheduled_weekly_remaining,
         "exclusions": exclusions,
         "explainability": "structured_route_cap_nisa_concentration_objective",
     }
@@ -251,42 +409,27 @@ def allocate_scheduled_broad_actions(
     weekly_paced_remaining_jpy: int | None = None,
     prior_scheduled_actions_this_week: int = 0, prior_scheduled_notional_jpy: int = 0,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    """Apply an independent, human-executed scheduled broad batch contract."""
-    copied = [dict(action) for action in actions if isinstance(action, dict)]
-    enabled = str(mode).lower() == "enforce"
-    candidates = [action for action in copied if _scheduled_broad_buy(action) and action.get("execution_readiness") == "ready"]
-    candidates.sort(key=_ranking_key)
-    weekly_cap = min(max(0, int(weekly_cap_jpy)), max(0, int(weekly_paced_remaining_jpy)) if weekly_paced_remaining_jpy is not None else max(0, int(weekly_cap_jpy)))
-    weekly_cap = max(0, weekly_cap - max(0, int(prior_scheduled_notional_jpy)))
-    selected: list[str] = []
-    remaining, exclusions = weekly_cap, []
-    if enabled:
-        for candidate in candidates:
-            if broad_execution_metadata(candidate.get("ticker")) is None:
-                candidate["execution_readiness"] = "review"
-                _append_reason(candidate, "scheduled_broad_metadata_unregistered", "scheduled broad対象は登録済みallowlistに限定します")
-                exclusions.append({"ticker": candidate.get("ticker"), "reason": "scheduled_broad_metadata_unregistered"})
-                continue
-            if int(prior_scheduled_actions_this_week) + len(selected) >= max(0, int(max_actions_per_week)) or remaining <= 0:
-                candidate["execution_readiness"] = "review"
-                _append_reason(candidate, "scheduled_broad_weekly_limit", "今週のscheduled broad配備枠を使い切りました")
-                exclusions.append({"ticker": candidate.get("ticker"), "reason": "scheduled_broad_weekly_limit"})
-                continue
-            cap = min(int(max_single_jpy), remaining)
-            resized, failure = _cap_quantity(candidate, cap_jpy=cap, min_trade_jpy=float(min_trade_jpy), fx_rate=float(fx_rate))
-            if failure:
-                candidate.update(resized)
-                candidate["execution_readiness"] = "review"
-                _append_reason(candidate, failure, "scheduled broad枠では最低取引額またはlotを満たせません")
-                exclusions.append({"ticker": candidate.get("ticker"), "reason": failure})
-                continue
-            candidate.update(resized)
-            candidate["scheduled_broad_selected"] = True
-            candidate["human_execution_only"] = True
-            candidate["scheduled_broad_max_single_jpy"] = cap
-            selected.append(str(candidate.get("ticker") or ""))
-            remaining -= int(round(_estimated_notional_jpy(candidate, fx_rate=float(fx_rate))))
-    return copied, {"mode": "enforce" if enabled else "legacy", "strategy_class": "scheduled_broad_deployment", "max_actions_per_week": int(max_actions_per_week), "prior_scheduled_actions_this_week": int(prior_scheduled_actions_this_week), "prior_scheduled_notional_jpy": int(prior_scheduled_notional_jpy), "max_single_jpy": int(max_single_jpy), "weekly_cap_jpy": weekly_cap, "weekly_remaining_jpy": max(0, remaining), "selected_tickers": selected, "selected_count": len(selected), "exclusions": exclusions}
+    """Compatibility wrapper using the same household allocator contract."""
+    broad_only = [
+        dict(action) for action in actions
+        if isinstance(action, dict) and _scheduled_broad_buy(action)
+    ]
+    allocated, report = allocate_actions(
+        broad_only,
+        mode=mode,
+        fx_rate=fx_rate,
+        min_trade_jpy=min_trade_jpy,
+        prior_normal_buys_today=0,
+        prior_scheduled_actions_this_week=prior_scheduled_actions_this_week,
+        prior_scheduled_notional_jpy=prior_scheduled_notional_jpy,
+        scheduled_max_actions_per_week=max_actions_per_week,
+        scheduled_max_single_jpy=max_single_jpy,
+        scheduled_weekly_cap_jpy=weekly_cap_jpy,
+        weekly_paced_remaining_jpy=weekly_paced_remaining_jpy,
+    )
+    report["strategy_class"] = "scheduled_broad_deployment"
+    report["selected_tickers"] = [report["selected_ticker"]] if report.get("selected_ticker") else []
+    return allocated, report
 
 
 def comparison_path(base_dir: Path = BASE_DIR) -> Path:

@@ -5630,26 +5630,52 @@ def _rebuild_readiness_narrative(synthesis: dict) -> None:
     conditional = [a for a in actions if a.get("execution_readiness") != "ready"]
     original = str(synthesis.get("weekly_theme") or "").strip()
     if original:
+        synthesis["analytical_summary"] = original
         synthesis["weekly_theme_analytical"] = original
-    if ready:
+    preflight_pending = [
+        action for action in ready
+        if _direction_of(action.get("type")) in {"buy", "short"}
+        and not action.get("preflight_token")
+    ]
+    executable_now = [action for action in ready if action not in preflight_pending]
+    if executable_now:
         labels = "、".join(
-            f"{a.get('ticker')} {a.get('type')}" for a in ready[:3]
+            f"{a.get('ticker')} {a.get('type')}" for a in executable_now[:3]
         )
-        synthesis["weekly_theme"] = f"実行可能: {labels}。分析テーマ: {original}"
+        synthesis["weekly_theme"] = f"実行可能: {labels}"
+    elif preflight_pending:
+        labels = "、".join(
+            f"{a.get('ticker')} {a.get('type')}" for a in preflight_pending[:3]
+        )
+        synthesis["weekly_theme"] = f"分析選定済み・発注前preflight待ち: {labels}"
     else:
         labels = "、".join(
             f"{a.get('ticker')}({a.get('execution_readiness')})"
             for a in conditional[:5]
         ) or "候補なし"
         synthesis["weekly_theme"] = (
-            f"実行可能なアクションなし。条件付き候補: {labels}。"
-            f"分析テーマ（非実行）: {original}"
+            f"実行可能なアクションなし。条件付き候補: {labels}"
         )
     synthesis["executable_plan_summary"] = {
+        "analysis_ready_count": len(ready),
+        "preflight_pending_count": len(preflight_pending),
+        "executable_now_count": len(executable_now),
         "ready_count": len(ready),
         "conditional_count": len(conditional),
         "ready_tickers": [a.get("ticker") for a in ready],
+        "preflight_pending_tickers": [a.get("ticker") for a in preflight_pending],
+        "executable_now_tickers": [a.get("ticker") for a in executable_now],
         "conditional_tickers": [a.get("ticker") for a in conditional],
+    }
+    ready_risk_buys = [
+        action for action in ready if _direction_of(action.get("type")) == "buy"
+    ]
+    synthesis["selection_consistency"] = {
+        "status": "ok" if len(ready_risk_buys) <= 1 else "inconsistent",
+        "household_ready_risk_buy_count": len(ready_risk_buys),
+        "household_ready_risk_buy_limit": 1,
+        "weekly_theme_uses_executable_state_only": True,
+        "analytical_summary_separated": True,
     }
 
 
@@ -10626,7 +10652,13 @@ def _inject_playbook_actions(synthesis: dict, data: dict) -> dict:
             "used_jpy": round(used_jpy), "cap_jpy": round(total_cap_jpy)}
 
 
-def _build_candidate_funnel(tier_results: dict[str, object], data: dict) -> dict:
+def _build_candidate_funnel(
+    tier_results: dict[str, object],
+    data: dict,
+    *,
+    now: datetime | None = None,
+    earnings_blackout_tickers: set[str] | None = None,
+) -> dict:
     """Expose every deterministic entry source before LLM synthesis narrows it.
 
     This is an audit/fallback input, never an executable action list.  Keeping
@@ -10660,11 +10692,44 @@ def _build_candidate_funnel(tier_results: dict[str, object], data: dict) -> dict
             generated_count += 1
             entry = by_ticker.setdefault(ticker, {"ticker": ticker, "sources": [], "screen_passed": False})
             entry["sources"].append({"tier": tier, "field": key})
-            for field in ("score", "composite_score", "price", "currency", "reason", "name", "sector"):
+            for field in (
+                "score", "composite_score", "price", "currency", "reason", "name", "sector",
+                "confidence_pct", "calibrated_confidence_pct",
+            ):
                 if entry.get(field) in (None, "") and raw.get(field) not in (None, ""):
                     entry[field] = raw.get(field)
 
     long_term = ((data.get("screening") or {}).get("long_term") or {}) if isinstance(data, dict) else {}
+    long_term_as_of = str(long_term.get("as_of") or "") if isinstance(long_term, dict) else ""
+    now = now or datetime.now(ZoneInfo("Asia/Tokyo"))
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=ZoneInfo("Asia/Tokyo"))
+    source_age_hours = None
+    try:
+        source_time = datetime.fromisoformat(long_term_as_of.replace("Z", "+00:00"))
+        if source_time.tzinfo is None:
+            source_time = source_time.replace(tzinfo=now.tzinfo)
+        source_age_hours = max(
+            0.0,
+            (now.astimezone(timezone.utc) - source_time.astimezone(timezone.utc)).total_seconds() / 3600,
+        )
+    except (TypeError, ValueError):
+        source_age_hours = None
+    earnings_blackout_resolved = earnings_blackout_tickers is not None
+    if earnings_blackout_tickers is None:
+        try:
+            _earnings_path = BASE_DIR / "earnings_hedge_suggestions.json"
+            if not _earnings_path.exists():
+                raise FileNotFoundError(_earnings_path)
+            json.loads(_earnings_path.read_text(encoding="utf-8"))
+            earnings_blackout_tickers = set(_load_earnings_blackout(within_business_days=7))
+            earnings_blackout_resolved = True
+        except Exception:
+            earnings_blackout_tickers = set()
+            earnings_blackout_resolved = False
+    earnings_blackout_tickers = {
+        canonical_ticker(value) for value in earnings_blackout_tickers or set()
+    }
     passed = long_term.get("passed") if isinstance(long_term, dict) else []
     passed_count = 0
     if not isinstance(passed, list):
@@ -10680,7 +10745,10 @@ def _build_candidate_funnel(tier_results: dict[str, object], data: dict) -> dict
         entry = by_ticker.setdefault(ticker, {"ticker": ticker, "sources": [], "screen_passed": False})
         entry["screen_passed"] = True
         entry["sources"].append({"tier": "screening", "field": "long_term.passed"})
-        for field in ("score", "composite_score", "price", "currency", "reason", "name", "sector", "ai_thesis"):
+        for field in (
+            "score", "composite_score", "price", "currency", "reason", "name", "sector",
+            "ai_thesis", "confidence_pct", "calibrated_confidence_pct",
+        ):
             if raw.get(field) not in (None, ""):
                 entry[field] = raw.get(field)
 
@@ -10690,14 +10758,41 @@ def _build_candidate_funnel(tier_results: dict[str, object], data: dict) -> dict
             entry["source_score"] = float(entry.get("score") or entry.get("composite_score") or 0)
         except (TypeError, ValueError):
             entry["source_score"] = 0.0
-        entry["eligible_for_fallback"] = bool(entry.get("screen_passed"))
+        confidence = entry.get("calibrated_confidence_pct", entry.get("confidence_pct"))
+        try:
+            confidence = float(confidence) if confidence is not None else None
+        except (TypeError, ValueError):
+            confidence = None
+        suppression: list[str] = []
+        if not entry.get("screen_passed"):
+            suppression.append("screen_not_passed")
+        if source_age_hours is None:
+            suppression.append("screen_freshness_unresolved")
+        elif source_age_hours > 72:
+            suppression.append("screen_stale_over_72h")
+        if confidence is None or not 0 <= confidence <= 100:
+            suppression.append("calibrated_confidence_unavailable")
+        if not earnings_blackout_resolved:
+            suppression.append("earnings_blackout_unresolved")
+        if canonical_ticker(entry.get("ticker")) in earnings_blackout_tickers:
+            suppression.append("earnings_within_7_business_days")
+        entry["screen_as_of"] = long_term_as_of or None
+        entry["screen_age_hours"] = round(source_age_hours, 2) if source_age_hours is not None else None
+        entry["fallback_confidence_pct"] = confidence
+        entry["fallback_suppression_reasons"] = suppression
+        entry["eligible_for_fallback"] = not suppression
     candidates.sort(key=lambda row: (-float(row.get("source_score") or 0), str(row.get("ticker") or "")))
     return {
-        "version": 1,
+        "version": 2,
         "complete": not errors,
         "errors": errors,
         "generated_candidate_count": generated_count,
         "screen_passed_count": passed_count,
+        "screen_as_of": long_term_as_of or None,
+        "screen_age_hours": round(source_age_hours, 2) if source_age_hours is not None else None,
+        "fallback_freshness_limit_hours": 72,
+        "earnings_blackout_business_days": 7,
+        "earnings_blackout_resolved": earnings_blackout_resolved,
         "unique_candidate_count": len(candidates),
         "candidates": candidates,
     }
@@ -10713,6 +10808,12 @@ def _fallback_action_from_candidate(
     """Create one routed, bounded add candidate from an already-passed screen row."""
     ticker = canonical_ticker(candidate.get("ticker"))
     if not ticker or not candidate.get("screen_passed"):
+        return None
+    try:
+        confidence = float(candidate.get("fallback_confidence_pct"))
+    except (TypeError, ValueError):
+        return None
+    if not 0 <= confidence <= 100:
         return None
     try:
         from insider_restrictions import is_restricted_ticker
@@ -10751,9 +10852,10 @@ def _fallback_action_from_candidate(
     return {
         "type": "add",
         "ticker": ticker,
-        "tier": "Long",
+        "tier": str(position.get("investment_type") or "Long").title(),
         "urgency": "medium",
-        "confidence_pct": 70,
+        "confidence_pct": confidence,
+        "confidence_source": "candidate_funnel_explicit",
         "quantity": quantity,
         "requested_buy_quantity": quantity,
         "amount_hint": f"{quantity}{label}",
@@ -10794,7 +10896,12 @@ def _apply_capital_allocator(
     if not isinstance(synthesis, dict) or not isinstance(synthesis.get("priority_actions"), list):
         return
     try:
-        from capital_allocator import allocate_actions, allocate_scheduled_broad_actions, build_comparison, record_comparison
+        from capital_allocator import (
+            annotate_post_trade_concentration,
+            allocate_actions,
+            build_comparison,
+            record_comparison,
+        )
         from tunable_params import get as _tp_get
 
         configured_mode = str(_tp_get("capital_allocator_mode", "enforce") or "enforce").lower()
@@ -10848,21 +10955,31 @@ def _apply_capital_allocator(
             prior_scheduled_actions_this_week = 2
             prior_scheduled_notional_jpy = 1_000_000
 
-        original_actions = copy.deepcopy(synthesis.get("priority_actions") or [])
+        original_actions = annotate_post_trade_concentration(
+            copy.deepcopy(synthesis.get("priority_actions") or []),
+            policy_observation=data.get("investment_policy_observation") if isinstance(data, dict) else None,
+            fx_rate=float(fx_rate),
+        )
         original_summary = copy.deepcopy(synthesis.get("decision_summary"))
+        _execution_plan_for_allocator = data.get("execution_plan") if isinstance(data, dict) else {}
+        _allocator_budgets = (
+            _execution_plan_for_allocator.get("budgets")
+            if isinstance(_execution_plan_for_allocator, dict)
+            and isinstance(_execution_plan_for_allocator.get("budgets"), dict)
+            else {}
+        )
         allocated, report = allocate_actions(
             copy.deepcopy(original_actions),
             mode=mode,
             fx_rate=float(fx_rate),
             min_trade_jpy=minimum_notional,
             prior_normal_buys_today=prior_normal_buys,
-        )
-        allocated, scheduled_report = allocate_scheduled_broad_actions(
-            allocated, mode=mode, fx_rate=float(fx_rate), min_trade_jpy=minimum_notional,
             prior_scheduled_actions_this_week=prior_scheduled_actions_this_week,
             prior_scheduled_notional_jpy=prior_scheduled_notional_jpy,
+            weekly_paced_remaining_jpy=int(
+                float(_allocator_budgets.get("weekly_normal_jpy") or 0)
+            ) or None,
         )
-        report["scheduled_broad"] = scheduled_report
         report["minimum_notional_jpy"] = round(minimum_notional)
         report["run_id"] = analysis_id or str(as_of)
 
@@ -11644,7 +11761,11 @@ def run_analysis(force: bool = False) -> dict:
             "  ⚠️ tier direction context incomplete: "
             f"{len(_tier_direction_context.get('errors') or [])} error(s)"
         )
-    _candidate_funnel = _build_candidate_funnel(_tier_results_for_funnel, data)
+    _candidate_funnel = _build_candidate_funnel(
+        _tier_results_for_direction,
+        data,
+        now=_analysis_now,
+    )
 
     print("  ✅ Sonnet×3 + book-aware×2 + Red Team 分析完了")
 
@@ -12414,6 +12535,64 @@ def run_analysis(force: bool = False) -> dict:
         except Exception as _inj_e:
             print(f"  ⚠️ playbook 注入 skip (fail-open で AI 案のみ): {_inj_e}")
 
+    # Approved surplus cash gets one deterministic broad-core candidate before
+    # the common policy gate.  Missing route/wallet/price facts create a visible
+    # observation, never a guessed account or an alternate family.
+    if isinstance(synthesis, dict) and isinstance(synthesis.get("priority_actions"), list):
+        try:
+            from broad_deployment import generate_from_analysis_context
+
+            try:
+                from tunable_params import get as _broad_tp_get
+
+                _broad_minimum = max(
+                    float(_broad_tp_get("min_action_jpy", 150_000)) / 3,
+                    float(data.get("portfolio_total") or 0)
+                    * float(_broad_tp_get("min_action_pct_of_portfolio", 0.005)),
+                )
+            except Exception:
+                _broad_minimum = 150_000.0
+            _broad_action, _broad_observation = generate_from_analysis_context(
+                base_dir=BASE_DIR,
+                execution_plan=data.get("execution_plan") if isinstance(data, dict) else None,
+                policy_observation=data.get("investment_policy_observation") if isinstance(data, dict) else None,
+                existing_actions=synthesis.get("priority_actions") or [],
+                fx_rate_usdjpy=float(_asl_fx),
+                now=_analysis_now,
+                min_notional_jpy=round(_broad_minimum),
+            )
+            synthesis["broad_deployment_generation"] = _broad_observation
+            if isinstance(_broad_action, dict):
+                _broad_action["analysis_id"] = _asl_analysis_id
+                synthesis["priority_actions"].append(_broad_action)
+                if _asl_analysis_id:
+                    try:
+                        from action_stage_log import log_deterministic_broad_generated
+
+                        log_deterministic_broad_generated(
+                            analysis_id=_asl_analysis_id,
+                            as_of=_asl_as_of,
+                            actions=[_broad_action],
+                            scenario_key=_asl_scenario_key,
+                            regime=_asl_regime,
+                            actual_dd_stage=_asl_dd_stage,
+                            leverage_status=_asl_leverage,
+                        )
+                    except Exception:
+                        pass
+                print(
+                    "  🌐 broad-core候補: "
+                    f"{_broad_action.get('ticker')} 約¥{_broad_action.get('estimated_notional_jpy', 0):,.0f}"
+                )
+        except Exception as _broad_error:
+            synthesis["broad_deployment_generation"] = {
+                "version": 1,
+                "status": "generator_error",
+                "error": type(_broad_error).__name__,
+                "alternate_selected": False,
+            }
+            print(f"  ⚠️ broad-core候補生成を保留: {type(_broad_error).__name__}")
+
     # ── P1-17/P1-21: Deterministic Policy Engine gate ──
     # AI の priority_actions を ex-ante 制約 (VaR / DD stage / leverage / earnings / VIX / freshness)
     # で deterministic にフィルタする。プロンプト依頼ではなくコード側で執行する。
@@ -12716,13 +12895,21 @@ def run_analysis(force: bool = False) -> dict:
             for _a in synthesis.get("priority_actions") or []
         )
         _fallback_record: dict = {
-            "version": 1,
+            "version": 2,
             "attempted": False,
             "reason": None,
             "attempts": [],
             "selected": None,
         }
-        if int(_summary_before_fallback.get("executable_count") or 0) == 0 and not _ready_risk_before:
+        _broad_generation_status = str(
+            (synthesis.get("broad_deployment_generation") or {}).get("status") or ""
+        )
+        _broad_requires_explicit_resolution = _broad_generation_status in {
+            "caution_review", "default_concentration_cap_reached",
+        }
+        if _broad_requires_explicit_resolution:
+            _fallback_record["reason"] = "broad_default_requires_explicit_resolution_no_alternate"
+        elif int(_summary_before_fallback.get("executable_count") or 0) == 0 and not _ready_risk_before:
             _funnel = synthesis.get("candidate_funnel") or {}
             if not isinstance(_funnel, dict) or not _funnel.get("complete"):
                 _fallback_record["reason"] = "candidate_funnel_incomplete"
@@ -12806,7 +12993,65 @@ def run_analysis(force: bool = False) -> dict:
                         "decision_summary": _trial_synthesis.get("decision_summary") or {},
                     })
                     continue
-                synthesis.setdefault("priority_actions", []).append(dict(_trial_policy.accepted[0]))
+                _plan_decision = str(
+                    _selected.get("execution_plan_decision")
+                    or _selected.get("execution_plan_observed_decision")
+                    or ""
+                )
+                if _plan_decision != "plan_new_order":
+                    _fallback_record["attempts"].append({
+                        "ticker": _ticker,
+                        "outcome": "exact_plan_new_order_required",
+                        "execution_plan_decision": _plan_decision or None,
+                    })
+                    continue
+                try:
+                    from execution_preflight import evaluate_preflight_decision
+
+                    _preflight_payload = {
+                        "analysis_id": _asl_analysis_id,
+                        "analysis_as_of": _asl_as_of,
+                        "investment_policy_observation": data.get("investment_policy_observation") or {},
+                        "ticker": _selected.get("ticker"),
+                        "direction": "buy",
+                        "quantity": _selected.get("quantity") or _selected.get("requested_buy_quantity"),
+                        "price": _selected.get("decision_price") or _selected.get("limit_price"),
+                        "limit_price": _selected.get("limit_price"),
+                        "order_type": _selected.get("order_type") or "limit",
+                        "currency": _selected.get("currency"),
+                        "account": _selected.get("execution_account"),
+                        "execution_owner": _selected.get("execution_owner"),
+                        "execution_broker": _selected.get("execution_broker"),
+                        "execution_position_keys": _selected.get("execution_position_keys") or [],
+                    }
+                    _preflight = evaluate_preflight_decision(
+                        _preflight_payload, base_dir=BASE_DIR,
+                    )
+                except Exception as _fallback_preflight_error:
+                    _fallback_record["attempts"].append({
+                        "ticker": _ticker,
+                        "outcome": "preflight_error",
+                        "error": type(_fallback_preflight_error).__name__,
+                    })
+                    continue
+                if _preflight.get("disposition") != "ready":
+                    _fallback_record["attempts"].append({
+                        "ticker": _ticker,
+                        "outcome": "preflight_not_ready",
+                        "disposition": _preflight.get("disposition"),
+                        "reason_codes": [
+                            row.get("code") for row in _preflight.get("reasons") or []
+                            if isinstance(row, dict)
+                        ],
+                    })
+                    continue
+                _selected["fallback_preflight"] = {
+                    "disposition": "ready",
+                    "policy_version": _preflight.get("policy_version"),
+                    "preflight_version": _preflight.get("preflight_version"),
+                    "action_digest": _preflight.get("action_digest"),
+                }
+                synthesis.setdefault("priority_actions", []).append(dict(_selected))
                 _fallback_record["selected"] = {
                     "ticker": _ticker,
                     "quantity": _selected.get("quantity"),

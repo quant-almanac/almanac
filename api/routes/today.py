@@ -44,6 +44,16 @@ def _build_cash_status(execution_plan_state: dict, holdings: dict) -> list[dict]
         str(row.get("wallet_key")): row
         for row in projected_rows if isinstance(row, dict) and row.get("wallet_key")
     }
+    capacity_timeline = (
+        cash_info.get("wallet_capacity_timeline")
+        if isinstance(cash_info, dict) and isinstance(cash_info.get("wallet_capacity_timeline"), dict)
+        else {}
+    )
+    capacity_by_key = {
+        str(row.get("wallet_key")): row
+        for row in capacity_timeline.get("wallets") or []
+        if isinstance(row, dict) and row.get("wallet_key")
+    }
     rows: list[dict] = []
     for wallet in wallets if isinstance(wallets, list) else []:
         if not isinstance(wallet, dict) or not wallet.get("wallet_key"):
@@ -55,8 +65,12 @@ def _build_cash_status(execution_plan_state: dict, holdings: dict) -> list[dict]
             {},
         ) if isinstance(holdings, dict) else {}
         projected = projected_by_key.get(wallet_key) or {}
+        capacity = capacity_by_key.get(wallet_key) or {}
         status = str(mirror.get("balance_status") or "confirmed")
         available_native = wallet.get("available_native")
+        executable_native = capacity.get("available_after_all_reservations_native")
+        if executable_native is None:
+            executable_native = available_native if status == "confirmed" else 0
         rows.append({
             "key": resources[0] if len(resources) == 1 else wallet_key,
             "wallet_key": wallet_key,
@@ -71,7 +85,12 @@ def _build_cash_status(execution_plan_state: dict, holdings: dict) -> list[dict]
             "ledger_delta_since_report": mirror.get("ledger_delta_since_report_jpy", 0),
             "balance_status": status,
             "reconciliation_required": bool(mirror.get("reconciliation_required", False)),
-            "available_for_new_buy": available_native if status == "confirmed" else 0,
+            "available_for_new_buy": executable_native if status == "confirmed" else 0,
+            "confirmed_balance_native": capacity.get("confirmed_balance_native", available_native),
+            "unreflected_wallet_outflows_jpy": capacity.get("unreflected_wallet_outflows_jpy", 0),
+            "future_operational_reservations_jpy": capacity.get("future_operational_reservations_jpy", 0),
+            "open_order_reservations_jpy": capacity.get("open_order_reservations_jpy", 0),
+            "reservation_status": capacity.get("reservation_status"),
             "projected_balance": projected.get("projected_available_native"),
             "projection_status": projected.get("status"),
             "projection_authoritative_for_new_buys": bool(
@@ -2405,6 +2424,10 @@ def _build_today() -> dict:
         "capital_allocator": synthesis.get("capital_allocator") or {},
         "capital_allocator_comparison": synthesis.get("capital_allocator_comparison") or {},
         "capital_allocator_comparisons": allocator_comparisons,
+        "broad_deployment_generation": synthesis.get("broad_deployment_generation") or {},
+        "executable_plan_summary": synthesis.get("executable_plan_summary") or {},
+        "selection_consistency": synthesis.get("selection_consistency") or {},
+        "analytical_summary": synthesis.get("analytical_summary") or synthesis.get("weekly_theme_analytical"),
         "optimizer_health": optimizer_health,
         "suppressed_reproposals": synthesis.get("suppressed_reproposals") or [],
         "decision_flow": decision_flow,

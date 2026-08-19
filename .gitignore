@@ -150,3 +150,10 @@ models/ginn_meta.json
 heartbeats.json
 watchdog_state.json
 signal_audit_report.json
+
+# 実行時に生成される財務・監査の状態ファイル（個人の口座実績を含むためコミットしない）
+capital_allocator_comparisons.json
+broad_execution_routes.json
+cash_wallet_projection.json
+flow_adjusted_dd_shadow.json
+holdings_attestation.json

@@ -212,6 +212,21 @@ def _current_var_threshold(base_dir: Path, *, loss_guard_stage: str) -> float:
 def _investment_policy_snapshot(
     payload: dict[str, Any], base_dir: Path,
 ) -> dict[str, Any] | None:
+    inline_observation = payload.get("investment_policy_observation")
+    if isinstance(inline_observation, dict):
+        try:
+            inline_denominator = float(inline_observation.get("denominator_jpy"))
+        except (TypeError, ValueError):
+            inline_denominator = 0.0
+        if math.isfinite(inline_denominator) and inline_denominator > 0:
+            canonical = _canonical_json(inline_observation)
+            return {
+                "analysis_id": str(payload.get("analysis_id") or "") or None,
+                "as_of": payload.get("analysis_as_of"),
+                "denominator_jpy": inline_denominator,
+                "observation": inline_observation,
+                "snapshot_hash": "sha256:" + hashlib.sha256(canonical.encode("utf-8")).hexdigest(),
+            }
     try:
         analysis = json.loads((base_dir / "ai_portfolio_analysis.json").read_text(encoding="utf-8"))
     except Exception:
@@ -383,8 +398,8 @@ def _broad_concentration_context(payload: dict[str, Any], base_dir: Path) -> dic
         return concentration_limits()
 
 
-def evaluate_preflight(payload: dict[str, Any], *, base_dir: Path) -> dict[str, Any]:
-    """Compute an execution-time decision without writing state."""
+def evaluate_preflight_decision(payload: dict[str, Any], *, base_dir: Path) -> dict[str, Any]:
+    """Compute the token-free execution decision without writing state."""
     daily, rolling = _guard_metrics(base_dir)
     loss = loss_guard_state(
         daily_pnl_decimal=daily,
@@ -441,25 +456,33 @@ def evaluate_preflight(payload: dict[str, Any], *, base_dir: Path) -> dict[str, 
         "canonical_drawdown_stage": drawdown_stage,
         "current_short_positions": short_positions,
     }
-    review_context = {
-        "policy_version": RISK_POLICY_VERSION,
-        "reason_codes": [str(item.get("code") or "") for item in decision["reasons"]],
-        "hard_reason_codes": [str(item.get("code") or "") for item in decision["hard_reasons"]],
-        "metrics": metrics,
-    }
-    token, expires_at = issue_preflight_token(
-        digest=digest,
-        disposition=decision["disposition"],
-        review_context=review_context,
-    )
     return {
         **decision,
         "policy_version": RISK_POLICY_VERSION,
         "preflight_version": PREFLIGHT_VERSION,
         "action_digest": digest,
+        "metrics": metrics,
+    }
+
+
+def evaluate_preflight(payload: dict[str, Any], *, base_dir: Path) -> dict[str, Any]:
+    """Compute an execution-time decision and bind it to an expiring token."""
+    result = evaluate_preflight_decision(payload, base_dir=base_dir)
+    review_context = {
+        "policy_version": RISK_POLICY_VERSION,
+        "reason_codes": [str(item.get("code") or "") for item in result["reasons"]],
+        "hard_reason_codes": [str(item.get("code") or "") for item in result["hard_reasons"]],
+        "metrics": result["metrics"],
+    }
+    token, expires_at = issue_preflight_token(
+        digest=result["action_digest"],
+        disposition=result["disposition"],
+        review_context=review_context,
+    )
+    return {
+        **result,
         "preflight_token": token,
         "expires_at": expires_at,
-        "metrics": metrics,
     }
 
 

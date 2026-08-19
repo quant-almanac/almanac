@@ -1639,3 +1639,49 @@ def test_reconciliation_review_cannot_consume_attributed_monthly_budget() -> Non
 
     assert summary["monthly_consumed_jpy"] == 0
     assert summary["unattributed_monthly_buy_total_notional_jpy"] == 100_000
+
+
+def test_market_deployment_target_creates_exact_global_broad_objective() -> None:
+    items = epe.build_plan_items(
+        rebalance_report={},
+        bottom_fishing={},
+        nisa={},
+        budgets={
+            "ordinary_deployment_allowed": True,
+            "market_deployment_target_jpy": 4_200_000,
+            "weekly_normal_jpy": 1_000_000,
+            "max_single_normal_action_jpy": 250_000,
+            "weekly_opportunity_reserve_jpy": 0,
+            "max_single_opportunity_action_jpy": 300_000,
+        },
+        horizon=epe.horizon_for(date(2026, 8, 19)),
+        monthly_remaining_jpy=2_000_000,
+        normal_pool_jpy=2_000_000,
+        opportunity_pool_jpy=0,
+    )
+
+    item = next(row for row in items if row["objective"] == "deploy_surplus_broad_core")
+    assert item["preferred_tickers"] == ["VT"]
+    assert item["constraints"]["broad_family"] == "global_all_country"
+    assert item["constraints"]["investment_types"] == ["long"]
+    decision = epe.classify_candidate_against_plan(
+        {
+            "ticker": "VT",
+            "type": "buy",
+            "plan_item_id": item["plan_item_id"],
+            "execution_investment_type": "long",
+            "estimated_notional_jpy": 495_000,
+            "urgency": "medium",
+            "source": "scheduled_broad_deployment",
+        },
+        {
+            "items": [item],
+            "budgets": {
+                "normal_pool_available_jpy": 2_000_000,
+                "monthly_remaining_jpy": 2_000_000,
+            },
+            "consumption_summary": {"remaining_opportunity_jpy": 0},
+        },
+    )
+    assert decision["execution_plan_decision"] == "plan_new_order"
+    assert decision["executable"] is True

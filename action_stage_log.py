@@ -212,6 +212,34 @@ def log_opus_raw(
     append_entries(entries)
 
 
+def log_deterministic_broad_generated(
+    *,
+    analysis_id: str,
+    as_of: str,
+    actions: list[dict],
+    scenario_key: Optional[str] = None,
+    regime: Optional[str] = None,
+    actual_dd_stage: Optional[str] = None,
+    leverage_status: Optional[str] = None,
+) -> None:
+    """Record deterministic broad candidates before the common policy gate."""
+    entries = [
+        _make_entry(
+            analysis_id=analysis_id,
+            as_of=as_of,
+            stage="deterministic_broad_generated",
+            action=action,
+            scenario_key=scenario_key,
+            regime=regime,
+            actual_dd_stage=actual_dd_stage,
+            leverage_status=leverage_status,
+        )
+        for action in actions or []
+        if isinstance(action, dict)
+    ]
+    append_entries(entries)
+
+
 def log_policy_decision(
     *,
     analysis_id: str,

@@ -1,0 +1,138 @@
+from datetime import datetime, timezone
+
+from broad_deployment import generate_candidate, generate_from_analysis_context
+
+
+def _plan(*, remaining=2_000_000, wallet=3_000_000):
+    return {
+        "budgets": {
+            "normal_pool_available_jpy": 1_500_000,
+            "weekly_normal_jpy": 1_000_000,
+        },
+        "items": [{
+            "plan_item_id": "broad-core-1",
+            "objective": "deploy_surplus_broad_core",
+            "status": "active",
+            "remaining_jpy": remaining,
+            "preferred_tickers": ["VT"],
+            "constraints": {"broad_family": "global_all_country"},
+        }],
+        "cash_info": {
+            "wallet_capacity_timeline": {
+                "all_wallets_resolved": True,
+                "wallets": [{
+                    "wallet_key": "owner_a|broker_a|broker_cash|USD",
+                    "reservation_status": "ok",
+                    "available_after_all_reservations_jpy": wallet,
+                }],
+            },
+        },
+    }
+
+
+def _route():
+    return {
+        "schema_version": 1,
+        "routes": [{
+            "route_id": "route-vt",
+            "active": True,
+            "ticker": "VT",
+            "owner": "owner_a",
+            "broker": "broker_a",
+            "account": "taxable",
+            "investment_type": "long",
+            "settlement_pool": "broker_cash",
+            "currency": "USD",
+            "cash_route": "cash-usd",
+        }],
+    }
+
+
+def _policy(*, vt_value=0):
+    return {
+        "denominator_jpy": 30_000_000,
+        "positions": [
+            {"canonical_instrument_id": "SLIM_ORCAN", "value_jpy": 2_000_000, "cap_basis_tier": "long"},
+            {"canonical_instrument_id": "VT", "value_jpy": vt_value, "cap_basis_tier": "long"},
+        ],
+    }
+
+
+def test_active_global_gap_generates_exact_routed_vt_candidate():
+    action, observation = generate_candidate(
+        execution_plan=_plan(),
+        policy_observation=_policy(),
+        route_config=_route(),
+        price=100,
+        fx_rate_usdjpy=150,
+        now=datetime(2026, 8, 19, tzinfo=timezone.utc),
+    )
+
+    assert observation["status"] == "candidate_generated"
+    assert action["ticker"] == "VT"
+    assert action["quantity"] == 33
+    assert action["estimated_notional_jpy"] == 495_000
+    assert action["plan_item_id"] == "broad-core-1"
+    assert action["cash_wallet_key"] == "owner_a|broker_a|broker_cash|USD"
+    assert action["human_execution_only"] is True
+
+
+def test_no_active_global_gap_means_no_default_candidate():
+    plan = _plan()
+    plan["items"] = []
+    action, observation = generate_candidate(
+        execution_plan=plan, policy_observation=_policy(), route_config=_route(),
+        price=100, fx_rate_usdjpy=150,
+    )
+    assert action is None
+    assert observation["status"] == "no_active_global_all_country_gap"
+
+
+def test_vt_caution_stays_reviewable_and_never_selects_an_alternate():
+    action, observation = generate_candidate(
+        execution_plan=_plan(), policy_observation=_policy(vt_value=5_600_000),
+        route_config=_route(), price=100, fx_rate_usdjpy=150,
+    )
+    assert action is not None
+    assert observation["status"] == "caution_review"
+    assert action["concentration_review_required"] is True
+    assert observation["alternate_selected"] is False
+
+
+def test_vt_cap_or_missing_route_fails_closed_without_alternate():
+    capped, cap_observation = generate_candidate(
+        execution_plan=_plan(), policy_observation=_policy(vt_value=7_100_000),
+        route_config=_route(), price=100, fx_rate_usdjpy=150,
+    )
+    missing, route_observation = generate_candidate(
+        execution_plan=_plan(), policy_observation=_policy(), route_config={"routes": []},
+        price=100, fx_rate_usdjpy=150,
+    )
+    assert capped is None
+    assert cap_observation["status"] == "default_concentration_cap_reached"
+    assert missing is None
+    assert route_observation["status"] == "route_missing"
+
+
+def test_wallet_reservations_bound_candidate_notional():
+    action, observation = generate_candidate(
+        execution_plan=_plan(wallet=400_000), policy_observation=_policy(),
+        route_config=_route(), price=100, fx_rate_usdjpy=150,
+    )
+    assert observation["status"] == "candidate_generated"
+    assert action["quantity"] == 26
+    assert action["estimated_notional_jpy"] == 390_000
+
+
+def test_missing_route_does_not_trigger_a_market_price_request(tmp_path):
+    action, observation = generate_from_analysis_context(
+        base_dir=tmp_path,
+        execution_plan=_plan(),
+        policy_observation=_policy(),
+        existing_actions=[],
+        fx_rate_usdjpy=150,
+        now=datetime(2026, 8, 19, tzinfo=timezone.utc),
+        price_provider=lambda *_args: (_ for _ in ()).throw(AssertionError("must not fetch")),
+    )
+    assert action is None
+    assert observation["status"] == "route_missing"
