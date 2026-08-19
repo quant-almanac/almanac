@@ -31,7 +31,13 @@ def _number(value: Any, default: float = 0.0) -> float:
 
 
 def _state_root(base_dir: Path) -> Path:
-    return Path(os.environ.get("ALMANAC_STATE_DIR") or base_dir)
+    base = Path(base_dir)
+    state_dir = os.environ.get("ALMANAC_STATE_DIR")
+    # An explicit directory is a test/recovery boundary. The process-wide
+    # runtime redirect applies only to the normal repository-root invocation.
+    if state_dir and base.resolve() == Path(__file__).resolve().parent:
+        return Path(state_dir)
+    return base
 
 
 def load_route_config(*, base_dir: Path) -> dict[str, Any]:
@@ -82,10 +88,15 @@ def _exact_route(config: dict[str, Any], *, ticker: str) -> tuple[dict[str, Any]
     required = ("route_id", "owner", "broker", "account", "investment_type", "settlement_pool", "currency")
     if any(not str(route.get(key) or "").strip() for key in required):
         return None, "route_incomplete"
-    if str(route.get("investment_type") or "").lower() != "long":
+    route["investment_type"] = str(route.get("investment_type") or "").strip().lower()
+    route["settlement_pool"] = str(route.get("settlement_pool") or "").strip().lower()
+    route["currency"] = str(route.get("currency") or "").strip().upper()
+    if route["investment_type"] != "long":
         return None, "route_not_long"
-    if str(route.get("settlement_pool") or "").lower() != "broker_cash":
+    if route["settlement_pool"] != "broker_cash":
         return None, "route_not_broker_cash"
+    if route["currency"] not in {"JPY", "USD"}:
+        return None, "route_currency_unsupported"
     return route, "ok"
 
 
@@ -190,14 +201,15 @@ def generate_candidate(
     route, route_status = _exact_route(route_config or {}, ticker=DEFAULT_TICKER)
     if route is None:
         return None, {**observation, "status": route_status}
-    if str(route.get("currency") or "").upper() != str(metadata.get("listing_currency") or ""):
+    route_currency = str(route.get("currency") or "").upper()
+    if route_currency != str(metadata.get("listing_currency") or ""):
         return None, {**observation, "status": "route_currency_mismatch"}
     wallet, wallet_status = _wallet_for_route(plan, route)
     if wallet is None:
         return None, {**observation, "status": wallet_status, "route_id": route.get("route_id")}
     price_value = _number(price)
     fx = _number(fx_rate_usdjpy)
-    if price_value <= 0 or (route.get("currency") == "USD" and not 50 < fx < 500):
+    if price_value <= 0 or (route_currency == "USD" and not 50 < fx < 500):
         return None, {**observation, "status": "price_or_fx_unresolved", "route_id": route.get("route_id")}
 
     budgets = plan.get("budgets") if isinstance(plan.get("budgets"), dict) else {}
@@ -209,7 +221,7 @@ def generate_candidate(
         _number(budgets.get("weekly_normal_jpy")),
         available_jpy,
     )
-    unit_jpy = price_value * (fx if route.get("currency") == "USD" else 1.0)
+    unit_jpy = price_value * (fx if route_currency == "USD" else 1.0)
     quantity = int(math.floor(amount_cap / unit_jpy))
     notional_jpy = quantity * unit_jpy
     if quantity <= 0 or notional_jpy < float(min_notional_jpy):
@@ -251,7 +263,7 @@ def generate_candidate(
         "quantity": quantity,
         "requested_buy_quantity": quantity,
         "amount_hint": f"{quantity}{label}",
-        "currency": route.get("currency"),
+        "currency": route_currency,
         "decision_price": price_value,
         "limit_price": price_value,
         "order_type": "limit",
@@ -281,6 +293,48 @@ def generate_candidate(
             f"gap ¥{_number(item.get('remaining_jpy')):,.0f}のうち約¥{notional_jpy:,.0f}を閉じる"
         ),
     }
+    dd_stage = str(budgets.get("canonical_dd_stage") or "")
+    if dd_stage in {"freeze", "objective_breach"}:
+        return None, {
+            **observation,
+            "status": "dd_pacing_disallows_scheduled_broad",
+            "route_id": route.get("route_id"),
+        }
+    if dd_stage in {"block", "derisk_review"}:
+        multiplier = _number(budgets.get("dd_pacing_multiplier"), default=-1.0)
+        if multiplier != 0.25 or budgets.get("dd_enforcement_active") is not True:
+            return None, {
+                **observation,
+                "status": "dd_permission_state_unresolved",
+                "route_id": route.get("route_id"),
+            }
+        try:
+            from capital_deployment import issue_scheduled_broad_permission
+
+            action["capital_deployment_permission"] = issue_scheduled_broad_permission(
+                action=action,
+                canonical_dd_stage=dd_stage,
+                dd_pacing_multiplier=multiplier,
+                state_snapshot={
+                    "execution_plan_as_of": plan.get("as_of"),
+                    "plan_item_id": item.get("plan_item_id"),
+                    "canonical_dd_stage": dd_stage,
+                    "dd_pacing_multiplier": multiplier,
+                    "dd_enforcement_active": budgets.get("dd_enforcement_active"),
+                    "dd_promotion_history_status": budgets.get("dd_promotion_history_status"),
+                    "deployment_basis_cash_jpy": budgets.get("deployment_basis_cash_jpy"),
+                    "market_deployment_target_jpy": budgets.get("market_deployment_target_jpy"),
+                    "normal_pool_available_jpy": budgets.get("normal_pool_available_jpy"),
+                    "weekly_normal_jpy": budgets.get("weekly_normal_jpy"),
+                },
+                now=now,
+            )
+        except Exception:
+            return None, {
+                **observation,
+                "status": "dd_permission_issue_failed",
+                "route_id": route.get("route_id"),
+            }
     return action, {
         **observation,
         "status": "caution_review" if caution else "candidate_generated",
@@ -288,6 +342,9 @@ def generate_candidate(
         "wallet_key": wallet.get("wallet_key"),
         "candidate_notional_jpy": round(notional_jpy),
         "concentration_review_required": caution,
+        "capital_deployment_permission_id": (
+            (action.get("capital_deployment_permission") or {}).get("permission_id")
+        ),
     }
 
 

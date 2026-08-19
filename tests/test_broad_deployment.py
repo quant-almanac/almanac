@@ -1,6 +1,8 @@
+import json
 from datetime import datetime, timezone
 
 from broad_deployment import generate_candidate, generate_from_analysis_context
+from capital_deployment import validate_scheduled_broad_permission
 
 
 def _plan(*, remaining=2_000_000, wallet=3_000_000):
@@ -77,6 +79,51 @@ def test_active_global_gap_generates_exact_routed_vt_candidate():
     assert action["human_execution_only"] is True
 
 
+def test_route_currency_is_canonicalized_before_fx_sizing():
+    route = _route()
+    route["routes"][0]["currency"] = "usd"
+
+    action, observation = generate_candidate(
+        execution_plan=_plan(), policy_observation=_policy(),
+        route_config=route, price=100, fx_rate_usdjpy=150,
+    )
+
+    assert observation["status"] == "candidate_generated"
+    assert action["currency"] == "USD"
+    assert action["quantity"] == 33
+    assert action["estimated_notional_jpy"] == 495_000
+
+
+def test_block_pacing_issues_an_action_bound_human_permission():
+    plan = _plan()
+    plan["as_of"] = "2026-08-19T06:30:00+09:00"
+    plan["budgets"].update({
+        "canonical_dd_stage": "block",
+        "dd_pacing_multiplier": 0.25,
+        "dd_enforcement_active": True,
+        "dd_promotion_history_status": "promoted_valid",
+        "deployment_basis_cash_jpy": 8_000_000,
+        "market_deployment_target_jpy": 4_000_000,
+    })
+
+    action, observation = generate_candidate(
+        execution_plan=plan, policy_observation=_policy(),
+        route_config=_route(), price=100, fx_rate_usdjpy=150,
+        now=datetime(2026, 8, 19, tzinfo=timezone.utc),
+    )
+
+    assert observation["status"] == "candidate_generated"
+    assert observation["capital_deployment_permission_id"]
+    assert validate_scheduled_broad_permission(
+        action, canonical_dd_stage="block",
+        now=datetime(2026, 8, 19, 1, tzinfo=timezone.utc),
+    )
+    assert not validate_scheduled_broad_permission(
+        {**action, "route_id": "another-route"}, canonical_dd_stage="block",
+        now=datetime(2026, 8, 19, 1, tzinfo=timezone.utc),
+    )
+
+
 def test_no_active_global_gap_means_no_default_candidate():
     plan = _plan()
     plan["items"] = []
@@ -134,5 +181,31 @@ def test_missing_route_does_not_trigger_a_market_price_request(tmp_path):
         now=datetime(2026, 8, 19, tzinfo=timezone.utc),
         price_provider=lambda *_args: (_ for _ in ()).throw(AssertionError("must not fetch")),
     )
+    assert action is None
+    assert observation["status"] == "route_missing"
+
+
+def test_explicit_base_dir_wins_over_process_state_redirect(tmp_path, monkeypatch):
+    runtime_state = tmp_path / "runtime"
+    explicit_state = tmp_path / "explicit"
+    runtime_state.mkdir()
+    explicit_state.mkdir()
+    (runtime_state / "broad_execution_routes.json").write_text(
+        json.dumps(_route()), encoding="utf-8",
+    )
+    monkeypatch.setenv("ALMANAC_STATE_DIR", str(runtime_state))
+
+    action, observation = generate_from_analysis_context(
+        base_dir=explicit_state,
+        execution_plan=_plan(),
+        policy_observation=_policy(),
+        existing_actions=[],
+        fx_rate_usdjpy=150,
+        now=datetime(2026, 8, 19, tzinfo=timezone.utc),
+        price_provider=lambda *_args: (_ for _ in ()).throw(
+            AssertionError("explicit route is missing, so price must not be fetched")
+        ),
+    )
+
     assert action is None
     assert observation["status"] == "route_missing"

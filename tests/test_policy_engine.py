@@ -92,6 +92,44 @@ def test_dd_block_threshold_rejects_buy():
     assert d.rejected[0]["rule"] == "_rule_dd_stage"
 
 
+def test_dd_block_allows_only_a_valid_scheduled_broad_permission():
+    from capital_deployment import issue_scheduled_broad_permission
+
+    ctx = pe.PolicyContext(
+        current_dd=-0.081,
+        canonical_drawdown_stage="block",
+        loss_guard_stage="ok",
+    )
+    action = _action("buy", ticker="VT")
+    action.update({
+        "source": "scheduled_broad_deployment",
+        "human_execution_only": True,
+        "estimated_notional_jpy": 500_000,
+        "plan_item_id": "broad-plan-1",
+        "route_id": "route-vt",
+        "cash_wallet_key": "owner_a|broker_a|broker_cash|USD",
+        "execution_owner": "owner_a",
+        "execution_broker": "broker_a",
+        "execution_account": "taxable",
+        "settlement_pool": "broker_cash",
+        "currency": "USD",
+        "broad_family": "global_all_country",
+    })
+    action["capital_deployment_permission"] = issue_scheduled_broad_permission(
+        action=action,
+        canonical_dd_stage="block",
+        dd_pacing_multiplier=0.25,
+        state_snapshot={"dd_stage": "block", "as_of": "2026-08-18"},
+    )
+
+    accepted = pe.apply_policy_gate([action], ctx)
+    tampered = pe.apply_policy_gate([{**action, "route_id": "different-route"}], ctx)
+
+    assert len(accepted.accepted) == 1
+    assert len(tampered.rejected) == 1
+    assert tampered.rejected[0]["rule"] == "_rule_dd_stage"
+
+
 def test_loss_guard_stage_blocks_buy_when_canonical_dd_is_unavailable():
     ctx = pe.PolicyContext(current_dd=None, loss_guard_stage="stage_1")
     d = pe.apply_policy_gate([_action("buy")], ctx)

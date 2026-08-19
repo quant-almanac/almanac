@@ -49,6 +49,49 @@ def ExecutionRequest(**kwargs):
     return _ExecutionRequestModel(**kwargs)
 
 
+def test_preflight_payload_inherits_linked_permission_and_route(monkeypatch):
+    permission = {"permission_id": "capital-deployment:test"}
+    linked = {
+        "ticker": "VT",
+        "type": "buy",
+        "source": "scheduled_broad_deployment",
+        "plan_item_id": "broad-plan-1",
+        "route_id": "route-vt",
+        "cash_wallet_key": "owner_a|broker_a|broker_cash|USD",
+        "capital_deployment_permission": permission,
+        "human_execution_only": True,
+        "settlement_pool": "broker_cash",
+        "broad_family": "global_all_country",
+        "estimated_notional_jpy": 150_000,
+        "execution_owner": "owner_a",
+        "execution_broker": "broker_a",
+        "execution_account": "taxable",
+        "currency": "USD",
+    }
+    monkeypatch.setattr(actions, "_linked_ai_action", lambda _req: linked)
+    request = actions.PreflightRequest(
+        ticker="VT",
+        direction="buy",
+        quantity=10,
+        price=100,
+        currency="USD",
+        analysis_id="analysis-1",
+    )
+
+    payload = actions._with_linked_preflight_metadata(
+        request, request.execution_payload(),
+    )
+
+    assert payload["source"] == "scheduled_broad_deployment"
+    assert payload["plan_item_id"] == "broad-plan-1"
+    assert payload["route_id"] == "route-vt"
+    assert payload["cash_wallet_key"] == "owner_a|broker_a|broker_cash|USD"
+    assert payload["capital_deployment_permission"] is permission
+    assert payload["execution_owner"] == "owner_a"
+    assert payload["execution_broker"] == "broker_a"
+    assert payload["execution_account"] == "taxable"
+
+
 # ---------------------------------------------------------------------------
 # Shared fixture (same pattern as test_actions_ledger_safety.py)
 # ---------------------------------------------------------------------------

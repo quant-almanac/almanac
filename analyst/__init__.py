@@ -10925,7 +10925,9 @@ def _apply_capital_allocator(
             for execution in load_effective_execution_records(base_dir=BASE_DIR):
                 if not isinstance(execution, dict):
                     continue
-                if str(execution.get("status") or "").lower() not in {"executed", "partial", "filled"}:
+                if str(execution.get("status") or "").lower() not in {
+                    "ordered", "placed", "executed", "partial", "filled",
+                }:
                     continue
                 execution_time = str(execution.get("saved_at") or execution.get("executed_at_time") or "")
                 if execution_time[:10] != analysis_day:

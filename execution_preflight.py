@@ -38,6 +38,10 @@ def _canonical_json(value: dict[str, Any]) -> str:
 def action_identity(payload: dict[str, Any]) -> dict[str, Any]:
     """Fields that cannot change after a user has reviewed the preflight."""
     position_keys = payload.get("execution_position_keys") or []
+    permission = payload.get("capital_deployment_permission")
+    permission_id = (
+        permission.get("permission_id") if isinstance(permission, dict) else None
+    )
     return {
         "ticker": str(payload.get("ticker") or ""),
         "direction": str(payload.get("direction") or ""),
@@ -50,6 +54,11 @@ def action_identity(payload: dict[str, Any]) -> dict[str, Any]:
         "execution_owner": str(payload.get("execution_owner") or ""),
         "execution_broker": str(payload.get("execution_broker") or ""),
         "execution_position_keys": sorted(str(key) for key in position_keys),
+        "source": str(payload.get("source") or ""),
+        "plan_item_id": str(payload.get("plan_item_id") or ""),
+        "route_id": str(payload.get("route_id") or ""),
+        "cash_wallet_key": str(payload.get("cash_wallet_key") or ""),
+        "capital_deployment_permission_id": str(permission_id or ""),
         "analysis_id": str(payload.get("analysis_id") or ""),
         "action_state_id": str(payload.get("action_state_id") or ""),
     }
@@ -398,6 +407,44 @@ def _broad_concentration_context(payload: dict[str, Any], base_dir: Path) -> dic
         return concentration_limits()
 
 
+def _scheduled_broad_permission_assessment(
+    payload: dict[str, Any],
+    *,
+    canonical_drawdown_stage: str | None,
+    proposed_notional_jpy: Any,
+) -> dict[str, Any]:
+    source = str(payload.get("source") or "").strip().lower()
+    direction = str(payload.get("direction") or "").strip().lower()
+    stage = str(canonical_drawdown_stage or "").strip()
+    blocking_stages = {"block", "derisk_review", "freeze", "objective_breach"}
+    if source != "scheduled_broad_deployment" or direction not in {"buy", "margin_buy"}:
+        return {"required": False, "valid": None, "stage": stage or None}
+    if stage not in blocking_stages:
+        return {"required": False, "valid": None, "stage": stage or None}
+    valid = False
+    if stage in {"block", "derisk_review"}:
+        try:
+            from capital_deployment import validate_scheduled_broad_permission
+
+            valid = validate_scheduled_broad_permission(
+                payload,
+                canonical_dd_stage=stage,
+                requested_notional_jpy=proposed_notional_jpy,
+            )
+        except Exception:
+            valid = False
+    return {
+        "required": True,
+        "valid": bool(valid),
+        "stage": stage,
+        "permission_id": str(
+            ((payload.get("capital_deployment_permission") or {}).get("permission_id"))
+            if isinstance(payload.get("capital_deployment_permission"), dict)
+            else ""
+        ) or None,
+    }
+
+
 def evaluate_preflight_decision(payload: dict[str, Any], *, base_dir: Path) -> dict[str, Any]:
     """Compute the token-free execution decision without writing state."""
     daily, rolling = _guard_metrics(base_dir)
@@ -425,6 +472,11 @@ def evaluate_preflight_decision(payload: dict[str, Any], *, base_dir: Path) -> d
     direction = str(payload.get("direction") or "").lower()
     risk_increasing = direction in {"buy", "margin_buy", "short"}
     short_positions = _current_short_positions(base_dir)
+    scheduled_broad_permission = _scheduled_broad_permission_assessment(
+        payload,
+        canonical_drawdown_stage=drawdown_stage,
+        proposed_notional_jpy=concentration_observation.get("proposed_notional_jpy"),
+    )
     decision = classify_execution_risk(
         daily_pnl_decimal=daily,
         rolling_30_pnl_decimal=rolling,
@@ -441,6 +493,20 @@ def evaluate_preflight_decision(payload: dict[str, Any], *, base_dir: Path) -> d
         family_concentration_decimal=concentration_context.get("family_concentration_decimal"),
         family_concentration_cap_decimal=concentration_context.get("family_cap_decimal"),
     )
+    if (
+        scheduled_broad_permission.get("required") is True
+        and scheduled_broad_permission.get("valid") is not True
+    ):
+        hard_reasons = list(decision.get("hard_reasons") or [])
+        hard_reasons.append({
+            "code": "scheduled_broad_permission_invalid",
+            "message": "The scheduled broad permission no longer matches the current order, route, or plan.",
+        })
+        decision = {
+            **decision,
+            "disposition": "hard_reject",
+            "hard_reasons": hard_reasons,
+        }
     digest = action_digest(payload)
     metrics = {
         "daily_pnl_decimal": daily,
@@ -455,6 +521,7 @@ def evaluate_preflight_decision(payload: dict[str, Any], *, base_dir: Path) -> d
         "canonical_drawdown_decimal": drawdown,
         "canonical_drawdown_stage": drawdown_stage,
         "current_short_positions": short_positions,
+        "scheduled_broad_permission": scheduled_broad_permission,
     }
     return {
         **decision,

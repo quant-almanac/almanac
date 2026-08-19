@@ -246,6 +246,39 @@ def test_scheduled_broad_execution_same_day_blocks_ordinary_allocator(monkeypatc
     assert synthesis["capital_allocator"]["prior_normal_buys_today"] == 1
 
 
+def test_open_scheduled_broad_order_same_day_already_consumes_buy_slot(monkeypatch, tmp_path):
+    import analyst
+    import execution_reconciliation
+
+    monkeypatch.setattr(analyst, "BASE_DIR", tmp_path)
+    monkeypatch.setattr(
+        execution_reconciliation,
+        "load_effective_execution_records",
+        lambda **_kwargs: [{
+            "status": "ordered", "saved_at": "2026-08-14T09:00:00",
+            "strategy_class": "scheduled_broad_deployment", "direction": "buy",
+            "estimated_notional_jpy": 500_000,
+        }],
+    )
+    synthesis = {
+        "priority_actions": [_buy("V", 4)],
+        "decision_summary": {
+            "candidate_count": 1, "executable_count": 1, "review_count": 0,
+            "deferred_count": 0, "reason_counts": {}, "count_conservation_ok": True,
+        },
+        "overall_stance": "neutral",
+    }
+
+    analyst._apply_capital_allocator(
+        synthesis, _allocator_data(), fx_rate=159.452,
+        analysis_id="scheduled-broad-open-order", as_of="2026-08-14T12:00:00",
+    )
+
+    assert synthesis["priority_actions"][0]["execution_readiness"] == "review"
+    assert synthesis["capital_allocator"]["prior_normal_buys_today"] == 1
+    assert synthesis["capital_allocator"]["prior_scheduled_actions_this_week"] == 1
+
+
 def test_scenario_buy_execution_same_day_consumes_household_buy_slot(monkeypatch, tmp_path):
     import analyst
     import execution_reconciliation

@@ -1129,7 +1129,7 @@ def _is_risk_increasing(direction: Direction | str) -> bool:
 
 
 def _execution_preflight_payload(req: ExecutionRequest) -> dict:
-    return {
+    payload = {
         "ticker": req.ticker,
         "direction": req.direction.value,
         "order_type": req.order_type,
@@ -1144,6 +1144,33 @@ def _execution_preflight_payload(req: ExecutionRequest) -> dict:
         "execution_broker": req.execution_broker,
         "execution_position_keys": req.execution_position_keys,
     }
+    return _with_linked_preflight_metadata(req, payload)
+
+
+def _with_linked_preflight_metadata(
+    req: ExecutionRequest | PreflightRequest,
+    payload: dict,
+) -> dict:
+    """Bind a preflight to the persisted deterministic route and permission."""
+    linked = _linked_ai_action(req)
+    if not isinstance(linked, dict) or not linked:
+        return payload
+    enriched = dict(payload)
+    enriched["type"] = linked.get("type") or linked.get("action_type") or payload.get("direction")
+    enriched["source"] = linked.get("source")
+    enriched["plan_item_id"] = linked.get("plan_item_id")
+    enriched["route_id"] = linked.get("route_id")
+    enriched["cash_wallet_key"] = linked.get("cash_wallet_key")
+    enriched["capital_deployment_permission"] = linked.get("capital_deployment_permission")
+    enriched["human_execution_only"] = linked.get("human_execution_only")
+    enriched["settlement_pool"] = linked.get("settlement_pool")
+    enriched["broad_family"] = linked.get("broad_family")
+    enriched["estimated_notional_jpy"] = linked.get("estimated_notional_jpy")
+    enriched["execution_owner"] = payload.get("execution_owner") or linked.get("execution_owner")
+    enriched["execution_broker"] = payload.get("execution_broker") or linked.get("execution_broker")
+    enriched["execution_account"] = payload.get("account") or linked.get("execution_account")
+    enriched["currency"] = payload.get("currency") or linked.get("currency")
+    return enriched
 
 
 def _enforce_execution_preflight(req: ExecutionRequest) -> dict | None:
@@ -2404,7 +2431,8 @@ async def preflight_execution(req: PreflightRequest):
     """
     from execution_preflight import evaluate_preflight
 
-    result = evaluate_preflight(req.execution_payload(), base_dir=BASE_DIR)
+    payload = _with_linked_preflight_metadata(req, req.execution_payload())
+    result = evaluate_preflight(payload, base_dir=BASE_DIR)
     readiness, readiness_reasons = _linked_ai_readiness_values(
         analysis_id=req.analysis_id,
         action_state_id=req.action_state_id,

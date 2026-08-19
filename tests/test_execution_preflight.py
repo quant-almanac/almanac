@@ -8,7 +8,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 import execution_preflight as ep
-from risk_policy import POLICY, classify_execution_risk
+from risk_policy import POLICY, classify_execution_risk, concentration_limits
 
 
 def test_minus_point_one_daily_is_normal_when_all_metrics_are_known():
@@ -166,6 +166,87 @@ def test_order_type_change_invalidates_reviewed_identity():
             "order_type": "limit", "limit_price": 99}
     changed = dict(base, order_type="market")
     assert ep.action_digest(base) != ep.action_digest(changed)
+
+
+def test_permission_id_change_invalidates_reviewed_identity():
+    base = {
+        "ticker": "VT", "direction": "buy", "quantity": 10, "price": 100,
+        "capital_deployment_permission": {"permission_id": "permission-a"},
+    }
+    changed = {
+        **base,
+        "capital_deployment_permission": {"permission_id": "permission-b"},
+    }
+    assert ep.action_digest(base) != ep.action_digest(changed)
+
+
+def test_dd_block_preflight_revalidates_scheduled_permission(monkeypatch, tmp_path):
+    from capital_deployment import issue_scheduled_broad_permission
+
+    action = {
+        "ticker": "VT",
+        "type": "buy",
+        "direction": "buy",
+        "source": "scheduled_broad_deployment",
+        "human_execution_only": True,
+        "quantity": 10,
+        "price": 100,
+        "estimated_notional_jpy": 150_000,
+        "plan_item_id": "broad-plan-1",
+        "route_id": "route-vt",
+        "cash_wallet_key": "owner_a|broker_a|broker_cash|USD",
+        "execution_owner": "owner_a",
+        "execution_broker": "broker_a",
+        "execution_account": "taxable",
+        "settlement_pool": "broker_cash",
+        "currency": "USD",
+        "broad_family": "global_all_country",
+        "execution_investment_type": "long",
+    }
+    action["capital_deployment_permission"] = issue_scheduled_broad_permission(
+        action=action,
+        canonical_dd_stage="block",
+        dd_pacing_multiplier=0.25,
+        state_snapshot={"dd": -0.081},
+        now=datetime.now(timezone.utc),
+    )
+    monkeypatch.setattr(ep, "_guard_metrics", lambda _base: (0.0, 0.0))
+    monkeypatch.setattr(ep, "_analysis_risk_metrics", lambda _base: (0.01, "test", "2026-08-19"))
+    monkeypatch.setattr(ep, "_promoted_drawdown_metrics", lambda _base: (-0.081, "block"))
+    monkeypatch.setattr(ep, "_current_var_threshold", lambda _base, **_kwargs: 0.014)
+    monkeypatch.setattr(ep, "_current_short_positions", lambda _base: 0)
+    monkeypatch.setattr(ep, "_prospective_concentration", lambda _payload, _base: 0.04)
+    monkeypatch.setattr(
+        ep,
+        "_prospective_concentration_observation",
+        lambda _payload, _base: {
+            "ratio": 0.04,
+            "status": "ok",
+            "proposed_notional_jpy": 150_000,
+        },
+    )
+    monkeypatch.setattr(
+        ep,
+        "_broad_concentration_context",
+        lambda _payload, _base: {
+            **concentration_limits(
+                broad_family="global_all_country", investment_type="long",
+            ),
+            "family_concentration_decimal": 0.10,
+        },
+    )
+
+    valid = ep.evaluate_preflight_decision(action, base_dir=tmp_path)
+    tampered = ep.evaluate_preflight_decision(
+        {**action, "route_id": "another-route"}, base_dir=tmp_path,
+    )
+
+    assert valid["disposition"] == "confirmation_required"
+    assert valid["metrics"]["scheduled_broad_permission"]["valid"] is True
+    assert tampered["disposition"] == "hard_reject"
+    assert "scheduled_broad_permission_invalid" in {
+        row["code"] for row in tampered["hard_reasons"]
+    }
 
 
 def test_preflight_reads_risk_snapshot_and_live_promoted_drawdown(tmp_path, monkeypatch):

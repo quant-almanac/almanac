@@ -31,15 +31,16 @@ def _number(value: Any) -> int:
 
 
 def active_operational_reservations(rows: Iterable[dict[str, Any]] | None) -> list[dict[str, Any]]:
-    seen: set[str] = set()
-    out: list[dict[str, Any]] = []
+    by_id: dict[str, dict[str, Any]] = {}
     for row in rows or []:
         if not isinstance(row, dict):
             continue
         reservation_id = str(row.get("reservation_id") or "")
-        if not reservation_id or reservation_id in seen:
-            continue
-        seen.add(reservation_id)
+        if reservation_id:
+            # Later rows represent the latest state of the same debit.
+            by_id[reservation_id] = dict(row)
+    out: list[dict[str, Any]] = []
+    for row in by_id.values():
         if str(row.get("status") or "active") != "active" or row.get("reflected_in_confirmed_cash") is True:
             continue
         if row.get("deployment_assignment_id"):
@@ -173,6 +174,10 @@ def build_wallet_capacity_timeline(
         now = now.replace(tzinfo=timezone.utc)
     as_of_date = now.date()
     wallet_rows = [dict(row) for row in wallets or [] if isinstance(row, dict)]
+    known_wallet_keys = {
+        str(row.get("wallet_key") or "") for row in wallet_rows
+        if str(row.get("wallet_key") or "")
+    }
     earliest_source: date | None = None
     for wallet in wallet_rows:
         source = _parse_datetime(wallet.get("source_as_of"))
@@ -211,8 +216,9 @@ def build_wallet_capacity_timeline(
 
     open_by_wallet: dict[str, list[dict[str, Any]]] = {}
     unresolved_open_by_wallet: dict[str, list[str]] = {}
+    unresolved_open_routes: list[str] = []
     seen_execution_ids: set[str] = set()
-    for execution in executions or []:
+    for execution_index, execution in enumerate(executions or []):
         if not isinstance(execution, dict):
             continue
         if str(execution.get("status") or "").lower() not in {"ordered", "placed"}:
@@ -222,17 +228,24 @@ def build_wallet_capacity_timeline(
         ) != "buy":
             continue
         execution_id = str(execution.get("id") or execution.get("execution_id") or execution.get("action_state_id") or "")
-        if not execution_id or execution_id in seen_execution_ids:
+        if not execution_id:
+            unresolved_open_routes.append(f"missing-id:{execution_index}")
+            continue
+        if execution_id in seen_execution_ids:
             continue
         seen_execution_ids.add(execution_id)
         owner = canonical_owner(execution.get("execution_owner") or execution.get("owner"))
         broker = canonical_broker(execution.get("execution_broker") or execution.get("broker"))
         ticker = canonical_ticker(execution.get("ticker"))
         currency = str(execution.get("cash_currency") or execution.get("currency") or ("JPY" if ticker.endswith(".T") else "USD")).upper()
-        settlement_pool = str(execution.get("settlement_pool") or "broker_cash")
+        settlement_pool = str(execution.get("settlement_pool") or "broker_cash").strip().lower()
         if not owner or not broker or currency not in {"JPY", "USD"}:
+            unresolved_open_routes.append(execution_id)
             continue
         wallet_key = f"{owner}|{broker}|{settlement_pool}|{currency}"
+        if wallet_key not in known_wallet_keys:
+            unresolved_open_routes.append(execution_id)
+            continue
         amount_jpy, amount_native = _execution_notional(
             execution,
             currency=currency,
@@ -288,8 +301,13 @@ def build_wallet_capacity_timeline(
             target = unreflected if due <= as_of_date else future
             target.append(dict(reservation))
         open_rows = open_by_wallet.get(key, [])
-        unresolved_open = unresolved_open_by_wallet.get(key, [])
-        if unresolved_open:
+        unresolved_open = [
+            *unresolved_open_routes,
+            *unresolved_open_by_wallet.get(key, []),
+        ]
+        if unresolved_open_routes:
+            status = "open_order_route_unresolved"
+        elif unresolved_open:
             status = "open_order_notional_unresolved"
         unreflected_jpy = sum(_number(row.get("amount_jpy")) for row in unreflected)
         future_jpy = sum(_number(row.get("amount_jpy")) for row in future)
@@ -324,7 +342,10 @@ def build_wallet_capacity_timeline(
         "unreflected_wallet_outflows_jpy": sum(_number(row.get("unreflected_wallet_outflows_jpy")) for row in projected),
         "future_operational_reservations_jpy": sum(_number(row.get("future_operational_reservations_jpy")) for row in projected),
         "open_order_reservations_jpy": sum(_number(row.get("open_order_reservations_jpy")) for row in projected),
-        "all_wallets_resolved": all(row.get("reservation_status") == "ok" for row in projected),
+        "unresolved_open_order_ids": sorted(set(unresolved_open_routes)),
+        "all_wallets_resolved": bool(projected) and all(
+            row.get("reservation_status") == "ok" for row in projected
+        ),
     }
 
 
@@ -438,25 +459,85 @@ def _canonical_payload(payload: dict[str, Any]) -> str:
     return json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
 
+def _scheduled_broad_action_binding(action: dict[str, Any]) -> dict[str, Any]:
+    """Return the complete plan and wallet route authorized by a carve-out."""
+    return {
+        "source": str(action.get("source") or "").strip().lower(),
+        "ticker": canonical_ticker(action.get("ticker")),
+        "action_type": str(action.get("type") or action.get("action_type") or "").strip().lower(),
+        "plan_item_id": str(action.get("plan_item_id") or "").strip(),
+        "route_id": str(action.get("route_id") or "").strip(),
+        "cash_wallet_key": str(action.get("cash_wallet_key") or "").strip(),
+        "execution_owner": str(action.get("execution_owner") or "").strip().lower(),
+        "execution_broker": str(action.get("execution_broker") or "").strip().lower(),
+        "execution_account": str(action.get("execution_account") or action.get("account") or "").strip(),
+        "settlement_pool": str(action.get("settlement_pool") or "").strip().lower(),
+        "currency": str(action.get("currency") or "").strip().upper(),
+        "broad_family": str(action.get("broad_family") or "").strip(),
+    }
+
+
+def _payload_sha256(payload: dict[str, Any]) -> str:
+    return "sha256:" + sha256(_canonical_payload(payload).encode("utf-8")).hexdigest()
+
+
+def _valid_sha256(value: Any) -> bool:
+    text = str(value or "")
+    if not text.startswith("sha256:") or len(text) != 71:
+        return False
+    try:
+        int(text[7:], 16)
+    except ValueError:
+        return False
+    return True
+
+
 def issue_scheduled_broad_permission(*, action: dict[str, Any], canonical_dd_stage: str, dd_pacing_multiplier: float, state_snapshot: dict[str, Any], now: datetime | None = None, ttl_days: int = 7) -> dict[str, Any]:
     now = now or datetime.now(timezone.utc)
     ticker, action_type = canonical_ticker(action.get("ticker")), str(action.get("type") or "").lower()
     amount = _number(action.get("estimated_notional_jpy") or action.get("amount_jpy"))
     if not ticker or action_type not in {"buy", "add", "dca"} or amount <= 0 or canonical_dd_stage not in {"block", "derisk_review"} or float(dd_pacing_multiplier) != 0.25:
         raise ValueError("invalid scheduled broad deployment permission")
-    permission = {"source": "scheduled_broad_deployment", "ticker": ticker, "action_type": action_type, "max_notional_jpy": amount, "canonical_dd_stage": canonical_dd_stage, "dd_pacing_multiplier": 0.25, "state_snapshot_hash": "sha256:" + sha256(_canonical_payload(dict(state_snapshot or {})).encode()).hexdigest(), "issued_at": now.isoformat(), "expires_at": (now + timedelta(days=max(1, int(ttl_days)))).isoformat(), "human_execution_only": True}
-    permission["permission_id"] = "capital-deployment:" + sha256(_canonical_payload(permission).encode()).hexdigest()[:24]
+    if str(action.get("source") or "").strip().lower() != "scheduled_broad_deployment" or action.get("human_execution_only") is not True:
+        raise ValueError("scheduled broad permission requires a human-only scheduled source")
+    binding = _scheduled_broad_action_binding(action)
+    required = (
+        "plan_item_id", "route_id", "cash_wallet_key", "execution_owner",
+        "execution_broker", "execution_account", "settlement_pool", "currency",
+        "broad_family",
+    )
+    if any(not binding.get(key) for key in required):
+        raise ValueError("scheduled broad permission requires a complete plan and wallet route")
+    permission = {
+        "source": "scheduled_broad_deployment",
+        "ticker": ticker,
+        "action_type": action_type,
+        "max_notional_jpy": amount,
+        "canonical_dd_stage": canonical_dd_stage,
+        "dd_pacing_multiplier": 0.25,
+        "state_snapshot_hash": _payload_sha256(dict(state_snapshot or {})),
+        "issued_at": now.isoformat(),
+        "expires_at": (now + timedelta(days=max(1, int(ttl_days)))).isoformat(),
+        "human_execution_only": True,
+        "action_binding": binding,
+        "action_binding_hash": _payload_sha256(binding),
+    }
+    permission["permission_id"] = "capital-deployment:" + sha256(_canonical_payload(permission).encode("utf-8")).hexdigest()[:24]
     return permission
 
 
-def validate_scheduled_broad_permission(action: dict[str, Any], *, canonical_dd_stage: str, now: datetime | None = None) -> bool:
+def validate_scheduled_broad_permission(action: dict[str, Any], *, canonical_dd_stage: str, now: datetime | None = None, requested_notional_jpy: int | float | None = None) -> bool:
     permission = action.get("capital_deployment_permission")
     if not isinstance(permission, dict):
         return False
     try:
         now = now or datetime.now(timezone.utc)
         expires_at = datetime.fromisoformat(str(permission.get("expires_at") or "").replace("Z", "+00:00"))
-        amount = _number(action.get("estimated_notional_jpy") or action.get("amount_jpy"))
-        return expires_at.tzinfo is not None and expires_at >= now and str(permission.get("source")) == str(action.get("source")) == "scheduled_broad_deployment" and bool(action.get("human_execution_only")) and bool(permission.get("human_execution_only")) and bool(permission.get("permission_id")) and str(permission.get("state_snapshot_hash") or "").startswith("sha256:") and canonical_ticker(permission.get("ticker")) == canonical_ticker(action.get("ticker")) and str(permission.get("action_type") or "").lower() == str(action.get("type") or "").lower() and amount > 0 and amount <= _number(permission.get("max_notional_jpy")) and str(permission.get("canonical_dd_stage") or "") == str(canonical_dd_stage) and float(permission.get("dd_pacing_multiplier")) == 0.25 and canonical_dd_stage in {"block", "derisk_review"}
+        amount = _number(requested_notional_jpy if requested_notional_jpy is not None else action.get("estimated_notional_jpy") or action.get("amount_jpy"))
+        binding = _scheduled_broad_action_binding(action)
+        stored_binding = permission.get("action_binding")
+        unsigned = {key: value for key, value in permission.items() if key != "permission_id"}
+        expected_id = "capital-deployment:" + sha256(_canonical_payload(unsigned).encode("utf-8")).hexdigest()[:24]
+        return expires_at.tzinfo is not None and expires_at >= now and str(permission.get("source")) == str(action.get("source")) == "scheduled_broad_deployment" and bool(action.get("human_execution_only")) and bool(permission.get("human_execution_only")) and str(permission.get("permission_id") or "") == expected_id and _valid_sha256(permission.get("state_snapshot_hash")) and isinstance(stored_binding, dict) and stored_binding == binding and _valid_sha256(permission.get("action_binding_hash")) and str(permission.get("action_binding_hash")) == _payload_sha256(binding) and canonical_ticker(permission.get("ticker")) == canonical_ticker(action.get("ticker")) and str(permission.get("action_type") or "").lower() == str(action.get("type") or "").lower() and amount > 0 and amount <= _number(permission.get("max_notional_jpy")) and str(permission.get("canonical_dd_stage") or "") == str(canonical_dd_stage) and float(permission.get("dd_pacing_multiplier")) == 0.25 and canonical_dd_stage in {"block", "derisk_review"}
     except (TypeError, ValueError):
         return False
