@@ -1,11 +1,10 @@
 'use client'
-import { useState } from 'react'
 import { OPS, TYPE_META, STANCE_LABEL } from './tokens'
 import { SectionHead } from './Shell'
 import PerformanceChart from './PerformanceChart'
 import ScenarioStrip from './ScenarioStrip'
 import type {
-  BoardRow, Engine, RedTeamVerdict, LaneVerdict, ChartsData, DeltaData, BenchmarkData,
+  BoardRow, Engine, RedTeamVerdict, ChartsData, DeltaData, BenchmarkData,
 } from './types'
 
 /**
@@ -25,11 +24,6 @@ export default function SignalMap({
   delta?: DeltaData | null
   benchmark?: BenchmarkData | null
 }) {
-  const adopted = engine.red_team.filter(r => r.verdict !== 'reject')
-  const rejected = engine.red_team.filter(r => r.verdict === 'reject')
-  const usedLanes = engine.lanes.filter(l => ['adopt', 'partial', 'adopt_partial'].includes(l.verdict))
-  const otherLanes = engine.lanes.length - usedLanes.length
-
   return (
     <section>
       <SectionHead
@@ -82,18 +76,10 @@ export default function SignalMap({
         </p>
       </div>
 
-      {/* 反論と情報の3列 */}
-      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(min(100%, 240px), 1fr))', gap: 24, marginTop: 20 }}>
-        <VerdictColumn title="採用した反論" accent={OPS.green} empty="採用なし" items={adopted.map(redTeamItem)} />
-        <VerdictColumn title="棄却した反論" accent={OPS.redSoft} empty="棄却なし" items={rejected.map(redTeamItem)} />
-        <VerdictColumn
-          title="採用した情報レーン"
-          accent={OPS.blue}
-          empty="採用なし"
-          items={usedLanes.map(laneItem)}
-          footer={otherLanes > 0 ? `ほか ${otherLanes} 件は棄却・無視` : undefined}
-        />
-      </div>
+      {/* 反論・情報レーンの内訳は DECISION FLOW の表に統合した (2026-08-19)。
+          同じ engine.red_team / engine.lanes を、ここでは3列カードとして、
+          DECISION FLOW では銘柄ごとの停止点と同じ表として、別々に描いていた。
+          結論(何件採用・何件棄却)はこの上の RationaleSummary カードに残す。 */}
 
       </div>
 
@@ -214,84 +200,3 @@ function redTeamItem(r: RedTeamVerdict, i: number): VerdictItem {
   }
 }
 
-function laneItem(l: LaneVerdict, i: number): VerdictItem {
-  return {
-    key: `lane-${i}`,
-    head: (
-      <>
-        <span style={{ fontFamily: OPS.mono, color: OPS.text, fontWeight: 500, marginRight: 6 }}>{l.ticker}</span>
-        <span style={{ color: OPS.dim }}>{l.lane}</span>
-      </>
-    ),
-    body: l.verdict_reason ?? '',
-    suffix: l.adopted_as && l.adopted_as !== 'n/a' ? l.adopted_as : undefined,
-  }
-}
-
-function VerdictColumn({
-  title,
-  accent,
-  items,
-  empty,
-  footer,
-}: {
-  title: string
-  accent: string
-  items: VerdictItem[]
-  empty: string
-  footer?: string
-}) {
-  const [showAll, setShowAll] = useState(false)
-  const visible = showAll ? items : items.slice(0, 3)
-
-  return (
-    <div style={{ borderLeft: `2px solid ${accent}66`, paddingLeft: 14 }}>
-      <h3
-        style={{
-          fontSize: 13.5,
-          fontWeight: 600,
-          color: OPS.text,
-          margin: '0 0 10px',
-          letterSpacing: '0.06em',
-        }}
-      >
-        {title}
-        <span style={{ fontFamily: OPS.mono, fontSize: 12, color: OPS.dim, marginLeft: 8, fontWeight: 400 }}>
-          {items.length}
-        </span>
-      </h3>
-
-      {items.length === 0 && <p style={{ fontSize: 12, color: OPS.dim, margin: 0 }}>{empty}</p>}
-
-      <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
-        {visible.map(it => (
-          <div key={it.key} style={{ fontSize: 12.5, lineHeight: 1.7 }}>
-            <div style={{ color: OPS.text, marginBottom: 2 }}>{it.head}</div>
-            <div style={{ color: OPS.dim }}>
-              {it.body}
-              {it.suffix && <span style={{ color: OPS.sub }}> → {it.suffix}</span>}
-            </div>
-          </div>
-        ))}
-      </div>
-
-      {items.length > 3 && (
-        <button
-          onClick={() => setShowAll(!showAll)}
-          style={{
-            background: 'none',
-            border: 'none',
-            padding: '8px 0 0',
-            cursor: 'pointer',
-            fontSize: 12,
-            color: OPS.gold,
-            fontFamily: OPS.sans,
-          }}
-        >
-          {showAll ? '折りたたむ' : `残り ${items.length - 3} 件`}
-        </button>
-      )}
-      {footer && <p style={{ fontSize: 11.5, color: OPS.dim, margin: '8px 0 0' }}>{footer}</p>}
-    </div>
-  )
-}

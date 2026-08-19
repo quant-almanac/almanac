@@ -12,7 +12,7 @@
  */
 
 import type {
-  DecisionFlowAction, DecisionFlowUnselected, RedTeamAttack, RedTeamVerdict,
+  DecisionFlowAction, DecisionFlowUnselected, LaneVerdict, RedTeamAttack, RedTeamVerdict,
 } from './types'
 
 /** 判断フローの3ゲート。列見出しとして1回だけ描く。 */
@@ -61,7 +61,7 @@ export type StopState = {
   kind: StopKind
 }
 
-export type RowKind = 'candidate' | 'dropped' | 'rebuttal'
+export type RowKind = 'candidate' | 'dropped' | 'rebuttal' | 'lane'
 
 export type DecisionRow = {
   id: string
@@ -253,6 +253,43 @@ export function rebuttalDetail(r: Rebuttal): string {
   return parts.join('\n')
 }
 
+const LANE_VERDICT_KIND: Record<string, StopKind> = {
+  adopt: 'pass', partial: 'pass', adopt_partial: 'pass',
+  reject: 'reject',
+  // ignore は「評価したが積極的に却下したわけではない」(未登録銘柄・様子見)。
+  // reject と同じ扱いにすると、能動的な却下と「まだ判断材料が無い」の
+  // 区別が消える。
+  ignore: 'defer',
+}
+
+const LANE_OUTCOME_LABEL: Record<StopKind, string> = {
+  pass: '採用', reject: '棄却', defer: '監視のみ', review: '要確認',
+}
+
+/**
+ * 情報レーン(catalyst・ipo_watch・geopolitical 等)の評価を行にする。
+ *
+ * 対案(Red Team)とは別の入力チャネルで、対案検証ゲートを通るものではない
+ * ——銘柄候補が生成される前段の情報収集なので、ゲートのラダーは対象外(depth 0)。
+ * レーン名を subtitle に出し、対案・不採用候補と混ざらないようにする。
+ */
+function laneRows(lanes: LaneVerdict[]): DecisionRow[] {
+  return lanes.map((l, i) => {
+    const kind = LANE_VERDICT_KIND[l.verdict] ?? 'defer'
+    const parts = [l.verdict_reason, l.adopted_as ? `→ ${l.adopted_as}` : null].filter(Boolean)
+    return {
+      id: `lane:${l.lane}|${l.ticker ?? ''}|${i}`,
+      kind: 'lane',
+      ticker: l.ticker || '候補',
+      subtitle: `情報レーン ・ ${l.lane}`,
+      stop: { depth: 0, gate: 0, kind },
+      outcomeLabel: LANE_OUTCOME_LABEL[kind],
+      headline: l.verdict_reason ?? '',
+      detail: parts.join('\n') || l.verdict_reason || '',
+    }
+  })
+}
+
 function rebuttalRows(rebuttals: Rebuttal[]): DecisionRow[] {
   // 採用を先に、それぞれ内部は銘柄名で安定ソート。
   const ordered = [...rebuttals].sort((a, b) =>
@@ -300,10 +337,12 @@ export function buildDecisionRows(
   actions: DecisionFlowAction[] | null | undefined,
   unselected: DecisionFlowUnselected[] | null | undefined,
   rebuttals: Rebuttal[] | null | undefined,
+  lanes: LaneVerdict[] | null | undefined = [],
 ): DecisionRows {
   const list = actions ?? []
   const unselectedList = unselected ?? []
   const reb = rebuttals ?? []
+  const laneList = lanes ?? []
 
   const tickerSeen = new Map<string, number>()
   for (const t of [...list.map(a => a.ticker), ...unselectedList.map(u => u.ticker)]) {
@@ -317,7 +356,9 @@ export function buildDecisionRows(
       || String(a.action.ticker ?? '').localeCompare(String(b.action.ticker ?? '')))
     .map(({ action, i }) => candidateRow(action, i))
 
-  const considered = [...droppedRows(unselectedList, tickerSeen), ...rebuttalRows(reb)]
+  const considered = [
+    ...droppedRows(unselectedList, tickerSeen), ...rebuttalRows(reb), ...laneRows(laneList),
+  ]
 
   return { today, considered }
 }

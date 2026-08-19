@@ -228,3 +228,66 @@ describe('buildDecisionRows: full shape from the live payload', () => {
     expect(considered.filter(r => r.kind === 'dropped')).toHaveLength(7)
   })
 })
+
+describe('buildDecisionRows: information lanes', () => {
+  const lanes = [
+    { lane: 'catalyst', ticker: '1489.T', verdict: 'adopt', verdict_reason: '独立根拠で裏づけ', adopted_as: 'buy 100口' },
+    { lane: 'catalyst', ticker: 'NVDA', verdict: 'reject', verdict_reason: '決算ブラックアウト中' },
+    { lane: 'ipo_watch', ticker: 'SKHY', verdict: 'ignore', verdict_reason: 'ユニバース未登録で評価不能' },
+  ]
+
+  it('gives every lane verdict its own row', () => {
+    const { considered } = buildDecisionRows([], [], [], lanes)
+    expect(considered.filter(r => r.kind === 'lane')).toHaveLength(3)
+  })
+
+  it('does not draw a gate ladder for a lane row — it never enters the gate pipeline', () => {
+    const { considered } = buildDecisionRows([], [], [], lanes)
+    expect(considered.every(r => r.kind !== 'lane' || r.stop.depth === 0)).toBe(true)
+  })
+
+  it('marks adopt as passed and reject as rejected, matching the rebuttal color language', () => {
+    const { considered } = buildDecisionRows([], [], [], lanes)
+    const adopted = considered.find(r => r.ticker === '1489.T')!
+    const rejected = considered.find(r => r.ticker === 'NVDA')!
+    expect(adopted.stop.kind).toBe('pass')
+    expect(adopted.outcomeLabel).toBe('採用')
+    expect(rejected.stop.kind).toBe('reject')
+    expect(rejected.outcomeLabel).toBe('棄却')
+  })
+
+  it('does not call "ignore" a rejection — it is a distinct claim (not evaluated, not refused)', () => {
+    const { considered } = buildDecisionRows([], [], [], lanes)
+    const ignored = considered.find(r => r.ticker === 'SKHY')!
+    expect(ignored.stop.kind).not.toBe('reject')
+    expect(ignored.outcomeLabel).not.toBe('棄却')
+  })
+
+  it('names the lane in the subtitle so it reads apart from a dropped candidate or a rebuttal', () => {
+    const { considered } = buildDecisionRows([], [], [], lanes)
+    const row = considered.find(r => r.ticker === '1489.T')!
+    expect(row.subtitle).toContain('catalyst')
+  })
+
+  it('carries the adopted-as text into the detail', () => {
+    const { considered } = buildDecisionRows([], [], [], lanes)
+    expect(considered.find(r => r.ticker === '1489.T')!.detail).toContain('buy 100口')
+  })
+
+  it('changes nothing when there are no lanes', () => {
+    const { considered } = buildDecisionRows([action()], [], [], [])
+    expect(considered.some(r => r.kind === 'lane')).toBe(false)
+  })
+
+  it('handles a missing lanes argument without throwing', () => {
+    expect(() => buildDecisionRows([action()], [], [])).not.toThrow()
+  })
+
+  it('falls back safely on an unrecognised verdict string instead of throwing', () => {
+    const { considered } = buildDecisionRows([], [], [], [
+      { lane: 'x', ticker: 'Z', verdict: 'unknown_future_value' },
+    ])
+    expect(considered).toHaveLength(1)
+    expect(considered[0].stop.kind).toBe('defer')
+  })
+})

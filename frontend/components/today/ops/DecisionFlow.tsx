@@ -94,7 +94,8 @@ export default function DecisionFlow({
   const rebuttals = useMemo(
     () => buildRebuttals(engine?.attacks, engine?.red_team), [engine])
   const rows = useMemo(
-    () => buildDecisionRows(actions, unselected, rebuttals), [actions, unselected, rebuttals])
+    () => buildDecisionRows(actions, unselected, rebuttals, engine?.lanes),
+    [actions, unselected, rebuttals, engine?.lanes])
 
   // 展開のON/OFFは選択(selectedKey)と独立させる。選択は他パネルとの連動用で
   // 外から動くことがあり、そこへ連動させると「自分でクリックして閉じても
@@ -148,7 +149,8 @@ export default function DecisionFlow({
       .df-row[data-active="true"] { border-color:#4FD0F5; background:rgba(79,208,245,.06); }
       .df-row[data-kind="candidate"] .df-row-ticker b { color:${OPS.text}; }
       .df-row[data-kind="dropped"] .df-row-ticker b,
-      .df-row[data-kind="rebuttal"] .df-row-ticker b { color:${OPS.sub}; }
+      .df-row[data-kind="rebuttal"] .df-row-ticker b,
+      .df-row[data-kind="lane"] .df-row-ticker b { color:${OPS.sub}; }
 
       .df-row-ticker { display:flex; flex-direction:column; gap:1px; overflow:hidden; min-width:0; }
       .df-row-ticker b { font-family:${OPS.mono}; font-size:12px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
