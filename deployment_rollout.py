@@ -26,7 +26,14 @@ _RISK_INCREASING_TYPES = _BUY_TYPES | {"short"}
 
 
 def _root(base_dir: Path) -> Path:
-    return Path(os.environ.get("ALMANAC_STATE_DIR") or base_dir)
+    base = Path(base_dir)
+    state_dir = os.environ.get("ALMANAC_STATE_DIR")
+    # An explicit base_dir is an isolation/recovery boundary and must win over
+    # the process-wide runtime directory.  The environment redirect applies
+    # only to the normal repository-root invocation.
+    if state_dir and base.resolve() == Path(__file__).resolve().parent:
+        return Path(state_dir)
+    return base
 
 
 def _paths(base_dir: Path) -> tuple[Path, Path]:
@@ -273,8 +280,19 @@ def record_production_canary(
     if not canary["analysis_id"] or not canary["actor"] or not canary["reference"]:
         raise ValueError("analysis_id, actor, and reference are required")
     canaries = [row for row in state.get("production_canaries") or [] if isinstance(row, dict)]
-    if not any(row.get("analysis_id") == canary["analysis_id"] for row in canaries):
+    existing_index = next(
+        (index for index, row in enumerate(canaries) if row.get("analysis_id") == canary["analysis_id"]),
+        None,
+    )
+    if existing_index is None:
         canaries.append(canary)
+    else:
+        # Idempotent re-recording may enrich an older entry after an audit
+        # reader fix, but must never create duplicate promotion evidence.
+        existing = dict(canaries[existing_index])
+        existing.update({key: value for key, value in canary.items() if value not in (None, "")})
+        canary = existing
+        canaries[existing_index] = canary
     state["production_canaries"] = canaries[-20:]
     return _write_transition(
         base_dir=base_dir,
@@ -464,7 +482,15 @@ def quarantine_analysis_if_needed(
 def _load_analysis(path: Path) -> dict[str, Any]:
     value = _read_json(path)
     synthesis = value.get("synthesis") if isinstance(value.get("synthesis"), dict) else value
-    return synthesis if isinstance(synthesis, dict) else {}
+    if not isinstance(synthesis, dict):
+        return {}
+    # Production analysis artifacts keep the timestamp at the document root,
+    # while the rollout validator consumes the synthesis payload.  Preserve
+    # that root metadata in the audit record without mutating the artifact.
+    loaded = dict(synthesis)
+    if not loaded.get("as_of") and value.get("as_of"):
+        loaded["as_of"] = value.get("as_of")
+    return loaded
 
 
 def main(argv: list[str] | None = None) -> int:

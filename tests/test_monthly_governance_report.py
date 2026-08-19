@@ -49,12 +49,8 @@ def test_leveraged_decay_with_positions_still_insufficient_until_60_days():
     assert section["positions_flagged"] == 1
 
 
-def test_red_team_section_insufficient_data_when_no_verdicts(tmp_path, monkeypatch):
-    import red_team_ledger as rtl
-    monkeypatch.setattr(rtl, "VERDICT_LOG_PATH", tmp_path / "v.jsonl")
-    monkeypatch.setattr(rtl, "OUTCOME_LOG_PATH", tmp_path / "o.jsonl")
-
-    section = mgr._red_team_section()
+def test_red_team_section_insufficient_data_when_no_verdicts(tmp_path):
+    section = mgr._red_team_section(base_dir=tmp_path)
     assert section["available"] is True
     assert section["verdict"] == "insufficient_data"
 

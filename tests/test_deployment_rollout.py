@@ -3,6 +3,7 @@ import json
 import pytest
 
 from deployment_rollout import (
+    _load_analysis,
     load_state,
     promote,
     quarantine_analysis_if_needed,
@@ -47,6 +48,62 @@ def _analysis(*, extra_actions=None):
             "household_ready_risk_buy_limit": 1,
         },
     }
+
+
+def test_load_analysis_preserves_root_as_of_for_rollout_audit(tmp_path):
+    artifact = {
+        "as_of": "2026-08-19 14:09",
+        "synthesis": _analysis(),
+    }
+    artifact["synthesis"].pop("as_of")
+    path = tmp_path / "analysis.json"
+    path.write_text(json.dumps(artifact), encoding="utf-8")
+
+    loaded = _load_analysis(path)
+
+    assert loaded["analysis_id"] == "analysis-canary"
+    assert loaded["as_of"] == "2026-08-19 14:09"
+    assert "as_of" not in artifact["synthesis"]
+
+
+def test_explicit_base_dir_remains_isolated_from_runtime_state_dir(tmp_path, monkeypatch):
+    runtime_state = tmp_path / "runtime"
+    explicit_state = tmp_path / "explicit"
+    monkeypatch.setenv("ALMANAC_STATE_DIR", str(runtime_state))
+
+    rollback(
+        base_dir=explicit_state,
+        actor="operator",
+        reason="isolation check",
+        reference="test",
+        quarantine=False,
+        set_mode=lambda mode, **kwargs: {},
+    )
+
+    assert (explicit_state / "deployment_rollout_state.json").is_file()
+    assert not (runtime_state / "deployment_rollout_state.json").exists()
+
+
+def test_canary_rerecord_enriches_metadata_without_duplicate_evidence(tmp_path):
+    payload = _analysis()
+    payload.pop("as_of")
+    record_production_canary(
+        base_dir=tmp_path,
+        synthesis=payload,
+        actor="operator",
+        reference="canary",
+    )
+    payload["as_of"] = "2026-08-19 14:09"
+
+    state = record_production_canary(
+        base_dir=tmp_path,
+        synthesis=payload,
+        actor="operator",
+        reference="canary",
+    )
+
+    assert len(state["production_canaries"]) == 1
+    assert state["production_canaries"][0]["analysis_as_of"] == "2026-08-19 14:09"
 
 
 def test_valid_analysis_preserves_risk_reducing_action():
