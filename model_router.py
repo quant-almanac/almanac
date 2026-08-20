@@ -62,6 +62,11 @@ MODEL_REGISTRY: dict[str, str] = {
     "deepseek_r":   "deepseek-reasoner",          # DeepSeek R1 推論モデル（V4 reasoner 出たら差替）
     "qwen":         "qwen2.5-72b-instruct",       # DashScope OpenAI 互換
     "gemini_flash": "gemini-flash-latest",        # google-genai (最新 flash stable alias)
+    # Groq. 旧 "llama-3.3-70b-versatile" は提供終了し、404 を返すようになった
+    # (2026-08-20 に Red Team の1枠が静かに欠落していた)。現行カタログで
+    # 同格の open-weight 大型は gpt-oss-120b。同カタログの qwen3.6-27b は
+    # <think> ブロックを吐き JSON 抽出に不利なため採らない。
+    "groq_open":    "openai/gpt-oss-120b",
 }
 
 # ベンダー判定：Anthropic SDK で叩くか、llm_adapters.py の外部 adapter で叩くか

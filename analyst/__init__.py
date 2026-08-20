@@ -2930,9 +2930,16 @@ def _analyze_redteam_multi(data: dict, shared_ctx: str = "",
         key = os.environ.get("GROQ_API_KEY", "")
         if not key:
             return {"attacks": [], "underutilized": []}
+        # モデル ID は model_router で一元管理する。ここに直書きすると
+        # 提供終了に気づけず、Red Team の枠が黙って減る。
+        try:
+            from model_router import MODEL_REGISTRY as _REG
+            _groq_model = _REG.get("groq_open", "openai/gpt-oss-120b")
+        except Exception:
+            _groq_model = "openai/gpt-oss-120b"
         return _call_openai_compat_redteam(
             base_url="https://api.groq.com/openai/v1",
-            api_key=key, model_id="llama-3.3-70b-versatile",
+            api_key=key, model_id=_groq_model,
             system=_SYSTEM, user=_USER,
         )
 
@@ -3018,6 +3025,23 @@ def _analyze_redteam_multi(data: dict, shared_ctx: str = "",
         print(f"  [RedTeam/{name}] タイムアウト: {_RT_TIMEOUT}s 超過 → スキップ")
         results[name] = {"attacks": [], "underutilized": []}
     _ex_rt.shutdown(wait=False)
+
+    # 稼働率を1行で出す。個々の失敗は上に出ているが、6枠中2枠しか動いて
+    # いない状態が数週間続いても、行ごとに散っていると気づけなかった
+    # (2026-08-20 時点で llama は提供終了404・qwen はクレジット不足402)。
+    # 反証の多様性そのものが Red Team の価値なので、欠けたら数字で言う。
+    _rt_live = sorted(n for n, r in results.items() if r.get("attacks"))
+    _rt_dead = sorted(n for n in providers if n not in _rt_live)
+    print(
+        f"  ⚔️ Red Team 稼働: {len(_rt_live)}/{len(providers)}"
+        + (f" (稼働: {', '.join(_rt_live)})" if _rt_live else "")
+        + (f" / 無応答: {', '.join(_rt_dead)}" if _rt_dead else "")
+    )
+    if len(_rt_live) * 2 < len(providers):
+        print(
+            "  ⚠️ Red Team の過半数が無応答です。反証の多様性が設計より落ちています"
+            " — モデルIDの提供終了・APIクレジット・キー設定を確認してください。"
+        )
 
     # マージ（ticker+action先頭20字で重複除去、最大12件）
     seen: set[str] = set()
@@ -11228,6 +11252,37 @@ def run_analysis(force: bool = False) -> dict:
     write_progress(0, 8, "📊 データ収集開始", "ポートフォリオ・シグナル・レジーム情報を読み込み中")
     print("📊 データ収集中…")
     data = gather_data()
+
+    # Phase 1B-3: 実行計画をレジーム確定後に組み直す。
+    #
+    # Phase 1B-2 の refresh は gather_data() より前に走る必要がある一方、
+    # 戦術現金目標 (cash_target_pct) を出す Market Regime v2 は gather_data()
+    # の中で初めて評価・永続化される。つまり前段の plan は必ず「1サイクル前の
+    # レジーム」を読んでいた。
+    #
+    # 通常は前日と同じ判定なので表面化しないが、レジーム評価が一度でも
+    # insufficient_component_coverage (status=review) で終わると、その残骸を
+    # 次回の plan が読んで cash_target が解決できず、配備予算が丸ごと 0 円に
+    # なる。現金が潤沢でも全ての買いが no_approved_discretionary_funding で
+    # 止まり、原因は plan の warnings にしか残らない。
+    #
+    # ここで組み直せば当日のレジームで評価され、LLM が読む予算文脈も揃う。
+    # 同日の再評価は _advance_scope が same_evaluation_date で確認カウンタを
+    # 進めないため、レジーム側のヒステリシスには影響しない。
+    try:
+        _plan_after_regime = _refresh_execution_plan_state()
+        if _plan_after_regime.get("ok"):
+            data["execution_plan"] = load_json(BASE_DIR / "execution_plan_state.json", {})
+            _before = _plan_refresh.get("remaining_normal_jpy")
+            _after = _plan_after_regime.get("remaining_normal_jpy")
+            if _before != _after:
+                print(
+                    "  🧭 execution_plan 再組成 (レジーム確定後): "
+                    f"remaining_normal ¥{int(_before or 0):,} → ¥{int(_after or 0):,}"
+                )
+    except Exception as _pre:
+        # 前段の plan が残るだけなので分析は続行できる。黙って落とさない。
+        print(f"  ⚠️ execution_plan 再組成スキップ: {_pre}")
 
     # The decorator issues one run-wide ID before refresh/gather/LLM work.
     # It remains distinct from decision_snapshot_id (the immutable input key).

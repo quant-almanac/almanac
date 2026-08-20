@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import json
 import math
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 
@@ -61,6 +61,7 @@ def _get_current_price_atr(ticker: str) -> dict:
             "bid": bid,
             "ask": ask,
             "spread_bps": round(spread_bps, 1) if spread_bps is not None else None,
+            "quote_as_of": datetime.now(timezone.utc).isoformat(),
         }
     except Exception:
         return {}
@@ -252,9 +253,19 @@ def re_evaluate(send_telegram: bool = False) -> dict:
             if any(ticker.startswith(p) for p in FUND_PREFIXES):
                 continue
             info = price_map.get(ticker) or {}
-            for key in ("spread_bps", "bid", "ask"):
+            for key in ("spread_bps", "bid", "ask", "quote_as_of"):
                 if info.get(key) is not None:
                     action[{"bid": "quote_bid", "ask": "quote_ask"}.get(key, key)] = info.get(key)
+            if (
+                info.get("bid") is not None
+                and info.get("ask") is not None
+                and not action.get("quote_as_of")
+            ):
+                # The quote was fetched in this re-evaluation pass.  Older
+                # adapters may not provide an explicit timestamp, but leaving
+                # it blank would falsely classify this freshly fetched pair as
+                # unverifiable downstream.
+                action["quote_as_of"] = datetime.now(timezone.utc).isoformat()
             if action.get("decision_price") is None and info.get("current_price") is not None:
                 action["decision_price"] = info.get("current_price")
             normalized = normalize_execution_explanation(action)

@@ -919,11 +919,13 @@ def test_ambiguous_holding_scope_blocks_execution(tmp_path):
 
 
 def test_low_urgency_market_order_is_blocked(tmp_path):
-    now = datetime(2026, 7, 14, 6, 0, tzinfo=JST)
+    # spread判定は米国場中でのみ意味を持つ (場外は session_closed で spread不明)
+    now = datetime(2026, 7, 14, 23, 30, tzinfo=JST)
     _write_base(tmp_path, now, ticker="ROBO")
     result = classify_execution_readiness({
         "ticker": "ROBO", "type": "sell", "urgency": "low", "order_type": "market",
         "decision_price": 82.96, "spread_bps": 408,
+        "quote_bid": 81.30, "quote_ask": 84.70, "quote_as_of": now.isoformat(),
     }, base_dir=tmp_path, now=now)
     assert result["execution_readiness"] == "blocked"
     codes = {row["code"] for row in result["execution_block_reasons"]}
@@ -932,11 +934,13 @@ def test_low_urgency_market_order_is_blocked(tmp_path):
 
 
 def test_limit_order_with_wide_spread_requires_review(tmp_path):
-    now = datetime(2026, 7, 14, 6, 0, tzinfo=JST)
+    # 同上: 広いspreadを「実際のコスト」として扱えるのは場中だけ
+    now = datetime(2026, 7, 14, 23, 30, tzinfo=JST)
     _write_base(tmp_path, now, ticker="ROBO")
     result = classify_execution_readiness({
         "ticker": "ROBO", "type": "sell", "urgency": "low", "order_type": "limit",
         "limit_price": 82.96, "decision_price": 82.96, "spread_bps": 408,
+        "quote_bid": 81.30, "quote_ask": 84.70, "quote_as_of": now.isoformat(),
         "amount_hint": "1株", "holding_shares_before": 10, "requested_sell_quantity": 1,
     }, base_dir=tmp_path, now=now)
     assert result["execution_readiness"] == "review"
@@ -1051,7 +1055,11 @@ def test_observe_plan_conflict_is_advisory_while_other_guards_still_block(tmp_pa
         row["code"] for row in rows[0]["execution_advisories"]
     }
     assert "market_order_low_urgency" in codes_4063
-    assert "market_order_spread_too_wide" in codes_robo
+    # ROBO は bid/ask を伴わない spread_bps だけを持つ。新しいクオート契約では
+    # spread の裏付けが取れないので spread_too_wide では止めない。板から外す
+    # 本質は低urgencyの成行禁止で、そこは変わらない。
+    assert "market_order_low_urgency" in codes_robo
+    assert "market_order_spread_too_wide" not in codes_robo
     assert sum(row["execution_readiness"] == "ready" for row in rows) == 0
 
 

@@ -376,21 +376,41 @@ def resolve_cash_target_policy(
         if isinstance(synthesis, dict):
             candidates.append(("ai_analysis.synthesis.market_regime_v2", synthesis.get("market_regime_v2")))
 
+    # 却下理由を残す。目標が解けないと配備予算が丸ごと0円になり全買いが
+    # 止まるが、以前は「確定できない」としか出ず、レジームが古いのか本当に
+    # 分類不能なのかを後から切り分けられなかった (2026-08-20)。
+    rejections: list[str] = []
     for source, candidate in candidates:
         if not isinstance(candidate, dict):
             continue
-        if str(candidate.get("mode") or "").lower() in {"off", "shadow"}:
+        mode = str(candidate.get("mode") or "").lower()
+        if mode in {"off", "shadow"}:
+            rejections.append(f"{source}:mode={mode}")
             continue
-        if str(candidate.get("status") or "").lower() in {"review", "error", "off"}:
+        status = str(candidate.get("status") or "").lower()
+        if status in {"review", "error", "off"}:
+            # status=review はレジーム側が insufficient_component_coverage 等で
+            # 判定を保留した状態。評価日も添えて、古い残骸か当日の保留かを示す。
+            evaluated_on = str(
+                (candidate.get("portfolio") or {}).get("evaluated_on")
+                or candidate.get("evaluated_at")
+                or ""
+            )[:10]
+            rejections.append(
+                f"{source}:status={status}" + (f"@{evaluated_on}" if evaluated_on else "")
+            )
             continue
         policy = candidate.get("policy")
         if not isinstance(policy, dict):
+            rejections.append(f"{source}:policy_missing")
             continue
         try:
             target = float(policy.get("cash_target_pct"))
         except (TypeError, ValueError):
+            rejections.append(f"{source}:cash_target_pct_invalid")
             continue
         if not math.isfinite(target) or not 0 <= target <= 100:
+            rejections.append(f"{source}:cash_target_pct_out_of_range={target}")
             continue
         return {
             "cash_target_pct": target,
@@ -410,6 +430,7 @@ def resolve_cash_target_policy(
         "portfolio_label": None,
         "portfolio_level": None,
         "shock_active": False,
+        "unresolved_reasons": rejections or ["no_regime_candidate_supplied"],
     }
 
 
@@ -577,7 +598,11 @@ def derive_budgets(
     dd_pacing_multiplier = 1.0
     if all_cash_is_surplus and cash_info.get("valid_for_budget"):
         if tactical_reserve is None:
-            warnings.append("cash_target_unresolved: confirmed cash not converted into deployment budget")
+            _why = ",".join(cash_target_policy.get("unresolved_reasons") or []) or "unknown"
+            warnings.append(
+                "cash_target_unresolved: confirmed cash not converted into deployment budget"
+                f" ({_why})"
+            )
         elif not deployment_horizon.get("resolved"):
             warnings.append("deployment_horizon_unresolved: ordinary deployment budget disabled")
         else:
@@ -669,6 +694,7 @@ def derive_budgets(
         "confirmed_cash_jpy": confirmed_cash,
         "cash_target_pct": cash_target_pct,
         "cash_target_source": cash_target_policy.get("source"),
+        "cash_target_unresolved_reasons": cash_target_policy.get("unresolved_reasons") or [],
         "cash_target_policy_version": cash_target_policy.get("policy_version"),
         "tactical_cash_reserve_jpy": tactical_reserve,
         "protected_cash_reserve_jpy": protected_reserve,
@@ -2729,9 +2755,16 @@ def build_execution_plan(
                 ),
             }
         elif budgets.get("cash_target_pct") is None:
+            # 「確定できない」だけでは、レジーム判定が古いのか当日保留なのかが
+            # 読めない。切り分けに要る理由コードをそのまま出す。
+            _unresolved = budgets.get("cash_target_unresolved_reasons") or []
+            _detail = f"（理由: {', '.join(_unresolved)}）" if _unresolved else ""
             funding_reason = {
                 "reason_code": "cash_target_unresolved",
-                "message": "相場別の戦術現金目標を確定できないため、新規配備枠を作成しません。",
+                "message": (
+                    "相場別の戦術現金目標を確定できないため、新規配備枠を作成しません。"
+                    + _detail
+                ),
             }
         elif _jpy(budgets.get("surplus_cash_above_targets_jpy")) <= 0:
             funding_reason = {

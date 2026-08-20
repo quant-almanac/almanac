@@ -168,13 +168,18 @@ def call_qwen(system: str, user: str, *,
             system=system, user=user, max_tokens=max_tokens, temperature=temperature,
             json_mode=json_mode, adapter_name="qwen_via_openrouter", request_timeout=request_timeout,
         )
-    # Fallback 2: Groq (Llama 3.1 70B — Qwen と同格の open-weight 大型)
+    # Fallback 2: Groq (Qwen と同格の open-weight 大型)
     groq_key = os.environ.get("GROQ_API_KEY", "")
     if groq_key:
+        try:
+            from model_router import MODEL_REGISTRY as _REG
+            _groq_model = _REG.get("groq_open", "openai/gpt-oss-120b")
+        except Exception:
+            _groq_model = "openai/gpt-oss-120b"
         return _retry_openai_compat(
             base_url="https://api.groq.com/openai/v1",
             api_key=groq_key,
-            model="llama-3.3-70b-versatile",
+            model=_groq_model,
             system=system, user=user, max_tokens=max_tokens, temperature=temperature,
             json_mode=json_mode, adapter_name="groq_llama_fallback", request_timeout=request_timeout,
         )

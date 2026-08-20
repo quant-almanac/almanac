@@ -46,10 +46,16 @@ MARKET_INDICES = ["SPY", "QQQ", "SOXX", "TLT", "IWM", "EEM", "FXI", "ITA", "SMH"
 # Fresh screener artifacts can introduce a new action ticker that is neither a
 # holding nor a scenario-playbook symbol.  If omitted here, execution readiness
 # necessarily blocks every such candidate as technical_data_missing.
+# screener.py の出力は US=screen_results.json (朝バッチは screen_results_morning.json)、
+# JP=screen_results_jp.json。"screen_results_us.json" を書く経路は存在せず、
+# load_json が既定値 {} を返すだけで米国スクリーナー候補が丸ごとテクニカル
+# 取得対象から漏れていた (2026-08-21 に JPM/VT の technical_data_missing を
+# 追って発覚)。欠落は例外にならないので、名前を間違えても誰も気づかない。
 CANDIDATE_UNIVERSE_FILES = (
     "margin_long_candidates.json",
     "short_candidates.json",
-    "screen_results_us.json",
+    "screen_results.json",
+    "screen_results_morning.json",
     "screen_results_jp.json",
     "pair_trade_candidates.json",
     "squeeze_candidates.json",
@@ -273,6 +279,10 @@ def _build_ticker_universe() -> list[str]:
         raise RuntimeError("failed to extract scenario action tickers for technical universe") from exc
 
     for filename in CANDIDATE_UNIVERSE_FILES:
+        # 名前を間違えても load_json は {} を返して黙って続行する。それが
+        # screen_results_us.json の欠落を長期間見えなくしていたので、
+        # 「候補ファイルが1つも実在しない」ときだけは声を出す。個々の
+        # 不在は正常 (その日スクリーナーが走っていないレーンもある)。
         payload = load_json(BASE_DIR / filename, {})
         rows = []
         if isinstance(payload, dict):
@@ -289,6 +299,13 @@ def _build_ticker_universe() -> list[str]:
                 ticker = str(row.get(key) or "").strip().upper()
                 if ticker and ticker not in SKIP_TICKERS and not is_pseudo_market_ticker(ticker):
                     tickers.add(ticker)
+    _present = [f for f in CANDIDATE_UNIVERSE_FILES if (BASE_DIR / f).exists()]
+    if not _present:
+        logger.warning(
+            "候補ユニバースのファイルが1つも見つかりません (%s) — "
+            "スクリーナー候補がテクニカル取得対象から漏れます",
+            ", ".join(CANDIDATE_UNIVERSE_FILES),
+        )
     return sorted(tickers)
 
 

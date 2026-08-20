@@ -5,6 +5,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 import json
+from market_quote_validation import validate_market_quote
 import re
 
 from macro_event_calendar import evaluate_macro_event_gate, load_macro_event_state
@@ -1375,7 +1376,39 @@ def classify_execution_readiness(
     is_fund = ticker_upper.startswith(FUND_PREFIXES)
     order_type = str(action.get("order_type") or "").lower()
     urgency = str(action.get("urgency") or "medium").lower()
-    spread = action.get("spread_bps")
+    quote_validation = validate_market_quote(action, now=now)
+    if quote_validation.get("status") == "invalid":
+        # A supplied but inconsistent quote must never be converted into a
+        # reassuring spread or a price-level explanation.  Keep an exit on the
+        # board for manual review, but block risk-increasing orders.
+        add(
+            "blocked" if risk_increasing else "review",
+            "market_quote_invalid",
+            str(quote_validation.get("message") or "注文用quoteを検証できない"),
+            quote_code=quote_validation.get("code"),
+            bid=quote_validation.get("bid"),
+            ask=quote_validation.get("ask"),
+        )
+        spread = None
+    elif quote_validation.get("status") == "session_closed":
+        # 取引所が時間外。板が薄く composite/last-trade が混ざるので、この
+        # spread は実際に発注する次のセッションのコストではない。行き先は
+        # 「spread不明」= 発注前に確認、であって「異常に広い」ではない。
+        # action 側の spread_bps も同じ時間外クオート由来なので拾い直さない。
+        add(
+            "review",
+            "market_quote_session_closed",
+            str(quote_validation.get("message") or "取引所が時間外のためspreadを検証できない"),
+            quote_code=quote_validation.get("code"),
+            bid=quote_validation.get("bid"),
+            ask=quote_validation.get("ask"),
+            observed_spread_bps=quote_validation.get("observed_spread_bps"),
+        )
+        spread = None
+    elif quote_validation.get("status") == "valid":
+        spread = quote_validation.get("spread_bps")
+    else:
+        spread = action.get("spread_bps")
     try:
         spread = float(spread) if spread is not None else None
     except (TypeError, ValueError):
@@ -1410,7 +1443,11 @@ def classify_execution_readiness(
         "execution_readiness": readiness,
         "execution_block_reasons": reasons,
         "execution_advisories": advisories,
+        "quote_validation": quote_validation,
     }
+    if quote_validation.get("status") in {"invalid", "session_closed"}:
+        # 時間外のspreadを執行判断の数値として下流へ流さない。
+        result["spread_bps"] = None
     if isinstance(cash_capacity_observation, dict):
         result["cash_capacity_observation"] = cash_capacity_observation
     if market_context is not None:

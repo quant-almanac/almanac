@@ -34,7 +34,10 @@ DEFAULT_PRICES_PER_MILLION = {
     #    実際の課金元が変わるため、0 が正しいのは全経路が無料枠である間だけ。
     # モデルIDは完全形で登録する。版が上がった新IDは意図的に未登録=None となり、
     # 「気づかないうちに 0 円計上される」のではなく欠落として表面化する。
+    # llama-3.3-70b-versatile は Groq が提供終了 (404)。過去ログの集計のため
+    # 登録は残す。現行の Groq 無料枠モデルは gpt-oss-120b。
     "llama-3.3-70b-versatile": {"input": 0.0, "output": 0.0},
+    "openai/gpt-oss-120b": {"input": 0.0, "output": 0.0},
     "qwen/qwen3-235b-a22b-2507": {"input": 0.0, "output": 0.0},
     "qwen/qwen-2.5-72b-instruct": {"input": 0.0, "output": 0.0},
     "gemini-flash-latest": {"input": 0.0, "output": 0.0},

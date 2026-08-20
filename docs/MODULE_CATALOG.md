@@ -41,7 +41,7 @@ The large orchestration implementation lives in the `analyst/` package; see §15
 | Lifecycle | Modules | Boundary |
 |---|---|---|
 | live | `action_stage_log.py`, `action_state_tracker.py`, `execution_invalidation.py` | Stage audit, action lifecycle and invalidation overlay |
-| live | `execution_readiness.py`, `execution_safety.py`, `execution_preflight.py`, `policy_engine.py` | Deterministic admission, freshness and signed pre-order safety gates |
+| live | `execution_readiness.py`, `execution_safety.py`, `execution_preflight.py`, `market_quote_validation.py`, `policy_engine.py` | Deterministic admission, freshness and signed pre-order safety gates. Quote validation checks a supplied bid/ask and reports whether the exchange was open when it was taken, so an after-hours spread never gates an order |
 | live | `feature_controls.py` | Runtime feature switches, effective-state reasons and fail-closed UI contract |
 | live | `order_intent_resolver.py`, `exit_sizing.py`, `execution_explanation.py`, `action_amounts.py` | Idempotent intent, deterministic quantity and structured amount display |
 | observe | `execution_plan_engine.py`, `execution_plan_observer.py`, `execution_quality.py` | Plan budgets, enforce-readiness evidence and implementation shortfall |

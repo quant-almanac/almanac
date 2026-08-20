@@ -41,7 +41,7 @@
 | Lifecycle | Modules | 境界 |
 |---|---|---|
 | live | `action_stage_log.py`, `action_state_tracker.py`, `execution_invalidation.py` | stage監査、action lifecycle、invalidation |
-| live | `execution_readiness.py`, `execution_safety.py`, `execution_preflight.py`, `policy_engine.py` | 決定論的採用、freshness、署名付き発注前安全gate |
+| live | `execution_readiness.py`, `execution_safety.py`, `execution_preflight.py`, `market_quote_validation.py`, `policy_engine.py` | 決定論的採用、freshness、署名付き発注前安全gate。クオート検証は bid/ask の整合性と取得時点の取引所セッションを判定し、時間外のspreadで発注を止めないようにする |
 | live | `feature_controls.py` | runtime機能switch、実効状態の理由、fail-closed UI contract |
 | live | `order_intent_resolver.py`, `exit_sizing.py`, `execution_explanation.py`, `action_amounts.py` | 冪等intent、決定論的数量、構造化金額表示 |
 | observe | `execution_plan_engine.py`, `execution_plan_observer.py`, `execution_quality.py` | plan budget、enforce readiness、shortfall |
