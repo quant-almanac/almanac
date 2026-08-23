@@ -234,3 +234,24 @@ def test_a_float_price_is_rounded_to_an_orderable_limit():
     # 表示と構造化フィールドが一致していること。
     assert "160.77" in action["action"]
     assert "160.77000427246094" not in action["action"]
+
+
+def test_a_price_that_rounds_to_zero_fails_closed_instead_of_dividing():
+    """丸めた結果が 0 になる価格でゼロ除算しないこと。
+
+    price_value <= 0 の検査は丸める前の値しか見ていないので、
+    丸めを入れたことで 0 < price < 0.005 が新たにゼロ除算経路になった。
+    generate_candidate は分析の実行中に呼ばれるため、ここで落ちると
+    その日の分析ごと巻き込む。
+    """
+    action, observation = generate_candidate(
+        execution_plan=_plan(),
+        policy_observation=_policy(),
+        route_config=_route(),
+        price=0.004,
+        fx_rate_usdjpy=150,
+        now=datetime(2026, 8, 19, tzinfo=timezone.utc),
+    )
+
+    assert action is None
+    assert observation["status"] == "price_or_fx_unresolved"

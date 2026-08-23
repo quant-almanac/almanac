@@ -260,3 +260,73 @@ def test_the_freshness_score_falls_back_to_the_file_without_an_attestation(tmp_p
 
     assert "VERY_STALE holdings" in text
     assert "attested" not in text
+
+
+def test_an_attestation_does_not_survive_an_unapplied_execution(tmp_path, monkeypatch):
+    """本題: attest 済みでも未反映の約定があれば fresh を名乗らないこと。
+
+    表明は「表明した時点の内容」しか保証しない。壁時計で止めない設計にした
+    代わりに置いた唯一の停止条件が divergence なので、attestation を見る
+    経路は必ず divergence も見なければならない。
+    analysis_snapshot は _provenance_for_file(diverged=...) で持っているが、
+    鮮度スコア側に同じ条件が無いと、そこだけ fail-open になる。
+    """
+    import os
+    from pathlib import Path
+
+    import analyst
+
+    stale = datetime.now() - timedelta(hours=127)
+    holdings = tmp_path / "holdings.json"
+    _write(holdings, {"AAPL": {"ticker": "AAPL", "shares": 10}})
+    os.utime(holdings, (stale.timestamp(), stale.timestamp()))
+    monkeypatch.setattr(analyst, "BASE_DIR", Path(tmp_path))
+    hf.record_attestation(scope="holdings", base_dir=tmp_path, actor="user")
+
+    monkeypatch.setattr(
+        hf, "holdings_divergence",
+        lambda **kwargs: {"diverged": True, "unapplied": [{"ticker": "AAPL"}], "unresolved": []},
+    )
+    diverged_text = analyst._compute_data_freshness()
+
+    assert "holdings(diverged)" in diverged_text
+    assert "VERY_STALE holdings" in diverged_text
+    assert "holdings(attested)" not in diverged_text
+
+    monkeypatch.setattr(
+        hf, "holdings_divergence",
+        lambda **kwargs: {"diverged": False, "unapplied": [], "unresolved": []},
+    )
+    clean_text = analyst._compute_data_freshness()
+
+    assert "holdings(attested)" in clean_text
+    assert "VERY_STALE holdings" not in clean_text
+
+
+def test_the_freshness_score_and_the_snapshot_agree_on_divergence(tmp_path, monkeypatch):
+    """2経路が同じ停止条件を持つこと（権威の一致）。"""
+    import os
+    from pathlib import Path
+
+    import analysis_snapshot as asn
+    import analyst
+
+    stale = datetime.now() - timedelta(hours=127)
+    holdings = tmp_path / "holdings.json"
+    _write(holdings, {"AAPL": {"ticker": "AAPL", "shares": 10}})
+    os.utime(holdings, (stale.timestamp(), stale.timestamp()))
+    _write(tmp_path / "account.json", {"last_updated": stale.isoformat()})
+    monkeypatch.setattr(analyst, "BASE_DIR", Path(tmp_path))
+    hf.record_attestation(scope="holdings", base_dir=tmp_path, actor="user")
+
+    diverged = {"diverged": True, "unapplied": [{"ticker": "AAPL"}], "unresolved": []}
+    # 両経路とも呼び出し時に holdings_freshness から import するので、
+    # 元モジュール側を差し替えれば双方に効く。
+    monkeypatch.setattr(hf, "holdings_divergence", lambda **kwargs: diverged)
+
+    snap = asn.build_base_snapshot(base_dir=tmp_path, now=datetime.now())
+    score_text = analyst._compute_data_freshness()
+
+    assert snap.holdings.freshness_status == "stale"
+    assert "(diverged)" in snap.holdings.source
+    assert "VERY_STALE holdings" in score_text

@@ -217,6 +217,11 @@ def generate_candidate(
     # 見えていたため、構造化フィールドの側だけ気付かれずに残っていた)。
     # USD株は1セント刻み、JPY建ては本モジュールの価格帯では1円刻み。
     price_value = round(price_value, 2 if route_currency == "USD" else 0)
+    # 丸めで 0 になりうる (JPY 0.4円 / USD 0.004ドル)。上の price_value <= 0 は
+    # 丸める前の値しか見ていないので、ここで測り直さないと下の
+    # amount_cap / unit_jpy がゼロ除算で分析ごと落ちる。
+    if price_value <= 0:
+        return None, {**observation, "status": "price_or_fx_unresolved", "route_id": route.get("route_id")}
 
     budgets = plan.get("budgets") if isinstance(plan.get("budgets"), dict) else {}
     available_jpy = _number(wallet.get("available_after_all_reservations_jpy"))

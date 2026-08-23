@@ -1327,8 +1327,20 @@ def _compute_data_freshness() -> str:
                         base_dir=BASE_DIR,
                     )
                     if origin == "attestation" and effective is not None:
-                        age_h = max(0.0, (now - effective).total_seconds() / 3600)
-                        label = f"{label}(attested)"
+                        # 表明は「表明した時点の内容」しか保証しない。その後に
+                        # 記録された約定が holdings へ未反映なら、attest 済みを
+                        # 理由に fresh を名乗ってはならない。analysis_snapshot が
+                        # _provenance_for_file(diverged=...) で同じ停止条件を
+                        # 持っているので、権威を揃える。ここを落とすと、
+                        # 「壁時計では止めない」設計と引き換えに置いた唯一の
+                        # 停止条件がこの経路にだけ存在しないことになる。
+                        from holdings_freshness import holdings_divergence
+
+                        if holdings_divergence(base_dir=BASE_DIR).get("diverged"):
+                            label = f"{label}(diverged)"
+                        else:
+                            age_h = max(0.0, (now - effective).total_seconds() / 3600)
+                            label = f"{label}(attested)"
                 except Exception:
                     pass
 
