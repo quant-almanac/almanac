@@ -95,6 +95,61 @@ def portfolio_snapshot_health(base_dir: Path, *, now: datetime) -> dict:
     }
 
 
+# 「この銘柄には流動性・売買単位の裏付けがある」と言える候補ファイル。
+#
+# technical_signals.CANDIDATE_UNIVERSE_FILES と意図的に一致させない。
+# あちらは「テクニカルを取得すべき対象か」の集合で、
+# proposed_ticker_candidates.json (AI/決定論レーンが名指ししただけの銘柄) を
+# 含む。ここで必要なのは「screener.py の ADV・価格フィルタを通ったか」という
+# 別の証拠なので、レジストリを裏付けとして数えてはならない。数えると
+# first_time_symbol が狙った銘柄でだけ黙る。
+#
+# 重い import を安全ゲートへ持ち込まないため名前だけ複製する。
+# 乖離は tests/test_execution_readiness.py が検出する。
+_LIQUIDITY_EVIDENCE_FILES = (
+    "margin_long_candidates.json",
+    "short_candidates.json",
+    "screen_results.json",
+    "screen_results_morning.json",
+    "screen_results_jp.json",
+    "pair_trade_candidates.json",
+    "squeeze_candidates.json",
+)
+
+
+def _symbol_has_liquidity_evidence(base_dir: Path, ticker: str) -> bool:
+    """保有実績かスクリーナー通過のどちらかがあるか。
+
+    どちらも無い銘柄は、売買単位も出来高も本システムが一度も検証していない。
+    """
+    if not ticker:
+        return True  # 判定材料が無いなら黙る (fail-open: これは助言であって門ではない)
+    target = ticker.strip().upper()
+    holdings = _load_json_object(base_dir / "holdings.json") or {}
+    for key, row in holdings.items():
+        if str(key).strip().upper() == target:
+            return True
+        if isinstance(row, dict) and str(row.get("ticker") or "").strip().upper() == target:
+            return True
+    for filename in _LIQUIDITY_EVIDENCE_FILES:
+        payload = _load_json_object(base_dir / filename)
+        rows: list = []
+        if isinstance(payload, dict):
+            for key in ("candidates", "all_candidates", "passed", "picks"):
+                value = payload.get(key)
+                if isinstance(value, list):
+                    rows.extend(value)
+        elif isinstance(payload, list):
+            rows = payload
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            for key in ("ticker", "symbol", "long_ticker", "short_ticker"):
+                if str(row.get(key) or "").strip().upper() == target:
+                    return True
+    return False
+
+
 def _technical_entry(base_dir: Path, ticker: str) -> dict | None:
     try:
         raw = json.loads((base_dir / "technical_state.json").read_text(encoding="utf-8"))
@@ -1327,6 +1382,28 @@ def classify_execution_readiness(
                 "口座・保有スナップショットが不足・不完全です",
                 **snapshot,
             )
+
+        # 一度も保有せず、スクリーナーも通っていない銘柄。ready までの経路に
+        # 流動性・出来高・売買単位の検証は存在しないので、readiness は変えずに
+        # 発注する人間の目の前へ出すだけにする (advisories は reasons と別リストで
+        # _merge を通らない)。テクニカル行が揃えば ready に到達しうる設計は
+        # 意図どおりで、ここで止めると「AI提案であること自体のペナルティ」に
+        # なってしまう。
+        if not ticker.startswith(FUND_PREFIXES) and not _symbol_has_liquidity_evidence(
+            base_dir, ticker
+        ):
+            from instrument_metadata import trading_unit_for_ticker
+
+            advisories.append({
+                "code": "first_time_symbol",
+                "message": (
+                    f"{ticker} は保有実績もスクリーナー通過も無い初回銘柄です。"
+                    "売買単位と板の厚み（出来高・スプレッド）を発注前に確認してください"
+                ),
+                # 未登録の .T は 100 が既定値として返るだけで、JPX ETF では
+                # 誤りうる (1489.T=1 / 1306.T=10)。想定値だと明示して出す。
+                "trading_unit_assumed": trading_unit_for_ticker(ticker),
+            })
 
         if not ticker.startswith(FUND_PREFIXES):
             tech = _technical_entry(base_dir, ticker)

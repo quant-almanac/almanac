@@ -491,3 +491,39 @@ def test_nisa_capacity_uses_route_overlay_and_fails_closed_when_stale(tmp_path) 
         reason["code"] == "nisa_capacity_unattributed_activity"
         for reason in stale["reasons"]
     )
+
+
+def test_an_all_day_closed_exchange_still_reports_a_session_state():
+    """終日休場でも session_state を返すこと。
+
+    market_quote_validation._session_state() はこのキーだけを見て
+    「そのクオートは板が立っている時刻のものか」を判定する。
+    trading_day 分岐にしか session_state が無かった間、週末と祝日は
+    None に落ちて時間外の spread がそのまま執行ゲートへ渡っていた。
+    月曜朝の分析 (日曜17時ET) が毎回それに当たる。
+    """
+    from datetime import datetime
+
+    # 日曜 17:16 ET = 月曜朝の分析が見る時刻。NYSE は終日休場。
+    weekend = market_session_context("AVGO", datetime.fromisoformat("2026-08-24T06:16:41+09:00"))
+    assert weekend["status"] == "closed"
+    assert weekend["session_state"] == "closed"
+
+    # 平日引け後は従来どおり trading_day 側で closed を返す。
+    weekday = market_session_context("AVGO", datetime.fromisoformat("2026-08-25T06:16:41+09:00"))
+    assert weekday["status"] == "trading_day"
+    assert weekday["session_state"] == "closed"
+
+
+def test_an_unresolvable_exchange_does_not_claim_a_session_state():
+    """判定できないときに closed を騙らないこと。
+
+    unresolved は「開いていたか分からない」であって「閉まっていた」ではない。
+    ここで closed を返すと、カレンダーを引けないだけで spread 検証が
+    黙って無効になる。
+    """
+    from datetime import datetime
+
+    context = market_session_context("SLIM_SP500", datetime.fromisoformat("2026-08-24T06:16:41+09:00"))
+    assert context["status"] == "unresolved"
+    assert "session_state" not in context

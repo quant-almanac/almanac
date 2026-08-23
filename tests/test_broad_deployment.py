@@ -209,3 +209,28 @@ def test_explicit_base_dir_wins_over_process_state_redirect(tmp_path, monkeypatc
 
     assert action is None
     assert observation["status"] == "route_missing"
+
+
+def test_a_float_price_is_rounded_to_an_orderable_limit():
+    """本題: 証券会社が受け付けられる刻みで指値を出すこと。
+
+    2026-08-24 の本番出力に limit_price=160.77000427246094 が出ていた。
+    price は parquet/yfinance 由来の float なのでそのまま渡していたのが原因。
+    人間が読む action 文だけは :g 書式で "160.77" に見えており、
+    構造化フィールドの側だけ気付かれずに残っていた。
+    """
+    action, observation = generate_candidate(
+        execution_plan=_plan(),
+        policy_observation=_policy(),
+        route_config=_route(),
+        price=160.77000427246094,
+        fx_rate_usdjpy=150,
+        now=datetime(2026, 8, 19, tzinfo=timezone.utc),
+    )
+
+    assert observation["status"] == "candidate_generated"
+    assert action["limit_price"] == 160.77
+    assert action["decision_price"] == 160.77
+    # 表示と構造化フィールドが一致していること。
+    assert "160.77" in action["action"]
+    assert "160.77000427246094" not in action["action"]

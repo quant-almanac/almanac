@@ -1249,6 +1249,16 @@ def _ensure_macro_event_state_fresh(
     return True
 
 
+# 鮮度スコアの対象ファイルのうち、attestation で「中身は確認済み」と表明
+# できるもの。holdings_freshness.ATTESTABLE_SCOPES と対応する。
+# 証券会社CSVの取込でしか mtime が動かないファイルはこれが無いと恒久的に
+# VERY_STALE になる。
+_FRESHNESS_ATTESTATION_SCOPES = {
+    "holdings.json": "holdings",
+    "account.json": "cash",
+}
+
+
 def _compute_data_freshness() -> str:
     """
     各データソースのタイムスタンプを検査し、鮮度スコアとOpus注入用テキストを生成。
@@ -1298,6 +1308,29 @@ def _compute_data_freshness() -> str:
             )
             if age_h is None:
                 continue
+
+            # 内容ハッシュ束縛の attestation は「ファイルの mtime は古いが、
+            # 中身が現時点の口座と一致することを本人が確認した」という表明。
+            # analysis_snapshot はこれを見て provenance を fresh にするのに、
+            # この鮮度スコアは holdings.json の mtime を直読みしていたため、
+            # attest 済みでも "❌ VERY_STALE holdings: 127h前" を LLM へ渡し、
+            # 事実でない警告と不要な urgency 抑制を生んでいた。
+            # 権威を両経路で揃える。読めなければ従来どおりファイル基準。
+            scope = _FRESHNESS_ATTESTATION_SCOPES.get(fname)
+            if scope:
+                try:
+                    from holdings_freshness import effective_source_as_of
+
+                    effective, origin = effective_source_as_of(
+                        scope=scope,
+                        file_as_of=now - timedelta(hours=age_h),
+                        base_dir=BASE_DIR,
+                    )
+                    if origin == "attestation" and effective is not None:
+                        age_h = max(0.0, (now - effective).total_seconds() / 3600)
+                        label = f"{label}(attested)"
+                except Exception:
+                    pass
 
             try:
                 freshness = max(0.0, 1.0 - age_h / stale_h)

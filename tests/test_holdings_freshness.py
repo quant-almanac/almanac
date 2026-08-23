@@ -207,3 +207,56 @@ def test_screening_status_takes_the_worst_per_file_status(tmp_path):
 
     snap = asn.build_base_snapshot(base_dir=tmp_path, now=now)
     assert snap.screening.freshness_status == "stale"
+
+
+def test_the_freshness_score_honours_an_attestation(tmp_path, monkeypatch):
+    """本題: attest したのに鮮度スコアが VERY_STALE のままにならないこと。
+
+    2026-08-24 の実測: 本人が holdings_freshness.py attest を実行し、
+    analysis_snapshot の provenance は holdings(attested)/fresh になったのに、
+    analyst._compute_data_freshness は holdings.json の mtime を直読みしていた
+    ため "❌ VERY_STALE holdings: 127h前" を出し続け、その文字列が LLM の
+    プロンプトへ入って urgency を不必要に抑制していた。
+    権威が2経路で食い違っていたのが原因。
+    """
+    import os
+    from pathlib import Path
+
+    import analyst
+
+    stale = datetime.now() - timedelta(hours=127)
+    holdings = tmp_path / "holdings.json"
+    _write(holdings, {"AAPL": {"ticker": "AAPL", "shares": 1}})
+    os.utime(holdings, (stale.timestamp(), stale.timestamp()))
+    _write(tmp_path / "account.json", {"last_updated": stale.isoformat()})
+    monkeypatch.setattr(analyst, "BASE_DIR", Path(tmp_path))
+
+    before = analyst._compute_data_freshness()
+    assert "VERY_STALE holdings" in before
+
+    hf.record_attestation(scope="holdings", base_dir=tmp_path, actor="user")
+    hf.record_attestation(scope="cash", base_dir=tmp_path, actor="user")
+    after = analyst._compute_data_freshness()
+
+    assert "VERY_STALE holdings" not in after
+    assert "holdings(attested)" in after
+    assert "account_cash(attested)" in after
+
+
+def test_the_freshness_score_falls_back_to_the_file_without_an_attestation(tmp_path, monkeypatch):
+    """attestation が無ければ従来どおりファイル基準のままであること。"""
+    import os
+    from pathlib import Path
+
+    import analyst
+
+    stale = datetime.now() - timedelta(hours=127)
+    holdings = tmp_path / "holdings.json"
+    _write(holdings, {"AAPL": {"ticker": "AAPL", "shares": 1}})
+    os.utime(holdings, (stale.timestamp(), stale.timestamp()))
+    monkeypatch.setattr(analyst, "BASE_DIR", Path(tmp_path))
+
+    text = analyst._compute_data_freshness()
+
+    assert "VERY_STALE holdings" in text
+    assert "attested" not in text

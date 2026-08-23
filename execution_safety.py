@@ -621,6 +621,14 @@ def market_session_context(ticker: object, when: datetime) -> dict:
             "local_date": local_date.isoformat(),
             "reason": "exchange_closed_local_date",
             "source": "pandas_market_calendars",
+            # 終日休場も「その時刻に板が立っていなかった」ことに変わりはない。
+            # market_quote_validation._session_state() はこのキーだけを見て
+            # 時間外クオートを判定するので、trading_day 分岐にしか
+            # session_state が無いと、週末と祝日だけ判定が None に落ちて
+            # 時間外の spread が執行ゲートへ流れていた (月曜朝の分析が
+            # 毎回それに当たる)。判定不能な unresolved 系とは違い、ここは
+            # 「閉まっていた」と確定できる。
+            "session_state": "closed",
         }
         if not future.empty:
             next_open = future.iloc[0]["market_open"].to_pydatetime()

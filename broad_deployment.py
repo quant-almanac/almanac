@@ -211,6 +211,12 @@ def generate_candidate(
     fx = _number(fx_rate_usdjpy)
     if price_value <= 0 or (route_currency == "USD" and not 50 < fx < 500):
         return None, {**observation, "status": "price_or_fx_unresolved", "route_id": route.get("route_id")}
+    # 発注可能な刻みへ丸める。price は parquet/yfinance 由来の float なので
+    # そのまま渡すと limit_price が 160.77000427246094 のような値になり、
+    # 証券会社が受け付けない (人間が読む action 文だけは :g で 160.77 に
+    # 見えていたため、構造化フィールドの側だけ気付かれずに残っていた)。
+    # USD株は1セント刻み、JPY建ては本モジュールの価格帯では1円刻み。
+    price_value = round(price_value, 2 if route_currency == "USD" else 0)
 
     budgets = plan.get("budgets") if isinstance(plan.get("budgets"), dict) else {}
     available_jpy = _number(wallet.get("available_after_all_reservations_jpy"))

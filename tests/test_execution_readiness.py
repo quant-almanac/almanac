@@ -1246,3 +1246,151 @@ def test_the_coverage_marker_does_not_change_the_verdict(tmp_path):
     with_marker = classify_execution_readiness(_buy(), base_dir=tmp_path, now=now)
 
     assert with_marker == without
+
+
+# ---------------------------------------------------------------------------
+# first_time_symbol: 初回銘柄の非ブロック助言。
+#
+# ready から発注板までの経路に流動性・出来高・売買単位の検証は存在しない。
+# 一度も保有せずスクリーナーも通っていない銘柄は、単元も板の厚みも
+# 本システムが検証していないまま ready に到達しうる (2026-08-24 に VT が
+# 実際にそうなった)。readiness は変えずに、発注する人間へ出すだけにする。
+# ---------------------------------------------------------------------------
+
+def _advisory_codes(result):
+    return {row["code"] for row in result["execution_advisories"]}
+
+
+def test_a_symbol_with_no_holding_and_no_screener_pass_is_flagged(tmp_path):
+    now = datetime(2026, 7, 14, 6, 0, tzinfo=JST)
+    _write_base(tmp_path, now)
+    _write_technical(tmp_path, "MDB")
+
+    result = classify_execution_readiness(
+        {"ticker": "MDB", "type": "buy", "order_type": "limit", "limit_price": 210},
+        base_dir=tmp_path, now=now,
+    )
+
+    assert "first_time_symbol" in _advisory_codes(result)
+    row = next(r for r in result["execution_advisories"] if r["code"] == "first_time_symbol")
+    assert row["trading_unit_assumed"] == 1
+
+
+def test_a_held_symbol_is_not_flagged(tmp_path):
+    now = datetime(2026, 7, 14, 6, 0, tzinfo=JST)
+    _write_base(tmp_path, now)
+    (tmp_path / "holdings.json").write_text(
+        json.dumps({"XLF_NISA": {"ticker": "XLF", "shares": 10}}), encoding="utf-8")
+
+    result = classify_execution_readiness(
+        {"ticker": "XLF", "type": "buy", "order_type": "limit", "limit_price": 55},
+        base_dir=tmp_path, now=now,
+    )
+
+    assert "first_time_symbol" not in _advisory_codes(result)
+
+
+def test_a_screener_candidate_is_not_flagged(tmp_path):
+    """screener.py の ADV・価格フィルタを通っていれば流動性の裏付けがある。"""
+    now = datetime(2026, 7, 14, 6, 0, tzinfo=JST)
+    _write_base(tmp_path, now)
+    _write_technical(tmp_path, "MRNA")
+    (tmp_path / "screen_results.json").write_text(
+        json.dumps({"candidates": [{"ticker": "MRNA"}]}), encoding="utf-8")
+
+    result = classify_execution_readiness(
+        {"ticker": "MRNA", "type": "buy", "order_type": "limit", "limit_price": 210},
+        base_dir=tmp_path, now=now,
+    )
+
+    assert "first_time_symbol" not in _advisory_codes(result)
+
+
+def test_the_proposal_registry_is_not_liquidity_evidence(tmp_path):
+    """本題: レジストリ登録を裏付けとして数えないこと。
+
+    proposed_ticker_candidates.json は「テクニカルを取りに行った銘柄」の
+    記録であって、ADV や板の厚みを一度も見ていない。これを裏付けに数えると
+    first_time_symbol が狙った銘柄でだけ黙る (補完が動いた翌日から
+    永久に警告が出なくなる)。
+    """
+    now = datetime(2026, 7, 14, 6, 0, tzinfo=JST)
+    _write_base(tmp_path, now)
+    _write_technical(tmp_path, "VT")
+    (tmp_path / "proposed_ticker_candidates.json").write_text(
+        json.dumps({"version": 1, "candidates": [{"ticker": "VT"}]}), encoding="utf-8")
+
+    result = classify_execution_readiness(
+        {"ticker": "VT", "type": "buy", "order_type": "limit", "limit_price": 160.77},
+        base_dir=tmp_path, now=now,
+    )
+
+    assert "first_time_symbol" in _advisory_codes(result)
+
+
+def test_the_advisory_never_changes_readiness(tmp_path):
+    """advisories は reasons と別リストで _merge を通らない。
+
+    「AI提案であること自体にペナルティを設けない」方針の実行可能な形。
+    """
+    now = datetime(2026, 7, 14, 6, 0, tzinfo=JST)
+    _write_base(tmp_path, now)
+    _write_technical(tmp_path, "MDB")
+    action = {"ticker": "MDB", "type": "buy", "order_type": "limit", "limit_price": 210}
+
+    flagged = classify_execution_readiness(action, base_dir=tmp_path, now=now)
+    assert "first_time_symbol" in _advisory_codes(flagged)
+
+    # 同じ銘柄をスクリーナー通過済みにすると助言だけが消え、判定は不変。
+    (tmp_path / "screen_results.json").write_text(
+        json.dumps({"candidates": [{"ticker": "MDB"}]}), encoding="utf-8")
+    unflagged = classify_execution_readiness(action, base_dir=tmp_path, now=now)
+
+    assert "first_time_symbol" not in _advisory_codes(unflagged)
+    assert flagged["execution_readiness"] == unflagged["execution_readiness"]
+    assert flagged["execution_block_reasons"] == unflagged["execution_block_reasons"]
+
+
+def test_a_sell_is_not_flagged(tmp_path):
+    """リスク非増加の売りに初回警告は要らない。"""
+    now = datetime(2026, 7, 14, 6, 0, tzinfo=JST)
+    _write_base(tmp_path, now)
+
+    result = classify_execution_readiness(
+        {"ticker": "MDB", "type": "sell", "order_type": "limit", "limit_price": 210},
+        base_dir=tmp_path, now=now,
+    )
+
+    assert "first_time_symbol" not in _advisory_codes(result)
+
+
+def test_an_unlisted_jpx_symbol_surfaces_the_assumed_unit(tmp_path):
+    """未登録の .T は 100 が既定で返る。1489.T=1 / 1306.T=10 なので誤りうる。"""
+    now = datetime(2026, 7, 14, 6, 0, tzinfo=JST)
+    _write_base(tmp_path, now)
+    _write_technical(tmp_path, "7203.T")
+
+    result = classify_execution_readiness(
+        {"ticker": "7203.T", "type": "buy", "order_type": "limit", "limit_price": 3100},
+        base_dir=tmp_path, now=now,
+    )
+
+    row = next(r for r in result["execution_advisories"] if r["code"] == "first_time_symbol")
+    assert row["trading_unit_assumed"] == 100
+
+
+def test_liquidity_evidence_files_stay_aligned_with_the_universe_sources():
+    """名前を複製している以上、乖離を検出できるようにしておく。
+
+    technical_signals 側に screener レーンが増えたのにこちらへ追随しないと、
+    その銘柄が永久に初回扱いになる。逆にレジストリを取り込むと警告が黙る。
+    """
+    import execution_readiness as er
+    import technical_signals as ts
+
+    universe = set(ts.CANDIDATE_UNIVERSE_FILES)
+    evidence = set(er._LIQUIDITY_EVIDENCE_FILES)
+
+    assert evidence <= universe
+    # 意図的に除外しているのはレジストリだけ。
+    assert universe - evidence == {"proposed_ticker_candidates.json"}
