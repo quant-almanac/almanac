@@ -1159,3 +1159,90 @@ def test_capacity_below_minimum_is_blocked_with_dedicated_reason(tmp_path):
     )
     assert reason["capacity_shortfall_jpy"] == 35_000
     assert "必要余力差額" in reason["message"]
+
+
+# ---------------------------------------------------------------------------
+# 実行内テクニカル補完 (technical_signals.ensure_technical_coverage) が
+# 書いた行に対するゲートの振る舞い。
+#
+# 補完の目的は「取得の網羅漏れによる誤検知」だけを消すことで、ゲートの強度は
+# 一切下げない。以下は下げていないことの検証。
+# ---------------------------------------------------------------------------
+
+def _write_technical(tmp_path, ticker, **fields):
+    row = {
+        "price": 210.0,
+        "data_as_of": "2026-07-13",
+        "freshness_status": "fresh",
+        "data_quality_status": "ok",
+    }
+    row.update(fields)
+    (tmp_path / "technical_state.json").write_text(
+        json.dumps({"tickers": {ticker: row}}), encoding="utf-8")
+
+
+def _technical_codes(result):
+    return {row["code"] for row in result["execution_block_reasons"]
+            if str(row.get("code", "")).startswith("technical_")}
+
+
+def _buy(ticker="JPM"):
+    return {"ticker": ticker, "type": "buy", "order_type": "limit", "limit_price": 210}
+
+
+def test_a_topped_up_row_clears_technical_data_missing(tmp_path):
+    """補完が入る前は必ず blocked、入った後は技術的理由が消えること。"""
+    now = datetime(2026, 7, 14, 6, 0, tzinfo=JST)
+    _write_base(tmp_path, now)  # XLF の行だけがある = JPM は行なし
+
+    before = classify_execution_readiness(_buy(), base_dir=tmp_path, now=now)
+    assert "technical_data_missing" in _technical_codes(before)
+
+    _write_technical(tmp_path, "JPM", coverage_source="topup",
+                     coverage_added_at=now.isoformat())
+    after = classify_execution_readiness(_buy(), base_dir=tmp_path, now=now)
+
+    assert _technical_codes(after) == set()
+
+
+def test_a_topped_up_row_with_blocked_quality_is_still_blocked(tmp_path):
+    now = datetime(2026, 7, 14, 6, 0, tzinfo=JST)
+    _write_base(tmp_path, now)
+    _write_technical(tmp_path, "JPM", coverage_source="topup",
+                     data_quality_status="blocked",
+                     data_quality_reasons=[{"code": "unadjusted_price_discontinuity"}])
+
+    result = classify_execution_readiness(_buy(), base_dir=tmp_path, now=now)
+
+    assert result["execution_readiness"] == "blocked"
+    assert "technical_data_degraded" in _technical_codes(result)
+
+
+def test_a_topped_up_row_that_is_stale_is_still_blocked(tmp_path):
+    """古い parquet しか無い銘柄は補完しても blocked のまま。"""
+    now = datetime(2026, 7, 14, 6, 0, tzinfo=JST)
+    _write_base(tmp_path, now)
+    _write_technical(tmp_path, "JPM", coverage_source="topup", freshness_status="stale")
+
+    result = classify_execution_readiness(_buy(), base_dir=tmp_path, now=now)
+
+    assert result["execution_readiness"] == "blocked"
+    assert "technical_data_stale" in _technical_codes(result)
+
+
+def test_the_coverage_marker_does_not_change_the_verdict(tmp_path):
+    """AI 提案であること自体にペナルティも優遇も設けない (方針①)。
+
+    マーカーは監査専用で、判定は朝の再計算が作った行と1ビットも変わらない。
+    """
+    now = datetime(2026, 7, 14, 6, 0, tzinfo=JST)
+    _write_base(tmp_path, now)
+
+    _write_technical(tmp_path, "JPM")
+    without = classify_execution_readiness(_buy(), base_dir=tmp_path, now=now)
+
+    _write_technical(tmp_path, "JPM", coverage_source="topup",
+                     coverage_added_at=now.isoformat())
+    with_marker = classify_execution_readiness(_buy(), base_dir=tmp_path, now=now)
+
+    assert with_marker == without

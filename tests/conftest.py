@@ -29,6 +29,29 @@ def _isolate_llm_call_log(tmp_path, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _block_technical_ohlcv_fetch(monkeypatch):
+    """technical_signals の価格取得を既定でネットワークから切り離す。
+
+    隔離コピーには technical_state.json がそのまま入っている (rsync の除外に
+    無い) ため、ensure_technical_coverage は "ベース state 不在" で早期終了
+    せず本当に取得へ進む。tests/test_phase1_post_filter.py は
+    _phase1_post_filter を 77 回呼ぶが base_dir を渡すのは 2 回だけで、残り
+    75 回は analyst.BASE_DIR (= このチェックアウトのルート) を state_dir に
+    する。差し替えが無いと、その 75 回がそのまま yfinance への実アクセスに
+    なる。
+
+    専用テストは自前の fake を monkeypatch で被せて opt-in する (後勝ちで
+    このスタブを上書きし、teardown で両方戻る)。
+    """
+    try:
+        import technical_signals
+    except Exception:
+        return None
+    monkeypatch.setattr(technical_signals, "_load_ohlcv", lambda tickers: {})
+    return None
+
+
+@pytest.fixture(autouse=True)
 def _isolate_action_stage_log(tmp_path, monkeypatch):
     """The stage ledger ignores ALMANAC_STATE_DIR, so isolate it explicitly."""
     import action_stage_log
@@ -75,6 +98,12 @@ PROTECTED_STATE = (
     "models/ginn_model.pt", "models/ginn_meta.json", "models/ginn/current.json",
     "data/tax_harvest_reports.jsonl",
     "data/short_universe.json", "beliefs/agent_beliefs.json",
+    # technical_state.json / proposed_ticker_candidates.json は
+    # ensure_technical_coverage が read-modify-write する唯一の対象。
+    # pytest_sessionstart が本番 ROOT を拒否するので「本番へ漏れる」経路は
+    # 元から無いが、ここに載せることで _block_technical_ohlcv_fetch の
+    # 退行 (= 差し替えが外れて実取得が走った) を書き込みとして即座に検出する。
+    "technical_state.json", "proposed_ticker_candidates.json",
 )
 
 

@@ -59,6 +59,16 @@ CANDIDATE_UNIVERSE_FILES = (
     "screen_results_jp.json",
     "pair_trade_candidates.json",
     "squeeze_candidates.json",
+    # AI が保有・指数・playbook・スクリーナー成果物のどこにも無い銘柄を
+    # 名指しした場合の受け皿 (proposed_ticker_registry が書く)。実行内の
+    # ensure_technical_coverage が行を作れた銘柄だけがここへ登録され、
+    # 以降の全再計算がネイティブに行を再生成する。これが無いと、
+    # 08:30/12:00/17:05 の再計算がファイルを丸ごと置換するたびに補完行が
+    # 消え、「朝 ready → 正午 technical_data_missing」の間欠障害になる。
+    # 508e948 と同じ「静かな取りこぼし」を作らないよう、消費側スライス
+    # (CANDIDATE_TICKERS_PER_FILE) と registry の MAX_ENTRIES を一致させて
+    # あることに注意。
+    "proposed_ticker_candidates.json",
 )
 CANDIDATE_TICKERS_PER_FILE = 30
 PRICE_DISCONTINUITY_THRESHOLD = 0.50
@@ -516,6 +526,254 @@ def _analyze_ticker(ticker: str, df: pd.DataFrame) -> dict | None:
         return None
 
 
+# ====================================================================
+# 実行内テクニカル補完
+# ====================================================================
+
+# 壁時計キャップ。yf.download の timeout=10 は HTTP 1本あたりのソケット
+# タイムアウトで、threads=True と内部リトライがあるため実時間は無制限。
+COVERAGE_TOPUP_TIMEOUT_SECONDS = 90.0
+
+# coverage_source は監査専用のマーカー。ゲート・フィルタ・サイジング・UI の
+# どの実行経路も、これを読んで分岐してはならない。AI 提案であること自体に
+# ペナルティを設けないという方針の、実行可能な形。用途は2つだけ:
+#   1) 「この提案は朝の全再計算で ready になったのか、実行内の補完で ready に
+#      なったのか」に答える唯一の永続的手段
+#   2) proposed_ticker_registry の配線ミス検知器 — 登録済みなのにマーカーが
+#      残り続けるなら、レジストリが _build_ticker_universe に届いていない
+COVERAGE_SOURCE_TOPUP = "topup"
+
+
+def ensure_technical_coverage(
+    tickers,
+    *,
+    base_dir: Path,
+    now: datetime | None = None,
+    timeout_seconds: float | None = None,
+) -> dict:
+    """直近の再計算が拾えなかった銘柄のテクニカル行を追加する。
+
+    追加専用: 既存行は絶対に書き換えない。cached_at は保持し、source_health
+    (再計算の報告であって本関数の報告ではない) は触らない。
+    {"status","requested","added","unavailable"} を返す。例外は投げない。
+
+    cached_at を進めてはいけない理由は決定的で、
+      - get_technical_context の30分TTLを駆動する。11:45 の補完で進めると
+        12:00 の cron が「まだ15分」と判断してキャッシュを返し、定時の全
+        再計算を握り潰す (cron は force 無し)
+      - analysis_snapshot.py と analyst._compute_data_freshness が
+        「ユニバースを値付けした時刻」として読む。数銘柄の取得は
+        ユニバースを値付けしていない
+
+    source_health を触ってはいけない理由も同様に、
+      - max_lag_sessions は 2 以上で分析全体の鮮度スコアを 0 にする
+      - missing_count / analyzed_count は _ensure_technical_state_fresh が
+        「再計算は完全だった」の判定に使う
+
+    **ロックは無い。** atomic_write_json は os.replace なのでファイルは壊れ
+    ないが、read-modify-write は保護しない。cron の再計算と衝突した場合の
+    最悪形は「古い state + topup 行」への巻き戻りで、そのとき cached_at も
+    古いまま残るため、次回の分析が _ensure_technical_state_fresh で stale と
+    判定して全再計算を回し自己修復する。行が消えるだけで、誤って新鮮に
+    見えることはない。
+    """
+    requested_raw = list(tickers or [])
+    report: dict = {
+        "status": "noop",
+        "requested": [],
+        "added": [],
+        "unavailable": [],
+    }
+    try:
+        from instrument_metadata import canonical_ticker
+        # ゲート側と同じ定数を使う。execution_readiness は risk_increasing 分岐で
+        # `if not ticker.startswith(FUND_PREFIXES)` としてテクニカル判定自体を
+        # 飛ばすので、投信を補完しても発注可否は1ミリも動かない。
+        # 遅延 import: execution_readiness は technical_signals を import しない
+        # ので循環にはならないが、モジュール読み込み時の依存は増やさない。
+        from execution_readiness import FUND_PREFIXES
+
+        base_dir = Path(base_dir)
+        now = now or datetime.now(timezone.utc)
+
+        # 1) yfinance のグローバル session に timeout を設定する。
+        #    ⚠️ これはプロセス全体の singleton を書き換え、本関数を抜けた後も
+        #    残る。「短くするだけ」が成り立つのは、それ以前に誰もこれより
+        #    短く設定していない場合だけ。
+        try:
+            from utils import init_yfinance_timeout
+            init_yfinance_timeout()
+        except Exception:
+            pass
+
+        # 2) ベース state が無ければ何もしない。補完は再計算の補助であって
+        #    代替ではない。
+        state = load_json(base_dir / "technical_state.json", {})
+        if not isinstance(state, dict) or not isinstance(state.get("tickers"), dict):
+            return {**report, "status": "no_base_state"}
+        existing = set(state["tickers"].keys())
+
+        # 3) 要求の正規化。
+        targets: list[str] = []
+        for value in requested_raw:
+            if not value or not isinstance(value, str):
+                continue
+            ticker = value.strip()
+            if not ticker or ticker in targets:
+                continue
+            # 非正規形 (裸JPXコード・小文字・保有キー等) は補完しない。
+            # ここで取得すると「要求文字列でキーした行」を作ることになるが、
+            # その行は cron の再計算が再現できない (_build_ticker_universe →
+            # _load_ohlcv が正規形でないと解決できない)。結果は
+            # 「朝 ready → 正午 technical_data_missing」という間欠障害で、
+            # 恒常的に blocked な現状より悪い。正規形でない要求は今まで通り
+            # blocked のまま残す。
+            if canonical_ticker(ticker) != ticker:
+                continue
+            if ticker.startswith(FUND_PREFIXES):
+                continue
+            if ticker in SKIP_TICKERS or is_pseudo_market_ticker(ticker):
+                continue
+            if ticker in existing:
+                continue
+            targets.append(ticker)
+        report["requested"] = list(targets)
+
+        # 4) 空なら取得も書き込みもしない。
+        if not targets:
+            return report
+
+        # 5) 壁時計キャップ付きで取得する。
+        #    ワーカーを放棄して安全なのは _load_ohlcv が一切書き込みを
+        #    しないから (parquet を読む・yfinance から読む、それだけ)。
+        #    書き込みを行う関数へこのパターンを流用してはならない。
+        #
+        #    ⚠️ ThreadPoolExecutor は使えない。concurrent.futures.thread は
+        #    atexit フック (_python_exit) で全ワーカーを join するので、
+        #    shutdown(wait=False) を呼んでも「同期待ちを飛ばす」だけで、
+        #    プロセス自体は取得が終わるまで終了できない (実測: 6秒のワーカーを
+        #    0.2秒で放棄してもプロセスは6.07秒かかる)。yfinance が固まった
+        #    ときに portfolio_analyst.py が exit で固まり process_lock を
+        #    握ったまま次の cron に衝突する。daemon スレッドはインタプリタ
+        #    終了時に落とせるので、本当に放棄できる。
+        #
+        #    ⚠️ _load_ohlcv が読む parquet は technical_signals.BASE_DIR/
+        #    data/ohlcv (モジュールグローバル)。base_dir はサンドボックスに
+        #    ならないので、テストは必ず _load_ohlcv を差し替えること。
+        import threading
+
+        limit = COVERAGE_TOPUP_TIMEOUT_SECONDS if timeout_seconds is None else float(timeout_seconds)
+        outcome: dict = {}
+
+        def _fetch() -> None:
+            try:
+                outcome["ohlcv"] = _load_ohlcv(list(targets))
+            except Exception as exc:  # バッチ全体の失敗。呼び元で再送出する。
+                outcome["error"] = exc
+
+        worker = threading.Thread(
+            target=_fetch, name="technical-coverage-topup", daemon=True)
+        worker.start()
+        worker.join(timeout=limit)
+        if worker.is_alive():
+            logger.warning("テクニカル補完タイムアウト (%.0fs): %s", limit, targets)
+            return {**report, "status": "timeout", "unavailable": list(targets)}
+        if "error" in outcome:
+            raise outcome["error"]
+        ohlcv = outcome.get("ohlcv")
+        if not isinstance(ohlcv, dict):
+            ohlcv = {}
+
+        # 6) 解析。_analyze_ticker は再計算経路と完全に同一のまま呼び、
+        #    マーカーは戻り値へ後から付ける。
+        added_rows: dict[str, dict] = {}
+        unavailable: list[str] = []
+        for ticker in targets:
+            df = ohlcv.get(ticker)
+            if df is None:
+                unavailable.append(ticker)
+                continue
+            row = _analyze_ticker(ticker, df)
+            if not row:
+                # 30本未満・解析失敗。_load_ohlcv は20本以上を通すので
+                # 20〜29本は「ローダ通過・解析拒否」になる。
+                unavailable.append(ticker)
+                continue
+            row = dict(row)
+            row["coverage_source"] = COVERAGE_SOURCE_TOPUP
+            row["coverage_added_at"] = now.isoformat()
+            added_rows[ticker] = row
+
+            # 7) blocked 品質の行は再計算経路 (compute_technical_state) と
+            #    同じく sanity 台帳へ記録し、一貫性を保つ。
+            if row.get("data_quality_status") == "blocked":
+                try:
+                    from data_fetcher import append_price_sanity_flags, detect_price_sanity_flags
+
+                    append_price_sanity_flags(
+                        detect_price_sanity_flags(
+                            ticker, df, threshold=PRICE_DISCONTINUITY_THRESHOLD,
+                        )
+                    )
+                except Exception as exc:
+                    logger.warning("価格sanityログ記録失敗 %s: %s", ticker, exc)
+
+        report["unavailable"] = unavailable
+
+        # 8) 1行も追加できなければ書き込まない。
+        if not added_rows:
+            return report
+
+        # 9) マージ直前に読み直す。手順2のコピーではなく最新を土台にして、
+        #    同時進行の cron 再計算との lost-update 窓を縮める。
+        latest = load_json(base_dir / "technical_state.json", {})
+        if not isinstance(latest, dict) or not isinstance(latest.get("tickers"), dict):
+            latest = state
+        rows = dict(latest["tickers"])
+        inserted = []
+        for ticker, row in added_rows.items():
+            # 存在しないキーだけ挿入する。既存行を書き換えると、朝の再計算が
+            # 正しく stale と判定した保有銘柄を数銘柄の取得が「stale解除」して
+            # しまい、fail-closed だったものが ready に化ける。
+            if ticker in rows:
+                continue
+            rows[ticker] = row
+            inserted.append(ticker)
+        if not inserted:
+            return report
+
+        merged = dict(latest)
+        merged["tickers"] = rows
+        source_health = merged.get("source_health")
+        analyzed = 0
+        if isinstance(source_health, dict):
+            try:
+                analyzed = int(source_health.get("analyzed_count") or 0)
+            except (TypeError, ValueError):
+                analyzed = 0
+        merged["coverage_topup"] = {
+            "updated_at": now.isoformat(),
+            "base_cached_at": merged.get("cached_at"),
+            "requested": list(targets),
+            "added": sorted(inserted),
+            "unavailable": sorted(unavailable),
+            # 当回の len(added) ではなく導出値。再計算を挟まず2回 topup した
+            # 時点で突き合わせ式が壊れるため。
+            # len(tickers) == source_health.analyzed_count + rows_outside_rebuild
+            "rows_outside_rebuild": max(0, len(rows) - analyzed),
+        }
+        atomic_write_json(base_dir / "technical_state.json", merged)
+        report["status"] = "ok"
+        report["added"] = sorted(inserted)
+        logger.info("テクニカル補完: +%d 行 (%s)", len(inserted), ", ".join(sorted(inserted)))
+        return report
+    except Exception as exc:
+        logger.warning("テクニカル補完失敗: %s", exc)
+        # バッチ単位の失敗 (yf.download の例外など) と個別銘柄の
+        # unavailable を報告上区別する。前者では実在銘柄まで巻き込まれる。
+        return {**report, "status": "error", "error": f"{type(exc).__name__}: {exc}"}
+
+
 def _calc_market_breadth(
     tickers_data: dict[str, dict],
     ohlcv: dict[str, pd.DataFrame],
@@ -615,6 +873,24 @@ def compute_technical_state() -> dict:
                     )
                 except Exception as exc:
                     logger.warning("価格sanityログ記録失敗 %s: %s", ticker, exc)
+
+    # 再計算が行を作れなかった登録銘柄をレジストリから追い出す。
+    # 解決不能な銘柄をユニバースに残すと _ensure_technical_state_fresh の
+    # universe_is_complete が恒久的に false になり、分析のたびに全銘柄の
+    # 強制再計算が無警告で走り続ける。この位置は既に副作用を持つ
+    # (append_price_sanity_flags) ので新種の挙動ではない。
+    _missing = sorted(set(tickers) - set(tickers_result))
+    if _missing:
+        try:
+            import proposed_ticker_registry
+
+            proposed_ticker_registry.evict_unresolved(
+                _missing,
+                base_dir=BASE_DIR,
+                rebuild_coverage=(len(tickers_result) / len(tickers)) if tickers else 0.0,
+            )
+        except Exception as exc:
+            logger.warning("提案銘柄レジストリの整理に失敗: %s", exc)
 
     breadth = _calc_market_breadth(tickers_result, ohlcv, holdings_tickers)
 

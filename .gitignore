@@ -123,6 +123,7 @@ overnight_gap_signals.json
 opus_thinking_log.json
 pair_trade_candidates.json
 portfolio_optimization.json
+proposed_ticker_candidates.json
 rebalance_report.json
 regime_*.json
 revision_state.json

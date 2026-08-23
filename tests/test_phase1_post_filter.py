@@ -4327,3 +4327,152 @@ def test_legacy_reproposal_history_does_not_suppress(tmp_path):
 
     assert kept == [action]
     assert suppressed == []
+
+
+# ---------------------------------------------------------------------------
+# 実行内テクニカル補完の呼び出し配線。
+#
+# 補完そのものの正しさは tests/test_technical_universe_sources.py が見る。
+# ここで守るのは配線の3点:
+#   - 反実仮想 (side_effects=False) でネットワークI/Oを起こさないこと
+#   - 取得対象がゲートの risk_increasing 判定と完全に一致すること
+#   - 補完の失敗がその日の板を丸ごと消さないこと
+# ---------------------------------------------------------------------------
+
+def _coverage_synthesis(actions):
+    return {"overall_stance": "neutral", "priority_actions": [dict(a) for a in actions]}
+
+
+def _buy_action(ticker, **overrides):
+    action = {
+        "ticker": ticker, "type": "buy", "tier": "Medium",
+        "quantity": 10, "amount_hint": "10株", "decision_price": 200,
+        "limit_price": 200, "order_type": "limit", "currency": "USD",
+        "execution_owner": "husband", "execution_broker": "rakuten",
+        "execution_account": "特定", "action": f"{ticker}を10株買付",
+    }
+    action.update(overrides)
+    return action
+
+
+@pytest.fixture
+def coverage_spy(monkeypatch):
+    """ensure_technical_coverage / registry.record を記録専用に差し替える。"""
+    import technical_signals
+    import proposed_ticker_registry
+
+    calls = {"coverage": [], "record": [], "raises": None}
+
+    def _coverage(tickers, **kwargs):
+        calls["coverage"].append(list(tickers))
+        if calls["raises"]:
+            raise calls["raises"]
+        return {"status": "ok", "requested": list(tickers),
+                "added": list(tickers), "unavailable": []}
+
+    def _record(proposed, **kwargs):
+        calls["record"].append(list(proposed))
+        return {"status": "ok"}
+
+    monkeypatch.setattr(technical_signals, "ensure_technical_coverage", _coverage)
+    monkeypatch.setattr(proposed_ticker_registry, "record", _record)
+    return calls
+
+
+def test_coverage_runs_once_with_side_effects_and_never_without(
+    monkeypatch, tmp_path, coverage_spy
+):
+    """side_effects=False は Kelly shadow とフォールバック試行の印。
+
+    1回の実行で _phase1_post_filter は4回呼ばれ、うち3回は反実仮想。ガードが
+    無いと1回の分析で最大4回ネットワーク取得し、反実仮想の中でI/Oが走る。
+    """
+    _silence_external_filters(monkeypatch)
+    monkeypatch.setattr(tunable_params, "get", _tp_get)
+
+    analyst._phase1_post_filter(
+        _coverage_synthesis([_buy_action("JPM")]), 30_000_000,
+        positions=[], base_dir=tmp_path, side_effects=False)
+    assert coverage_spy["coverage"] == []
+
+    analyst._phase1_post_filter(
+        _coverage_synthesis([_buy_action("JPM")]), 30_000_000,
+        positions=[], base_dir=tmp_path, side_effects=True)
+    assert len(coverage_spy["coverage"]) == 1
+    assert coverage_spy["coverage"][0] == ["JPM"]
+
+
+def test_an_action_typed_only_by_action_type_is_still_topped_up(
+    monkeypatch, tmp_path, coverage_spy
+):
+    """execution_readiness.py:1253 は type or action_type を見る。
+
+    type だけで絞ると、action_type しか持たない行が「ゲートされるのに
+    補完されない」= blocked のまま残る。ズレの向きは取りこぼし。
+    """
+    _silence_external_filters(monkeypatch)
+    monkeypatch.setattr(tunable_params, "get", _tp_get)
+
+    analyst._phase1_post_filter(
+        _coverage_synthesis([
+            _buy_action("JPM"),
+            _buy_action("MDB", type=None, action_type="buy"),
+        ]),
+        30_000_000, positions=[], base_dir=tmp_path, side_effects=True)
+
+    assert coverage_spy["coverage"], "補完が呼ばれていない"
+    assert "MDB" in coverage_spy["coverage"][0]
+
+
+def test_risk_reducing_actions_are_not_requested(monkeypatch, tmp_path, coverage_spy):
+    _silence_external_filters(monkeypatch)
+    monkeypatch.setattr(tunable_params, "get", _tp_get)
+
+    analyst._phase1_post_filter(
+        _coverage_synthesis([
+            _buy_action("JPM"),
+            _buy_action("XLF", type="sell"),
+        ]),
+        30_000_000, positions=[], base_dir=tmp_path, side_effects=True)
+
+    assert coverage_spy["coverage"]
+    assert "XLF" not in coverage_spy["coverage"][0]
+
+
+def test_a_coverage_failure_does_not_quarantine_the_board(
+    monkeypatch, tmp_path, coverage_spy
+):
+    """爆発半径の退行テスト。
+
+    _phase1_post_filter は _quarantine_post_filter_failure に包まれている。
+    補完の例外が漏れると priority_actions が丸ごと 0 件に fail-close され、
+    1銘柄の劣化ではなくその日の板の全消失になる。
+    """
+    _silence_external_filters(monkeypatch)
+    monkeypatch.setattr(tunable_params, "get", _tp_get)
+    coverage_spy["raises"] = RuntimeError("yfinance down")
+
+    synthesis = _coverage_synthesis([_buy_action("JPM")])
+    result = analyst._phase1_post_filter(
+        synthesis, 30_000_000, positions=[], base_dir=tmp_path, side_effects=True)
+
+    assert "post_filter_error" not in result
+    assert [a["ticker"] for a in result["priority_actions"]] == ["JPM"]
+
+
+def test_the_coverage_report_survives_the_post_filter_reassignment(
+    monkeypatch, tmp_path, coverage_spy
+):
+    """synthesis["post_filter"] は補完呼び出しより後で丸ごと再代入される。
+
+    呼び出し地点で載せると消える。execution_plan_gate と同じ位置に載せること。
+    """
+    _silence_external_filters(monkeypatch)
+    monkeypatch.setattr(tunable_params, "get", _tp_get)
+
+    result = analyst._phase1_post_filter(
+        _coverage_synthesis([_buy_action("JPM")]), 30_000_000,
+        positions=[], base_dir=tmp_path, side_effects=True)
+
+    report = result["post_filter"]["technical_coverage_topup"]
+    assert report["added"] == ["JPM"]

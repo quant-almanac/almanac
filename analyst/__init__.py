@@ -9637,6 +9637,52 @@ def _phase1_post_filter(
             filtered.append(action)
         kept = batch_kept
 
+    # モデルは保有・セクターETF・主要指数・シナリオ playbook・直近スクリーナー
+    # 候補のどこにも属さない銘柄を名指しできる。朝の再計算はそれを値付けして
+    # いないので technical_state.json に行が無く、readiness ゲートは必然的に
+    # technical_data_missing で blocked にする。ゲートは正しい (データが無いのに
+    # 発注させてはならない) ので緩めず、取得の側を補完する。
+    #
+    # ここが ticker 集合が確定する最初の点かつ、ゲートがファイルを読む直前の
+    # 最後の点。書き先はディスクなので、呼出元を増やさずに re_evaluate() や
+    # API からの再判定にもその日ずっと効く。
+    _coverage_report = None
+    if side_effects and kept:
+        try:
+            import technical_signals
+            from execution_readiness import RISK_INCREASING
+
+            _coverage_targets = [
+                str(action.get("ticker") or "") for action in kept
+                if isinstance(action, dict)
+                # execution_readiness.py:1253 と同一式。ゲートは type だけでなく
+                # action_type もフォールバックで見るので、type だけで絞ると
+                # 「ゲートされるのに補完されない」行が blocked のまま残る。
+                # ズレの向きは過剰取得ではなく取りこぼし。
+                and str(action.get("type") or action.get("action_type") or "").lower()
+                in RISK_INCREASING
+            ]
+            _coverage_report = technical_signals.ensure_technical_coverage(
+                _coverage_targets, base_dir=state_dir, now=analysis_now,
+            )
+            try:
+                import proposed_ticker_registry
+
+                proposed_ticker_registry.record(
+                    _coverage_targets,
+                    resolved=set(_coverage_report.get("added") or []),
+                    base_dir=state_dir,
+                    now=analysis_now,
+                )
+            except Exception as e:
+                print(f"  ⚠️ 提案銘柄レジストリ更新失敗（スキップ）: {e}")
+        except Exception as e:
+            # _phase1_post_filter 全体は _quarantine_post_filter_failure に
+            # 包まれており、ここから例外が漏れると priority_actions が丸ごと
+            # 0 件に fail-close される。1銘柄の劣化ではなくその日の板の全消失に
+            # なるため、この try/except は保険ではなく必須。
+            print(f"  ⚠️ テクニカル補完失敗（該当銘柄は blocked のまま）: {e}")
+
     try:
         from execution_readiness import apply_execution_readiness
         apply_execution_readiness(kept, base_dir=state_dir, now=analysis_now)
@@ -9754,6 +9800,11 @@ def _phase1_post_filter(
     if plan_batch_report["applied"] or plan_batch_report.get("error"):
         plan_gate_report["batch_allocation"] = plan_batch_report
     synthesis["post_filter"]["execution_plan_gate"] = plan_gate_report
+    # synthesis["post_filter"] は上で丸ごと再代入されるので、補完の報告は
+    # execution_plan_gate と同じくその後で載せる。補完の呼び出し自体は
+    # readiness ゲートより前 (ファイルを読む前) でなければ意味がない。
+    if _coverage_report is not None:
+        synthesis["post_filter"]["technical_coverage_topup"] = _coverage_report
 
     reason_counts = dict(reasons)
     for action in deferred:

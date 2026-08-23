@@ -69,7 +69,7 @@
 
 | Lifecycle | Modules | 境界 |
 |---|---|---|
-| live | `data_fetcher.py`, `technical_signals.py`, `chart_analyzer.py`, `options_fetcher.py` | price history、technical、chart、options |
+| live | `data_fetcher.py`, `technical_signals.py`, `chart_analyzer.py`, `options_fetcher.py`, `proposed_ticker_registry.py` | price history、technical、chart、options、AI提案銘柄のカバレッジ追跡 |
 | live | `macro_fetcher.py`, `macro_event_calendar.py`, `event_calendar.py`, `follow_rate_analyzer.py` | macro/rates/event calendar |
 | live | `news_fetcher.py`, `geopolitical_monitor.py`, `earnings_proximity_manager.py`, `earnings_season.py` | news/geopolitics/earnings blackout |
 | live | `sector_rotation.py`, `sector_strength_updater.py` | sector state |
