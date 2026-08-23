@@ -128,6 +128,22 @@ def test_active_hedge_6j_direction_is_buy_not_sell():
 def _isolate_hedge_state(tmp_path, monkeypatch):
     monkeypatch.setattr(fx, "HEDGE_STATE", tmp_path / "hedge_target.json")
     monkeypatch.setattr(fx, "SHADOW_HEDGE_STATE", tmp_path / "hedge_target_shadow.json")
+    # fx._state_path() checks os.environ["ALMANAC_STATE_DIR"] first and only
+    # falls back to the two constants above when the env var is unset — that
+    # priority is deliberate (see test_state_dir_env_routes_actual_and_shadow_files,
+    # which relies on it for subprocess isolation). But it means that whenever
+    # the *test runner itself* is invoked with ALMANAC_STATE_DIR set — which is
+    # exactly what the documented before/after baseline-comparison workflow
+    # does — every test in this file silently ignored the two monkeypatches
+    # above and persisted hedge_target.json / hedge_target_shadow.json into
+    # that one shared, external directory instead. Tests in this file that
+    # never touch each other's tmp_path ended up sharing a single real file:
+    # observed history entries from three unrelated tests merged into one
+    # hedge_target_shadow.json, corrupting results within a single run and
+    # getting worse on every rerun against the same directory. Pointing the
+    # env var at this test's own tmp_path makes both resolution paths agree,
+    # so isolation holds regardless of what the ambient environment set.
+    monkeypatch.setenv("ALMANAC_STATE_DIR", str(tmp_path))
     return tmp_path
 
 
