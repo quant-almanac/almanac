@@ -825,17 +825,26 @@ class TestConcurrentRebuildMerge:
         assert before == after
         assert report.get("added") != ["MDB"]
 
-    def test_a_topup_landing_mid_rebuild_is_not_erased_by_the_rebuild_write(
+    def test_a_topup_landing_mid_rebuild_survives_even_before_the_registry_record_call(
         self, tmp_path, monkeypatch
     ):
         """compute_technical_state はロックの外で計算するため、計算が始まった
         「後」に着地した topup 行を知らずに書き込む。process_lock は書き込み
         の排他を保証するだけで、「知らない内容で丸ごと置換する」こと自体は
         防げない (Codex レビュー 2026-08-24 で再現: topup added=['MDB'] の
-        直後、続く全再計算の書き込みで MDB が消えた:
-        present_after_topup=True, present_after_rebuild=False)。
-        get_technical_context は書く直前にもう一度読み、まだ現役の登録銘柄
-        (evict_unresolved 未到達) である topup 行を引き継がねばならない。
+        直後、続く全再計算の書き込みで MDB が消えた)。
+
+        本番の呼び出し順序は analyst/__init__.py の通り
+        ensure_technical_coverage() → proposed_ticker_registry.record() の
+        2段階で、record() は ensure が返ってから初めて呼ばれる。旧実装は
+        「レジストリに現役登録されているか」で引き継ぎを判定していたが、
+        ensure がロックを解放した直後・record が走る前に全再計算の書き込みが
+        割り込む窓では、対象銘柄はまだレジストリに存在せず引き継げなかった
+        (Codex レビュー 2026-08-24 の再指摘: registry_present=True は
+        「その後」の状態で、書込み時点では False だった)。このテストは
+        record() を意図的に呼ばないまま全再計算の書き込みを行わせ、
+        pre_rebuild_tickers ベースの引き継ぎがレジストリ状態に依存せず
+        機能することを確認する。
         """
         _write_base(tmp_path, rows={
             "XLF": {"price": 50.0, "freshness_status": "fresh",
@@ -872,15 +881,18 @@ class TestConcurrentRebuildMerge:
         rebuild_thread.start()
         assert rebuild_fetch_started.wait(timeout=5.0), "全再計算のfetchが開始しなかった"
 
-        # 全再計算がまだ (ロックの外で) fetch 中の間に、提案銘柄が登録され
-        # テクニカル行が topup される — レビューが再現した衝突順序そのもの。
-        proposed_ticker_registry.record(["MDB"], resolved={"MDB"}, base_dir=tmp_path)
+        # 全再計算がまだ (ロックの外で fetch 中に、pre_rebuild_tickers を
+        # 既に確定させた後) 走っている間に ensure_technical_coverage だけを
+        # 実行する。record() はまだ「意図的に」呼ばない —— 本番の2段階呼び
+        # 出しのうち、record が走る前の窓を再現するため。
         report = technical_signals.ensure_technical_coverage(["MDB"], base_dir=tmp_path)
         assert report["status"] == "ok"
         assert report["added"] == ["MDB"]
         assert _read_state(tmp_path)["tickers"]["MDB"]["coverage_source"] == (
             technical_signals.COVERAGE_SOURCE_TOPUP
         )
+        # レジストリはまだ空 —— record() を呼んでいない。
+        assert not (tmp_path / "proposed_ticker_candidates.json").exists()
 
         release_rebuild_fetch.set()
         rebuild_thread.join(timeout=5.0)
@@ -891,12 +903,15 @@ class TestConcurrentRebuildMerge:
         assert final["tickers"]["MDB"]["coverage_source"] == technical_signals.COVERAGE_SOURCE_TOPUP
         assert "XLF" in final["tickers"], "全再計算自身が計算した行も生きているべき"
 
-    def test_an_evicted_topup_ticker_is_not_resurrected_by_the_rebuild(
+    def test_a_topup_ticker_predating_the_rebuild_is_not_carried_when_unresolved(
         self, tmp_path, monkeypatch
     ):
-        """引き継ぎはレジストリに現役の銘柄限定。追い出し済み(もしくは一度も
-        登録されなかった)行まで救うと、evict_unresolved が本来落とすはずの
-        行が全再計算のたびに復活し、technical_state.json が無限に肥大化する。
+        """引き継ぎは「今回の計算時間中に新規着地した」行限定。計算開始より
+        前から technical_state.json に存在していた topup 行は、今回の
+        再計算がそれを再現できなくても引き継がない —— 他の全銘柄と同じく
+        「直近の成功結果だけが残る」のが本来の挙動。レジストリにまだ
+        現役登録されているかどうかでは判定しない (それだと ensure→record の
+        2段階呼び出しの窓を正しく扱えない、別テストの通り)。
         """
         _write_base(tmp_path, rows={
             "XLF": {"price": 50.0, "freshness_status": "fresh",
@@ -907,8 +922,19 @@ class TestConcurrentRebuildMerge:
         })
         (tmp_path / "holdings.json").write_text("{}", encoding="utf-8")
         (tmp_path / "scenario_playbook.json").write_text("{}", encoding="utf-8")
-        (tmp_path / "proposed_ticker_candidates.json").write_text(
-            json.dumps({"version": 1, "candidates": []}), encoding="utf-8")
+        # GHOST はレジストリにまだ現役登録されている状態でも (旧実装なら
+        # 引き継がれてしまう状態でも)、計算開始前から存在していた行である
+        # 以上は落とされるべきことを確認する。TTL_DAYS=21 を跨がないよう
+        # last_seen はテスト実行時点の「今日」にする (固定日付だと実行日が
+        # 進むにつれて TTL 切れで別の理由で通ってしまう)。
+        import datetime as _dt
+        _today_iso = _dt.date.today().isoformat()
+        (tmp_path / "proposed_ticker_candidates.json").write_text(json.dumps({
+            "version": 1, "candidates": [
+                {"ticker": "GHOST", "first_seen": _today_iso, "last_seen": _today_iso,
+                 "seen_count": 1, "source": "ai_proposal", "missed_rebuilds": 0},
+            ],
+        }), encoding="utf-8")
 
         monkeypatch.setattr(technical_signals, "BASE_DIR", tmp_path)
         monkeypatch.setattr(technical_signals, "CACHE_FILE", tmp_path / "technical_state.json")
@@ -920,5 +946,58 @@ class TestConcurrentRebuildMerge:
         technical_signals.get_technical_context(force=True)
 
         final = _read_state(tmp_path)
-        assert "GHOST" not in final["tickers"], "追い出し済みのtopup行が復活した"
+        assert "GHOST" not in final["tickers"], "計算開始前から存在した未解決topup行が復活した"
         assert "XLF" in final["tickers"]
+
+    def test_consecutive_unresolved_cycles_still_advance_missed_rebuilds(
+        self, tmp_path, monkeypatch
+    ):
+        """pre_rebuild_tickers ベースの引き継ぎに変えても、レジストリ現役の
+        銘柄が全再計算で連続して解決できなければ missed_rebuilds は進み、
+        いずれ追い出されること (Codex レビュー 2026-08-24 で追加要請)。
+        """
+        import proposed_ticker_registry as registry_mod
+
+        _write_base(tmp_path, rows={
+            "XLF": {"price": 50.0, "freshness_status": "fresh",
+                    "data_quality_status": "ok", "data_as_of": "2026-08-21"},
+        })
+        (tmp_path / "holdings.json").write_text("{}", encoding="utf-8")
+        (tmp_path / "scenario_playbook.json").write_text("{}", encoding="utf-8")
+        # last_seen はテスト実行時点の「今日」にする (TTL_DAYS=21 を跨ぐと
+        # missed_rebuilds に関係なく TTL 切れで落ちてしまい、このテストが
+        # 検証したい経路を通らなくなる)。
+        import datetime as _dt
+        _today_iso = _dt.date.today().isoformat()
+        (tmp_path / "proposed_ticker_candidates.json").write_text(json.dumps({
+            "version": 1, "candidates": [
+                {"ticker": "GHOST", "first_seen": _today_iso, "last_seen": _today_iso,
+                 "seen_count": 1, "source": "ai_proposal", "missed_rebuilds": 0},
+            ],
+        }), encoding="utf-8")
+
+        monkeypatch.setattr(technical_signals, "BASE_DIR", tmp_path)
+        monkeypatch.setattr(technical_signals, "CACHE_FILE", tmp_path / "technical_state.json")
+        # GHOST は毎サイクル解決できない (上場廃止・幻覚ティッカー相当)。
+        # XLF 他ユニバースの大半は解決できるので coverage は十分高く、
+        # MIN_REBUILD_COVERAGE_FOR_EVICTION に阻まれない。
+        monkeypatch.setattr(
+            technical_signals, "_load_ohlcv",
+            lambda tickers: {t: _frame() for t in tickers if t != "GHOST"},
+        )
+
+        for cycle in range(registry_mod.MISSED_REBUILDS_BEFORE_EVICTION):
+            technical_signals.get_technical_context(force=True)
+            registry = json.loads(
+                (tmp_path / "proposed_ticker_candidates.json").read_text())
+            candidates = {c["ticker"]: c for c in registry["candidates"]}
+            if cycle < registry_mod.MISSED_REBUILDS_BEFORE_EVICTION - 1:
+                assert "GHOST" in candidates, f"cycle {cycle}: 早すぎる追い出し"
+                assert candidates["GHOST"]["missed_rebuilds"] == cycle + 1
+
+        final_registry = json.loads(
+            (tmp_path / "proposed_ticker_candidates.json").read_text())
+        assert "GHOST" not in {c["ticker"] for c in final_registry["candidates"]}, (
+            "連続失敗後もGHOSTが追い出されていない"
+        )
+        assert "GHOST" not in _read_state(tmp_path)["tickers"]

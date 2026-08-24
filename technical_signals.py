@@ -986,6 +986,17 @@ def get_technical_context(*, force: bool = False) -> dict:
         except Exception:
             pass
 
+    # compute_technical_state を呼ぶ「前」の世代を記録する。この読みは
+    # ロックの外なので厳密ではないが、目的は「今回の計算時間中に着地した
+    # 行」と「計算開始より前から存在していた行」の大まかな境界だけなので
+    # 数百ms のずれは許容できる。
+    pre_rebuild = load_json(CACHE_FILE, {})
+    pre_rebuild_tickers: set[str] = (
+        set(pre_rebuild["tickers"].keys())
+        if isinstance(pre_rebuild, dict) and isinstance(pre_rebuild.get("tickers"), dict)
+        else set()
+    )
+
     state = compute_technical_state()
     # ensure_technical_coverage (実行内補完) と同じロックを取ってから書く。
     # compute_technical_state 自体はこのファイルへ書き込まない (ネットワーク
@@ -999,31 +1010,37 @@ def get_technical_context(*, force: bool = False) -> dict:
     # ロックを排他するだけでは「知らない内容で丸ごと置換する」こと自体は防げず、
     # 新しい topup がその場で消える (Codex レビュー 2026-08-24 で再現:
     # topup で追加した行が直後の全再計算の書き込みで消失)。
-    # 書く直前にもう一度読み、(a) 今回の再計算に含まれておらず
-    # (b) coverage_source=topup で (c) まだ提案銘柄レジストリに残っている
-    # (= evict_unresolved 未到達) 行だけを引き継ぐ。(c) が無いと、追い出し済み
-    # の行が全再計算のたびに復活し続け、technical_state.json が無限に肥大化する。
+    #
+    # 書く直前にもう一度読み、今回の再計算に含まれておらず、かつ
+    # pre_rebuild_tickers に無かった (= 今回の計算時間中に新規着地した)
+    # coverage_source=topup 行だけを引き継ぐ。
+    #
+    # 「まだ提案銘柄レジストリに現役登録されているか」では判定しない —
+    # 当初はそうしていたが、本番の呼び出し順序は
+    # analyst/__init__.py の通り ensure_technical_coverage() が先、
+    # proposed_ticker_registry.record() が後 (2段階) なので、ensure が
+    # ロックを解放した直後・record が走る前に全再計算の書き込みが割り込むと、
+    # 対象銘柄はまだレジストリに存在せず、レジストリ判定では引き継げなかった
+    # (Codex レビュー 2026-08-24 で再現: registry_present=True になった
+    # 「後」の状態だけを見ていて、書込み時点では False だった窓を見落とした)。
+    # pre_rebuild_tickers はレジストリの更新タイミングに一切依存しない。
+    #
+    # 逆に、計算開始より「前」から存在していた行 (pre_rebuild_tickers に
+    # 含まれる) は、今回解決できなくても引き継がない。他の全銘柄と同じく
+    # 「直近の成功結果だけが残る」が本来の挙動であり、topup 行を無条件に
+    # 生かし続けると、レジストリに残っている限り every cycle 復活してしまい
+    # missed_rebuilds が進まず eviction を妨げる (Codex レビュー
+    # 2026-08-24 の2点目)。
     with process_lock(TECHNICAL_STATE_LOCK_NAME, timeout=TECHNICAL_STATE_LOCK_TIMEOUT_SECONDS):
         latest = load_json(CACHE_FILE, {})
         if isinstance(latest, dict) and isinstance(latest.get("tickers"), dict):
-            active_candidates: set[str] = set()
-            try:
-                registry = load_json(BASE_DIR / "proposed_ticker_candidates.json", {})
-                if isinstance(registry, dict):
-                    active_candidates = {
-                        str(c.get("ticker") or "").strip().upper()
-                        for c in registry.get("candidates", [])
-                        if isinstance(c, dict)
-                    }
-            except Exception:
-                active_candidates = set()
             carried = []
             for ticker, row in latest["tickers"].items():
                 if ticker in state["tickers"]:
                     continue
-                if not isinstance(row, dict) or row.get("coverage_source") != COVERAGE_SOURCE_TOPUP:
+                if ticker in pre_rebuild_tickers:
                     continue
-                if ticker not in active_candidates:
+                if not isinstance(row, dict) or row.get("coverage_source") != COVERAGE_SOURCE_TOPUP:
                     continue
                 state["tickers"][ticker] = row
                 carried.append(ticker)

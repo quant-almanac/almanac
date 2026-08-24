@@ -15,14 +15,28 @@ print/traceback を無防備にログへ流すことを防ぐため、他の送�
 import os
 
 # bot_commands はモジュール読み込み時に os.environ[...] を直接引く
-# (デフォルト無し)。実環境の値を上書きしないよう setdefault で最小限のみ補う。
-os.environ.setdefault("TELEGRAM_TOKEN", "test-placeholder-token")
-os.environ.setdefault("TELEGRAM_CHAT_ID", "test-placeholder-chat")
+# (デフォルト無し)。import の瞬間だけ os.environ に値が要るが、置いたままだと
+# この後 import される他モジュール (alert.py 等、os.environ.get で読む) に
+# プレースホルダーが漏れる (Codex レビュー 2026-08-24)。import 直後に
+# 自分が置いた分だけ削除して元の環境へ戻す — bot_commands.TELEGRAM_TOKEN は
+# import 時点でモジュール定数として値を確定させるので、この後 os.environ から
+# 消しても bot_commands 自身の動作には影響しない。
+_had_token = "TELEGRAM_TOKEN" in os.environ
+_had_chat_id = "TELEGRAM_CHAT_ID" in os.environ
+if not _had_token:
+    os.environ["TELEGRAM_TOKEN"] = "test-placeholder-token"
+if not _had_chat_id:
+    os.environ["TELEGRAM_CHAT_ID"] = "test-placeholder-chat"
 
 import pytest
 import requests
 
 import bot_commands
+
+if not _had_token:
+    del os.environ["TELEGRAM_TOKEN"]
+if not _had_chat_id:
+    del os.environ["TELEGRAM_CHAT_ID"]
 
 
 def test_send_telegram_does_not_leak_the_token_on_connection_error(monkeypatch):

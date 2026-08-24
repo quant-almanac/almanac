@@ -48,6 +48,12 @@ XLF_ID = "5185b2d8b12e"
 def _isolate_state(tmp_path, monkeypatch):
     monkeypatch.setattr(ei, "STATE_PATH", tmp_path / "execution_invalidation_state.json")
     monkeypatch.setattr(ast, "STATE_FILE", tmp_path / "action_state.json")
+    # ei._state_path() は ALMANAC_STATE_DIR が環境にあれば STATE_PATH より
+    # 優先する。これを差し替えないと、ALMANAC_STATE_DIR を明示指定した
+    # 受け入れ実行 (フレッシュな全体テスト比較など) では全テストが同じ
+    # 共有ファイルを読み書きし、無効化状態が前のテストから漏れて残る
+    # (Codex レビュー 2026-08-24 で再現: before_ids が空集合になった)。
+    monkeypatch.setenv("ALMANAC_STATE_DIR", str(tmp_path))
     return tmp_path
 
 
