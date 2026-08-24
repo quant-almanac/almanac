@@ -277,8 +277,14 @@ def get_updates(offset=None):
     params = {"timeout": 30}
     if offset:
         params["offset"] = offset
-    res = requests.get(url, params=params)
-    return res.json()
+    try:
+        res = requests.get(url, params=params)
+        return res.json()
+    except Exception as e:
+        # send_telegram と同じ理由: 例外の文字列表現はURL(token込み)を
+        # 埋め込む。ここは main() の while ループが Exception を拾って
+        # そのまま print するので、素通しすると受信経路でも漏れる。
+        reraise_with_secret_redacted(e, TELEGRAM_TOKEN)
 
 def main():
     print("コマンド受付開始...")

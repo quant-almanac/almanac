@@ -824,3 +824,101 @@ class TestConcurrentRebuildMerge:
 
         assert before == after
         assert report.get("added") != ["MDB"]
+
+    def test_a_topup_landing_mid_rebuild_is_not_erased_by_the_rebuild_write(
+        self, tmp_path, monkeypatch
+    ):
+        """compute_technical_state はロックの外で計算するため、計算が始まった
+        「後」に着地した topup 行を知らずに書き込む。process_lock は書き込み
+        の排他を保証するだけで、「知らない内容で丸ごと置換する」こと自体は
+        防げない (Codex レビュー 2026-08-24 で再現: topup added=['MDB'] の
+        直後、続く全再計算の書き込みで MDB が消えた:
+        present_after_topup=True, present_after_rebuild=False)。
+        get_technical_context は書く直前にもう一度読み、まだ現役の登録銘柄
+        (evict_unresolved 未到達) である topup 行を引き継がねばならない。
+        """
+        _write_base(tmp_path, rows={
+            "XLF": {"price": 50.0, "freshness_status": "fresh",
+                    "data_quality_status": "ok", "data_as_of": "2026-08-21"},
+        })
+        (tmp_path / "holdings.json").write_text("{}", encoding="utf-8")
+        (tmp_path / "scenario_playbook.json").write_text("{}", encoding="utf-8")
+
+        monkeypatch.setattr(technical_signals, "BASE_DIR", tmp_path)
+        monkeypatch.setattr(technical_signals, "CACHE_FILE", tmp_path / "technical_state.json")
+
+        import threading
+
+        rebuild_fetch_started = threading.Event()
+        release_rebuild_fetch = threading.Event()
+
+        def _fake_load_ohlcv(tickers):
+            if "MDB" in tickers:
+                # ensure_technical_coverage 側の取得。即座に返す。
+                return {t: _frame() for t in tickers if t == "MDB"}
+            # 全再計算側の取得 (XLF 等)。ここで待たせて topup を割り込ませる。
+            rebuild_fetch_started.set()
+            release_rebuild_fetch.wait(timeout=5.0)
+            return {t: _frame() for t in tickers if t == "XLF"}
+
+        monkeypatch.setattr(technical_signals, "_load_ohlcv", _fake_load_ohlcv)
+
+        result: dict = {}
+
+        def _run_rebuild():
+            result["state"] = technical_signals.get_technical_context(force=True)
+
+        rebuild_thread = threading.Thread(target=_run_rebuild)
+        rebuild_thread.start()
+        assert rebuild_fetch_started.wait(timeout=5.0), "全再計算のfetchが開始しなかった"
+
+        # 全再計算がまだ (ロックの外で) fetch 中の間に、提案銘柄が登録され
+        # テクニカル行が topup される — レビューが再現した衝突順序そのもの。
+        proposed_ticker_registry.record(["MDB"], resolved={"MDB"}, base_dir=tmp_path)
+        report = technical_signals.ensure_technical_coverage(["MDB"], base_dir=tmp_path)
+        assert report["status"] == "ok"
+        assert report["added"] == ["MDB"]
+        assert _read_state(tmp_path)["tickers"]["MDB"]["coverage_source"] == (
+            technical_signals.COVERAGE_SOURCE_TOPUP
+        )
+
+        release_rebuild_fetch.set()
+        rebuild_thread.join(timeout=5.0)
+        assert not rebuild_thread.is_alive(), "全再計算スレッドが終了しなかった"
+
+        final = _read_state(tmp_path)
+        assert "MDB" in final["tickers"], "競合窓のtopup行が全再計算の書き込みで消えた"
+        assert final["tickers"]["MDB"]["coverage_source"] == technical_signals.COVERAGE_SOURCE_TOPUP
+        assert "XLF" in final["tickers"], "全再計算自身が計算した行も生きているべき"
+
+    def test_an_evicted_topup_ticker_is_not_resurrected_by_the_rebuild(
+        self, tmp_path, monkeypatch
+    ):
+        """引き継ぎはレジストリに現役の銘柄限定。追い出し済み(もしくは一度も
+        登録されなかった)行まで救うと、evict_unresolved が本来落とすはずの
+        行が全再計算のたびに復活し、technical_state.json が無限に肥大化する。
+        """
+        _write_base(tmp_path, rows={
+            "XLF": {"price": 50.0, "freshness_status": "fresh",
+                    "data_quality_status": "ok", "data_as_of": "2026-08-21"},
+            "GHOST": {"price": 1.0, "freshness_status": "fresh",
+                      "data_quality_status": "ok", "data_as_of": "2026-08-01",
+                      "coverage_source": technical_signals.COVERAGE_SOURCE_TOPUP},
+        })
+        (tmp_path / "holdings.json").write_text("{}", encoding="utf-8")
+        (tmp_path / "scenario_playbook.json").write_text("{}", encoding="utf-8")
+        (tmp_path / "proposed_ticker_candidates.json").write_text(
+            json.dumps({"version": 1, "candidates": []}), encoding="utf-8")
+
+        monkeypatch.setattr(technical_signals, "BASE_DIR", tmp_path)
+        monkeypatch.setattr(technical_signals, "CACHE_FILE", tmp_path / "technical_state.json")
+        monkeypatch.setattr(
+            technical_signals, "_load_ohlcv",
+            lambda tickers: {t: _frame() for t in tickers if t == "XLF"},
+        )
+
+        technical_signals.get_technical_context(force=True)
+
+        final = _read_state(tmp_path)
+        assert "GHOST" not in final["tickers"], "追い出し済みのtopup行が復活した"
+        assert "XLF" in final["tickers"]

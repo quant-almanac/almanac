@@ -992,7 +992,46 @@ def get_technical_context(*, force: bool = False) -> dict:
     # 取得は utils.process_lock の外) ので、ロック保持区間はこの書き込み
     # だけに絞れる。取れなければ LockBusy を伝播させる —— 全再計算の結果を
     # 書けないのは異常系で、次回のスケジュール実行に委ねるのが妥当。
+    #
+    # ただしロックの外で state を計算している以上、compute_technical_state
+    # が _build_ticker_universe を読んだ「後」に ensure_technical_coverage が
+    # 別プロセスで新規 topup 行を書き込んだ場合、この state はその行を知らない。
+    # ロックを排他するだけでは「知らない内容で丸ごと置換する」こと自体は防げず、
+    # 新しい topup がその場で消える (Codex レビュー 2026-08-24 で再現:
+    # topup で追加した行が直後の全再計算の書き込みで消失)。
+    # 書く直前にもう一度読み、(a) 今回の再計算に含まれておらず
+    # (b) coverage_source=topup で (c) まだ提案銘柄レジストリに残っている
+    # (= evict_unresolved 未到達) 行だけを引き継ぐ。(c) が無いと、追い出し済み
+    # の行が全再計算のたびに復活し続け、technical_state.json が無限に肥大化する。
     with process_lock(TECHNICAL_STATE_LOCK_NAME, timeout=TECHNICAL_STATE_LOCK_TIMEOUT_SECONDS):
+        latest = load_json(CACHE_FILE, {})
+        if isinstance(latest, dict) and isinstance(latest.get("tickers"), dict):
+            active_candidates: set[str] = set()
+            try:
+                registry = load_json(BASE_DIR / "proposed_ticker_candidates.json", {})
+                if isinstance(registry, dict):
+                    active_candidates = {
+                        str(c.get("ticker") or "").strip().upper()
+                        for c in registry.get("candidates", [])
+                        if isinstance(c, dict)
+                    }
+            except Exception:
+                active_candidates = set()
+            carried = []
+            for ticker, row in latest["tickers"].items():
+                if ticker in state["tickers"]:
+                    continue
+                if not isinstance(row, dict) or row.get("coverage_source") != COVERAGE_SOURCE_TOPUP:
+                    continue
+                if ticker not in active_candidates:
+                    continue
+                state["tickers"][ticker] = row
+                carried.append(ticker)
+            if carried:
+                logger.info(
+                    "全再計算: 競合窓で追加された topup 行を引き継ぎ (%s)",
+                    ", ".join(sorted(carried)),
+                )
         atomic_write_json(CACHE_FILE, state)
     logger.info("technical_state.json 更新完了")
     return state
