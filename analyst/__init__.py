@@ -9735,9 +9735,21 @@ def _phase1_post_filter(
             try:
                 import proposed_ticker_registry
 
+                # ensure_technical_coverage は、行を書いたのと同じロックの
+                # 中で自分が追加した銘柄を既にレジストリへ登録している
+                # (inline_registered)。ここで同じ銘柄をもう一度渡すと
+                # seen_count が二重に増え、同日候補の並び順と MAX_ENTRIES の
+                # 切り捨てが歪む (Codex レビュー round 6 で 1→2 を再現)。
+                # 残り (ensure が解決できなかった銘柄) の continuing 追跡だけ
+                # をここで行う —— それらは resolved に入らないので空集合。
+                _inline = {
+                    str(t or "").strip().upper()
+                    for t in (_coverage_report.get("inline_registered") or [])
+                }
                 proposed_ticker_registry.record(
-                    _coverage_targets,
-                    resolved=set(_coverage_report.get("added") or []),
+                    [t for t in _coverage_targets
+                     if str(t or "").strip().upper() not in _inline],
+                    resolved=set(),
                     base_dir=state_dir,
                     now=analysis_now,
                 )

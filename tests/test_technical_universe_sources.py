@@ -985,6 +985,11 @@ class TestConcurrentRebuildMerge:
         final = _read_state(tmp_path)
         assert "MDB" in final["tickers"], "現役登録済みのtopup行が未解決サイクルで消えた"
         assert final["tickers"]["MDB"]["coverage_source"] == technical_signals.COVERAGE_SOURCE_TOPUP
+        # 引き継いだ行には必ず「今回は取得できなかった」印が付くこと。
+        # これが無いと execution_readiness が凍結された freshness_status を
+        # 見て ready を出す (Codex レビュー round 6)。
+        assert final["tickers"]["MDB"][technical_signals.REBUILD_UNRESOLVED_KEY] is True
+        assert final["tickers"]["MDB"].get("rebuild_unresolved_at")
 
     def test_consecutive_unresolved_cycles_still_advance_missed_rebuilds(
         self, tmp_path, monkeypatch
@@ -1234,4 +1239,190 @@ class TestConcurrentRebuildMerge:
         final = _read_state(tmp_path)
         assert final["tickers"]["XLF"]["price"] == result["b"]["tickers"]["XLF"]["price"], (
             "後発の再計算の結果が最終状態に反映されていない"
+        )
+
+    def test_a_carried_row_does_not_reset_the_grace_counter_on_the_next_analysis(
+        self, tmp_path, monkeypatch
+    ):
+        """引き継ぎと猶予リセットの循環を塞ぐ。
+
+        全再計算が取得に失敗した銘柄の行は (レジストリ現役なら) 引き継がれる。
+        その直後に通常の分析が走って record() が呼ばれると、record は
+        「technical_state.json に行がある」ことを継続成功の証拠として
+        missed_rebuilds を 0 に戻していた。分析のたびにリセットできるため、
+        全再計算だけを連続実行する既存テストでは見つからず、実運用では
+        eviction が永久に効かない (Codex レビュー round 6 で 1→0 を再現)。
+        引き継いだ行には rebuild_unresolved が付き、record はそれを実在の
+        証拠として数えないことを確認する。
+        """
+        import datetime as _dt
+
+        import proposed_ticker_registry as registry_mod
+
+        _write_base(tmp_path, rows={
+            "XLF": {"price": 50.0, "freshness_status": "fresh",
+                    "data_quality_status": "ok", "data_as_of": "2026-08-21"},
+            "MDB": {"price": 1.0, "freshness_status": "fresh",
+                    "data_quality_status": "ok", "data_as_of": "2026-08-20",
+                    "coverage_source": technical_signals.COVERAGE_SOURCE_TOPUP},
+        })
+        (tmp_path / "holdings.json").write_text("{}", encoding="utf-8")
+        (tmp_path / "scenario_playbook.json").write_text("{}", encoding="utf-8")
+        _today_iso = _dt.date.today().isoformat()
+        (tmp_path / "proposed_ticker_candidates.json").write_text(json.dumps({
+            "version": 1, "candidates": [
+                {"ticker": "MDB", "first_seen": _today_iso, "last_seen": _today_iso,
+                 "seen_count": 1, "source": "ai_proposal", "missed_rebuilds": 0},
+            ],
+        }), encoding="utf-8")
+
+        monkeypatch.setattr(technical_signals, "BASE_DIR", tmp_path)
+        monkeypatch.setattr(technical_signals, "CACHE_FILE", tmp_path / "technical_state.json")
+        monkeypatch.setattr(
+            technical_signals, "_load_ohlcv",
+            lambda tickers: {t: _frame() for t in tickers if t != "MDB"},
+        )
+
+        # 1) 全再計算が MDB を取得できず、猶予が 1 に進む。行は引き継がれる。
+        technical_signals.get_technical_context(force=True)
+        after_rebuild = json.loads(
+            (tmp_path / "proposed_ticker_candidates.json").read_text())
+        mdb = {c["ticker"]: c for c in after_rebuild["candidates"]}["MDB"]
+        assert mdb["missed_rebuilds"] == 1, "全再計算後に猶予が進んでいない"
+        assert _read_state(tmp_path)["tickers"]["MDB"][
+            technical_signals.REBUILD_UNRESOLVED_KEY] is True
+
+        # 2) 続けて通常の分析が MDB を再提案する (ensure は行があるので
+        #    取得をスキップし、resolved は空)。ここで猶予が 0 に戻っては
+        #    ならない —— 行はあるが「今回取得できた」わけではない。
+        registry_mod.record(["MDB"], resolved=set(), base_dir=tmp_path)
+
+        after_record = json.loads(
+            (tmp_path / "proposed_ticker_candidates.json").read_text())
+        mdb_after = {c["ticker"]: c for c in after_record["candidates"]}["MDB"]
+        assert mdb_after["missed_rebuilds"] == 1, (
+            "引き継がれただけの行が継続成功として扱われ、猶予がリセットされた"
+        )
+
+    def test_a_failed_registry_registration_does_not_report_a_successful_topup(
+        self, tmp_path, loader, monkeypatch
+    ):
+        """レジストリ登録が失敗したら topup を成功扱いしない。
+
+        record_already_locked は例外ではなく {"status":"error"} を返すため、
+        try/except では捕まらない。旧実装は state を先に書いてから登録を
+        試み、その結果を検査していなかったので、登録に失敗しても
+        status=ok / added=["MDB"] を返していた (Codex レビュー round 6)。
+        レジストリに載らない行は次の全再計算で確実に消えるので、
+        書かずに次回へ委ねるのが正しい。
+        """
+        import proposed_ticker_registry as registry_mod
+
+        _write_base(tmp_path)
+        loader({"MDB": _frame()})
+        before = (tmp_path / "technical_state.json").read_bytes()
+
+        monkeypatch.setattr(
+            registry_mod, "record_already_locked",
+            lambda *a, **k: {"status": "error", "error": "simulated failure"},
+        )
+
+        report = technical_signals.ensure_technical_coverage(["MDB"], base_dir=tmp_path)
+
+        assert report["status"] == "registry_failed"
+        assert report["added"] == []
+        assert (tmp_path / "technical_state.json").read_bytes() == before, (
+            "レジストリ登録に失敗したのに行が書き込まれた"
+        )
+
+    def test_a_topped_up_ticker_is_not_registered_twice(self, tmp_path, loader):
+        """ensure が内部登録した銘柄を呼び出し元がもう一度 record すると
+        seen_count が二重に増える。report の inline_registered で除外できる
+        ことを確認する (Codex レビュー round 6 で 1→2 を再現)。
+        """
+        import proposed_ticker_registry as registry_mod
+
+        _write_base(tmp_path)
+        loader({"MDB": _frame()})
+
+        report = technical_signals.ensure_technical_coverage(["MDB"], base_dir=tmp_path)
+        assert report["added"] == ["MDB"]
+        assert report["inline_registered"] == ["MDB"]
+
+        after_ensure = registry_mod.load_registered(tmp_path)
+        assert after_ensure["MDB"]["seen_count"] == 1
+
+        # analyst/__init__.py と同じ除外を行った呼び出しでは、二重登録に
+        # ならない (対象が空になるので noop)。
+        _inline = {t.upper() for t in report["inline_registered"]}
+        registry_mod.record(
+            [t for t in ["MDB"] if t.upper() not in _inline],
+            resolved=set(), base_dir=tmp_path,
+        )
+
+        after_outer = registry_mod.load_registered(tmp_path)
+        assert after_outer["MDB"]["seen_count"] == 1, (
+            "呼び出し元の再登録で seen_count が二重に増えた"
+        )
+
+    def test_a_non_force_call_waiting_on_the_lock_reuses_the_fresh_result(
+        self, tmp_path, monkeypatch
+    ):
+        """single-flight は直列化するだけで同一処理を集約しない。
+
+        同時に stale と判定した2つの非force呼び出しは、ロックを取った順に
+        両方とも最初から計算し直していた (Codex レビュー round 6:
+        _load_ohlcv が期待1回に対して2回呼ばれた)。ロック取得後にキャッシュを
+        読み直し、その間に先行呼び出しが新しい結果を書いていればそれを返す。
+        """
+        # 期限切れのキャッシュを置く (非force呼び出しが再計算へ進む)。
+        _write_base(tmp_path, cached_at="2020-01-01T00:00:00+00:00")
+        (tmp_path / "holdings.json").write_text("{}", encoding="utf-8")
+        (tmp_path / "scenario_playbook.json").write_text("{}", encoding="utf-8")
+
+        monkeypatch.setattr(technical_signals, "BASE_DIR", tmp_path)
+        monkeypatch.setattr(technical_signals, "CACHE_FILE", tmp_path / "technical_state.json")
+
+        import threading
+
+        a_fetch_started = threading.Event()
+        release_a_fetch = threading.Event()
+        call_count = {"n": 0}
+
+        def _fake_load_ohlcv(tickers):
+            call_count["n"] += 1
+            if call_count["n"] == 1:
+                a_fetch_started.set()
+                release_a_fetch.wait(timeout=5.0)
+            return {t: _frame() for t in tickers}
+
+        monkeypatch.setattr(technical_signals, "_load_ohlcv", _fake_load_ohlcv)
+
+        result: dict = {}
+
+        def _run_a():
+            result["a"] = technical_signals.get_technical_context(force=False)
+
+        def _run_b():
+            result["b"] = technical_signals.get_technical_context(force=False)
+
+        thread_a = threading.Thread(target=_run_a)
+        thread_a.start()
+        assert a_fetch_started.wait(timeout=5.0), "Aのfetchが開始しなかった"
+
+        thread_b = threading.Thread(target=_run_b)
+        thread_b.start()
+        import time as _time
+        _time.sleep(0.3)
+        release_a_fetch.set()
+
+        thread_a.join(timeout=30.0)
+        thread_b.join(timeout=30.0)
+        assert not thread_a.is_alive() and not thread_b.is_alive()
+
+        assert call_count["n"] == 1, (
+            f"Bがロック取得後のキャッシュ再確認をせず再計算した (呼び出し {call_count['n']} 回)"
+        )
+        assert result["b"]["cached_at"] == result["a"]["cached_at"], (
+            "BがAの結果を再利用していない"
         )

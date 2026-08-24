@@ -1424,6 +1424,19 @@ def classify_execution_readiness(
                     add("blocked", "technical_data_stale", f"{ticker} の最終足が古い", data_as_of=tech.get("data_as_of"))
                 elif status == "degraded":
                     add("review", "technical_data_degraded", f"{ticker} の最終足が1セッション遅延", data_as_of=tech.get("data_as_of"))
+                # 直近の全再計算がこの銘柄を取得できず、前回の補完行を
+                # 引き継いだだけの行。freshness_status は補完時点の値で
+                # 凍結されているため、上の分岐では "fresh" として素通りする
+                # (Codex レビュー round 6 で fail-open を再現)。取得できて
+                # いない事実そのものを理由に、最低でも review へ落とす。
+                if tech.get("rebuild_unresolved"):
+                    add(
+                        "review",
+                        "technical_rebuild_unresolved",
+                        f"{ticker} は直近の全再計算で価格を取得できず、前回取得分をそのまま参照している",
+                        data_as_of=tech.get("data_as_of"),
+                        rebuild_unresolved_at=tech.get("rebuild_unresolved_at"),
+                    )
 
         event_result = evaluate_macro_event_gate(
             action,

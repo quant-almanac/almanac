@@ -1230,6 +1230,37 @@ def test_a_topped_up_row_that_is_stale_is_still_blocked(tmp_path):
     assert "technical_data_stale" in _technical_codes(result)
 
 
+def test_a_carried_forward_row_the_rebuild_could_not_refetch_is_not_ready(tmp_path):
+    """引き継がれた行の freshness_status は補完時点の値で凍結されている。
+
+    全再計算がその銘柄を取得できなくても、行が引き継がれる限り
+    freshness_status="fresh" のまま残るので、それだけを見ると ready へ
+    進んでしまう (Codex レビュー round 6 で再現した fail-open)。
+    rebuild_unresolved が付いた行は、取得できていない事実そのものを理由に
+    最低でも review へ落ちること。
+    """
+    now = datetime(2026, 7, 14, 6, 0, tzinfo=JST)
+    _write_base(tmp_path, now)
+
+    # 印が無ければ (通常の補完行) 技術的理由は出ない = 対照群。
+    _write_technical(tmp_path, "JPM", coverage_source="topup")
+    clean = classify_execution_readiness(_buy(), base_dir=tmp_path, now=now)
+    assert _technical_codes(clean) == set()
+
+    # 同じ "fresh" な行に印だけを足すと review へ落ちる。
+    _write_technical(tmp_path, "JPM", coverage_source="topup",
+                     rebuild_unresolved=True,
+                     rebuild_unresolved_at=now.isoformat())
+    result = classify_execution_readiness(_buy(), base_dir=tmp_path, now=now)
+
+    assert result["execution_readiness"] != "ready", (
+        "直近の全再計算で取得できていない行が ready になった"
+    )
+    assert "technical_rebuild_unresolved" in {
+        row["code"] for row in result["execution_block_reasons"]
+    }
+
+
 def test_the_coverage_marker_does_not_change_the_verdict(tmp_path):
     """AI 提案であること自体にペナルティも優遇も設けない (方針①)。
 

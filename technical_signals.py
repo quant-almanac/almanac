@@ -562,6 +562,18 @@ COVERAGE_TOPUP_TIMEOUT_SECONDS = 90.0
 #      残り続けるなら、レジストリが _build_ticker_universe に届いていない
 COVERAGE_SOURCE_TOPUP = "topup"
 
+# coverage_source と違い、こちらは**実行経路が読むべき**マーカー。
+# 「直近の全再計算がこの銘柄を取得できず、前回の topup 行をそのまま
+# 引き継いだ」ことを表す。行の freshness_status は topup した時点の値で
+# 凍結されているので、この印が無いと execution_readiness は
+# 「今回取得に失敗しているのに fresh」と読んでしまう (fail-open)。
+# 読み手は2つ:
+#   1) execution_readiness — 最低でも review へ落とす
+#   2) proposed_ticker_registry.record — この印のある行は「今も実在する」
+#      証拠として数えない (数えると missed_rebuilds が永久にリセットされ、
+#      eviction が効かなくなる)
+REBUILD_UNRESOLVED_KEY = "rebuild_unresolved"
+
 
 def ensure_technical_coverage(
     tickers,
@@ -606,6 +618,10 @@ def ensure_technical_coverage(
         "requested": [],
         "added": [],
         "unavailable": [],
+        # この関数が自分でレジストリへ登録済みの銘柄。呼び出し元が同じ
+        # 銘柄をもう一度 record() して seen_count を二重に増やさないよう、
+        # 除外に使う (Codex レビュー round 6)。
+        "inline_registered": [],
     }
     try:
         from instrument_metadata import canonical_ticker
@@ -807,7 +823,6 @@ def ensure_technical_coverage(
                     # len(tickers) == source_health.analyzed_count + rows_outside_rebuild
                     "rows_outside_rebuild": max(0, len(rows) - analyzed),
                 }
-                atomic_write_json(path, merged)
                 # レジストリ登録もこの同じロックの中で完結させる。ここで
                 # release してから呼び出し元 (analyst/__init__.py) の
                 # proposed_ticker_registry.record() 呼び出しに委ねると、
@@ -818,18 +833,45 @@ def ensure_technical_coverage(
                 # record_already_locked はロックを取らない本体なので、
                 # ここで保持中の TECHNICAL_STATE_LOCK_NAME (=
                 # proposed_ticker_registry.REGISTRY_LOCK_NAME と同名) を
-                # そのまま使い回せる。呼び出し元は引き続き ensure の後で
-                # 通常の record() を全銘柄に対して呼ぶ (continuing 追跡は
-                # ここでは行わないため) —— inserted 分は二重登録になるが、
-                # last_seen/seen_count の重複更新だけで実害はない。
+                # そのまま使い回せる。
+                #
+                # ⚠️ 順序は「レジストリ登録が成功してから state を確定」。
+                # 逆順 (state 先) だと、レジストリ更新に失敗したときに
+                # 「行はあるがレジストリに無い」状態が残り、次の全再計算が
+                # その行を引き継がずに落とす —— しかも
+                # record_already_locked は例外ではなく {"status":"error"} を
+                # 返すので、try/except では捕まらず status=ok が返っていた
+                # (Codex レビュー round 6 で再現)。この順序なら、途中で
+                # 落ちても残るのはレジストリ登録だけで、次の全再計算が
+                # ネイティブに行を作り直せる。行が無い間は execution 側が
+                # technical_data_missing で fail-closed するので安全側。
+                registry_status = "skipped"
                 try:
                     import proposed_ticker_registry
 
-                    proposed_ticker_registry.record_already_locked(
+                    _registry_result = proposed_ticker_registry.record_already_locked(
                         inserted, resolved=set(inserted), base_dir=base_dir, now=now,
                     )
+                    registry_status = str(
+                        (_registry_result or {}).get("status") or "unknown")
                 except Exception as exc:
                     logger.warning("テクニカル補完: レジストリ即時登録に失敗 %s", exc)
+                    registry_status = "error"
+                if registry_status not in {"ok", "noop"}:
+                    # レジストリに載らない行を書いても、次の全再計算で確実に
+                    # 消える。書かずに報告だけ返し、次回の実行に委ねる。
+                    logger.warning(
+                        "テクニカル補完: レジストリ登録が %s のため行を書き込まない (%s)",
+                        registry_status, ", ".join(sorted(inserted)),
+                    )
+                    return {**report, "status": "registry_failed"}
+                atomic_write_json(path, merged)
+                # 呼び出し元 (analyst/__init__.py) が同じ銘柄をもう一度
+                # record() すると seen_count が二重に増える。seen_count は
+                # 同日候補の並び順と MAX_ENTRIES の切り捨てに使われるので
+                # 実害があり、呼び出し元がここで登録済みの分を除外できるよう
+                # 報告に載せる (Codex レビュー round 6)。
+                report["inline_registered"] = sorted(inserted)
         except LockBusy:
             # get_technical_context 側の書き込み (JSON の直列化+置換だけ)
             # は通常ミリ秒で終わるので、タイムアウトまで埋まっているのは
@@ -1039,6 +1081,29 @@ def get_technical_context(*, force: bool = False) -> dict:
     with process_lock(
         TECHNICAL_REBUILD_LOCK_NAME, timeout=TECHNICAL_REBUILD_LOCK_TIMEOUT_SECONDS
     ):
+        # ロック待ちの間に、先行していた再計算が新しいキャッシュを書いて
+        # いるかもしれない。single-flight は直列化するだけで同一処理を
+        # 集約しないので、ここで再確認しないと「待たされた末に、たった今
+        # 作られたばかりの結果を捨ててもう一度数分かけて計算する」という
+        # 二度手間になる (Codex レビュー round 6 で _load_ohlcv が
+        # 期待1回に対して2回呼ばれることを再現)。
+        # force=True は「今のユニバースで確実に作り直す」という明示要求
+        # なので集約しない。
+        if not force:
+            fresh = load_json(CACHE_FILE, {})
+            if isinstance(fresh, dict) and fresh.get("cached_at"):
+                try:
+                    fresh_dt = datetime.fromisoformat(fresh["cached_at"])
+                    age = (datetime.now(timezone.utc) - fresh_dt).total_seconds()
+                    if age < CACHE_TTL:
+                        logger.info(
+                            "ロック取得後に有効なキャッシュを確認（残り %d 秒）— 再計算を省略",
+                            int(CACHE_TTL - age),
+                        )
+                        return fresh
+                except Exception:
+                    pass
+
         state = compute_technical_state()
         # ensure_technical_coverage (実行内補完) と同じロックを取ってから書く。
         # compute_technical_state 自体はこのファイルへ書き込まない (ネットワーク
@@ -1085,6 +1150,22 @@ def get_technical_context(*, force: bool = False) -> dict:
                         continue
                     if ticker not in active_candidates:
                         continue
+                    # 引き継ぐ行には「今回の再計算では取得できなかった」印を
+                    # 必ず付ける。この行の freshness_status は topup した
+                    # 時点の値のまま凍結されており (data_as_of から都度
+                    # 再計算されるわけではない)、"fresh" のまま何日でも
+                    # 生き延びうる。execution_readiness はその行だけを見て
+                    # 発注可否を決めるので、印が無いと「今回取得に失敗して
+                    # いるのに ready」という fail-open になる
+                    # (Codex レビュー round 6 で再現)。
+                    # proposed_ticker_registry.record もこの印を見て
+                    # missed_rebuilds のリセット可否を判断する —— 印が無いと
+                    # 「引き継がれた行が存在する」こと自体が「今も実在する」
+                    # 証拠として扱われ、猶予が永久にリセットされ続ける
+                    # (carry-forward と猶予リセットの循環)。
+                    row = dict(row)
+                    row[REBUILD_UNRESOLVED_KEY] = True
+                    row["rebuild_unresolved_at"] = datetime.now(timezone.utc).isoformat()
                     state["tickers"][ticker] = row
                     carried.append(ticker)
                 if carried:

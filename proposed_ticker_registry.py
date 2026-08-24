@@ -224,10 +224,21 @@ def record_already_locked(
         # missed_rebuilds=2 のMDBが、continuing 扱いで 0 へ戻った)。
         # 「今も実在する」の唯一の直接証拠は technical_state.json 自身の
         # tickers キーなので、それを読んで requested の絞り込みに使う。
+        #
+        # ⚠️ 「行がある」だけでは足りない。直近の全再計算が取得に失敗し、
+        # 前回の補完行がそのまま引き継がれただけの行には
+        # rebuild_unresolved=True が付く。それを実在の証拠として数えると、
+        # 「引き継ぎが行を生かす → 行があるので continuing 扱い →
+        # missed_rebuilds が 0 に戻る → 次も引き継がれる」の循環になり、
+        # eviction が永久に効かない (Codex レビュー round 6 で
+        # missed_rebuilds 1→0 のリセットを再現)。取得できた行だけを数える。
         try:
             _tech_state = load_json(Path(base_dir) / "technical_state.json", {})
             _live_tickers = (
-                set((_tech_state.get("tickers") or {}).keys())
+                {
+                    t for t, row in (_tech_state.get("tickers") or {}).items()
+                    if not (isinstance(row, dict) and row.get("rebuild_unresolved"))
+                }
                 if isinstance(_tech_state, dict) else set()
             )
         except Exception:
