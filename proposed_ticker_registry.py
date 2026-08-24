@@ -53,6 +53,15 @@ TTL_DAYS = 21
 # この閾値を割った日は追い出しごとスキップし、レジストリを守る。
 MIN_REBUILD_COVERAGE_FOR_EVICTION = 0.5
 
+# coverage が閾値を超えていても、1回の再計算で1銘柄だけ取得に失敗する
+# ことはある (yfinance の一時的なレート制限・単一銘柄のAPI不調)。それを
+# 上場廃止と区別できないまま即時追い出すと、一時的な取得失敗のたびに
+# レジストリが痩せ、翌日また resolved で再登録されるだけの往復が起きる。
+# 再計算は平日3回/日 (08:30/12:00/17:05) 走るので、連続してこの回数
+# 失敗して初めて追い出す。record() が resolved/継続提案のたびに 0 へ戻す
+# ので、間に1回でも成功が挟まれば猶予はリセットされる。
+MISSED_REBUILDS_BEFORE_EVICTION = 3
+
 SOURCE_LABEL = "ai_proposal"
 
 
@@ -79,12 +88,19 @@ def _read_rows(base_dir: Path) -> list[dict]:
         ticker = str(row.get("ticker") or "").strip().upper()
         if not ticker:
             continue
+        try:
+            missed_rebuilds = int(row.get("missed_rebuilds") or 0)
+        except (TypeError, ValueError):
+            missed_rebuilds = 0
         out.append({
             "ticker": ticker,
             "first_seen": str(row.get("first_seen") or ""),
             "last_seen": str(row.get("last_seen") or ""),
             "seen_count": int(row.get("seen_count") or 0),
             "source": str(row.get("source") or SOURCE_LABEL),
+            # 既存フィールドに無ければ 0 (旧形式のエントリも「失敗歴なし」
+            # として安全に読める)。
+            "missed_rebuilds": max(0, missed_rebuilds),
         })
     return out
 
@@ -147,6 +163,20 @@ def record(
 
         additions = [t for t in requested if t in resolved_upper]
         rows = {row["ticker"]: row for row in _read_rows(base_dir)}
+        # 継続提案: 今回は resolved に入らなかった (= ensure_technical_coverage
+        # が「既に行がある」として取得をスキップした) が、既に登録済みの銘柄。
+        # resolved はその呼び出しで実際に取得した銘柄しか含まないので、
+        # 2日目以降ずっと同じ銘柄が提案され続けても、行が既にあるせいで
+        # resolved には二度と入らない。それを見て additions だけで
+        # last_seen を判定すると、初日以降ずっと同じ日付のまま TTL に
+        # 引っかかって消える (last_seen が「最後に新規取得できた日」に
+        # なってしまい、「最後に提案された日」にならない)。
+        # rows に既にあるという事実自体が「過去に実在確認済み」の証拠なので、
+        # 未検証の新規登録 (additions 側の唯一の関門) とは安全性が異なる。
+        continuing = [
+            t for t in requested
+            if t not in resolved_upper and t in rows
+        ]
         for ticker in additions:
             row = rows.get(ticker)
             if row is None:
@@ -156,15 +186,27 @@ def record(
                     "last_seen": stamp,
                     "seen_count": 1,
                     "source": SOURCE_LABEL,
+                    "missed_rebuilds": 0,
                 }
             else:
                 row["last_seen"] = stamp
                 row["seen_count"] = int(row.get("seen_count") or 0) + 1
                 if not row.get("first_seen"):
                     row["first_seen"] = stamp
+                # 行を取得できた = 直近の再計算失敗歴を持ち越す理由がない。
+                row["missed_rebuilds"] = 0
+        for ticker in continuing:
+            row = rows[ticker]
+            row["last_seen"] = stamp
+            row["seen_count"] = int(row.get("seen_count") or 0) + 1
+            # continuing は「今も technical row がある」ことが前提条件
+            # (record() 呼び出し側の risk-increasing 銘柄は、行があるからこそ
+            # ensure_technical_coverage が取得をスキップして resolved に
+            # 入らなかった)。よって additions と同じく猶予をリセットする。
+            row["missed_rebuilds"] = 0
 
         ordered = _prune_and_order(list(rows.values()), today=today)
-        if not additions and len(ordered) == len(rows):
+        if not additions and not continuing and len(ordered) == len(rows):
             # 変化なし。mtime を動かさない。
             return {"status": "noop", "requested": requested, "registered": []}
         # 追加が無くても TTL 切れは書き戻して落とす。_build_ticker_universe は
@@ -178,6 +220,8 @@ def record(
             "requested": requested,
             "registered": [t for t in additions if t in kept],
             "dropped": [t for t in additions if t not in kept],
+            # 新規登録ではなく last_seen だけ更新した既存銘柄。
+            "continuing": [t for t in continuing if t in kept],
             "entries": len(ordered),
         }
     except Exception as exc:  # レジストリは補助。失敗しても分析を止めない。
@@ -191,12 +235,18 @@ def evict_unresolved(
     rebuild_coverage: float,
     now: datetime | None = None,
 ) -> dict:
-    """再計算が行を作れなかった登録銘柄を追い出す。例外は投げない。
+    """再計算が行を作れなかった登録銘柄の猶予を進め、尽きたものを追い出す。
+
+    例外は投げない。1回の再計算で欠けただけでは追い出さない —— yfinance の
+    一時的な単一銘柄不調と、本当の上場廃止を区別できないため
+    (MISSED_REBUILDS_BEFORE_EVICTION 参照)。連続してこの回数を欠けて
+    初めて追い出す。record() が成功のたびに猶予を 0 へ戻すので、
+    間に1回でも解決できればカウントは積み上がらない。
 
     上場廃止・改称された銘柄をユニバースに残し続けると
     _ensure_technical_state_fresh の universe_is_complete が恒久的に false に
-    なり、毎回の強制再計算が無警告で走る。最悪ケースは「強制再計算が2回
-    余分に走ってから自己修復」で、それ以上悪化しない。
+    なり、毎回の強制再計算が無警告で走る。猶予を使い切るまでの最悪ケースは
+    「強制再計算が数回余分に走ってから自己修復」で、それ以上悪化しない。
     """
     try:
         coverage = float(rebuild_coverage)
@@ -214,11 +264,31 @@ def evict_unresolved(
         if not rows:
             return {"status": "noop", "evicted": []}
 
-        survivors = [row for row in rows if row["ticker"] not in drop]
-        evicted = sorted({row["ticker"] for row in rows} & drop)
+        touched = {row["ticker"] for row in rows} & drop
+
+        survivors = []
+        evicted = []
+        for row in rows:
+            if row["ticker"] not in drop:
+                survivors.append(row)
+                continue
+            missed = int(row.get("missed_rebuilds") or 0) + 1
+            if missed >= MISSED_REBUILDS_BEFORE_EVICTION:
+                evicted.append(row["ticker"])
+                continue
+            row = dict(row)
+            row["missed_rebuilds"] = missed
+            survivors.append(row)
+        evicted = sorted(evicted)
+
         ordered = _prune_and_order(survivors, today=today)
-        if len(ordered) == len(rows) and not evicted:
-            # TTL でも落ちていないなら書かない (mtime を動かさない)。
+        if not touched and len(ordered) == len(rows):
+            # このレジストリの銘柄は1件もこの再計算で欠けておらず、
+            # TTL でも何も落ちていない。カウンタも件数も変わらないので
+            # 書かない (mtime を動かさない)。touched が非空なら、
+            # 追い出しに至らなくても missed_rebuilds の増分を必ず書く —
+            # ここを省くと猶予を跨いだカウントアップが失われ、
+            # 実質「1回の欠落で即追い出し」の旧挙動へ戻ってしまう。
             return {"status": "noop", "evicted": []}
         _write(base_dir, ordered, now=now)
         return {"status": "ok", "evicted": evicted, "entries": len(ordered)}

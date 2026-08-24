@@ -153,3 +153,80 @@ def test_bot_api_rejection_is_not_retried(monkeypatch, no_sleep):
     with pytest.raises(RuntimeError, match="rejected message"):
         alert.send_telegram("message")
     assert post.calls["n"] == 1
+
+
+def test_a_connection_timeout_does_not_leak_the_token_when_retries_exhaust(monkeypatch, no_sleep):
+    """Codex レビュー: Bot トークンが平文でログファイルに残っていた。
+
+    requests/urllib3 は接続エラーの文字列表現に完全な URL (トークンを
+    含むパス) を埋め込む。cron はこの関数の print/例外文字列を
+    ログファイルへリダイレクトするので、伏せずに print・re-raise すると
+    ディスクに平文で残る (実測: alert_log.txt / ai_analysis_log.txt から
+    検出)。
+    """
+    monkeypatch.setattr(alert, "TELEGRAM_TOKEN", "SECRET_TOKEN_VALUE")
+    monkeypatch.setattr(alert, "TELEGRAM_CHAT_ID", "chat")
+    real_error = requests.ConnectionError(
+        "HTTPSConnectionPool(host='api.telegram.org', port=443): "
+        "Max retries exceeded with url: /botSECRET_TOKEN_VALUE/sendMessage"
+    )
+    post = _post_sequence(*[real_error] * alert.TELEGRAM_MAX_ATTEMPTS)
+    monkeypatch.setattr(alert.requests, "post", post)
+
+    with pytest.raises(requests.ConnectionError) as excinfo:
+        alert.send_telegram("briefing")
+
+    assert "SECRET_TOKEN_VALUE" not in str(excinfo.value)
+    assert "<redacted>" in str(excinfo.value)
+
+
+def test_an_http_error_does_not_leak_the_token(monkeypatch):
+    """HTTPError.args[0] は "... for url: https://.../bot<TOKEN>/..." を含む。"""
+    monkeypatch.setattr(alert, "TELEGRAM_TOKEN", "SECRET_TOKEN_VALUE")
+    monkeypatch.setattr(alert, "TELEGRAM_CHAT_ID", "chat")
+    error = requests.HTTPError(
+        "404 Client Error: Not Found for url: "
+        "https://api.telegram.org/botSECRET_TOKEN_VALUE/sendMessage"
+    )
+    post = _post_sequence(_Response(status_code=404, error=error))
+    monkeypatch.setattr(alert.requests, "post", post)
+
+    with pytest.raises(requests.HTTPError) as excinfo:
+        alert.send_telegram("message")
+
+    assert "SECRET_TOKEN_VALUE" not in str(excinfo.value)
+
+
+def test_the_retry_warning_print_does_not_leak_the_token(monkeypatch, no_sleep, capsys):
+    monkeypatch.setattr(alert, "TELEGRAM_TOKEN", "SECRET_TOKEN_VALUE")
+    monkeypatch.setattr(alert, "TELEGRAM_CHAT_ID", "chat")
+    dns_error = requests.ConnectionError(
+        "Max retries exceeded with url: /botSECRET_TOKEN_VALUE/sendMessage"
+    )
+    post = _post_sequence(dns_error, _Response())
+    monkeypatch.setattr(alert.requests, "post", post)
+
+    assert alert.send_telegram("briefing") is True
+
+    captured = capsys.readouterr()
+    assert "SECRET_TOKEN_VALUE" not in captured.out
+
+
+def test_redaction_preserves_the_exception_type_and_traceback(monkeypatch):
+    """既存の呼出元は例外の型で分岐する (requests.HTTPError vs ConnectionError
+    vs RuntimeError)。伏字化のために型を変えてはならない。"""
+    monkeypatch.setattr(alert, "TELEGRAM_TOKEN", "")  # 伏字化は無効化
+    error = requests.ConnectionError("dns down")
+    post = _post_sequence(*[error] * alert.TELEGRAM_MAX_ATTEMPTS)
+    monkeypatch.setattr(alert.requests, "post", post)
+    monkeypatch.setattr(alert, "TELEGRAM_TOKEN", "unused")
+    monkeypatch.setattr(alert, "TELEGRAM_CHAT_ID", "chat")
+
+    with pytest.raises(requests.ConnectionError, match="dns down"):
+        alert.send_telegram("briefing")
+
+
+def test_no_token_configured_does_not_redact_or_crash(monkeypatch, no_sleep):
+    """TELEGRAM_TOKEN が空のときに伏字化ロジック自体が例外を起こさないこと。"""
+    monkeypatch.setattr(alert, "TELEGRAM_TOKEN", "")
+    assert alert._redact_telegram_token("plain text") == "plain text"

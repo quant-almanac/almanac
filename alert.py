@@ -73,6 +73,36 @@ def _telegram_retry_after(response) -> float | None:
     return value if value >= 0 else None
 
 
+def _redact_telegram_token(text: str) -> str:
+    """Bot トークンの平文をログへ出す前に伏せる。
+
+    requests/urllib3 は接続エラー・HTTPError の文字列表現に完全な URL
+    (トークンそのものを含むパス) を埋め込む。2026-08-24 のレビューで
+    alert_log.txt / ai_analysis_log.txt から実際に検出された。
+    """
+    if not TELEGRAM_TOKEN:
+        return text
+    return text.replace(TELEGRAM_TOKEN, "<redacted>")
+
+
+def _reraise_redacted(exc: Exception) -> None:
+    """例外を型を保ったまま、トークンを伏せたメッセージで再送出する。
+
+    ConnectTimeout.args[0] が MaxRetryError で、その __str__ の中に URL が
+    ある、というように url/token はネストした例外オブジェクトの奥に
+    埋め込まれる。args を浅く置換してもネストまでは書き換わらないので、
+    str(exc) で一度フラットな文字列へ落としてから置換し、同じ型で
+    作り直す。原因チェーンは黙って捨てる (from None) —— 残すと Python の
+    既定のトレースバック表示が元の (未伏字の) 例外も一緒に出してしまう。
+    """
+    redacted = _redact_telegram_token(str(exc))
+    try:
+        new_exc = type(exc)(redacted)
+    except Exception:
+        new_exc = RuntimeError(redacted)
+    raise new_exc.with_traceback(exc.__traceback__) from None
+
+
 def send_telegram(message) -> bool:
     """Send one Telegram message and report the actual API result.
 
@@ -105,8 +135,11 @@ def send_telegram(message) -> bool:
             # Never reached Telegram (DNS failure, refused/reset connection,
             # or no response in time), so a retry cannot duplicate a delivery.
             if last_attempt:
-                raise
-            print(f'[WARN] Telegram送信リトライ {attempt}/{TELEGRAM_MAX_ATTEMPTS} ({type(exc).__name__}): {exc}')
+                _reraise_redacted(exc)
+            print(
+                f'[WARN] Telegram送信リトライ {attempt}/{TELEGRAM_MAX_ATTEMPTS} '
+                f'({type(exc).__name__}): {_redact_telegram_token(str(exc))}'
+            )
             time.sleep(backoff)
             continue
 
@@ -115,14 +148,20 @@ def send_telegram(message) -> bool:
         status = getattr(response, "status_code", None)
         if isinstance(status, int) and (status == 429 or 500 <= status < 600):
             if last_attempt:
-                response.raise_for_status()
+                try:
+                    response.raise_for_status()
+                except requests.HTTPError as http_exc:
+                    _reraise_redacted(http_exc)
             hinted = _telegram_retry_after(response) if status == 429 else None
             delay = hinted if hinted is not None else backoff
             print(f'[WARN] Telegram送信リトライ {attempt}/{TELEGRAM_MAX_ATTEMPTS} (HTTP {status}, {delay:.1f}s待機)')
             time.sleep(delay)
             continue
 
-        response.raise_for_status()
+        try:
+            response.raise_for_status()
+        except requests.HTTPError as http_exc:
+            _reraise_redacted(http_exc)
         payload = response.json()
         if not isinstance(payload, dict) or payload.get("ok") is not True:
             raise RuntimeError(f"Telegram Bot API rejected message: {payload!r}")

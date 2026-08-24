@@ -53,20 +53,42 @@ def main(argv: list[str] | None = None) -> int:
         heartbeat("portfolio_analyst", "error", str(e)[:500])
         raise
 
+    # send_to_telegram の戻り値は Bool で「実際に届いたか」を返す
+    # (alert.send_telegram がリトライを使い切ると False)。以前はここで
+    # 戻り値を見ておらず、分析自体は正常終了コード0・heartbeat=ok を
+    # 返すため、「分析は動いたが Telegram が来ない」を watchdog が検知
+    # できなかった (2026-08-24 レビュー)。
+    telegram_ok = True
     if send_tg:
-        send_to_telegram(result)
+        # ``None`` は簡易テストダブル・レガシーラッパー向けに成功扱いのまま
+        # にする (analyst.send_to_telegram の _send_checked と同じ慣習)。
+        # 本番の transport は明示的な bool を返し、False だけが実際の失敗。
+        telegram_ok = send_to_telegram(result) is not False
 
     synthesis = result.get("synthesis", {}) if isinstance(result, dict) else {}
     actions = synthesis.get("priority_actions", []) if isinstance(synthesis, dict) else []
-    heartbeat(
-        "portfolio_analyst",
-        "ok",
-        None,
-        extra={
-            "as_of": result.get("as_of") if isinstance(result, dict) else None,
-            "priority_actions": len(actions) if isinstance(actions, list) else None,
-        },
-    )
+    if telegram_ok:
+        heartbeat(
+            "portfolio_analyst",
+            "ok",
+            None,
+            extra={
+                "as_of": result.get("as_of") if isinstance(result, dict) else None,
+                "priority_actions": len(actions) if isinstance(actions, list) else None,
+            },
+        )
+    else:
+        # 分析自体は成功しているので "error" ではなく "warn" —
+        # watchdog.py は status=="error" のみを既定で重大扱いする。
+        heartbeat(
+            "portfolio_analyst",
+            "warn",
+            "Telegram送信に失敗（分析は正常終了）",
+            extra={
+                "as_of": result.get("as_of") if isinstance(result, dict) else None,
+                "priority_actions": len(actions) if isinstance(actions, list) else None,
+            },
+        )
 
     if show_json:
         print(json.dumps(result, ensure_ascii=False, indent=2))
@@ -82,6 +104,9 @@ def main(argv: list[str] | None = None) -> int:
             for a in actions[:5]:
                 urg = {"high": "🔴", "medium": "🟡", "low": "🟢"}.get(a.get("urgency", "low"), "⚪")
                 print(f"  {urg} [{a.get('tier','?')}] {a.get('action','')}")
+    if not telegram_ok:
+        print("❌ Telegram送信に失敗（分析結果は保存済み）", file=sys.stderr)
+        return 2
     return 0
 
 

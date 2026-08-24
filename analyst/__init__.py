@@ -1317,32 +1317,35 @@ def _compute_data_freshness() -> str:
             # 事実でない警告と不要な urgency 抑制を生んでいた。
             # 権威を両経路で揃える。読めなければ従来どおりファイル基準。
             scope = _FRESHNESS_ATTESTATION_SCOPES.get(fname)
+            force_very_stale = False
             if scope:
-                try:
-                    from holdings_freshness import effective_source_as_of
+                # 乖離判定は attestation の有無に関係なく先に評価する。
+                # 「表明が無ければ壁時計だけ見る」という以前の構造だと、
+                # attestation の無い holdings.json が実際は1時間前でも
+                # 未反映の約定があるまま fresh を名乗れてしまう —
+                # mtime の新しさは中身の正しさを何も保証しない。
+                # divergence_or_unresolved は判定不能も True 側へ倒す
+                # (fail-closed)。attestation が壁時計での失効という後ろ盾を
+                # 外している以上、「わからないなら足さない」は成立しない。
+                from holdings_freshness import divergence_or_unresolved
 
-                    effective, origin = effective_source_as_of(
-                        scope=scope,
-                        file_as_of=now - timedelta(hours=age_h),
-                        base_dir=BASE_DIR,
-                    )
-                    if origin == "attestation" and effective is not None:
-                        # 表明は「表明した時点の内容」しか保証しない。その後に
-                        # 記録された約定が holdings へ未反映なら、attest 済みを
-                        # 理由に fresh を名乗ってはならない。analysis_snapshot が
-                        # _provenance_for_file(diverged=...) で同じ停止条件を
-                        # 持っているので、権威を揃える。ここを落とすと、
-                        # 「壁時計では止めない」設計と引き換えに置いた唯一の
-                        # 停止条件がこの経路にだけ存在しないことになる。
-                        from holdings_freshness import holdings_divergence
+                if divergence_or_unresolved(base_dir=BASE_DIR):
+                    force_very_stale = True
+                    label = f"{label}(diverged)"
+                else:
+                    try:
+                        from holdings_freshness import effective_source_as_of
 
-                        if holdings_divergence(base_dir=BASE_DIR).get("diverged"):
-                            label = f"{label}(diverged)"
-                        else:
+                        effective, origin = effective_source_as_of(
+                            scope=scope,
+                            file_as_of=now - timedelta(hours=age_h),
+                            base_dir=BASE_DIR,
+                        )
+                        if origin == "attestation" and effective is not None:
                             age_h = max(0.0, (now - effective).total_seconds() / 3600)
                             label = f"{label}(attested)"
-                except Exception:
-                    pass
+                    except Exception:
+                        pass
 
             try:
                 freshness = max(0.0, 1.0 - age_h / stale_h)
@@ -1358,10 +1361,14 @@ def _compute_data_freshness() -> str:
                             freshness = min(freshness, 0.5)
                     except Exception:
                         freshness = min(freshness, 0.25)
+                if force_very_stale:
+                    freshness = 0.0
                 overall_score += freshness * weight
                 total_weight  += weight
 
-                if age_h < warn_h:
+                if force_very_stale:
+                    status = "❌ VERY_STALE"
+                elif age_h < warn_h:
                     status = "✅ FRESH"
                 elif age_h < stale_h:
                     status = "⚠️ STALE"
@@ -10400,6 +10407,14 @@ def _log_recommendations(synthesis: dict, market_meta: dict) -> None:
             "execution_eligible": execution_eligible,
             "execution_readiness": readiness,
             "execution_block_reasons": block_reasons,
+            # readiness を変えない非ブロック助言 (first_time_symbol 等)。
+            # block_reasons はここに載るのに advisories が無かったため、
+            # 「初回銘柄で ready だった」という事実が事後の監査ログから
+            # 読み取れなかった。
+            "execution_advisories": [
+                dict(row) for row in (a.get("execution_advisories") or [])
+                if isinstance(row, dict)
+            ],
             "reproposal_policy_version": a.get("reproposal_policy_version"),
             "reproposal_reason_fingerprint": a.get("reproposal_reason_fingerprint"),
             "execution_scope_key": a.get("execution_scope_key"),
@@ -13653,6 +13668,21 @@ def send_to_telegram(result: dict) -> bool:
                 text += f"📋 注文: {_safe_plain(order_line, 240)}\n"
             if execution_reason:
                 text += f"⚙️ {_safe_plain(_trim_plain(execution_reason, 160), 180)}\n"
+            # execution_advisories は readiness を変えない非ブロック助言
+            # (例: first_time_symbol — 保有実績もスクリーナー通過も無い
+            # 初回銘柄への単元・流動性の確認喚起)。Today UI には出るのに
+            # ready の発注はこの Telegram メッセージだけで完結して指示が
+            # 出ることが多く、advisories を読まないと「発注する人間の目の
+            # 前へ出す」という実装目的を満たせない。
+            advisories = [
+                row for row in (a.get("execution_advisories") or [])
+                if isinstance(row, dict) and row.get("message")
+            ]
+            if advisories:
+                advisory_text = " / ".join(
+                    _trim_plain(str(row["message"]), 160) for row in advisories[:3]
+                )
+                text += f"🔔 {_safe_plain(advisory_text, 320)}\n"
             text += f"📝 {_clean(reason, 500)}"
             _send_checked(text[:3900], f"action #{i} {ticker}")
             sent_actions += 1

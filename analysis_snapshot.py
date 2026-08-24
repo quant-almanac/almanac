@@ -230,16 +230,18 @@ def _holdings_diverged(base_dir: Path) -> bool:
     モジュール変数に覚えさせると分析実行をまたいで残り、台帳が変わった
     のに古い答えを返す。
 
-    検出できない場合 (台帳が読めない等) は False にする —— ここで例外を
-    投げると分析全体が落ちる。乖離判定は他の停止条件を置き換えるもの
-    ではなく足すものなので、分からないなら足さないのが正しい。
+    検出できない場合 (台帳が読めない等) は True (乖離あり扱い) にする。
+    2026-08-17 の初版は False (問題なし扱い) だったが、これは attestation
+    が壁時計での失効という後ろ盾を外す前提だった。今は attested な
+    holdings/cash に対してこの判定が唯一残る停止条件なので、判定できない
+    ことを楽観すると、台帳を一時的に読めないだけで attest 済みの古い
+    holdings が無期限に fresh を名乗り続ける (holdings_freshness.py
+    レビューで実証済み)。分析全体を落とさないことと fail-open にする
+    ことは別の要求であり、後者だけを諦める。
     """
-    try:
-        from holdings_freshness import holdings_divergence
+    from holdings_freshness import divergence_or_unresolved
 
-        return bool(holdings_divergence(base_dir=base_dir).get("diverged"))
-    except Exception:
-        return False
+    return divergence_or_unresolved(base_dir=base_dir)
 
 
 def _provenance_for_file(

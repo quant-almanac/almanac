@@ -510,12 +510,115 @@ class TestProposedTickerRegistry:
         assert report["registered"] == ["JPM"]
         assert set(proposed_ticker_registry.load_registered(tmp_path)) == {"JPM"}
 
-    def test_a_ticker_the_rebuild_could_not_resolve_is_evicted(self, tmp_path):
+    def test_a_continuing_proposal_keeps_last_seen_current(self, tmp_path):
+        """Codex レビュー再現: last_seen が「最後に新規取得できた日」のまま
+        止まり、「最後に提案された日」を表さなくなっていた。
+
+        2日目以降、その銘柄は既に technical row を持つので
+        ensure_technical_coverage が取得をスキップし、resolved には
+        二度と入らない。resolved だけで last_seen を判定すると、
+        毎日提案され続けても初日の日付のまま TTL_DAYS 後に消える。
+        """
+        day1 = datetime(2026, 8, 1, tzinfo=timezone.utc)
+
+        proposed_ticker_registry.record(
+            ["VT"], resolved={"VT"}, base_dir=tmp_path, now=day1)
+        before = proposed_ticker_registry.load_registered(tmp_path)["VT"]
+        assert before["last_seen"] == "2026-08-01"
+        assert before["seen_count"] == 1
+
+        # 2日目以降、VT は毎日提案され続けるが行は既にあるので resolved には
+        # 入らない (ensure_technical_coverage が取得をスキップするため)。
+        for offset in range(1, 21):
+            day = day1 + timedelta(days=offset)
+            report = proposed_ticker_registry.record(
+                ["VT"], resolved=set(), base_dir=tmp_path, now=day)
+            assert report["continuing"] == ["VT"]
+
+        after = proposed_ticker_registry.load_registered(tmp_path)["VT"]
+        assert after["last_seen"] == "2026-08-21"
+        assert after["seen_count"] == 21
+
+        # TTL_DAYS(21) は「最後に提案された日」からの猶予であるべき。
+        # 提案が21日連続で続いた後、22日目に登録済みのまま生き残ること。
+        day22 = day1 + timedelta(days=21)
+        proposed_ticker_registry.record(
+            ["VT"], resolved=set(), base_dir=tmp_path, now=day22)
+        assert "VT" in proposed_ticker_registry.load_registered(tmp_path)
+
+    def test_a_continuing_proposal_for_an_unregistered_ticker_is_ignored(self, tmp_path):
+        """continuing は「既に登録済み」が前提。未登録銘柄を resolved 無しで
+        提案しても新規登録してはならない (ポジティブキャッシュ制約は不変)。
+        """
+        report = proposed_ticker_registry.record(
+            ["ZZQQXX"], resolved=set(), base_dir=tmp_path)
+
+        assert report["status"] == "noop"
+        assert proposed_ticker_registry.load_registered(tmp_path) == {}
+
+    def test_a_single_miss_does_not_evict(self, tmp_path):
+        """Codex レビュー再現: coverage99% でMDBだけ1回欠けても即追い出さない。
+
+        一時的な Yahoo 障害と本当の上場廃止を区別できないまま即時削除する
+        と、翌日また resolved で再登録されるだけの往復が起きる。
+        """
         proposed_ticker_registry.record(
             ["JPM", "MDB"], resolved={"JPM", "MDB"}, base_dir=tmp_path)
 
+        report = proposed_ticker_registry.evict_unresolved(
+            ["MDB"], base_dir=tmp_path, rebuild_coverage=0.99)
+
+        assert report["status"] == "ok"
+        assert report["evicted"] == []
+        registered = proposed_ticker_registry.load_registered(tmp_path)
+        assert set(registered) == {"JPM", "MDB"}
+        assert registered["MDB"]["missed_rebuilds"] == 1
+
+    def test_a_ticker_is_evicted_only_after_consecutive_misses(self, tmp_path):
+        """MISSED_REBUILDS_BEFORE_EVICTION 回連続で欠けて初めて追い出す。"""
+        proposed_ticker_registry.record(
+            ["MDB"], resolved={"MDB"}, base_dir=tmp_path)
+
+        for i in range(proposed_ticker_registry.MISSED_REBUILDS_BEFORE_EVICTION - 1):
+            proposed_ticker_registry.evict_unresolved(
+                ["MDB"], base_dir=tmp_path, rebuild_coverage=0.99)
+            assert "MDB" in proposed_ticker_registry.load_registered(tmp_path), (
+                f"{i + 1}回目の欠落で追い出された (閾値未満のはず)"
+            )
+
+        report = proposed_ticker_registry.evict_unresolved(
+            ["MDB"], base_dir=tmp_path, rebuild_coverage=0.99)
+
+        assert report["evicted"] == ["MDB"]
+        assert proposed_ticker_registry.load_registered(tmp_path) == {}
+
+    def test_a_success_between_misses_resets_the_grace_counter(self, tmp_path):
+        """猶予の途中で1回でも解決できれば、カウントは積み上がらない。"""
+        proposed_ticker_registry.record(
+            ["MDB"], resolved={"MDB"}, base_dir=tmp_path)
+
         proposed_ticker_registry.evict_unresolved(
-            ["MDB"], base_dir=tmp_path, rebuild_coverage=0.95)
+            ["MDB"], base_dir=tmp_path, rebuild_coverage=0.99)
+        assert proposed_ticker_registry.load_registered(tmp_path)["MDB"]["missed_rebuilds"] == 1
+
+        # 次の再計算では解決できた (継続提案としての record() 呼び出し)。
+        proposed_ticker_registry.record(["MDB"], resolved=set(), base_dir=tmp_path)
+        assert proposed_ticker_registry.load_registered(tmp_path)["MDB"]["missed_rebuilds"] == 0
+
+        # 再び欠けても、猶予は 1 からやり直しになる (2 からの続きではない)。
+        for _ in range(proposed_ticker_registry.MISSED_REBUILDS_BEFORE_EVICTION - 1):
+            proposed_ticker_registry.evict_unresolved(
+                ["MDB"], base_dir=tmp_path, rebuild_coverage=0.99)
+        assert "MDB" in proposed_ticker_registry.load_registered(tmp_path)
+
+    def test_a_ticker_the_rebuild_could_not_resolve_is_evicted(self, tmp_path):
+        """繰り返し欠け続ければ、猶予を使い切って最終的には追い出されること。"""
+        proposed_ticker_registry.record(
+            ["JPM", "MDB"], resolved={"JPM", "MDB"}, base_dir=tmp_path)
+
+        for _ in range(proposed_ticker_registry.MISSED_REBUILDS_BEFORE_EVICTION):
+            proposed_ticker_registry.evict_unresolved(
+                ["MDB"], base_dir=tmp_path, rebuild_coverage=0.95)
 
         assert set(proposed_ticker_registry.load_registered(tmp_path)) == {"JPM"}
 
@@ -548,32 +651,132 @@ class TestConcurrentRebuildMerge:
     def test_a_row_created_by_a_concurrent_rebuild_is_not_clobbered(
         self, tmp_path, loader, monkeypatch
     ):
+        """マージ用の読み取り (CAS の1回目) が既に新しい行を見ているケース。
+
+        再計算が JPM を落ち着いて拾えた場合、topup 側は「追加すべき行が
+        無い」と気付いてそもそも書かない。CAS のリトライを要さない、
+        最も穏当な競合形。より厳しい「読み終えた後・書く前」の競合は
+        test_a_write_that_lands_between_read_and_replace_does_not_get_clobbered
+        が見る。
+        """
         _write_base(tmp_path)
         loader({"JPM": _frame()})
 
         rebuilt_row = {"price": 999.0, "freshness_status": "fresh",
                        "data_quality_status": "ok", "data_as_of": "2026-08-24"}
-        real_load_json = technical_signals.load_json
+        real_read = technical_signals._read_state_bytes
         seen = {"n": 0}
 
-        def _staggered(path, default=None):
-            if str(path).endswith("technical_state.json"):
-                seen["n"] += 1
-                if seen["n"] >= 2:
-                    # 取得中に 12:00 の cron が再計算を終え、ファイルを丸ごと
-                    # 置換した状態を再現する。以降の読み直しは新しい行を見る。
-                    rebuilt = real_load_json(path, default)
-                    rebuilt["tickers"] = {**rebuilt["tickers"], "JPM": dict(rebuilt_row)}
-                    (tmp_path / "technical_state.json").write_text(
-                        json.dumps(rebuilt), encoding="utf-8")
-            return real_load_json(path, default)
+        def _staggered(path):
+            seen["n"] += 1
+            if seen["n"] == 1:
+                # 取得中に 12:00 の cron が再計算を終え、ファイルを丸ごと
+                # 置換した状態を再現する。CAS の1回目の読み取り
+                # (合成の土台) が既にこれを見る。
+                rebuilt = json.loads(real_read(path))
+                rebuilt["tickers"] = {**rebuilt["tickers"], "JPM": dict(rebuilt_row)}
+                (tmp_path / "technical_state.json").write_text(
+                    json.dumps(rebuilt), encoding="utf-8")
+            return real_read(path)
 
-        monkeypatch.setattr(technical_signals, "load_json", _staggered)
+        monkeypatch.setattr(technical_signals, "_read_state_bytes", _staggered)
 
         report = technical_signals.ensure_technical_coverage(["JPM"], base_dir=tmp_path)
 
         assert report["added"] == []
-        assert seen["n"] >= 2, "マージ直前の読み直しが行われていない"
+        assert seen["n"] >= 1, "マージ直前の読み直しが行われていない"
         state = _read_state(tmp_path)
         assert "coverage_source" not in state["tickers"]["JPM"]
         assert state["tickers"]["JPM"]["price"] == 999.0
+
+    def test_a_write_that_lands_between_read_and_replace_does_not_get_clobbered(
+        self, tmp_path, loader, monkeypatch
+    ):
+        """Codex レビュー Case: 書く直前の窓で cron が割り込む本当の競合。
+
+        既存の test_a_row_created_by_a_concurrent_rebuild_is_not_clobbered は
+        「手順9の読み直し」より前に割り込む場合しか再現しない (その場合は
+        再読み直しが新しい行を拾って inserted=[] になり、そもそも書かれない
+        ので安全)。本当に危ないのは、topup が読み終えた"後"・実際に
+        os.replace する"前"に cron が書き込む窓。再現した最悪順序:
+          a) topup が古い state を読む (cached_at=旧, XLF=旧値)
+          b) cron が新しい全再計算結果を書く (cached_at=新, XLF=999, NEW追加)
+          c) topup が (a) の古い内容 + MDB行 を書く
+        →(b)の新しい cached_at・XLF・NEW行がすべて消える。CASで検出し、
+        (b)の内容の上でMDBを合成し直さなければならない。
+        """
+        _write_base(tmp_path, rows={
+            "XLF": {"price": 50.0, "freshness_status": "fresh",
+                    "data_quality_status": "ok", "data_as_of": "2026-08-21"},
+        })
+        loader({"MDB": _frame()})
+
+        real_read = technical_signals._read_state_bytes
+        calls = {"n": 0}
+
+        def _staggered(path):
+            calls["n"] += 1
+            if calls["n"] == 2:
+                # topup が読み終えた後・書く前に、cron の全再計算が完了した
+                # ことを表す。実ファイルへの本当の書き込みなので、以降の
+                # 本物の読み取りもこの内容を見る。
+                rebuilt = {
+                    "tickers": {
+                        "XLF": {"price": 999.0, "freshness_status": "fresh",
+                                "data_quality_status": "ok", "data_as_of": "2026-08-24"},
+                        "NEW": {"price": 1.0, "freshness_status": "fresh",
+                                "data_quality_status": "ok"},
+                    },
+                    "market_breadth": {"pct_above_ma50": 0.9},
+                    "source_health": _source_health(2),
+                    "cached_at": "2026-08-24T12:00:00+00:00",
+                }
+                (tmp_path / "technical_state.json").write_text(
+                    json.dumps(rebuilt), encoding="utf-8")
+            return real_read(path)
+
+        monkeypatch.setattr(technical_signals, "_read_state_bytes", _staggered)
+
+        report = technical_signals.ensure_technical_coverage(["MDB"], base_dir=tmp_path)
+
+        assert report["status"] == "ok"
+        assert report["added"] == ["MDB"]
+        assert calls["n"] >= 4, "CASによる再試行が行われていない"
+
+        state = _read_state(tmp_path)
+        # cron が書いた新しい内容 (XLF=999, NEW, cached_at=新) が生きていて、
+        # その上に MDB が追加されていること。旧内容への巻き戻りではない。
+        assert state["cached_at"] == "2026-08-24T12:00:00+00:00"
+        assert state["tickers"]["XLF"]["price"] == 999.0
+        assert "NEW" in state["tickers"]
+        assert "MDB" in state["tickers"]
+
+    def test_two_consecutive_collisions_give_up_without_writing(
+        self, tmp_path, loader, monkeypatch
+    ):
+        """2回連続で衝突したら無限リトライせず、書かずに諦めること。"""
+        _write_base(tmp_path)
+        loader({"MDB": _frame()})
+
+        real_read = technical_signals._read_state_bytes
+        calls = {"n": 0}
+
+        def _always_changing(path):
+            calls["n"] += 1
+            if calls["n"] % 2 == 0:
+                # 検証読みのたびに、別の書き手が割り込んだことにする。
+                current = json.loads((tmp_path / "technical_state.json").read_text())
+                current["cached_at"] = f"2026-08-24T{calls['n']:02d}:00:00+00:00"
+                (tmp_path / "technical_state.json").write_text(
+                    json.dumps(current), encoding="utf-8")
+            return real_read(path)
+
+        monkeypatch.setattr(technical_signals, "_read_state_bytes", _always_changing)
+        before_bytes = (tmp_path / "technical_state.json").read_bytes()
+
+        report = technical_signals.ensure_technical_coverage(["MDB"], base_dir=tmp_path)
+
+        # 諦めた場合の report は「1件も追加しなかった」ときと区別しない
+        # (呼び出し側は既存の noop/ok いずれの経路でも安全に扱える)。
+        assert "MDB" not in _read_state(tmp_path)["tickers"]
+        assert report.get("added") != ["MDB"]

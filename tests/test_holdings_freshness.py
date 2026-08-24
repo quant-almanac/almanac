@@ -303,6 +303,65 @@ def test_an_attestation_does_not_survive_an_unapplied_execution(tmp_path, monkey
     assert "VERY_STALE holdings" not in clean_text
 
 
+def test_divergence_forces_very_stale_even_without_any_attestation(tmp_path, monkeypatch):
+    """Codex レビュー Case A: attestation が無くても divergence を見ること。
+
+    旧実装は divergence チェックを attestation ブロックの内側に置いていた
+    ので、attestation が無いファイルは wall-clock だけで判定され、
+    1時間前で未反映の約定があっても "✅ FRESH holdings: 1h前" になっていた
+    (再現: Codex レビュー 2026-08-24)。mtime の新しさは中身の正しさを
+    何も保証しない。
+    """
+    import os
+    from pathlib import Path
+
+    import analyst
+
+    recent = datetime.now() - timedelta(hours=1)
+    holdings = tmp_path / "holdings.json"
+    _write(holdings, {"AAPL": {"ticker": "AAPL", "shares": 10}})
+    os.utime(holdings, (recent.timestamp(), recent.timestamp()))
+    monkeypatch.setattr(analyst, "BASE_DIR", Path(tmp_path))
+    monkeypatch.setattr(
+        hf, "holdings_divergence",
+        lambda **kwargs: {"diverged": True, "unapplied": [{"ticker": "AAPL"}], "unresolved": []},
+    )
+
+    text = analyst._compute_data_freshness()
+
+    assert "VERY_STALE holdings(diverged): 1h前" in text
+
+
+def test_an_unresolvable_divergence_check_fails_closed_even_with_attestation(tmp_path, monkeypatch):
+    """Codex レビュー Case B: 台帳読込エラー時に attestation だけで fresh にしないこと。
+
+    再現: 800時間前の holdings + 有効な attestation + 乖離台帳の読込エラー。
+    divergence_or_unresolved は判定不能を True (乖離あり扱い) にするので、
+    ここが例外を投げても attested という理由だけで fresh を騙らない。
+    """
+    import os
+    from pathlib import Path
+
+    import analyst
+
+    ancient = datetime.now() - timedelta(hours=800)
+    holdings = tmp_path / "holdings.json"
+    _write(holdings, {"AAPL": {"ticker": "AAPL", "shares": 10}})
+    os.utime(holdings, (ancient.timestamp(), ancient.timestamp()))
+    monkeypatch.setattr(analyst, "BASE_DIR", Path(tmp_path))
+    hf.record_attestation(scope="holdings", base_dir=tmp_path, actor="user")
+
+    def boom(**kwargs):
+        raise RuntimeError("ledger unreadable")
+
+    monkeypatch.setattr(hf, "holdings_divergence", boom)
+
+    text = analyst._compute_data_freshness()
+
+    assert "VERY_STALE holdings(diverged)" in text
+    assert "holdings(attested)" not in text
+
+
 def test_the_freshness_score_and_the_snapshot_agree_on_divergence(tmp_path, monkeypatch):
     """2経路が同じ停止条件を持つこと（権威の一致）。"""
     import os

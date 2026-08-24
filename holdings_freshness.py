@@ -198,6 +198,23 @@ def holdings_divergence(*, base_dir: Path = BASE_DIR) -> dict:
     }
 
 
+def divergence_or_unresolved(*, base_dir: Path = BASE_DIR) -> bool:
+    """holdings が信頼できない証拠があるか (乖離自体、または判定不能)。
+
+    attestation は「表明した時点の内容」しか保証しない。その後に記録された
+    約定が holdings へ未反映なら fresh を名乗ってはならず、それを検出する
+    唯一の手段がこの関数の判定なので、判定できないこと自体を「問題なし」
+    と読んではいけない。台帳が読めないだけで attestation 済みの古い
+    holdings が永久に fresh を名乗り続ける方が、判定失敗で保守的に
+    stale/review へ倒すより悪い。分析全体を落とさないことと、
+    fail-open にすることは別の要求であり、後者だけを諦める。
+    """
+    try:
+        return bool(holdings_divergence(base_dir=base_dir).get("diverged"))
+    except Exception:
+        return True
+
+
 # ---------------------------------------------------------------------------
 # 旧現金rollforwardの隔離
 #

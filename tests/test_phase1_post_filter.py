@@ -2618,6 +2618,68 @@ def test_telegram_escapes_dynamic_html_and_numbers_only_ready_actions(monkeypatc
     assert not any("#2" in msg or "4063.T" in msg or "ROBO" in msg for msg in sent[1:])
 
 
+def test_telegram_surfaces_non_blocking_advisories_on_ready_actions(monkeypatch):
+    """Codex レビュー: first_time_symbol 等の advisories が Telegram に届かない。
+
+    execution_readiness.py は execution_advisories を作るが、
+    send_to_telegram はそれを一切参照していなかった。ready の発注が
+    この Telegram メッセージだけで完結して指示が出ることが多いので、
+    「発注する人間の目の前へ出す」という advisories の実装目的を
+    Today UI だけでなくここでも満たす必要がある。
+    """
+    sent = []
+    monkeypatch.setattr("alert.send_telegram", lambda msg: sent.append(msg) or True)
+    monkeypatch.setattr("time.sleep", lambda _: None)
+    monkeypatch.setattr("brief_disclosures.yesterday_disclosure_signals", lambda limit=5: [])
+    monkeypatch.setattr("brief_disclosures.format_brief_section", lambda signals: "")
+    result = {
+        "as_of": "2026-08-24 06:21",
+        "synthesis": {
+            "telegram_message": "ready 1件",
+            "telegram_message_scope": "ready_only",
+            "priority_actions": [{
+                "ticker": "VT", "type": "buy", "execution_readiness": "ready",
+                "action": "VTを9株買付", "reason": "広域コア配備", "urgency": "medium",
+                "execution_advisories": [{
+                    "code": "first_time_symbol",
+                    "message": "VT は保有実績もスクリーナー通過も無い初回銘柄です。"
+                               "売買単位と板の厚みを発注前に確認してください",
+                    "trading_unit_assumed": 1,
+                }],
+            }],
+        },
+    }
+
+    assert analyst.send_to_telegram(result) is True
+
+    action_message = sent[-1]
+    assert "first_time_symbol" not in action_message  # コードではなく文面を出す
+    assert "初回銘柄です" in action_message
+    assert "🔔" in action_message
+
+
+def test_telegram_omits_the_advisory_line_when_there_is_none(monkeypatch):
+    sent = []
+    monkeypatch.setattr("alert.send_telegram", lambda msg: sent.append(msg) or True)
+    monkeypatch.setattr("time.sleep", lambda _: None)
+    monkeypatch.setattr("brief_disclosures.yesterday_disclosure_signals", lambda limit=5: [])
+    monkeypatch.setattr("brief_disclosures.format_brief_section", lambda signals: "")
+    result = {
+        "as_of": "2026-08-24 06:21",
+        "synthesis": {
+            "telegram_message": "ready 1件",
+            "telegram_message_scope": "ready_only",
+            "priority_actions": [{
+                "ticker": "XLF", "type": "trim", "execution_readiness": "ready",
+                "action": "20株を売却", "reason": "risk cap", "urgency": "medium",
+            }],
+        },
+    }
+
+    assert analyst.send_to_telegram(result) is True
+    assert "🔔" not in sent[-1]
+
+
 def test_telegram_send_failure_is_not_reported_as_success(monkeypatch):
     monkeypatch.setattr("alert.send_telegram", lambda _msg: False)
     monkeypatch.setattr("time.sleep", lambda _: None)

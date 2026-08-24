@@ -10,7 +10,10 @@ Usage:
 
 from __future__ import annotations
 
+import json
 import logging
+import os
+import tempfile
 import time
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -544,6 +547,20 @@ COVERAGE_TOPUP_TIMEOUT_SECONDS = 90.0
 COVERAGE_SOURCE_TOPUP = "topup"
 
 
+def _read_state_bytes(path: Path) -> bytes | None:
+    """CAS 比較用の生バイト読み取り。存在しなければ None。
+
+    独立した関数にしてあるのは、ensure_technical_coverage の
+    「読む→合成する→書く直前にもう一度読んで比較する」という2回の読み取りを
+    テストが差し替えられるようにするため (2回目の呼び出しだけ、別プロセスが
+    書き込んだ後の内容を返す、といった競合の再現に使う)。
+    """
+    try:
+        return path.read_bytes()
+    except OSError:
+        return None
+
+
 def ensure_technical_coverage(
     tickers,
     *,
@@ -570,12 +587,14 @@ def ensure_technical_coverage(
       - missing_count / analyzed_count は _ensure_technical_state_fresh が
         「再計算は完全だった」の判定に使う
 
-    **ロックは無い。** atomic_write_json は os.replace なのでファイルは壊れ
-    ないが、read-modify-write は保護しない。cron の再計算と衝突した場合の
-    最悪形は「古い state + topup 行」への巻き戻りで、そのとき cached_at も
-    古いまま残るため、次回の分析が _ensure_technical_state_fresh で stale と
-    判定して全再計算を回し自己修復する。行が消えるだけで、誤って新鮮に
-    見えることはない。
+    **ファイルロックは無いが、書く直前に CAS (compare-and-swap) で衝突を
+    検出する** (2026-08-24, レビュー起因)。当初は単純な os.replace のみで、
+    「読む→合成する→書く」の間に cron の全再計算が割り込むと、新しい
+    cached_at・breadth・新規行・既存行の更新を丸ごと巻き戻す実害が
+    再現された (次回の自己修復を待つ間、ずっと古い state のまま)。
+    今は書く直前に読み直して土台が変わっていないか確認し、変わっていれば
+    新しい内容の上で1回だけ合成し直す。2回連続で衝突したら書かずに諦める
+    (ミリ秒単位の窓が連続する確率は無視できるため、無限リトライはしない)。
     """
     requested_raw = list(tickers or [])
     report: dict = {
@@ -724,48 +743,94 @@ def ensure_technical_coverage(
         if not added_rows:
             return report
 
-        # 9) マージ直前に読み直す。手順2のコピーではなく最新を土台にして、
-        #    同時進行の cron 再計算との lost-update 窓を縮める。
-        latest = load_json(base_dir / "technical_state.json", {})
-        if not isinstance(latest, dict) or not isinstance(latest.get("tickers"), dict):
-            latest = state
-        rows = dict(latest["tickers"])
-        inserted = []
-        for ticker, row in added_rows.items():
-            # 存在しないキーだけ挿入する。既存行を書き換えると、朝の再計算が
-            # 正しく stale と判定した保有銘柄を数銘柄の取得が「stale解除」して
-            # しまい、fail-closed だったものが ready に化ける。
-            if ticker in rows:
-                continue
-            rows[ticker] = row
-            inserted.append(ticker)
-        if not inserted:
-            return report
-
-        merged = dict(latest)
-        merged["tickers"] = rows
-        source_health = merged.get("source_health")
-        analyzed = 0
-        if isinstance(source_health, dict):
+        # 9) CAS (compare-and-swap) でマージする。
+        #
+        #    旧実装は「読む→合成する→書く」の間に他の書き手 (cron の全再計算)
+        #    が割り込んでも検出できなかった。実測した最悪順序:
+        #      a) topup がここで古い state を読む
+        #      b) cron が新しい全再計算結果を書く
+        #      c) topup が (a) の古い state + 追加行を書く
+        #    → 新しい cached_at・breadth・新規行・既存行の更新がすべて消える。
+        #    (b) が (a) より後ろにずれ込むだけで再現する、単なる read-then-write
+        #    の競合。書く直前にもう一度読み直し、(a) から変わっていないかを
+        #    確認してから置き換える。変わっていれば「その新しい内容の上に」
+        #    もう一度だけ合成し直す (無限リトライはしない — 衝突の窓は
+        #    ミリ秒単位で、2回連続は事実上起きない。それでも衝突するなら
+        #    今回は書かずに諦める。次回の topup か次の cron 再計算が
+        #    自己修復する)。
+        path = base_dir / "technical_state.json"
+        for _attempt in range(2):
+            before = _read_state_bytes(path)
+            if before is None:
+                return report
             try:
-                analyzed = int(source_health.get("analyzed_count") or 0)
-            except (TypeError, ValueError):
-                analyzed = 0
-        merged["coverage_topup"] = {
-            "updated_at": now.isoformat(),
-            "base_cached_at": merged.get("cached_at"),
-            "requested": list(targets),
-            "added": sorted(inserted),
-            "unavailable": sorted(unavailable),
-            # 当回の len(added) ではなく導出値。再計算を挟まず2回 topup した
-            # 時点で突き合わせ式が壊れるため。
-            # len(tickers) == source_health.analyzed_count + rows_outside_rebuild
-            "rows_outside_rebuild": max(0, len(rows) - analyzed),
-        }
-        atomic_write_json(base_dir / "technical_state.json", merged)
-        report["status"] = "ok"
-        report["added"] = sorted(inserted)
-        logger.info("テクニカル補完: +%d 行 (%s)", len(inserted), ", ".join(sorted(inserted)))
+                latest = json.loads(before)
+            except Exception:
+                return report
+            if not isinstance(latest, dict) or not isinstance(latest.get("tickers"), dict):
+                return report
+            rows = dict(latest["tickers"])
+            inserted = []
+            for ticker, row in added_rows.items():
+                # 存在しないキーだけ挿入する。既存行を書き換えると、朝の
+                # 再計算が正しく stale と判定した保有銘柄を数銘柄の取得が
+                # 「stale解除」してしまい、fail-closed だったものが ready に
+                # 化ける。
+                if ticker in rows:
+                    continue
+                rows[ticker] = row
+                inserted.append(ticker)
+            if not inserted:
+                return report
+
+            merged = dict(latest)
+            merged["tickers"] = rows
+            source_health = merged.get("source_health")
+            analyzed = 0
+            if isinstance(source_health, dict):
+                try:
+                    analyzed = int(source_health.get("analyzed_count") or 0)
+                except (TypeError, ValueError):
+                    analyzed = 0
+            merged["coverage_topup"] = {
+                "updated_at": now.isoformat(),
+                "base_cached_at": merged.get("cached_at"),
+                "requested": list(targets),
+                "added": sorted(inserted),
+                "unavailable": sorted(unavailable),
+                # 当回の len(added) ではなく導出値。再計算を挟まず2回 topup
+                # した時点で突き合わせ式が壊れるため。
+                # len(tickers) == source_health.analyzed_count + rows_outside_rebuild
+                "rows_outside_rebuild": max(0, len(rows) - analyzed),
+            }
+            payload = json.dumps(merged, ensure_ascii=False, indent=2).encode("utf-8")
+            tmp_fd, tmp_name = tempfile.mkstemp(dir=str(base_dir), suffix=".tmp")
+            try:
+                with os.fdopen(tmp_fd, "wb") as fh:
+                    fh.write(payload)
+                current = _read_state_bytes(path)
+                if current != before:
+                    # 合成の土台にした内容が、書く直前に変わっていた。
+                    # このtmpファイルは古い土台の産物なので捨て、
+                    # 新しい内容の上でもう一度だけ合成し直す。
+                    os.unlink(tmp_name)
+                    continue
+                os.replace(tmp_name, path)
+            except Exception:
+                try:
+                    os.unlink(tmp_name)
+                except OSError:
+                    pass
+                raise
+            else:
+                report["status"] = "ok"
+                report["added"] = sorted(inserted)
+                logger.info(
+                    "テクニカル補完: +%d 行 (%s)", len(inserted), ", ".join(sorted(inserted))
+                )
+                return report
+
+        logger.warning("テクニカル補完: 再計算との競合が解消せず、今回は見送り")
         return report
     except Exception as exc:
         logger.warning("テクニカル補完失敗: %s", exc)

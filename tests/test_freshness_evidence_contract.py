@@ -131,13 +131,20 @@ class TestSnapshotGating:
 
 class TestFailureIsolation:
     def test_an_unreadable_ledger_does_not_crash_the_analysis(self, tmp_path, monkeypatch):
-        # 乖離判定は他の停止条件に足すもの。判定できないことを理由に
-        # 分析全体を落としてはいけない。
+        # 判定できないことを理由に分析全体を落としてはいけない —— これは
+        # 変わらない。ただし答えは 2026-08-24 のレビューで反転した:
+        # attestation は壁時計での失効という後ろ盾を外すため、この判定は
+        # attested な holdings/cash に対する唯一の停止条件になっている。
+        # 台帳が一時的に読めないだけで「乖離なし」を仮定すると、attest 済み
+        # の古い holdings が無期限に fresh を名乗り続ける
+        # (Codex レビューで再現: 800h前 + attestation + 台帳読込エラー →
+        # decision snapshot が fresh のまま)。分析を落とさないことと
+        # fail-open にすることは別の要求で、後者だけを諦める。
         def boom(**kw):
             raise RuntimeError("ledger unreadable")
 
         monkeypatch.setattr(holdings_freshness, "holdings_divergence", boom)
-        assert analysis_snapshot._holdings_diverged(Path(tmp_path)) is False
+        assert analysis_snapshot._holdings_diverged(Path(tmp_path)) is True
 
     def test_the_answer_is_fixed_for_one_snapshot(self, tmp_path, monkeypatch):
         # 同じスナップショット内で holdings と cash が違う答えを見ると、

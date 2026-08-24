@@ -150,6 +150,12 @@ def test_an_uncached_registry_entry_forces_one_rebuild_then_self_heals(monkeypat
 
     ユニバースに入って行が無い間は強制再計算が走るが、compute_technical_state
     の追い出しフックがレジストリから外すので自己修復する。
+
+    2026-08-24 のレビューで、1回の欠落だけでは追い出さない仕様に変更した
+    (一時的な yfinance 障害と本当の上場廃止を区別するため。
+    proposed_ticker_registry.MISSED_REBUILDS_BEFORE_EVICTION 連続で
+    欠けて初めて追い出される)。ここでの「最悪ケースの上限」はその回数分の
+    強制再計算に伸びる —— それでも有限で、いずれ自己修復することに変わりはない。
     """
     import proposed_ticker_registry
 
@@ -165,9 +171,10 @@ def test_an_uncached_registry_entry_forces_one_rebuild_then_self_heals(monkeypat
     ) is True
     assert calls == ["refresh"]
 
-    # 再計算が ZZQQXX を解決できなければ追い出される = ユニバースから消える。
-    proposed_ticker_registry.evict_unresolved(
-        ["ZZQQXX"], base_dir=tmp_path, rebuild_coverage=0.99)
+    # 再計算が連続して ZZQQXX を解決できなければ追い出される = ユニバースから消える。
+    for _ in range(proposed_ticker_registry.MISSED_REBUILDS_BEFORE_EVICTION):
+        proposed_ticker_registry.evict_unresolved(
+            ["ZZQQXX"], base_dir=tmp_path, rebuild_coverage=0.99)
     assert proposed_ticker_registry.load_registered(tmp_path) == {}
 
     monkeypatch.setattr(ts, "_build_ticker_universe", lambda: ["SPY"])

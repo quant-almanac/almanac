@@ -90,3 +90,50 @@ def test_readiness_axes_are_recorded_separately(tmp_path, monkeypatch):
     log = json.loads((tmp_path / "ai_recommendation_log.json").read_text(encoding="utf-8"))
     assert log[0]["signal_evaluable"] is True
     assert log[0]["execution_eligible"] is False
+
+
+def test_execution_advisories_are_persisted_to_the_audit_log(tmp_path, monkeypatch):
+    """Codex レビュー: 監査ログに execution_advisories が記録されない。
+
+    block_reasons は記録されるのに advisories が無かったため、
+    「初回銘柄で ready だった」という事実が事後の推奨ログから読み取れず、
+    first_time_symbol が実際に何件出たかを追跡できなかった。
+    """
+    monkeypatch.setattr(analyst, "BASE_DIR", tmp_path)
+    monkeypatch.setattr(action_state_tracker, "record_recommendations", _no_op_record_recommendations)
+
+    synthesis = {
+        "priority_actions": [{
+            "ticker": "VT", "type": "buy", "decision_price": 160.77,
+            "execution_readiness": "ready",
+            "execution_advisories": [{
+                "code": "first_time_symbol",
+                "message": "VT は初回銘柄です",
+                "trading_unit_assumed": 1,
+            }],
+        }],
+        "analysis_id": "test-analysis-advisory",
+        "overall_stance": "neutral",
+    }
+    analyst._log_recommendations(synthesis, market_meta={})
+
+    log = json.loads((tmp_path / "ai_recommendation_log.json").read_text(encoding="utf-8"))
+    assert log[0]["execution_advisories"] == [{
+        "code": "first_time_symbol",
+        "message": "VT は初回銘柄です",
+        "trading_unit_assumed": 1,
+    }]
+
+
+def test_no_advisories_persists_as_an_empty_list(tmp_path, monkeypatch):
+    monkeypatch.setattr(analyst, "BASE_DIR", tmp_path)
+    monkeypatch.setattr(action_state_tracker, "record_recommendations", _no_op_record_recommendations)
+
+    synthesis = {
+        "priority_actions": [{"ticker": "AAPL", "type": "buy", "decision_price": 210.5}],
+        "analysis_id": "test-analysis-no-advisory",
+    }
+    analyst._log_recommendations(synthesis, market_meta={})
+
+    log = json.loads((tmp_path / "ai_recommendation_log.json").read_text(encoding="utf-8"))
+    assert log[0]["execution_advisories"] == []
