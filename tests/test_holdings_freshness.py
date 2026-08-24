@@ -218,13 +218,19 @@ def test_the_freshness_score_honours_an_attestation(tmp_path, monkeypatch):
     ため "❌ VERY_STALE holdings: 127h前" を出し続け、その文字列が LLM の
     プロンプトへ入って urgency を不必要に抑制していた。
     権威が2経路で食い違っていたのが原因。
+
+    800h は freshness_policy.py の cash/holdings stale_after_hours=720h を
+    確実に超える値 (Codex レビューが指摘した2つ目の不整合: この関数だけが
+    独自に 96h をハードコードしており、720h という共通契約と7.5倍
+    食い違っていた。修正後は freshness_policy から引くので、720h 超で
+    初めて VERY_STALE になる)。
     """
     import os
     from pathlib import Path
 
     import analyst
 
-    stale = datetime.now() - timedelta(hours=127)
+    stale = datetime.now() - timedelta(hours=800)
     holdings = tmp_path / "holdings.json"
     _write(holdings, {"AAPL": {"ticker": "AAPL", "shares": 1}})
     os.utime(holdings, (stale.timestamp(), stale.timestamp()))
@@ -250,7 +256,7 @@ def test_the_freshness_score_falls_back_to_the_file_without_an_attestation(tmp_p
 
     import analyst
 
-    stale = datetime.now() - timedelta(hours=127)
+    stale = datetime.now() - timedelta(hours=800)
     holdings = tmp_path / "holdings.json"
     _write(holdings, {"AAPL": {"ticker": "AAPL", "shares": 1}})
     os.utime(holdings, (stale.timestamp(), stale.timestamp()))
@@ -259,6 +265,39 @@ def test_the_freshness_score_falls_back_to_the_file_without_an_attestation(tmp_p
     text = analyst._compute_data_freshness()
 
     assert "VERY_STALE holdings" in text
+
+
+def test_the_freshness_score_uses_the_canonical_720h_boundary_not_96h(tmp_path, monkeypatch):
+    """Codex レビュー: 鮮度スコアだけが 96h を独自にハードコードしていて、
+    freshness_policy.py の 720h という共通契約と食い違っていた。
+
+    再現していた実害: attestation を正しく無効化した account.json が
+    canonical snapshot 側では fresh (720h以内) なのに、このスコアだけ
+    ❌ VERY_STALE を報告していた。127h は 96h 基準なら VERY_STALE だが
+    720h 基準では STALE (warn 域超・stale 域未満) に留まるべき。
+    """
+    import os
+    from pathlib import Path
+
+    import analyst
+
+    aged = datetime.now() - timedelta(hours=127)
+    holdings = tmp_path / "holdings.json"
+    _write(holdings, {"AAPL": {"ticker": "AAPL", "shares": 1}})
+    os.utime(holdings, (aged.timestamp(), aged.timestamp()))
+    _write(tmp_path / "account.json", {"last_updated": aged.isoformat()})
+    monkeypatch.setattr(analyst, "BASE_DIR", Path(tmp_path))
+
+    text = analyst._compute_data_freshness()
+
+    # "⚠️ STALE" (warn 域超・stale 域未満) であって "❌ VERY_STALE" ではない
+    # ことを、絵文字プレフィックスまで含めて厳密に確認する
+    # ("STALE" は "VERY_STALE" の部分文字列なので、排他の確認だけでは
+    # 不十分)。
+    assert "⚠️ STALE holdings" in text
+    assert "⚠️ STALE account_cash" in text
+    assert "❌ VERY_STALE holdings" not in text
+    assert "❌ VERY_STALE account_cash" not in text
     assert "attested" not in text
 
 

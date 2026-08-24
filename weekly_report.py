@@ -6,6 +6,8 @@ from collections import defaultdict
 from datetime import datetime, timedelta
 from pathlib import Path
 
+from utils import reraise_with_secret_redacted
+
 # 状態ファイルはこのスクリプトの置き場所を基準に解決する。
 # (以前は開発環境のパスが直書きされており、別の場所へ clone すると
 #  そちらのディレクトリを読み書きしていた)
@@ -18,7 +20,16 @@ TELEGRAM_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID')
 
 def send_telegram(msg):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "HTML"})
+    try:
+        requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "HTML"})
+    except Exception as e:
+        # requests/urllib3 は接続エラーの文字列表現に URL (token を含む) を
+        # 埋め込む。cron (毎週月曜) はこのスクリプトの stderr を
+        # weekly_log.txt へリダイレクトするので、未捕捉のまま伝播すると
+        # Python の既定トレースバックがそこへ平文で残る
+        # (2026-08-24 レビューで同種の経路が実際に検出)。型と失敗自体は
+        # 保ったまま、メッセージだけ伏せて再送出する。
+        reraise_with_secret_redacted(e, TELEGRAM_TOKEN)
 
 
 def generate_weekly_report():

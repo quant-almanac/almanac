@@ -6,6 +6,8 @@ from datetime import datetime
 from generate_dashboard import generate as update_dashboard
 import time
 
+from utils import reraise_with_secret_redacted
+
 # 状態ファイルはこのスクリプトの置き場所を基準に解決する。
 # (以前は開発環境のパスが直書きされており、別の場所へ clone すると
 #  そちらのディレクトリを読み書きしていた)
@@ -18,11 +20,19 @@ HOLDINGS_FILE = os.path.join(_BASE_DIR, 'holdings.json')
 
 def send_telegram(message):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    requests.post(url, data={
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": message,
-        "parse_mode": "HTML"
-    })
+    try:
+        requests.post(url, data={
+            "chat_id": TELEGRAM_CHAT_ID,
+            "text": message,
+            "parse_mode": "HTML"
+        })
+    except Exception as e:
+        # requests/urllib3 は接続エラーの文字列表現に URL (token を含む) を
+        # 埋め込む。このモジュールは現在どの LaunchAgent/cron からも
+        # 呼ばれていない (telegram-bot LaunchAgent は telegram_bot.py の方を
+        # 起動する) が、将来の呼出元がこの print/traceback を無防備に
+        # ログへ流すことを防ぐため、他の送信経路と同じ保護をここにも置く。
+        reraise_with_secret_redacted(e, TELEGRAM_TOKEN)
 
 def load_holdings():
     if not os.path.exists(HOLDINGS_FILE):

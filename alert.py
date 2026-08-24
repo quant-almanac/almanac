@@ -6,7 +6,10 @@ import json
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
-from utils import atomic_write_json, load_json, init_yfinance_timeout, reset_yfinance_session
+from utils import (
+    atomic_write_json, load_json, init_yfinance_timeout, reset_yfinance_session,
+    redact_secret, reraise_with_secret_redacted,
+)
 
 init_yfinance_timeout()
 
@@ -74,33 +77,23 @@ def _telegram_retry_after(response) -> float | None:
 
 
 def _redact_telegram_token(text: str) -> str:
-    """Bot トークンの平文をログへ出す前に伏せる。
+    """Bot トークンの平文をログへ出す前に伏せる。utils.redact_secret の薄い委譲。
 
     requests/urllib3 は接続エラー・HTTPError の文字列表現に完全な URL
     (トークンそのものを含むパス) を埋め込む。2026-08-24 のレビューで
-    alert_log.txt / ai_analysis_log.txt から実際に検出された。
+    alert_log.txt / ai_analysis_log.txt から実際に検出された。他の送信
+    経路 (analyzer.py 等) にも同じ穴があったため、実装は utils.py へ
+    一本化した — ここは名前を保っている既存呼出元向けの薄いラッパー。
     """
-    if not TELEGRAM_TOKEN:
-        return text
-    return text.replace(TELEGRAM_TOKEN, "<redacted>")
+    return redact_secret(text, TELEGRAM_TOKEN)
 
 
 def _reraise_redacted(exc: Exception) -> None:
     """例外を型を保ったまま、トークンを伏せたメッセージで再送出する。
 
-    ConnectTimeout.args[0] が MaxRetryError で、その __str__ の中に URL が
-    ある、というように url/token はネストした例外オブジェクトの奥に
-    埋め込まれる。args を浅く置換してもネストまでは書き換わらないので、
-    str(exc) で一度フラットな文字列へ落としてから置換し、同じ型で
-    作り直す。原因チェーンは黙って捨てる (from None) —— 残すと Python の
-    既定のトレースバック表示が元の (未伏字の) 例外も一緒に出してしまう。
+    utils.reraise_with_secret_redacted の薄い委譲。
     """
-    redacted = _redact_telegram_token(str(exc))
-    try:
-        new_exc = type(exc)(redacted)
-    except Exception:
-        new_exc = RuntimeError(redacted)
-    raise new_exc.with_traceback(exc.__traceback__) from None
+    reraise_with_secret_redacted(exc, TELEGRAM_TOKEN)
 
 
 def send_telegram(message) -> bool:

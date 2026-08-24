@@ -22,6 +22,8 @@ from pathlib import Path
 
 import requests
 
+from utils import redact_secret
+
 TOKEN   = os.environ.get("TELEGRAM_TOKEN", "")
 CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 BASE_DIR    = Path(__file__).parent
@@ -50,7 +52,11 @@ def _send(text: str):
             timeout=10,
         )
     except Exception as e:
-        print(f"[send error] {e}")
+        # requests/urllib3 は接続エラーの文字列表現に URL (token を含む) を
+        # 埋め込む。LaunchAgent (com.almanac.telegram-bot) がこの print を
+        # 常駐ログへリダイレクトするので、伏せずに出すと平文で残る
+        # (2026-08-24 レビューで実際に検出)。
+        print(f"[send error] {redact_secret(str(e), TOKEN)}")
 
 
 # ─── コマンドハンドラ ────────────────────────────────────

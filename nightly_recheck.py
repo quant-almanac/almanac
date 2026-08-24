@@ -170,13 +170,31 @@ def main(force: bool = False) -> int:
         from analyst import run_analysis, send_to_telegram as send_ai_telegram
         result = run_analysis(force=True)
         if result and "synthesis" in result:
-            send_ai_telegram(result)
-            print("[nightly_recheck] ✅ 再分析 + Telegram 配信完了")
+            # None は簡易テストダブル・レガシーラッパー向けに成功扱いのまま
+            # にする (portfolio_analyst.main() / alert._send_checked と同じ
+            # 慣習)。本番の transport は明示的な bool を返し、False だけが
+            # 実際の失敗。以前はこの戻り値を見ておらず、配信が失敗しても
+            # 「配信完了」と表示し heartbeat=ok を書いていた
+            # (2026-08-24 レビュー)。
+            telegram_ok = send_ai_telegram(result) is not False
+            if telegram_ok:
+                print("[nightly_recheck] ✅ 再分析 + Telegram 配信完了")
+                try:
+                    heartbeat("nightly_recheck", "ok")
+                except Exception:
+                    pass
+                return 0
+            print("[nightly_recheck] ⚠️ 再分析は完了・Telegram配信は失敗")
             try:
-                heartbeat("nightly_recheck", "ok")
+                # 分析自体は成功しているので "error" ではなく "warn"。
+                # nightly_recheck は watchdog.EXPECTED_INTERVALS に登録が
+                # 無いため、この heartbeat は監視を能動的に起動しない —
+                # それでも durable な記録を残す (portfolio_analyst.py と
+                # 同じ配信結果契約に揃える)。
+                heartbeat("nightly_recheck", "warn", "Telegram送信に失敗（再分析は正常終了）")
             except Exception:
                 pass
-            return 0
+            return 2
         else:
             raise RuntimeError("run_analysis returned no synthesis")
     except Exception as e:

@@ -94,6 +94,7 @@ class TestUniverseAssembly:
 # 崩さずに。以下はその不変条件そのもののテスト。
 # ---------------------------------------------------------------------------
 import math
+import time
 from datetime import datetime, timedelta, timezone
 
 import pandas as pd
@@ -520,6 +521,13 @@ class TestProposedTickerRegistry:
         毎日提案され続けても初日の日付のまま TTL_DAYS 後に消える。
         """
         day1 = datetime(2026, 8, 1, tzinfo=timezone.utc)
+        # continuing は「今も technical_state.json に行がある」ことが前提
+        # (Codex レビュー: レジストリに載っているだけの過去の実在確認では
+        # 不十分 — 現在の実在を technical_state.json 自身で確認する)。
+        (tmp_path / "technical_state.json").write_text(
+            json.dumps({"tickers": {"VT": {"data_quality_status": "ok"}}}),
+            encoding="utf-8",
+        )
 
         proposed_ticker_registry.record(
             ["VT"], resolved={"VT"}, base_dir=tmp_path, now=day1)
@@ -545,6 +553,35 @@ class TestProposedTickerRegistry:
         proposed_ticker_registry.record(
             ["VT"], resolved=set(), base_dir=tmp_path, now=day22)
         assert "VT" in proposed_ticker_registry.load_registered(tmp_path)
+
+    def test_continuing_does_not_reset_the_grace_counter_without_a_live_row(self, tmp_path):
+        """Codex レビュー再現: レジストリに載っているだけで technical_state.json
+        に行が無い銘柄が、continuing 扱いで missed_rebuilds を 0 に戻してしまう。
+
+        再現した状態: MDB は technical_state に不在・直近の topup も
+        失敗・missed_rebuilds=2。この状態で MDB が resolved 無しで
+        再提案されると、旧実装では「レジストリにある」というだけで
+        continuing 扱いになり missed_rebuilds が 0 へリセットされていた —
+        ポジティブキャッシュ制約に反し、欠落銘柄が追い出されず
+        強制再計算を繰り返し得る。
+        """
+        proposed_ticker_registry.record(["MDB"], resolved={"MDB"}, base_dir=tmp_path)
+        for _ in range(2):
+            proposed_ticker_registry.evict_unresolved(
+                ["MDB"], base_dir=tmp_path, rebuild_coverage=0.99)
+        before = proposed_ticker_registry.load_registered(tmp_path)["MDB"]
+        assert before["missed_rebuilds"] == 2
+
+        # technical_state.json に MDB の行は無い (topup も直近の全再計算も
+        # 解決できなかった)。それでも再提案された。
+        (tmp_path / "technical_state.json").write_text(
+            json.dumps({"tickers": {}}), encoding="utf-8")
+        report = proposed_ticker_registry.record(
+            ["MDB"], resolved=set(), base_dir=tmp_path)
+
+        assert report.get("continuing") != ["MDB"]
+        after = proposed_ticker_registry.load_registered(tmp_path)["MDB"]
+        assert after["missed_rebuilds"] == 2, "実在しない行で猶予がリセットされた"
 
     def test_a_continuing_proposal_for_an_unregistered_ticker_is_ignored(self, tmp_path):
         """continuing は「既に登録済み」が前提。未登録銘柄を resolved 無しで
@@ -602,6 +639,11 @@ class TestProposedTickerRegistry:
         assert proposed_ticker_registry.load_registered(tmp_path)["MDB"]["missed_rebuilds"] == 1
 
         # 次の再計算では解決できた (継続提案としての record() 呼び出し)。
+        # continuing は「今も technical_state.json に行がある」ことが前提。
+        (tmp_path / "technical_state.json").write_text(
+            json.dumps({"tickers": {"MDB": {"data_quality_status": "ok"}}}),
+            encoding="utf-8",
+        )
         proposed_ticker_registry.record(["MDB"], resolved=set(), base_dir=tmp_path)
         assert proposed_ticker_registry.load_registered(tmp_path)["MDB"]["missed_rebuilds"] == 0
 
@@ -641,69 +683,26 @@ class TestProposedTickerRegistry:
 class TestConcurrentRebuildMerge:
     """cron の再計算と衝突したときの read-modify-write。
 
-    ensure_technical_coverage は取得前に「既に行がある銘柄」を除外するが、
-    それは手順2で読んだスナップショットの話。取得の最中に 12:00 の cron が
-    再計算を終えていると、マージ直前の読み直しでは行が既に存在しうる。
-    その行は再計算がネイティブに作った新しい行なので、数銘柄の取得結果で
-    上書きしてはならない。
+    2026-08-24 の Codex レビューで、旧実装 (書く直前にもう一度読んで比較する
+    check-then-replace) は「厳密には CAS ではない」と指摘された: 確認読みと
+    実際の os.replace の間にも窓が残り、隔離再現で実際に巻き戻った。
+    今は utils.process_lock (fcntl.flock、プロセス間で有効) で
+    「読む→合成する→書く」全体を直列化する。以下はモックではなく、実際に
+    ロックを取り合うスレッドで真の排他を検証する。
     """
 
-    def test_a_row_created_by_a_concurrent_rebuild_is_not_clobbered(
-        self, tmp_path, loader, monkeypatch
+    def test_a_concurrent_writer_holding_the_lock_is_not_clobbered(
+        self, tmp_path, loader
     ):
-        """マージ用の読み取り (CAS の1回目) が既に新しい行を見ているケース。
+        """真の直列化: ロック保持中の書き込みは、解放後まで待って合成される。
 
-        再計算が JPM を落ち着いて拾えた場合、topup 側は「追加すべき行が
-        無い」と気付いてそもそも書かない。CAS のリトライを要さない、
-        最も穏当な競合形。より厳しい「読み終えた後・書く前」の競合は
-        test_a_write_that_lands_between_read_and_replace_does_not_get_clobbered
-        が見る。
-        """
-        _write_base(tmp_path)
-        loader({"JPM": _frame()})
-
-        rebuilt_row = {"price": 999.0, "freshness_status": "fresh",
-                       "data_quality_status": "ok", "data_as_of": "2026-08-24"}
-        real_read = technical_signals._read_state_bytes
-        seen = {"n": 0}
-
-        def _staggered(path):
-            seen["n"] += 1
-            if seen["n"] == 1:
-                # 取得中に 12:00 の cron が再計算を終え、ファイルを丸ごと
-                # 置換した状態を再現する。CAS の1回目の読み取り
-                # (合成の土台) が既にこれを見る。
-                rebuilt = json.loads(real_read(path))
-                rebuilt["tickers"] = {**rebuilt["tickers"], "JPM": dict(rebuilt_row)}
-                (tmp_path / "technical_state.json").write_text(
-                    json.dumps(rebuilt), encoding="utf-8")
-            return real_read(path)
-
-        monkeypatch.setattr(technical_signals, "_read_state_bytes", _staggered)
-
-        report = technical_signals.ensure_technical_coverage(["JPM"], base_dir=tmp_path)
-
-        assert report["added"] == []
-        assert seen["n"] >= 1, "マージ直前の読み直しが行われていない"
-        state = _read_state(tmp_path)
-        assert "coverage_source" not in state["tickers"]["JPM"]
-        assert state["tickers"]["JPM"]["price"] == 999.0
-
-    def test_a_write_that_lands_between_read_and_replace_does_not_get_clobbered(
-        self, tmp_path, loader, monkeypatch
-    ):
-        """Codex レビュー Case: 書く直前の窓で cron が割り込む本当の競合。
-
-        既存の test_a_row_created_by_a_concurrent_rebuild_is_not_clobbered は
-        「手順9の読み直し」より前に割り込む場合しか再現しない (その場合は
-        再読み直しが新しい行を拾って inserted=[] になり、そもそも書かれない
-        ので安全)。本当に危ないのは、topup が読み終えた"後"・実際に
-        os.replace する"前"に cron が書き込む窓。再現した最悪順序:
+        再現していた最悪順序 (check-then-replace 時代):
           a) topup が古い state を読む (cached_at=旧, XLF=旧値)
           b) cron が新しい全再計算結果を書く (cached_at=新, XLF=999, NEW追加)
           c) topup が (a) の古い内容 + MDB行 を書く
-        →(b)の新しい cached_at・XLF・NEW行がすべて消える。CASで検出し、
-        (b)の内容の上でMDBを合成し直さなければならない。
+        → (b) の新しい cached_at・XLF・NEW行が消える。
+        process_lock を使えば、cron 側がロックを保持している間 topup は
+        本当にブロックされ、解放後の最新内容の上で合成するしかない。
         """
         _write_base(tmp_path, rows={
             "XLF": {"price": 50.0, "freshness_status": "fresh",
@@ -711,15 +710,18 @@ class TestConcurrentRebuildMerge:
         })
         loader({"MDB": _frame()})
 
-        real_read = technical_signals._read_state_bytes
-        calls = {"n": 0}
+        import threading
 
-        def _staggered(path):
-            calls["n"] += 1
-            if calls["n"] == 2:
-                # topup が読み終えた後・書く前に、cron の全再計算が完了した
-                # ことを表す。実ファイルへの本当の書き込みなので、以降の
-                # 本物の読み取りもこの内容を見る。
+        from utils import process_lock
+
+        writer_holds_lock = threading.Event()
+        release_writer = threading.Event()
+
+        def _simulated_rebuild_writer():
+            with process_lock(technical_signals.TECHNICAL_STATE_LOCK_NAME, timeout=5.0):
+                writer_holds_lock.set()
+                # topup 側がロック待ちで確実にブロックされる時間を作る。
+                release_writer.wait(timeout=5.0)
                 rebuilt = {
                     "tickers": {
                         "XLF": {"price": 999.0, "freshness_status": "fresh",
@@ -733,50 +735,92 @@ class TestConcurrentRebuildMerge:
                 }
                 (tmp_path / "technical_state.json").write_text(
                     json.dumps(rebuilt), encoding="utf-8")
-            return real_read(path)
 
-        monkeypatch.setattr(technical_signals, "_read_state_bytes", _staggered)
+        writer = threading.Thread(target=_simulated_rebuild_writer)
+        writer.start()
+        assert writer_holds_lock.wait(timeout=5.0), "writer がロックを取得できなかった"
+
+        def _release_shortly():
+            # ensure_technical_coverage は手順1〜6 (フェッチ相当・daemon
+            # スレッド生成含む) を通ってから手順9のロック区間へ入るので、
+            # 「本当に待たされているか」を確実に見るには、そのフェッチ相当の
+            # オーバーヘッドより明確に長く保持する。
+            time.sleep(0.6)
+            release_writer.set()
+
+        threading.Thread(target=_release_shortly).start()
 
         report = technical_signals.ensure_technical_coverage(["MDB"], base_dir=tmp_path)
+        writer.join(timeout=5.0)
+        assert not writer.is_alive(), "simulated writer が終了しなかった"
 
         assert report["status"] == "ok"
         assert report["added"] == ["MDB"]
-        assert calls["n"] >= 4, "CASによる再試行が行われていない"
 
         state = _read_state(tmp_path)
-        # cron が書いた新しい内容 (XLF=999, NEW, cached_at=新) が生きていて、
-        # その上に MDB が追加されていること。旧内容への巻き戻りではない。
+        # cron (writer) が書いた新しい内容が生きていて、その上に MDB が
+        # 追加されていること。旧内容への巻き戻りではない。
         assert state["cached_at"] == "2026-08-24T12:00:00+00:00"
         assert state["tickers"]["XLF"]["price"] == 999.0
         assert "NEW" in state["tickers"]
         assert "MDB" in state["tickers"]
 
-    def test_two_consecutive_collisions_give_up_without_writing(
+    def test_a_row_already_present_when_the_lock_is_acquired_needs_no_write(
+        self, tmp_path, loader
+    ):
+        """ロック取得時点で既に行があれば (他の書き手が先に済ませていた)、
+        そもそも書かない — 既存行を上書きしないという不変条件の一部。
+        """
+        rebuilt_row = {"price": 999.0, "freshness_status": "fresh",
+                       "data_quality_status": "ok", "data_as_of": "2026-08-24"}
+        _write_base(tmp_path, rows={"JPM": dict(rebuilt_row)})
+        loader({"JPM": _frame()})
+        before = (tmp_path / "technical_state.json").read_bytes()
+
+        report = technical_signals.ensure_technical_coverage(["JPM"], base_dir=tmp_path)
+
+        assert report["added"] == []
+        assert (tmp_path / "technical_state.json").read_bytes() == before
+        state = _read_state(tmp_path)
+        assert "coverage_source" not in state["tickers"]["JPM"]
+        assert state["tickers"]["JPM"]["price"] == 999.0
+
+    def test_a_lock_held_beyond_the_timeout_gives_up_without_writing(
         self, tmp_path, loader, monkeypatch
     ):
-        """2回連続で衝突したら無限リトライせず、書かずに諦めること。"""
+        """ロックが解放されなければ、待った末に書かず諦めること。
+
+        get_technical_context 側の書き込みは JSON の直列化+置換だけなので
+        通常ミリ秒で終わる。それでも埋まっているのは異常系で、無限に
+        待たず安全側に倒す。
+        """
         _write_base(tmp_path)
         loader({"MDB": _frame()})
+        monkeypatch.setattr(technical_signals, "TECHNICAL_STATE_LOCK_TIMEOUT_SECONDS", 0.3)
 
-        real_read = technical_signals._read_state_bytes
-        calls = {"n": 0}
+        import threading
 
-        def _always_changing(path):
-            calls["n"] += 1
-            if calls["n"] % 2 == 0:
-                # 検証読みのたびに、別の書き手が割り込んだことにする。
-                current = json.loads((tmp_path / "technical_state.json").read_text())
-                current["cached_at"] = f"2026-08-24T{calls['n']:02d}:00:00+00:00"
-                (tmp_path / "technical_state.json").write_text(
-                    json.dumps(current), encoding="utf-8")
-            return real_read(path)
+        from utils import process_lock
 
-        monkeypatch.setattr(technical_signals, "_read_state_bytes", _always_changing)
-        before_bytes = (tmp_path / "technical_state.json").read_bytes()
+        holder_ready = threading.Event()
+        release_holder = threading.Event()
 
-        report = technical_signals.ensure_technical_coverage(["MDB"], base_dir=tmp_path)
+        def _hold_lock():
+            with process_lock(technical_signals.TECHNICAL_STATE_LOCK_NAME, timeout=5.0):
+                holder_ready.set()
+                release_holder.wait(timeout=5.0)
 
-        # 諦めた場合の report は「1件も追加しなかった」ときと区別しない
-        # (呼び出し側は既存の noop/ok いずれの経路でも安全に扱える)。
-        assert "MDB" not in _read_state(tmp_path)["tickers"]
+        holder = threading.Thread(target=_hold_lock)
+        holder.start()
+        assert holder_ready.wait(timeout=5.0), "holder がロックを取得できなかった"
+
+        try:
+            before = (tmp_path / "technical_state.json").read_bytes()
+            report = technical_signals.ensure_technical_coverage(["MDB"], base_dir=tmp_path)
+            after = (tmp_path / "technical_state.json").read_bytes()
+        finally:
+            release_holder.set()
+            holder.join(timeout=5.0)
+
+        assert before == after
         assert report.get("added") != ["MDB"]

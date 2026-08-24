@@ -9,7 +9,7 @@ from sector_rotation import filter_by_sector_strength, save_sector_report
 from earnings_season import get_season_config
 from generate_dashboard import generate as update_dashboard
 import time
-from utils import init_yfinance_timeout
+from utils import init_yfinance_timeout, redact_secret
 
 # 状態ファイルはこのスクリプトの置き場所を基準に解決する。
 # (以前は開発環境のパスが直書きされており、別の場所へ clone すると
@@ -249,7 +249,11 @@ def send_telegram(message):
             "parse_mode": "HTML"
         }, timeout=15)
     except requests.RequestException as e:
-        print(f'[WARN] Telegram送信失敗: {e}')
+        # requests/urllib3 は接続エラーの文字列表現に URL (token を含む) を
+        # 埋め込む。cron (--delta-only / regen-stale) がこの print を
+        # analyzer_log.txt / analyzer_regen_log.txt へリダイレクトするので、
+        # 伏せずに出すと平文でディスクに残る (2026-08-24 レビューで実際に検出)。
+        print(f'[WARN] Telegram送信失敗: {redact_secret(str(e), TELEGRAM_TOKEN)}')
 
 def get_macro_score():
     """マクロ環境スコアを計算（0-10）+ 地合い情報

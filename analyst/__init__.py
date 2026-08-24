@@ -1275,6 +1275,19 @@ def _compute_data_freshness() -> str:
             local_tz=local_tz,
             now=now,
         )
+        # holdings/cash はここだけ freshness_policy.py の登録値から引く。
+        # 以前はこの関数だけ 24/96h をハードコードしており、
+        # freshness_policy (refresh 96h / stale 720h、"壁時計だけでは止めない"
+        # という 2026-08-05 の設計判断に基づく) と 7.5 倍食い違っていた。
+        # attestation を正しく無効化した account.json が canonical snapshot
+        # 側では fresh なのに、このスコアだけ VERY_STALE を報告する実例で
+        # 発覚した (2026-08-24 レビュー)。他のソースは意図的にこの関数
+        # 独自の (より短い) 警告閾値を持つので変更しない — holdings/cash
+        # だけが「壁時計で止めない」という明文化された特例。
+        from freshness_policy import get_freshness_policy
+
+        _holdings_policy = get_freshness_policy("holdings")
+        _cash_policy = get_freshness_policy("cash")
         sources = [
             # (file_path, timestamp_keys, description, warn_hours, stale_hours, weight)
             # P3-14: timestamp_keys を tuple にして複数候補対応（generated_at / cached_at 揺れ）
@@ -1287,8 +1300,10 @@ def _compute_data_freshness() -> str:
             ("margin_long_candidates_morning.json", ("generated_at",),        "margin_long_candidates_morning", 8, 24, 0.10),
             ("margin_long_candidates.json",   ("generated_at",),             "margin_long_candidates",     8,  24, 0.10),
             ("long_term_screen_results.json", ("as_of",),                   "long_term_screen",          24,  72, 0.05),
-            ("account.json",                  ("last_updated",),             "account_cash",              24,  96, 0.10),
-            ("holdings.json",                 ("__mtime__",),                "holdings",                  24,  96, 0.10),
+            ("account.json",                  ("last_updated",),             "account_cash",
+             _cash_policy.refresh_after_hours, _cash_policy.stale_after_hours, 0.10),
+            ("holdings.json",                 ("__mtime__",),                "holdings",
+             _holdings_policy.refresh_after_hours, _holdings_policy.stale_after_hours, 0.10),
             ("news_signal_candidates.json",  ("generated_at", "scan_time"), "news_candidates",            6,  12, 0.10),
             ("geopolitical_state.json",      ("cached_at",),                "geopolitical_state",        12,  24, 0.05),
         ]

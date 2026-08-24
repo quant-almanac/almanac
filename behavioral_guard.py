@@ -10,7 +10,7 @@ import time
 from datetime import datetime, date, timedelta
 from pathlib import Path
 
-from utils import atomic_write_json
+from utils import atomic_write_json, redact_secret
 from risk_policy import POLICY, RISK_POLICY_VERSION, loss_guard_state
 
 BASE_DIR = Path(__file__).parent
@@ -484,7 +484,11 @@ def _send_guardrail_suggestion(state: dict, trading_stopped: bool):
             timeout=10,
         )
     except Exception as e:
-        print(f"Telegram送信エラー（ガードレール提案）: {e}")
+        # requests/urllib3 は接続エラーの文字列表現に URL (token を含む) を
+        # 埋め込む。cron (17:35/18:55) がこの print を guard_log.txt へ
+        # リダイレクトするので、伏せずに出すと平文でディスクに残る
+        # (2026-08-24 レビューで実際に検出)。
+        print(f"Telegram送信エラー（ガードレール提案）: {redact_secret(str(e), token)}")
 
 
 # ============================================================
@@ -834,7 +838,7 @@ def _send_stop_loss_telegram(alerts: list[dict]) -> None:
             timeout=10,
         )
     except Exception as e:
-        print(f'Telegram送信エラー（損切りアラート）: {e}')
+        print(f'Telegram送信エラー（損切りアラート）: {redact_secret(str(e), token)}')
 
 
 # ============================================================

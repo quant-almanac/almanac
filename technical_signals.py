@@ -10,10 +10,7 @@ Usage:
 
 from __future__ import annotations
 
-import json
 import logging
-import os
-import tempfile
 import time
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -23,7 +20,7 @@ import numpy as np
 import pandas as pd
 import yfinance as yf
 
-from utils import load_json, atomic_write_json
+from utils import load_json, atomic_write_json, process_lock, LockBusy
 from pseudo_tickers import is_pseudo_market_ticker
 
 logger = logging.getLogger(__name__)
@@ -32,6 +29,15 @@ BASE_DIR = Path(__file__).parent
 # --- 定数 ---
 CACHE_FILE = BASE_DIR / "technical_state.json"
 CACHE_TTL = 30 * 60  # 30分
+
+# technical_state.json への書き込みを直列化するロック名。
+# ensure_technical_coverage (実行内補完) と get_technical_context
+# (cron の全再計算、別プロセス) の両方がこの名前で utils.process_lock を
+# 取る。process_lock は fcntl.flock なのでプロセスをまたいで効く。
+TECHNICAL_STATE_LOCK_NAME = "technical_state"
+# JSON の直列化+置換だけの区間なので、通常はミリ秒で解放される。
+# 10秒待っても取れない場合は異常系とみなし、安全側に倒して諦める。
+TECHNICAL_STATE_LOCK_TIMEOUT_SECONDS = 10.0
 
 # 価格データの無い投信・現金等はスキップ
 SKIP_TICKERS = {
@@ -547,20 +553,6 @@ COVERAGE_TOPUP_TIMEOUT_SECONDS = 90.0
 COVERAGE_SOURCE_TOPUP = "topup"
 
 
-def _read_state_bytes(path: Path) -> bytes | None:
-    """CAS 比較用の生バイト読み取り。存在しなければ None。
-
-    独立した関数にしてあるのは、ensure_technical_coverage の
-    「読む→合成する→書く直前にもう一度読んで比較する」という2回の読み取りを
-    テストが差し替えられるようにするため (2回目の呼び出しだけ、別プロセスが
-    書き込んだ後の内容を返す、といった競合の再現に使う)。
-    """
-    try:
-        return path.read_bytes()
-    except OSError:
-        return None
-
-
 def ensure_technical_coverage(
     tickers,
     *,
@@ -587,14 +579,16 @@ def ensure_technical_coverage(
       - missing_count / analyzed_count は _ensure_technical_state_fresh が
         「再計算は完全だった」の判定に使う
 
-    **ファイルロックは無いが、書く直前に CAS (compare-and-swap) で衝突を
-    検出する** (2026-08-24, レビュー起因)。当初は単純な os.replace のみで、
-    「読む→合成する→書く」の間に cron の全再計算が割り込むと、新しい
-    cached_at・breadth・新規行・既存行の更新を丸ごと巻き戻す実害が
-    再現された (次回の自己修復を待つ間、ずっと古い state のまま)。
-    今は書く直前に読み直して土台が変わっていないか確認し、変わっていれば
-    新しい内容の上で1回だけ合成し直す。2回連続で衝突したら書かずに諦める
-    (ミリ秒単位の窓が連続する確率は無視できるため、無限リトライはしない)。
+    **書き込みは process_lock によるプロセス間ロックで直列化する**
+    (2026-08-24, レビュー起因で2段階の修正を経た)。当初は単純な
+    os.replace のみで、「読む→合成する→書く」の間に cron の全再計算が
+    割り込むと、新しい cached_at・breadth・新規行・既存行の更新を丸ごと
+    巻き戻す実害が再現された。次に「書く直前にもう一度読んで比較する」
+    check-then-replace を入れたが、その確認と実際の置換の間にも窓が残り、
+    厳密には CAS ではなかった (Codex レビューで再現)。今は
+    TECHNICAL_STATE_LOCK_NAME を fcntl.flock で取ってから読む→合成する→
+    書くを行う。get_technical_context 側の書き込みも同じ名前でロックする
+    ので、別プロセスであっても真に直列化される。
     """
     requested_raw = list(tickers or [])
     report: dict = {
@@ -743,94 +737,82 @@ def ensure_technical_coverage(
         if not added_rows:
             return report
 
-        # 9) CAS (compare-and-swap) でマージする。
+        # 9) プロセス間ファイルロックでマージする。
         #
-        #    旧実装は「読む→合成する→書く」の間に他の書き手 (cron の全再計算)
-        #    が割り込んでも検出できなかった。実測した最悪順序:
-        #      a) topup がここで古い state を読む
-        #      b) cron が新しい全再計算結果を書く
-        #      c) topup が (a) の古い state + 追加行を書く
-        #    → 新しい cached_at・breadth・新規行・既存行の更新がすべて消える。
-        #    (b) が (a) より後ろにずれ込むだけで再現する、単なる read-then-write
-        #    の競合。書く直前にもう一度読み直し、(a) から変わっていないかを
-        #    確認してから置き換える。変わっていれば「その新しい内容の上に」
-        #    もう一度だけ合成し直す (無限リトライはしない — 衝突の窓は
-        #    ミリ秒単位で、2回連続は事実上起きない。それでも衝突するなら
-        #    今回は書かずに諦める。次回の topup か次の cron 再計算が
-        #    自己修復する)。
+        #    旧実装 (check-then-replace) は、書く直前にもう一度読み直して
+        #    土台が変わっていないか確認していたが、その「確認」と実際の
+        #    os.replace の間にも窓が残っていた。厳密には CAS ではなく
+        #    ただの check-then-replace で、両方の書き手が同じロックを
+        #    取らない限り閉じない (Codex レビュー 2026-08-24。隔離再現:
+        #    12:00 の新 state (XLF=999, NEW 追加) を、その窓に割り込んだ
+        #    08:30 の古い state で topup が上書きし、それでも status=ok を
+        #    返した)。
+        #
+        #    process_lock は fcntl.flock によるプロセス間の排他ロックで、
+        #    別プロセス (cron が起動する get_technical_context) からも
+        #    有効。あちら側の書き込みも同じ名前でロックするので、両者は
+        #    真に直列化される。ロック保持区間は「読む→合成する→書く」だけに
+        #    絞り、ネットワーク取得 (この関数の手順1〜6、最大90秒) は
+        #    ロックの外で終えてある — 保持区間はJSONの読み書きだけで
+        #    ミリ秒オーダー。
         path = base_dir / "technical_state.json"
-        for _attempt in range(2):
-            before = _read_state_bytes(path)
-            if before is None:
-                return report
-            try:
-                latest = json.loads(before)
-            except Exception:
-                return report
-            if not isinstance(latest, dict) or not isinstance(latest.get("tickers"), dict):
-                return report
-            rows = dict(latest["tickers"])
-            inserted = []
-            for ticker, row in added_rows.items():
-                # 存在しないキーだけ挿入する。既存行を書き換えると、朝の
-                # 再計算が正しく stale と判定した保有銘柄を数銘柄の取得が
-                # 「stale解除」してしまい、fail-closed だったものが ready に
-                # 化ける。
-                if ticker in rows:
-                    continue
-                rows[ticker] = row
-                inserted.append(ticker)
-            if not inserted:
-                return report
+        try:
+            with process_lock(
+                TECHNICAL_STATE_LOCK_NAME, timeout=TECHNICAL_STATE_LOCK_TIMEOUT_SECONDS
+            ):
+                latest = load_json(path, {})
+                if not isinstance(latest, dict) or not isinstance(latest.get("tickers"), dict):
+                    return report
+                rows = dict(latest["tickers"])
+                inserted = []
+                for ticker, row in added_rows.items():
+                    # 存在しないキーだけ挿入する。既存行を書き換えると、朝の
+                    # 再計算が正しく stale と判定した保有銘柄を数銘柄の取得が
+                    # 「stale解除」してしまい、fail-closed だったものが ready に
+                    # 化ける。
+                    if ticker in rows:
+                        continue
+                    rows[ticker] = row
+                    inserted.append(ticker)
+                if not inserted:
+                    return report
 
-            merged = dict(latest)
-            merged["tickers"] = rows
-            source_health = merged.get("source_health")
-            analyzed = 0
-            if isinstance(source_health, dict):
-                try:
-                    analyzed = int(source_health.get("analyzed_count") or 0)
-                except (TypeError, ValueError):
-                    analyzed = 0
-            merged["coverage_topup"] = {
-                "updated_at": now.isoformat(),
-                "base_cached_at": merged.get("cached_at"),
-                "requested": list(targets),
-                "added": sorted(inserted),
-                "unavailable": sorted(unavailable),
-                # 当回の len(added) ではなく導出値。再計算を挟まず2回 topup
-                # した時点で突き合わせ式が壊れるため。
-                # len(tickers) == source_health.analyzed_count + rows_outside_rebuild
-                "rows_outside_rebuild": max(0, len(rows) - analyzed),
-            }
-            payload = json.dumps(merged, ensure_ascii=False, indent=2).encode("utf-8")
-            tmp_fd, tmp_name = tempfile.mkstemp(dir=str(base_dir), suffix=".tmp")
-            try:
-                with os.fdopen(tmp_fd, "wb") as fh:
-                    fh.write(payload)
-                current = _read_state_bytes(path)
-                if current != before:
-                    # 合成の土台にした内容が、書く直前に変わっていた。
-                    # このtmpファイルは古い土台の産物なので捨て、
-                    # 新しい内容の上でもう一度だけ合成し直す。
-                    os.unlink(tmp_name)
-                    continue
-                os.replace(tmp_name, path)
-            except Exception:
-                try:
-                    os.unlink(tmp_name)
-                except OSError:
-                    pass
-                raise
-            else:
-                report["status"] = "ok"
-                report["added"] = sorted(inserted)
-                logger.info(
-                    "テクニカル補完: +%d 行 (%s)", len(inserted), ", ".join(sorted(inserted))
-                )
-                return report
+                merged = dict(latest)
+                merged["tickers"] = rows
+                source_health = merged.get("source_health")
+                analyzed = 0
+                if isinstance(source_health, dict):
+                    try:
+                        analyzed = int(source_health.get("analyzed_count") or 0)
+                    except (TypeError, ValueError):
+                        analyzed = 0
+                merged["coverage_topup"] = {
+                    "updated_at": now.isoformat(),
+                    "base_cached_at": merged.get("cached_at"),
+                    "requested": list(targets),
+                    "added": sorted(inserted),
+                    "unavailable": sorted(unavailable),
+                    # 当回の len(added) ではなく導出値。再計算を挟まず2回
+                    # topup した時点で突き合わせ式が壊れるため。
+                    # len(tickers) == source_health.analyzed_count + rows_outside_rebuild
+                    "rows_outside_rebuild": max(0, len(rows) - analyzed),
+                }
+                atomic_write_json(path, merged)
+        except LockBusy:
+            # get_technical_context 側の書き込み (JSON の直列化+置換だけ)
+            # は通常ミリ秒で終わるので、タイムアウトまで埋まっているのは
+            # 異常系。安全側に倒して今回は書かない。
+            logger.warning(
+                "テクニカル補完: %s秒待っても書込ロックを取得できず、今回は見送り",
+                TECHNICAL_STATE_LOCK_TIMEOUT_SECONDS,
+            )
+            return report
 
-        logger.warning("テクニカル補完: 再計算との競合が解消せず、今回は見送り")
+        report["status"] = "ok"
+        report["added"] = sorted(inserted)
+        logger.info(
+            "テクニカル補完: +%d 行 (%s)", len(inserted), ", ".join(sorted(inserted))
+        )
         return report
     except Exception as exc:
         logger.warning("テクニカル補完失敗: %s", exc)
@@ -1005,7 +987,13 @@ def get_technical_context(*, force: bool = False) -> dict:
             pass
 
     state = compute_technical_state()
-    atomic_write_json(CACHE_FILE, state)
+    # ensure_technical_coverage (実行内補完) と同じロックを取ってから書く。
+    # compute_technical_state 自体はこのファイルへ書き込まない (ネットワーク
+    # 取得は utils.process_lock の外) ので、ロック保持区間はこの書き込み
+    # だけに絞れる。取れなければ LockBusy を伝播させる —— 全再計算の結果を
+    # 書けないのは異常系で、次回のスケジュール実行に委ねるのが妥当。
+    with process_lock(TECHNICAL_STATE_LOCK_NAME, timeout=TECHNICAL_STATE_LOCK_TIMEOUT_SECONDS):
+        atomic_write_json(CACHE_FILE, state)
     logger.info("technical_state.json 更新完了")
     return state
 

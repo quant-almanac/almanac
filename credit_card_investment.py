@@ -617,6 +617,8 @@ def send_monthly_reminder():
     import os
     import requests
 
+    from utils import reraise_with_secret_redacted
+
     token   = os.environ.get('TELEGRAM_TOKEN')
     chat_id = os.environ.get('TELEGRAM_CHAT_ID')
     if not token or not chat_id:
@@ -644,11 +646,19 @@ def send_monthly_reminder():
     )
 
     url = f'https://api.telegram.org/bot{token}/sendMessage'
-    resp = requests.post(url, data={
-        'chat_id':    chat_id,
-        'text':       msg,
-        'parse_mode': 'HTML',
-    })
+    try:
+        resp = requests.post(url, data={
+            'chat_id':    chat_id,
+            'text':       msg,
+            'parse_mode': 'HTML',
+        })
+    except Exception as e:
+        # requests/urllib3 は接続エラーの文字列表現に URL (token を含む) を
+        # 埋め込む。cron (毎月1日) はこのスクリプトの stderr を
+        # credit_card_log.txt へリダイレクトするので、未捕捉のまま伝播すると
+        # Python の既定トレースバックがそこへ平文で残る
+        # (2026-08-24 レビューで同種の経路が実際に検出)。
+        reraise_with_secret_redacted(e, token)
     if resp.ok:
         print(f'月次リマインダーを送信しました（{today.isoformat()}）')
     else:

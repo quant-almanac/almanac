@@ -171,11 +171,28 @@ def record(
         # last_seen を判定すると、初日以降ずっと同じ日付のまま TTL に
         # 引っかかって消える (last_seen が「最後に新規取得できた日」に
         # なってしまい、「最後に提案された日」にならない)。
-        # rows に既にあるという事実自体が「過去に実在確認済み」の証拠なので、
-        # 未検証の新規登録 (additions 側の唯一の関門) とは安全性が異なる。
+        #
+        # rows に既にある = 「過去に実在確認済み」の証拠でしかなく、
+        # 「今も実在する」証拠ではない。missed_rebuilds は「今も実在するか」
+        # を数えるカウンタなので、過去の実在だけで continuing 扱いすると、
+        # 現在 technical_state.json に行を持たない銘柄 (直近の topup も
+        # 直近の全再計算も解決できなかった) が resolved 無しで再提案される
+        # たびに missed_rebuilds が 0 へリセットされ、永久に猶予が尽きなく
+        # なる (Codex レビュー再現: technical state に不在・topup失敗・
+        # missed_rebuilds=2 のMDBが、continuing 扱いで 0 へ戻った)。
+        # 「今も実在する」の唯一の直接証拠は technical_state.json 自身の
+        # tickers キーなので、それを読んで requested の絞り込みに使う。
+        try:
+            _tech_state = load_json(Path(base_dir) / "technical_state.json", {})
+            _live_tickers = (
+                set((_tech_state.get("tickers") or {}).keys())
+                if isinstance(_tech_state, dict) else set()
+            )
+        except Exception:
+            _live_tickers = set()
         continuing = [
             t for t in requested
-            if t not in resolved_upper and t in rows
+            if t not in resolved_upper and t in rows and t in _live_tickers
         ]
         for ticker in additions:
             row = rows.get(ticker)

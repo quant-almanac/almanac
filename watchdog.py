@@ -83,7 +83,13 @@ EXPECTED_INTERVALS = {
     # portfolio_analyst is the one morning AI analysis. analyzer_delta is a
     # separate lightweight observer and must not be described as a second
     # full portfolio analysis.
-    'portfolio_analyst': {'max_stale_sec': 26 * 3600, 'weekday_only': True},
+    # warn_is_error: portfolio_analyst.main() writes status="warn" when the
+    # analysis itself succeeded but Telegram delivery failed (2026-08-24).
+    # Without this flag, evaluate_health() treats "warn" identically to "ok"
+    # (see the status branch below) — writing "warn" would have been a
+    # complete no-op for alerting, silently reproducing the exact gap it was
+    # meant to close (Codex review, 2026-08-24).
+    'portfolio_analyst': {'max_stale_sec': 26 * 3600, 'weekday_only': True, 'warn_is_error': True},
     # 'analyzer' は --delta-only 運用で 'analyzer_delta' に heartbeat されるため
     # こちらを監視する（旧 'analyzer' キーは永遠に空で false positive の原因だった）。
     'analyzer_delta':    {'max_stale_sec': 24 * 3600, 'weekday_only': True},

@@ -370,6 +370,40 @@ def get_llm_temperature(default: float = 0.0) -> float:
     return 0.0 if is_deterministic_mode() else default
 
 
+# ── 秘密値の伏字化 ──────────────────────────────
+# Telegram Bot API は URL 自体にトークンを含む
+# (https://api.telegram.org/bot<TOKEN>/...) ため、requests/urllib3 は
+# 接続エラー・HTTPError の文字列表現にトークンをそのまま埋め込む
+# (ConnectTimeout.args[0] が MaxRetryError で、その __str__ の中に URL が
+# ある、というようにネストした例外オブジェクトの奥にも埋め込まれる。
+# str(exc) で一度フラットな文字列へ落としてから置換すれば、ネストの深さに
+# 関係なく届く)。alert.py 単体で塞いでも、同じパターンで独自に
+# requests.post を呼ぶ他の送信経路 (analyzer.py・telegram_bot.py・
+# behavioral_guard.py 等) には及ばず、2026-08-24 の Codex レビューで
+# それらから未伏字のトークンが実際に検出された。1箇所にまとめ、
+# 各送信経路はここを呼ぶだけにする。
+def redact_secret(text: str, secret: str) -> str:
+    if not secret:
+        return text
+    return text.replace(secret, "<redacted>")
+
+
+def reraise_with_secret_redacted(exc: Exception, secret: str) -> None:
+    """例外を型を保ったまま、秘密値を伏せたメッセージで再送出する。
+
+    args を浅く置換してもネストした例外までは書き換わらないので、str(exc)
+    で一度フラットな文字列へ落としてから置換し、同じ型で作り直す。
+    原因チェーンは黙って捨てる (from None) —— 残すと Python の既定の
+    トレースバック表示が元の (未伏字の) 例外も一緒に出してしまう。
+    """
+    redacted = redact_secret(str(exc), secret)
+    try:
+        new_exc = type(exc)(redacted)
+    except Exception:
+        new_exc = RuntimeError(redacted)
+    raise new_exc.with_traceback(exc.__traceback__) from None
+
+
 # ── ハートビート（P2-9） ──────────────────────────
 HEARTBEAT_PATH = Path(__file__).parent / 'heartbeats.json'
 
