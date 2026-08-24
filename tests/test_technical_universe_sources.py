@@ -831,20 +831,25 @@ class TestConcurrentRebuildMerge:
         """compute_technical_state はロックの外で計算するため、計算が始まった
         「後」に着地した topup 行を知らずに書き込む。process_lock は書き込み
         の排他を保証するだけで、「知らない内容で丸ごと置換する」こと自体は
-        防げない (Codex レビュー 2026-08-24 で再現: topup added=['MDB'] の
-        直後、続く全再計算の書き込みで MDB が消えた)。
+        防げない (Codex レビュー round 3 で再現)。
 
-        本番の呼び出し順序は analyst/__init__.py の通り
-        ensure_technical_coverage() → proposed_ticker_registry.record() の
-        2段階で、record() は ensure が返ってから初めて呼ばれる。旧実装は
-        「レジストリに現役登録されているか」で引き継ぎを判定していたが、
-        ensure がロックを解放した直後・record が走る前に全再計算の書き込みが
-        割り込む窓では、対象銘柄はまだレジストリに存在せず引き継げなかった
-        (Codex レビュー 2026-08-24 の再指摘: registry_present=True は
-        「その後」の状態で、書込み時点では False だった)。このテストは
-        record() を意図的に呼ばないまま全再計算の書き込みを行わせ、
-        pre_rebuild_tickers ベースの引き継ぎがレジストリ状態に依存せず
-        機能することを確認する。
+        さらに、行の書込みとレジストリ登録が別トランザクションだと
+        (旧実装: ensure_technical_coverage が返ってから
+        analyst/__init__.py が別途 proposed_ticker_registry.record() を呼ぶ
+        2段階呼び出し)、ensure がロックを解放した直後・record が走る前に
+        全再計算の書き込みが割り込む窓で「行はあるがレジストリに無い」状態を
+        観測され、レジストリ判定が引き継ぎを誤って拒否した (Codex レビュー
+        round 4 で pre_rebuild_tickers ベースの修正を試みたが、round 5 で
+        「計算開始直前に着地した行まで『計算開始前から存在した』と誤判定して
+        落とす」別の穴を再指摘された)。
+
+        今は ensure_technical_coverage が行の書込みと同じロック
+        (TECHNICAL_STATE_LOCK_NAME) の中で
+        proposed_ticker_registry.record_already_locked() も呼び、行の追加と
+        レジストリ登録を1つの臨界区間で完結させる。このテストは、呼び出し元
+        (analyst/__init__.py 相当) の別途の record() 呼び出しを意図的に
+        省いたまま全再計算の書き込みを行わせ、ensure 自身の内部登録だけで
+        引き継ぎが成立することを確認する。
         """
         _write_base(tmp_path, rows={
             "XLF": {"price": 50.0, "freshness_status": "fresh",
@@ -881,18 +886,20 @@ class TestConcurrentRebuildMerge:
         rebuild_thread.start()
         assert rebuild_fetch_started.wait(timeout=5.0), "全再計算のfetchが開始しなかった"
 
-        # 全再計算がまだ (ロックの外で fetch 中に、pre_rebuild_tickers を
-        # 既に確定させた後) 走っている間に ensure_technical_coverage だけを
-        # 実行する。record() はまだ「意図的に」呼ばない —— 本番の2段階呼び
-        # 出しのうち、record が走る前の窓を再現するため。
+        # 全再計算がまだ (ロックの外で) fetch 中の間に ensure_technical_coverage
+        # だけを実行する。呼び出し元 (analyst/__init__.py) 相当の別途
+        # record() はまだ「意図的に」呼ばない —— ensure 自身の内部登録だけで
+        # 足りることを確認するため。
         report = technical_signals.ensure_technical_coverage(["MDB"], base_dir=tmp_path)
         assert report["status"] == "ok"
         assert report["added"] == ["MDB"]
         assert _read_state(tmp_path)["tickers"]["MDB"]["coverage_source"] == (
             technical_signals.COVERAGE_SOURCE_TOPUP
         )
-        # レジストリはまだ空 —— record() を呼んでいない。
-        assert not (tmp_path / "proposed_ticker_candidates.json").exists()
+        # ensure 自身が行の書込みと同じロックの中でレジストリにも登録済み
+        # (呼び出し元の別途の record() 呼び出しを待たない)。
+        registry = json.loads((tmp_path / "proposed_ticker_candidates.json").read_text())
+        assert "MDB" in {c["ticker"] for c in registry["candidates"]}
 
         release_rebuild_fetch.set()
         rebuild_thread.join(timeout=5.0)
@@ -903,15 +910,13 @@ class TestConcurrentRebuildMerge:
         assert final["tickers"]["MDB"]["coverage_source"] == technical_signals.COVERAGE_SOURCE_TOPUP
         assert "XLF" in final["tickers"], "全再計算自身が計算した行も生きているべき"
 
-    def test_a_topup_ticker_predating_the_rebuild_is_not_carried_when_unresolved(
+    def test_an_unregistered_topup_ticker_is_not_carried_when_unresolved(
         self, tmp_path, monkeypatch
     ):
-        """引き継ぎは「今回の計算時間中に新規着地した」行限定。計算開始より
-        前から technical_state.json に存在していた topup 行は、今回の
-        再計算がそれを再現できなくても引き継がない —— 他の全銘柄と同じく
-        「直近の成功結果だけが残る」のが本来の挙動。レジストリにまだ
-        現役登録されているかどうかでは判定しない (それだと ensure→record の
-        2段階呼び出しの窓を正しく扱えない、別テストの通り)。
+        """引き継ぎはレジストリに現役登録されている銘柄限定。登録が無い
+        (追い出し済み、もしくは一度も登録されなかった) topup 行まで救うと、
+        evict_unresolved が本来落とすはずの行が全再計算のたびに復活し、
+        technical_state.json が無限に肥大化する。
         """
         _write_base(tmp_path, rows={
             "XLF": {"price": 50.0, "freshness_status": "fresh",
@@ -922,19 +927,8 @@ class TestConcurrentRebuildMerge:
         })
         (tmp_path / "holdings.json").write_text("{}", encoding="utf-8")
         (tmp_path / "scenario_playbook.json").write_text("{}", encoding="utf-8")
-        # GHOST はレジストリにまだ現役登録されている状態でも (旧実装なら
-        # 引き継がれてしまう状態でも)、計算開始前から存在していた行である
-        # 以上は落とされるべきことを確認する。TTL_DAYS=21 を跨がないよう
-        # last_seen はテスト実行時点の「今日」にする (固定日付だと実行日が
-        # 進むにつれて TTL 切れで別の理由で通ってしまう)。
-        import datetime as _dt
-        _today_iso = _dt.date.today().isoformat()
-        (tmp_path / "proposed_ticker_candidates.json").write_text(json.dumps({
-            "version": 1, "candidates": [
-                {"ticker": "GHOST", "first_seen": _today_iso, "last_seen": _today_iso,
-                 "seen_count": 1, "source": "ai_proposal", "missed_rebuilds": 0},
-            ],
-        }), encoding="utf-8")
+        (tmp_path / "proposed_ticker_candidates.json").write_text(
+            json.dumps({"version": 1, "candidates": []}), encoding="utf-8")
 
         monkeypatch.setattr(technical_signals, "BASE_DIR", tmp_path)
         monkeypatch.setattr(technical_signals, "CACHE_FILE", tmp_path / "technical_state.json")
@@ -946,15 +940,58 @@ class TestConcurrentRebuildMerge:
         technical_signals.get_technical_context(force=True)
 
         final = _read_state(tmp_path)
-        assert "GHOST" not in final["tickers"], "計算開始前から存在した未解決topup行が復活した"
+        assert "GHOST" not in final["tickers"], "未登録のtopup行が復活した"
         assert "XLF" in final["tickers"]
+
+    def test_a_registered_topup_ticker_survives_an_unresolved_cycle(
+        self, tmp_path, monkeypatch
+    ):
+        """前サイクルで topup された行は、まだレジストリに現役登録されている
+        限り、今回のサイクルで再現できなくても引き継がれる。eviction は
+        missed_rebuilds が閾値 (MISSED_REBUILDS_BEFORE_EVICTION) に達するまで
+        猶予付きであり、1回不在なだけで即座に落とすものではない —— この点は
+        test_consecutive_unresolved_cycles_still_advance_missed_rebuilds で
+        猶予の進行自体を別途確認済み。
+        """
+        _write_base(tmp_path, rows={
+            "XLF": {"price": 50.0, "freshness_status": "fresh",
+                    "data_quality_status": "ok", "data_as_of": "2026-08-21"},
+            "MDB": {"price": 1.0, "freshness_status": "fresh",
+                    "data_quality_status": "ok", "data_as_of": "2026-08-20",
+                    "coverage_source": technical_signals.COVERAGE_SOURCE_TOPUP},
+        })
+        (tmp_path / "holdings.json").write_text("{}", encoding="utf-8")
+        (tmp_path / "scenario_playbook.json").write_text("{}", encoding="utf-8")
+        import datetime as _dt
+        _today_iso = _dt.date.today().isoformat()
+        (tmp_path / "proposed_ticker_candidates.json").write_text(json.dumps({
+            "version": 1, "candidates": [
+                {"ticker": "MDB", "first_seen": _today_iso, "last_seen": _today_iso,
+                 "seen_count": 1, "source": "ai_proposal", "missed_rebuilds": 1},
+            ],
+        }), encoding="utf-8")
+
+        monkeypatch.setattr(technical_signals, "BASE_DIR", tmp_path)
+        monkeypatch.setattr(technical_signals, "CACHE_FILE", tmp_path / "technical_state.json")
+        # MDB だけが今回も解決できない。他は解決できるので coverage は
+        # 高く、MIN_REBUILD_COVERAGE_FOR_EVICTION には阻まれない。
+        monkeypatch.setattr(
+            technical_signals, "_load_ohlcv",
+            lambda tickers: {t: _frame() for t in tickers if t != "MDB"},
+        )
+
+        technical_signals.get_technical_context(force=True)
+
+        final = _read_state(tmp_path)
+        assert "MDB" in final["tickers"], "現役登録済みのtopup行が未解決サイクルで消えた"
+        assert final["tickers"]["MDB"]["coverage_source"] == technical_signals.COVERAGE_SOURCE_TOPUP
 
     def test_consecutive_unresolved_cycles_still_advance_missed_rebuilds(
         self, tmp_path, monkeypatch
     ):
-        """pre_rebuild_tickers ベースの引き継ぎに変えても、レジストリ現役の
-        銘柄が全再計算で連続して解決できなければ missed_rebuilds は進み、
-        いずれ追い出されること (Codex レビュー 2026-08-24 で追加要請)。
+        """レジストリ判定ベースの引き継ぎでも、レジストリ現役の銘柄が
+        全再計算で連続して解決できなければ missed_rebuilds は進み、
+        いずれ追い出されること (Codex レビュー round 4 で追加要請)。
         """
         import proposed_ticker_registry as registry_mod
 
@@ -1001,3 +1038,200 @@ class TestConcurrentRebuildMerge:
             "連続失敗後もGHOSTが追い出されていない"
         )
         assert "GHOST" not in _read_state(tmp_path)["tickers"]
+
+    def test_record_and_evict_unresolved_do_not_lose_each_others_update(
+        self, tmp_path, monkeypatch
+    ):
+        """record() と evict_unresolved() はどちらも registry ファイルへの
+        read-modify-write で、共通ロックが無いと互いの更新を上書きし合う
+        (Codex レビュー round 5 で実スレッド再現: eviction が旧内容を読んで
+        書込み待ちの間に record() が割り込み登録し、eviction 再開後の
+        書込みでその登録が消えた)。REGISTRY_LOCK_NAME
+        (= TECHNICAL_STATE_LOCK_NAME と同名) を両者が共有することで、
+        evict が読み込んでから書き込むまでの間、record は待たされ、
+        古い内容の上に書くことがないことを確認する。
+
+        _read_rows を差し替えて「読んだ直後・評価前」で足止めする —— これで
+        evict がロックを保持したまま停止する。ここで record を動かして、
+        真にロック待ちでブロックされること (そのまま抜けてしまわないこと)
+        を検証する。
+        """
+        import datetime as _dt
+        import threading
+        import time as _time
+
+        import proposed_ticker_registry as registry_mod
+
+        # last_seen はテスト実行時点の「今日」にする。固定日付だと TTL_DAYS=21
+        # を跨いだ実行日に record() 自身の書込み (_prune_and_order 経由) が
+        # OLD を TTL 切れとして先に消してしまい、このテストが検証したい
+        # 「missed_rebuilds 到達による eviction」を通らなくなる。
+        _today_iso = _dt.date.today().isoformat()
+        (tmp_path / "proposed_ticker_candidates.json").write_text(json.dumps({
+            "version": 1, "candidates": [
+                {"ticker": "OLD", "first_seen": _today_iso, "last_seen": _today_iso,
+                 "seen_count": 1, "source": "ai_proposal", "missed_rebuilds": 2},
+            ],
+        }), encoding="utf-8")
+        (tmp_path / "technical_state.json").write_text(json.dumps({
+            "tickers": {}, "market_breadth": {}, "source_health": {}, "cached_at": None,
+        }), encoding="utf-8")
+
+        real_read_rows = registry_mod._read_rows
+        evict_is_reading = threading.Event()
+        release_evict = threading.Event()
+        call_count = {"n": 0}
+
+        def _paused_read_rows(base_dir):
+            call_count["n"] += 1
+            rows = real_read_rows(base_dir)
+            if call_count["n"] == 1:
+                # evict 側の最初の読み込みだけ、読んだ直後で足止めする。
+                evict_is_reading.set()
+                release_evict.wait(timeout=5.0)
+            return rows
+
+        monkeypatch.setattr(registry_mod, "_read_rows", _paused_read_rows)
+
+        results: dict = {}
+
+        def _run_evict():
+            # OLD は missed_rebuilds=2+1=3 で MISSED_REBUILDS_BEFORE_EVICTION
+            # に到達し追い出される (evict 自身の計算は読み込み後、足止め解除
+            # まで進まない)。
+            results["evict"] = registry_mod.evict_unresolved(
+                ["OLD"], base_dir=tmp_path, rebuild_coverage=1.0)
+
+        t_evict = threading.Thread(target=_run_evict)
+        t_evict.start()
+        assert evict_is_reading.wait(timeout=5.0), "evictの読み込みが開始しなかった"
+
+        # evict がロックを保持したまま読み込み直後で止まっている間に record
+        # を動かす。ロックを共有していれば record はここでブロックされ、
+        # evict の書込みが完了してから初めて動く。共有していなければ
+        # record はここで割り込み、evict が (古い読み込み内容のまま)
+        # 書き込むときに record の追加ごと上書きされる。
+        def _run_record():
+            results["record"] = registry_mod.record(
+                ["NEW"], resolved={"NEW"}, base_dir=tmp_path)
+
+        t_record = threading.Thread(target=_run_record)
+        t_record.start()
+        # record がロック待ちで確実にブロックされる時間を与える。
+        _time.sleep(0.3)
+
+        release_evict.set()
+        t_evict.join(timeout=5.0)
+        t_record.join(timeout=5.0)
+        assert not t_evict.is_alive() and not t_record.is_alive()
+        assert results["evict"]["status"] == "ok"
+        assert results["record"]["status"] == "ok"
+
+        final = json.loads((tmp_path / "proposed_ticker_candidates.json").read_text())
+        tickers = {c["ticker"] for c in final["candidates"]}
+        assert "OLD" not in tickers, "evictionの結果がrecordの書込みで消えた"
+        assert "NEW" in tickers, "recordの結果がevictionの書込みで消えた"
+
+    def test_a_slow_rebuild_started_first_does_not_clobber_a_faster_later_rebuild(
+        self, tmp_path, monkeypatch
+    ):
+        """全再計算同士も、計算区間自体はロックの外にあるため、先に始まった
+        (が遅い) 再計算Aが、後から始まって先に書き終えた再計算Bの結果を
+        古い内容で巻き戻しうる (Codex レビュー round 5 で実スレッド再現:
+        古い再計算Aが開始・停止 → 新しい再計算Bが完了しNEW行を書込 →
+        Aが再開してOLD行を書込 → NEWが消えてOLDだけ残る)。
+        TECHNICAL_REBUILD_LOCK_NAME による single-flight 化で、後発の
+        再計算はどちらであれ先発が完全に (計算+書込みまで) 終わるまで
+        自分の計算すら始められず、二つの計算が並走すること自体が
+        起きないことを確認する。
+        """
+        _write_base(tmp_path, rows={
+            "XLF": {"price": 1.0, "freshness_status": "fresh",
+                    "data_quality_status": "ok", "data_as_of": "2026-08-20"},
+        })
+        (tmp_path / "holdings.json").write_text("{}", encoding="utf-8")
+        (tmp_path / "scenario_playbook.json").write_text("{}", encoding="utf-8")
+
+        monkeypatch.setattr(technical_signals, "BASE_DIR", tmp_path)
+        monkeypatch.setattr(technical_signals, "CACHE_FILE", tmp_path / "technical_state.json")
+
+        import threading
+
+        a_fetch_started = threading.Event()
+        release_a_fetch = threading.Event()
+        a_released = threading.Event()
+        call_count = {"n": 0}
+        # 各 _load_ohlcv 呼び出しが「A解放より前」か「後」かを記録する。
+        # 実測 (計算自体が pandas の行ループで数秒かかりうる) では、
+        # single-flight 無効時に B の呼び出しが即座に走っても B 自身の
+        # 計算がAと同時実行になり GIL 競合で両方遅くなるだけで、
+        # 「Bが速く終わる」という単純な wall-clock 比較は当てにならない。
+        # 確定的に検証できるのは「Bの_load_ohlcv呼び出しがAの解放より
+        # 前に起きたか」そのものなので、それを直接記録する。
+        call_order: list[tuple[int, bool]] = []
+
+        def _fake_load_ohlcv(tickers):
+            call_count["n"] += 1
+            this_call = call_count["n"]
+            call_order.append((this_call, a_released.is_set()))
+            if this_call == 1:
+                # A (先に始まった呼び出し) だけを足止めする。
+                a_fetch_started.set()
+                release_a_fetch.wait(timeout=5.0)
+            frame = _frame()
+            frame = frame.copy()
+            frame["Close"] = frame["Close"] + this_call * 1000.0
+            frame["Open"] = frame["Open"] + this_call * 1000.0
+            frame["High"] = frame["High"] + this_call * 1000.0
+            frame["Low"] = frame["Low"] + this_call * 1000.0
+            return {t: frame for t in tickers}
+
+        monkeypatch.setattr(technical_signals, "_load_ohlcv", _fake_load_ohlcv)
+
+        result: dict = {}
+
+        def _run_a():
+            result["a"] = technical_signals.get_technical_context(force=True)
+
+        thread_a = threading.Thread(target=_run_a)
+        thread_a.start()
+        assert a_fetch_started.wait(timeout=5.0), "Aのfetchが開始しなかった"
+
+        # B はここで single-flight ロック待ちに入るはず。A がまだ fetch すら
+        # 終えていないので、single-flight が効いていれば B の
+        # compute_technical_state (と _load_ohlcv 呼び出し) は、A の解放後
+        # 完全に完了するまで始まらないはず。
+        def _run_b():
+            result["b"] = technical_signals.get_technical_context(force=True)
+
+        thread_b = threading.Thread(target=_run_b)
+        thread_b.start()
+        # B が (single-flight が壊れていれば) 即座に _load_ohlcv を
+        # 呼んでしまう余地を与えるため、少し待ってから解放する。
+        import time as _time
+        _time.sleep(0.3)
+
+        a_released.set()
+        release_a_fetch.set()
+        # 計算自体 (pandas 行ループ) が実時間で数秒かかりうるため、
+        # 単なるロック待ちより大幅に長いタイムアウトを与える。
+        thread_a.join(timeout=30.0)
+        thread_b.join(timeout=30.0)
+        assert not thread_a.is_alive() and not thread_b.is_alive(), (
+            "スレッドが時間内に終了しなかった"
+        )
+
+        assert call_count["n"] == 2, f"_load_ohlcv の呼び出し回数が想定外: {call_order}"
+        # 決定的な検証本体: 2回目の呼び出し (B) は、A を解放した「後」に
+        # 初めて起きたはずで、A の fetch がまだ止まっている間に割り込んで
+        # いてはならない。
+        second_call_number, second_call_after_release = call_order[1]
+        assert second_call_number == 2
+        assert second_call_after_release, (
+            f"Bの_load_ohlcv呼び出しがAの解放前に起きた (single-flightが効いていない): {call_order}"
+        )
+
+        final = _read_state(tmp_path)
+        assert final["tickers"]["XLF"]["price"] == result["b"]["tickers"]["XLF"]["price"], (
+            "後発の再計算の結果が最終状態に反映されていない"
+        )

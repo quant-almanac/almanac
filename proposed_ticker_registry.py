@@ -37,11 +37,28 @@ from __future__ import annotations
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
-from utils import atomic_write_json, load_json
+from utils import atomic_write_json, load_json, process_lock, LockBusy
 
 # _build_ticker_universe が既に解釈できる形 (candidates キー・ticker フィールド)
 # で書く。ユニバース解析コードを新規に書かないため。
 REGISTRY_FILENAME = "proposed_ticker_candidates.json"
+
+# このレジストリファイルへの読込→更新→書込を直列化するロック名。
+# technical_signals.TECHNICAL_STATE_LOCK_NAME と意図的に同じ文字列にしてある
+# (utils.process_lock はロック名をそのままファイル名に使うので、同じ名前を
+# 使う全呼び出しが同じ OS ロックを取り合う)。record()/evict_unresolved() の
+# read-modify-write に共通ロックが無いと、両者が同時に古い内容を読んで
+# 互いの更新を上書きし合う (Codex レビュー round 5 で実スレッド再現:
+# eviction が旧registryを読んで書込み待ちの間に record() が割り込み登録、
+# eviction 再開後の書込みでその登録が消えた)。加えて
+# technical_signals.ensure_technical_coverage は、この名前のロックを
+# 保持したまま record_already_locked() を直接呼ぶことで、technical_state.json
+# への行追加とレジストリ登録を1つの臨界区間で完結させる —— そうしないと
+# 「行はあるがレジストリに無い」窓を全再計算に観測されうる
+# (Codex レビュー round 4/5 で再現)。
+REGISTRY_LOCK_NAME = "technical_state"
+# JSON の読み書きだけの短い区間なので、通常はミリ秒で解放される。
+REGISTRY_LOCK_TIMEOUT_SECONDS = 10.0
 
 # technical_signals.CANDIDATE_TICKERS_PER_FILE 以下に保つこと。消費側の
 # スライスより大きいと、超過分が読まれないまま黙って捨てられる。
@@ -144,6 +161,31 @@ def record(
     now: datetime | None = None,
 ) -> dict:
     """補完に成功した銘柄だけを登録する。例外は投げない。
+
+    REGISTRY_LOCK_NAME を取得してから record_already_locked() を呼ぶ。
+    呼び出し元が既にこのロックを保持している場合 (technical_signals.
+    ensure_technical_coverage 等) は、代わりに record_already_locked() を
+    直接呼ぶこと —— fcntl.flock は同一プロセスからの二重取得もブロックする
+    ため、ここを呼ぶとロック保持中の呼び出し元ごとタイムアウトまで
+    デッドロックする。
+    """
+    try:
+        with process_lock(REGISTRY_LOCK_NAME, timeout=REGISTRY_LOCK_TIMEOUT_SECONDS):
+            return record_already_locked(
+                proposed, resolved=resolved, base_dir=base_dir, now=now)
+    except LockBusy:
+        return {"status": "lock_busy", "requested": [], "registered": []}
+
+
+def record_already_locked(
+    proposed,
+    *,
+    resolved: set[str],
+    base_dir: Path,
+    now: datetime | None = None,
+) -> dict:
+    """record() のロックフリーな本体。呼び出し元が REGISTRY_LOCK_NAME を
+    既に保持していることを前提とする。単独では呼ばないこと。
 
     proposed は監査のための全要求。実際に登録されるのは resolved との積集合
     だけで、これはポジティブキャッシュ制約 (モジュール docstring 1.) の
@@ -252,7 +294,28 @@ def evict_unresolved(
     rebuild_coverage: float,
     now: datetime | None = None,
 ) -> dict:
-    """再計算が行を作れなかった登録銘柄の猶予を進め、尽きたものを追い出す。
+    """evict_unresolved_already_locked() を REGISTRY_LOCK_NAME 取得の上で呼ぶ。
+
+    record() と共通のロックを取ることで、両者の read-modify-write が
+    互いの更新を上書きしないようにする (Codex レビュー round 5 で再現済み)。
+    """
+    try:
+        with process_lock(REGISTRY_LOCK_NAME, timeout=REGISTRY_LOCK_TIMEOUT_SECONDS):
+            return evict_unresolved_already_locked(
+                missing, base_dir=base_dir, rebuild_coverage=rebuild_coverage, now=now)
+    except LockBusy:
+        return {"status": "lock_busy", "evicted": []}
+
+
+def evict_unresolved_already_locked(
+    missing,
+    *,
+    base_dir: Path,
+    rebuild_coverage: float,
+    now: datetime | None = None,
+) -> dict:
+    """evict_unresolved() のロックフリーな本体。呼び出し元が
+    REGISTRY_LOCK_NAME を既に保持していることを前提とする。
 
     例外は投げない。1回の再計算で欠けただけでは追い出さない —— yfinance の
     一時的な単一銘柄不調と、本当の上場廃止を区別できないため

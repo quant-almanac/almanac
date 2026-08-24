@@ -39,6 +39,16 @@ TECHNICAL_STATE_LOCK_NAME = "technical_state"
 # 10秒待っても取れない場合は異常系とみなし、安全側に倒して諦める。
 TECHNICAL_STATE_LOCK_TIMEOUT_SECONDS = 10.0
 
+# get_technical_context の全再計算 (compute_technical_state + 書込み)
+# 全体を single-flight 化するロック名。TECHNICAL_STATE_LOCK_NAME とは別の
+# ロック —— こちらはネットワーク取得を含む数十秒〜数分の区間を保持するため、
+# JSON I/O だけの前者と混ぜると topup が全再計算の完了を待たされてしまう。
+TECHNICAL_REBUILD_LOCK_NAME = "technical_rebuild"
+# 全再計算はネットワーク取得込みで数分かかりうる。定時 cron と手動 --force
+# が重なった程度なら「待って完了後の状態から再計算し直す」のが正しい
+# 挙動なので、JSON I/O 用ロックよりずっと長いタイムアウトにしてある。
+TECHNICAL_REBUILD_LOCK_TIMEOUT_SECONDS = 300.0
+
 # 価格データの無い投信・現金等はスキップ
 SKIP_TICKERS = {
     "SLIM_SP500", "SLIM_ORCAN", "MNXACT",
@@ -798,6 +808,28 @@ def ensure_technical_coverage(
                     "rows_outside_rebuild": max(0, len(rows) - analyzed),
                 }
                 atomic_write_json(path, merged)
+                # レジストリ登録もこの同じロックの中で完結させる。ここで
+                # release してから呼び出し元 (analyst/__init__.py) の
+                # proposed_ticker_registry.record() 呼び出しに委ねると、
+                # 「行は書けたがレジストリはまだ知らない」窓が生まれ、その
+                # 窓に get_technical_context 側の全再計算が割り込むと
+                # 「レジストリに無い」という理由で行の引き継ぎを拒否されて
+                # しまう (Codex レビュー round 4/5 で実際に再現)。
+                # record_already_locked はロックを取らない本体なので、
+                # ここで保持中の TECHNICAL_STATE_LOCK_NAME (=
+                # proposed_ticker_registry.REGISTRY_LOCK_NAME と同名) を
+                # そのまま使い回せる。呼び出し元は引き続き ensure の後で
+                # 通常の record() を全銘柄に対して呼ぶ (continuing 追跡は
+                # ここでは行わないため) —— inserted 分は二重登録になるが、
+                # last_seen/seen_count の重複更新だけで実害はない。
+                try:
+                    import proposed_ticker_registry
+
+                    proposed_ticker_registry.record_already_locked(
+                        inserted, resolved=set(inserted), base_dir=base_dir, now=now,
+                    )
+                except Exception as exc:
+                    logger.warning("テクニカル補完: レジストリ即時登録に失敗 %s", exc)
         except LockBusy:
             # get_technical_context 側の書き込み (JSON の直列化+置換だけ)
             # は通常ミリ秒で終わるので、タイムアウトまで埋まっているのは
@@ -986,70 +1018,81 @@ def get_technical_context(*, force: bool = False) -> dict:
         except Exception:
             pass
 
-    # compute_technical_state を呼ぶ「前」の世代を記録する。この読みは
-    # ロックの外なので厳密ではないが、目的は「今回の計算時間中に着地した
-    # 行」と「計算開始より前から存在していた行」の大まかな境界だけなので
-    # 数百ms のずれは許容できる。
-    pre_rebuild = load_json(CACHE_FILE, {})
-    pre_rebuild_tickers: set[str] = (
-        set(pre_rebuild["tickers"].keys())
-        if isinstance(pre_rebuild, dict) and isinstance(pre_rebuild.get("tickers"), dict)
-        else set()
-    )
-
-    state = compute_technical_state()
-    # ensure_technical_coverage (実行内補完) と同じロックを取ってから書く。
-    # compute_technical_state 自体はこのファイルへ書き込まない (ネットワーク
-    # 取得は utils.process_lock の外) ので、ロック保持区間はこの書き込み
-    # だけに絞れる。取れなければ LockBusy を伝播させる —— 全再計算の結果を
-    # 書けないのは異常系で、次回のスケジュール実行に委ねるのが妥当。
+    # 全再計算 (計算+書込み) 全体を single-flight 化する。取れなければ
+    # 別プロセスが既に再計算中ということで、LockBusy を伝播させる。
     #
-    # ただしロックの外で state を計算している以上、compute_technical_state
-    # が _build_ticker_universe を読んだ「後」に ensure_technical_coverage が
-    # 別プロセスで新規 topup 行を書き込んだ場合、この state はその行を知らない。
-    # ロックを排他するだけでは「知らない内容で丸ごと置換する」こと自体は防げず、
-    # 新しい topup がその場で消える (Codex レビュー 2026-08-24 で再現:
-    # topup で追加した行が直後の全再計算の書き込みで消失)。
+    # これが無いと、遅い再計算 A (例: 古いユニバースで始まった手動 --force)
+    # と速い再計算 B (定時 cron) が並走したとき、B が先に新しい内容を
+    # 書いても A が後から古い内容で上書きしてしまう —— technical_state
+    # ロックは「書き込みの排他」であって「どちらの計算世代が新しいか」は
+    # 判定しないため、これ単体では防げない (Codex レビュー round 5 で
+    # 実スレッド再現: 遅い再計算が新しい書き込みを巻き戻した)。
+    # ロック保持区間は計算 (数十秒〜数分、ネットワーク取得込み) を含むため
+    # TECHNICAL_STATE_LOCK_TIMEOUT_SECONDS (JSON I/O 専用、10秒) より
+    # 大幅に長いタイムアウトを使う —— 正常な同時実行 (遅れて起動した cron
+    # が前回の再計算完了を待つだけ) を異常系として弾いてしまわないため。
     #
-    # 書く直前にもう一度読み、今回の再計算に含まれておらず、かつ
-    # pre_rebuild_tickers に無かった (= 今回の計算時間中に新規着地した)
-    # coverage_source=topup 行だけを引き継ぐ。
-    #
-    # 「まだ提案銘柄レジストリに現役登録されているか」では判定しない —
-    # 当初はそうしていたが、本番の呼び出し順序は
-    # analyst/__init__.py の通り ensure_technical_coverage() が先、
-    # proposed_ticker_registry.record() が後 (2段階) なので、ensure が
-    # ロックを解放した直後・record が走る前に全再計算の書き込みが割り込むと、
-    # 対象銘柄はまだレジストリに存在せず、レジストリ判定では引き継げなかった
-    # (Codex レビュー 2026-08-24 で再現: registry_present=True になった
-    # 「後」の状態だけを見ていて、書込み時点では False だった窓を見落とした)。
-    # pre_rebuild_tickers はレジストリの更新タイミングに一切依存しない。
-    #
-    # 逆に、計算開始より「前」から存在していた行 (pre_rebuild_tickers に
-    # 含まれる) は、今回解決できなくても引き継がない。他の全銘柄と同じく
-    # 「直近の成功結果だけが残る」が本来の挙動であり、topup 行を無条件に
-    # 生かし続けると、レジストリに残っている限り every cycle 復活してしまい
-    # missed_rebuilds が進まず eviction を妨げる (Codex レビュー
-    # 2026-08-24 の2点目)。
-    with process_lock(TECHNICAL_STATE_LOCK_NAME, timeout=TECHNICAL_STATE_LOCK_TIMEOUT_SECONDS):
-        latest = load_json(CACHE_FILE, {})
-        if isinstance(latest, dict) and isinstance(latest.get("tickers"), dict):
-            carried = []
-            for ticker, row in latest["tickers"].items():
-                if ticker in state["tickers"]:
-                    continue
-                if ticker in pre_rebuild_tickers:
-                    continue
-                if not isinstance(row, dict) or row.get("coverage_source") != COVERAGE_SOURCE_TOPUP:
-                    continue
-                state["tickers"][ticker] = row
-                carried.append(ticker)
-            if carried:
-                logger.info(
-                    "全再計算: 競合窓で追加された topup 行を引き継ぎ (%s)",
-                    ", ".join(sorted(carried)),
-                )
-        atomic_write_json(CACHE_FILE, state)
+    # ensure_technical_coverage はこのロックを取らない。topup 自体は
+    # ネットワーク取得も含め数十秒で終わる短い処理で、全再計算 (数分) の
+    # 完了を待たされる理由が無い —— topup が待つべきは
+    # TECHNICAL_STATE_LOCK_NAME (JSON I/O だけの短い区間) だけで十分。
+    with process_lock(
+        TECHNICAL_REBUILD_LOCK_NAME, timeout=TECHNICAL_REBUILD_LOCK_TIMEOUT_SECONDS
+    ):
+        state = compute_technical_state()
+        # ensure_technical_coverage (実行内補完) と同じロックを取ってから書く。
+        # compute_technical_state 自体はこのファイルへ書き込まない (ネットワーク
+        # 取得は utils.process_lock の外) ので、ロック保持区間はこの書き込み
+        # だけに絞れる。
+        #
+        # ただしロックの外で state を計算している以上、compute_technical_state
+        # が _build_ticker_universe を読んだ「後」に ensure_technical_coverage が
+        # 別プロセスで新規 topup 行を書き込んだ場合、この state はその行を知らない。
+        # 書く直前にもう一度読み、今回の再計算に含まれておらず、かつ
+        # coverage_source=topup で、まだ提案銘柄レジストリに現役登録されている
+        # (＝ evict_unresolved 未到達) 行だけを引き継ぐ。
+        #
+        # レジストリ判定が安全なのは、technical_signals.ensure_technical_coverage
+        # が行の書込みと同じ TECHNICAL_STATE_LOCK_NAME の中で
+        # proposed_ticker_registry.record_already_locked() も呼び、行の追加と
+        # レジストリ登録を1つの臨界区間で完結させているため —— 「行はあるが
+        # レジストリに無い」という中間状態は、この関数から見て決して観測されない
+        # (以前はここが2段階の別呼び出しで、その間の窓を Codex レビューに
+        # 実際に踏まれた: ensure が返ってから analyst/__init__.py の record() が
+        # 走るまでの間に全再計算が割り込み、レジストリ未登録を理由に引き継ぎを
+        # 拒否した)。
+        with process_lock(
+            TECHNICAL_STATE_LOCK_NAME, timeout=TECHNICAL_STATE_LOCK_TIMEOUT_SECONDS
+        ):
+            latest = load_json(CACHE_FILE, {})
+            if isinstance(latest, dict) and isinstance(latest.get("tickers"), dict):
+                active_candidates: set[str] = set()
+                try:
+                    registry = load_json(BASE_DIR / "proposed_ticker_candidates.json", {})
+                    if isinstance(registry, dict):
+                        active_candidates = {
+                            str(c.get("ticker") or "").strip().upper()
+                            for c in registry.get("candidates", [])
+                            if isinstance(c, dict)
+                        }
+                except Exception:
+                    active_candidates = set()
+                carried = []
+                for ticker, row in latest["tickers"].items():
+                    if ticker in state["tickers"]:
+                        continue
+                    if not isinstance(row, dict) or row.get("coverage_source") != COVERAGE_SOURCE_TOPUP:
+                        continue
+                    if ticker not in active_candidates:
+                        continue
+                    state["tickers"][ticker] = row
+                    carried.append(ticker)
+                if carried:
+                    logger.info(
+                        "全再計算: 競合窓で追加された topup 行を引き継ぎ (%s)",
+                        ", ".join(sorted(carried)),
+                    )
+            atomic_write_json(CACHE_FILE, state)
     logger.info("technical_state.json 更新完了")
     return state
 
