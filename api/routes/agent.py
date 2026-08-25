@@ -65,7 +65,7 @@ def _log_agent_result(
         "ts": time.strftime("%Y-%m-%dT%H:%M:%S"),
         "role": "agent_sdk_run",
         "model": "claude-agent-sdk",
-        "use_tool": True,
+        "use_tool": False,  # ツールは与えていない (round 11 以降)
         "max_turns": 1,
         "elapsed_sec": round(time.monotonic() - started, 2),
         "prompt_chars": len(prompt),
@@ -141,7 +141,7 @@ async def _run_agent(mode: str) -> AsyncIterator[str]:
                 if message.subtype != "success":
                     yield _sse("done", {"success": False, "error": message.subtype})
                     return
-                result_payload = message.result
+                result_payload = message
             await asyncio.sleep(0)  # イベントループに制御を返す
     except AgentProtocolViolation as e:
         _log_agent_result(mode=mode, prompt=prompt, started=started,

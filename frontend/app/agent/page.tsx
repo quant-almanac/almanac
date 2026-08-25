@@ -19,6 +19,18 @@ type AgentResult = {
   as_of?: string
   overall_stance?: string
   headline?: string
+  // 新契約 (agent_projection): ホストが検証した actions。
+  // action_type は元の推奨方向、actionability は Agent が超えられない天井。
+  actions?: Array<{
+    rank: number
+    ticker: string
+    action_type: string
+    actionability: 'blocked' | 'watch_only' | 'review'
+    reason?: string
+    candidate_id?: string
+  }>
+  projection_sha256?: string
+  // 旧契約。移行期間中は既存の保存物を読めるように残す。
   priority_actions?: Array<{ rank: number; urgency: string; ticker?: string; action: string; reason?: string }>
   risk_warnings?: string[]
   opportunity?: string
@@ -28,6 +40,32 @@ type AgentResult = {
   // nisa mode
   strategy?: string
   [key: string]: unknown
+}
+
+// 新旧どちらの保存形式でも同じ形で描画する。
+//
+// 2026-08-25 に Agent の保存形式が priority_actions -> actions へ変わった
+// (agent_projection)。画面が旧キーだけを読んでいると、新しい結果が保存された
+// 瞬間に「headline だけ出てアクションが全部消える」状態になる。
+// 移行期間は両方読む。
+function normaliseActions(result: AgentResult): Array<{
+  rank: number; urgency: string; ticker?: string; action: string; reason?: string
+}> {
+  if (Array.isArray(result.actions) && result.actions.length > 0) {
+    return result.actions.map((a) => ({
+      rank: a.rank,
+      // actionability を既存の緊急度バッジへ写す。review は人間確認つきで
+      // 扱える水準、watch_only/blocked は見るだけ。
+      urgency: a.actionability === 'review' ? 'medium' : 'low',
+      ticker: a.ticker,
+      action: `${a.action_type}（${a.actionability}）`,
+      reason: a.reason,
+    }))
+  }
+  return (result.priority_actions ?? []).map((a) => ({
+    rank: a.rank, urgency: a.urgency, ticker: a.ticker,
+    action: a.action, reason: a.reason,
+  }))
 }
 
 const MODES: { value: Mode; label: string; icon: string; desc: string }[] = [
@@ -113,13 +151,13 @@ function ResultCard({ result }: { result: AgentResult }) {
       )}
 
       {/* 優先アクション */}
-      {(result.priority_actions ?? []).length > 0 && (
+      {normaliseActions(result).length > 0 && (
         <div style={{ background: OPS.panelAlt, border: `1px solid ${OPS.border}`, borderRadius: 10, padding: '14px 18px', marginBottom: 12 }}>
           <p style={{ color: OPS.gold, fontFamily: OPS.mono, fontSize: 12, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.08em', marginBottom: 10 }}>
             優先アクション
           </p>
           <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
-            {result.priority_actions!.map((a, i) => {
+            {normaliseActions(result).map((a, i) => {
               const u = URGENCY_CFG[a.urgency] ?? URGENCY_CFG.low
               return (
                 <div key={i} style={{ display: 'flex', gap: 10, alignItems: 'flex-start' }}>

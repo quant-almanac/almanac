@@ -91,7 +91,7 @@ async def run_analysis(mode: str = "default") -> int:
                 if message.subtype != "success":
                     print(f"❌ エラー: {message.subtype}")
                     return 1
-                result_payload = message.result
+                result_payload = message
     except AgentProtocolViolation as exc:
         print(f"\n❌ プロトコル違反: {exc}")
         return 1

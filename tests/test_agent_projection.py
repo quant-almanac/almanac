@@ -53,10 +53,22 @@ def base_dir(tmp_path):
             "broker_total_cost_basis_jpy": 1234567,
         },
         "BAD_row": {"ticker": "BAD", "shares": 1.0, "currency": "USD"},
+        # ↓ 本番 holdings.json はこれらを通常の保有行と同じ形で並べる。
+        #   fixture に無いと漏洩テストが素通りする (round 12 の実際の見落とし)。
+        "CASH_JPY_SBI_WIFE": {"ticker": "CASH_JPY_SBI_WIFE", "shares": 512345.0,
+                              "currency": "JPY", "investment_type": "cash"},
+        "CASH_JPY_SBI": {"ticker": "CASH_JPY_SBI", "shares": 367891.0,
+                         "currency": "JPY", "investment_type": "cash"},
+        "GS_MMF_USD": {"ticker": "GS_MMF_USD", "shares": 1000.0,
+                       "currency": "USD", "asset_type": "money_market_fund"},
+        "SLIM_SP500": {"ticker": "SLIM_SP500", "shares": 100.0, "currency": "JPY"},
     })
     _write(tmp_path, "ai_portfolio_analysis.json", {
-        "synthesis": {"overall_stance": "neutral",
-                      "priority_actions": [{"ticker": "NEWONE"}]}})
+        "synthesis": {"overall_stance": "neutral", "priority_actions": [
+            {"ticker": "VT", "type": "buy", "execution_readiness": "review"},
+            {"ticker": "BAD", "type": "buy", "execution_readiness": "review"},
+            {"ticker": "BLOCKEDONE", "type": "buy", "execution_readiness": "blocked"},
+        ]}})
     _write(tmp_path, "guard_state.json", {"daily_pnl_pct": -1.0, "monthly_pnl_pct": 2.0,
                                           "portfolio_value": 30_000_000,
                                           "short_positions": ["secret"]})
@@ -75,7 +87,11 @@ class TestProjectionLeakage:
         blob = ap.canonical_json(projection)
         # 値そのもの (owner 名・broker 名・note 本文・照合ハッシュ・原価)。
         for forbidden in ("楽天証券", "husband", "wife", "特定",
-                          "保有同期", "deadbeef", "1234567", "secret", "INTERNALNOTEMARKER"):
+                          "保有同期", "deadbeef", "1234567", "secret",
+                          "INTERNALNOTEMARKER",
+                          # 現金経路・世帯構成・MMF・投信の疑似ティッカー
+                          "CASH_JPY_SBI_WIFE", "CASH_JPY_SBI", "GS_MMF_USD",
+                          "SLIM_SP500", "SBI", "512345", "367891"):
             assert forbidden not in blob, f"{mode}: leaked value {forbidden!r}"
         # フィールド名も、値を伴う形では出てはいけない。
         for forbidden in ('"note"', '"owner"', '"broker"', '"account"',
@@ -90,6 +106,22 @@ class TestProjectionLeakage:
         blob = ap.canonical_json(projection)
         assert str(base_dir) not in blob
         assert ".json" not in blob
+
+    def test_cash_and_fund_pseudo_tickers_are_never_candidates(self, base_dir):
+        """現金ウォレット・MMF・投信の疑似ティッカーは候補にも明細にも出さない。
+
+        文字列 deny-list ではなく構造 (SKIP_TICKERS / is_pseudo_market_ticker /
+        investment_type / asset_type) で除外していること。
+        """
+        for mode in ap.MODES:
+            projection = ap.build_agent_projection(mode, base_dir=base_dir, now=NOW)
+            ids = {c["canonical_instrument_id"] for c in projection["candidates"]}
+            for cash_route in ("CASH_JPY_SBI_WIFE", "CASH_JPY_SBI", "GS_MMF_USD",
+                               "SLIM_SP500"):
+                assert cash_route not in ids, f"{mode}: {cash_route} が候補に出た"
+            holdings = projection["portfolio_context"].get("holdings", [])
+            held_ids = {h["canonical_instrument_id"] for h in holdings}
+            assert not (held_ids & {"CASH_JPY_SBI_WIFE", "GS_MMF_USD", "SLIM_SP500"})
 
     @pytest.mark.parametrize("mode", ap.MODES)
     def test_the_prompt_carries_no_path_and_no_filename(self, base_dir, mode):
@@ -199,7 +231,10 @@ class TestAgentOptionsHaveNoTools:
     def test_a_structured_output_schema_is_required(self):
         options = ap.build_agent_options()
         assert options.output_format is not None
-        assert options.output_format["additionalProperties"] is False
+        # SDK は {"type": "json_schema", "schema": ...} でしか --json-schema を
+        # 渡さない。素のスキーマだと黙って無視される (round 12)。
+        assert options.output_format["type"] == "json_schema"
+        assert options.output_format["schema"]["additionalProperties"] is False
 
 
 class TestOutputValidation:

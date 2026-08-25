@@ -16,6 +16,9 @@ import pytest
 from api.routes import agent
 
 
+_UNSET = object()
+
+
 class _TextBlock:
     def __init__(self, text: str):
         self.text = text
@@ -27,7 +30,8 @@ class _ToolUseBlock:
         self.input = input
 
 
-def _install_fake_sdk(monkeypatch, *, blocks, result, subtype="success", cost=0.0123):
+def _install_fake_sdk(monkeypatch, *, blocks, result, subtype="success", cost=0.0123,
+                      structured=_UNSET):
     class AssistantMessage:
         def __init__(self):
             self.content = blocks
@@ -38,6 +42,17 @@ def _install_fake_sdk(monkeypatch, *, blocks, result, subtype="success", cost=0.
     ResultMessage.subtype = subtype
     ResultMessage.result = result
     ResultMessage.total_cost_usd = cost
+    # 実 SDK は --json-schema を渡したとき structured_output に dict を入れる。
+    # ホストはそちらを優先し、欠損なら fail-closed にする。
+    if structured is not _UNSET:
+        ResultMessage.structured_output = structured
+    elif isinstance(result, str):
+        try:
+            ResultMessage.structured_output = json.loads(result)
+        except json.JSONDecodeError:
+            ResultMessage.structured_output = None
+    else:
+        ResultMessage.structured_output = None
 
     async def fake_query(prompt, options):
         yield AssistantMessage()
@@ -68,7 +83,11 @@ def sandbox(tmp_path, monkeypatch):
         "VT": {"price": 160.0, "rsi": 57.0, "data_quality_status": "ok",
                "freshness_status": "fresh", "data_as_of": "2026-08-24"}}})
     _write("holdings.json", {"VT_row": {"ticker": "VT", "shares": 10.0}})
-    _write("ai_portfolio_analysis.json", {"synthesis": {}})
+    # default モードの action_scope は正式 priority_actions から作られる。
+    # 空にすると候補ゼロになり、Agent へ渡すものが無くなる。
+    _write("ai_portfolio_analysis.json", {"synthesis": {"priority_actions": [
+        {"ticker": "VT", "type": "buy", "execution_readiness": "review"},
+    ]}})
     monkeypatch.setattr(agent, "BASE_DIR", tmp_path)
     return tmp_path
 
@@ -177,3 +196,24 @@ def test_a_verified_output_is_saved_with_the_projection_hash(monkeypatch, sandbo
     assert len(saved["projection_sha256"]) == 64
     assert saved["actions"][0]["ticker"] == "VT"
     assert saved["as_of"]
+
+
+def test_a_missing_structured_output_is_fail_closed(monkeypatch, sandbox):
+    """structured_output が無ければ保存しない。
+
+    result 文字列を当てにすると、スキーマが実際には効いていないとき
+    (SDK へ渡す形を間違えている等) に自由形式のテキストを受け入れてしまう
+    (Codex レビュー round 12: output_format の渡し方が違い --json-schema が
+    付いていなかった)。
+    """
+    rows: list[dict] = []
+    _install_fake_sdk(monkeypatch, blocks=[_TextBlock("analysis")],
+                      result="自由形式のテキストです", structured=None)
+    monkeypatch.setattr(agent, "_append_llm_call_log", lambda row: rows.append(row),
+                        raising=False)
+
+    chunks = asyncio.run(_collect_agent_chunks("default"))
+
+    assert any("event: error" in chunk for chunk in chunks)
+    assert rows[-1]["status"] == "output_rejected"
+    assert not (sandbox / "agent_briefing.json").exists()

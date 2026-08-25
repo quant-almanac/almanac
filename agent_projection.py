@@ -102,21 +102,84 @@ def projection_sha256(payload: dict) -> str:
 
 
 def _file_hash(path: Path) -> str | None:
-    """入力ファイルの内容ハッシュ。projection 生成後に元データが変わって
-    いないかをホストが確認するために使う。"""
+    """入力ファイルの内容ハッシュ。"""
     try:
         return hashlib.sha256(path.read_bytes()).hexdigest()
     except OSError:
         return None
 
 
+def read_hashed_json(path: Path, default):
+    """**同じ bytes から** JSON と SHA-256 を作る。
+
+    ⚠️ 内容を load_json で読み、ハッシュを別途 read_bytes で取ると、その間に
+    ファイルが差し替わったとき「古い内容を projection しながら新しい
+    ファイルのハッシュを記録する」ことが起きる。source-unchanged 検査は
+    通ってしまうので、世代の食い違いに気づけない
+    (Codex レビュー round 12 で再現: projection 内 price=100 /
+    現在ファイル price=999 / 検査 passed)。
+    """
+    try:
+        raw = Path(path).read_bytes()
+    except OSError:
+        return default, None
+    digest = hashlib.sha256(raw).hexdigest()
+    try:
+        return json.loads(raw.decode("utf-8")), digest
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return default, digest
+
+
 # ──────────────────────────────────────────────────────────────
 #  projection の構築
 # ──────────────────────────────────────────────────────────────
 
-def _technical_projection(row: object) -> dict:
+def _recomputed_freshness(row: object, now: datetime) -> str | None:
+    """保存済みの freshness_status ではなく、data_as_of から今のラグを引き直す。
+
+    ⚠️ 保存値は「その行を計算した時点」の判定で、時間が経っても変わらない。
+    evaluation_as_of を hash に入れるだけでは鮮度判定に使われず、
+    data_as_of=2026-01-01 / freshness_status=fresh の行が8か月後でも
+    usable のままになる (Codex レビュー round 12 で再現)。
+    """
+    if not isinstance(row, dict):
+        return None
+    as_of = row.get("data_as_of")
+    if not as_of:
+        return "unknown"
+    try:
+        from datetime import date as _date
+
+        from technical_signals import (
+            _freshness_status, _last_completed_session, _session_lag,
+        )
+
+        ticker = str(row.get("ticker") or "")
+        lag = _session_lag(
+            ticker,
+            _date.fromisoformat(str(as_of)[:10]),
+            expected=_last_completed_session(ticker, now=now),
+        )
+        return _freshness_status(lag)
+    except Exception:
+        return "unknown"
+
+
+def _technical_projection(row: object, *, now: datetime | None = None) -> dict:
     """テクニカル行を projection 形へ。使えない行には数値を入れない。"""
     verdict, reason = classify_technical_row(row)
+    if verdict in (USABLE, DEGRADED) and now is not None:
+        # 保存済み判定を通っても、今のラグで見直して stale なら落とす。
+        live = _recomputed_freshness(row, now)
+        if live in {"stale", "unknown"}:
+            return {
+                "usable": False,
+                "reason": ("technical_data_stale" if live == "stale"
+                           else "technical_freshness_unknown"),
+                "data_as_of": row.get("data_as_of") if isinstance(row, dict) else None,
+            }
+        if live == "degraded":
+            verdict, reason = DEGRADED, "technical_data_degraded"
     if verdict not in (USABLE, DEGRADED):
         return {
             "usable": False,
@@ -163,6 +226,190 @@ def _actionability_for(tech: dict) -> str:
     return "review" if tech.get("usable") else "watch_only"
 
 
+def _exposure_rows(held: list[str], holdings: object, tech_rows: object) -> list[dict]:
+    """銘柄ごとの評価額と構成比。集中リスクの判断に数量だけでは足りない。
+
+    価格はテクニカル行から取る (使える行だけ)。取れない銘柄は金額を出さず
+    `valuation_available: false` にする —— 推測値を入れると、Agent が
+    根拠のある比率として読んでしまう。
+    """
+    rows: dict[str, dict] = {}
+    for key, row in (holdings.items() if isinstance(holdings, dict) else []):
+        if not isinstance(row, dict):
+            continue
+        ticker = str(row.get("ticker") or key or "").strip()
+        if ticker not in held:
+            continue
+        try:
+            shares = float(row.get("shares") or 0.0)
+        except (TypeError, ValueError):
+            shares = 0.0
+        entry = rows.setdefault(ticker, {
+            "canonical_instrument_id": ticker,
+            "shares": 0.0,
+            "currency": row.get("currency"),
+        })
+        # 同じ銘柄が複数口座に分かれている場合は合算する (口座名は出さない)。
+        entry["shares"] += shares
+
+    tech = tech_rows if isinstance(tech_rows, dict) else {}
+    for ticker, entry in rows.items():
+        price = None
+        raw = tech.get(ticker)
+        if isinstance(raw, dict) and classify_technical_row(raw)[0] in (USABLE, DEGRADED):
+            try:
+                price = float(raw.get("price"))
+            except (TypeError, ValueError):
+                price = None
+        if price is None:
+            entry["valuation_available"] = False
+        else:
+            entry["valuation_available"] = True
+            entry["market_value_native"] = round(entry["shares"] * price, 2)
+
+    valued = [e for e in rows.values() if e.get("valuation_available")]
+    total = sum(e["market_value_native"] for e in valued) or 0.0
+    for entry in valued:
+        entry["weight_pct_of_valued"] = (
+            round(entry["market_value_native"] / total * 100.0, 2) if total else None
+        )
+    return sorted(rows.values(), key=lambda e: e["canonical_instrument_id"])
+
+
+def _currency_mix(exposures: list[dict]) -> dict:
+    """通貨別の構成比。世帯・口座ではなく通貨だけで集計する。"""
+    totals: dict[str, float] = {}
+    for entry in exposures:
+        if not entry.get("valuation_available"):
+            continue
+        currency = str(entry.get("currency") or "unknown")
+        totals[currency] = totals.get(currency, 0.0) + entry["market_value_native"]
+    grand = sum(totals.values())
+    if not grand:
+        return {}
+    return {k: round(v / grand * 100.0, 2) for k, v in sorted(totals.items())}
+
+
+#: nisa_portfolio.json のうち owner ではないトップレベルキー。
+#: ⚠️ 「last_updated 以外は全部 owner」と数えると、将来 metadata が
+#: 増えたときに誤カウントする (Codex レビュー round 12)。
+_NISA_NON_OWNER_KEYS = {"last_updated", "as_of", "generated_at", "version",
+                        "schema_version", "source", "meta", "metadata"}
+
+
+def _nisa_capacity(nisa: object) -> dict:
+    """枠の残量を世帯合算で。owner 名も口座経路も出さない。
+
+    枠消化戦略を立てるには残枠が要る。owner_count だけでは何も決められない
+    (Codex レビュー round 12)。金額は合算値のみで、誰の枠かは出さない。
+    """
+    if not isinstance(nisa, dict):
+        return {}
+    owners = [k for k in nisa if k not in _NISA_NON_OWNER_KEYS
+              and isinstance(nisa.get(k), dict)]
+    out: dict = {"last_updated": nisa.get("last_updated"), "owner_count": len(owners)}
+    buckets = {
+        "annual_tsumitate_remaining_jpy": ("tsumitate_remaining", "annual_tsumitate_remaining"),
+        "annual_growth_remaining_jpy": ("growth_remaining", "annual_growth_remaining"),
+        "lifetime_remaining_jpy": ("lifetime_remaining", "remaining_lifetime"),
+    }
+    for out_key, source_keys in buckets.items():
+        total = 0.0
+        found = False
+        for owner in owners:
+            row = nisa[owner]
+            for candidate in source_keys:
+                if candidate in row:
+                    try:
+                        total += float(row[candidate] or 0.0)
+                        found = True
+                    except (TypeError, ValueError):
+                        pass
+                    break
+        if found:
+            out[out_key] = round(total)
+    return out
+
+
+def _is_investable(ticker: str, row: object) -> bool:
+    """この行を「投資候補」として扱ってよいか。
+
+    ⚠️ 文字列の deny-list ではなく構造で判定する。holdings.json には現金
+    ウォレット (CASH_JPY_SBI_WIFE 等)・MMF・投信の疑似ティッカーが通常の
+    保有行と同じ形で並んでおり、素通しすると口座経路・世帯構成・現金残高が
+    そのまま Agent のプロンプトへ出る (Codex レビュー round 12 で全3モード
+    から CASH_JPY_SBI_WIFE / SBI / GS_MMF_USD の漏洩を再現)。
+
+    判定は既存の権威ある集合をそのまま使う —— ここで独自の一覧を作ると、
+    新しい現金経路が増えたときにこちらだけ更新漏れになる。
+    """
+    from pseudo_tickers import is_pseudo_market_ticker
+    from technical_signals import SKIP_TICKERS
+
+    if not ticker or ticker in SKIP_TICKERS or is_pseudo_market_ticker(ticker):
+        return False
+    if isinstance(row, dict):
+        if row.get("investment_type") == "cash":
+            return False
+        if str(row.get("asset_type") or "") in {"cash", "money_market_fund"}:
+            return False
+    return True
+
+
+def _official_actions(analysis: object) -> dict[str, dict]:
+    """正式分析の priority_actions を ticker -> 判断 に。
+
+    Agent の action_scope はこれを土台にする。保有しているだけの銘柄へ
+    add/trim を自動付与すると、正式分析が一度も評価していない銘柄に
+    Agent が売買方向を出せてしまう (Codex レビュー round 12)。
+    """
+    synthesis = analysis.get("synthesis", {}) if isinstance(analysis, dict) else {}
+    out: dict[str, dict] = {}
+    for act in (synthesis.get("priority_actions") or []):
+        if not isinstance(act, dict):
+            continue
+        ticker = str(act.get("ticker") or "").strip()
+        if not ticker or not _is_investable(ticker, None):
+            continue
+        out[ticker] = {
+            "action_type": str(act.get("type") or act.get("action_type") or "").lower(),
+            "readiness": str(act.get("execution_readiness") or "review").lower(),
+            "recommendation_id": str(act.get("id") or act.get("recommendation_id") or ""),
+        }
+    return out
+
+
+#: 正式判断の readiness を Agent の天井へ写す。
+#: blocked は blocked のまま —— Agent が review へ上げてはならない。
+_READINESS_TO_CEILING = {"ready": "review", "review": "review", "blocked": "blocked"}
+
+
+def _scope_for_official(ticker: str, verdict: dict, tech: dict) -> dict:
+    """正式判断1件ぶんの action_scope エントリ。
+
+    allowed_actions は **元の方向 + 見送り系** だけ。trim を add へ反転
+    させない。天井は正式 readiness とテクニカル品質の厳しい方。
+    """
+    direction = verdict["action_type"]
+    allowed = [a for a in (direction, "watch", "hold") if a]
+    ceiling = _READINESS_TO_CEILING.get(verdict["readiness"], "blocked")
+    if not tech.get("usable"):
+        ceiling = "watch_only"
+    if ceiling == "blocked":
+        # blocked は提案そのものを許さない。見るだけ。
+        allowed = ["watch"]
+    return {
+        # candidate_id は ticker ではなく **正式判断の識別子**。同じ銘柄に
+        # 複数の推奨がある場合に取り違えないため。
+        "candidate_id": (f"candidate:{verdict['recommendation_id']}"
+                         if verdict["recommendation_id"]
+                         else f"candidate:{ticker}:{direction or 'na'}"),
+        "canonical_instrument_id": ticker,
+        "allowed_actions": list(dict.fromkeys(allowed)),
+        "max_actionability": ceiling,
+    }
+
+
 def build_agent_projection(
     mode: str,
     *,
@@ -176,124 +423,118 @@ def build_agent_projection(
     base_dir = Path(base_dir)
     now = now or datetime.now(timezone.utc)
 
-    tech_state = load_json(base_dir / "technical_state.json", {})
+    # 内容とハッシュは必ず同じ bytes から作る (read_hashed_json 参照)。
+    tech_state, tech_hash = read_hashed_json(base_dir / "technical_state.json", {})
+    holdings, holdings_hash = read_hashed_json(base_dir / "holdings.json", {})
     tech_rows = tech_state.get("tickers", {}) if isinstance(tech_state, dict) else {}
-    holdings = load_json(base_dir / "holdings.json", {})
 
-    source_hashes = {
-        "technical_state": _file_hash(base_dir / "technical_state.json"),
-        "holdings": _file_hash(base_dir / "holdings.json"),
-    }
+    source_hashes = {"technical_state": tech_hash, "holdings": holdings_hash}
 
     portfolio_context: dict = {}
     market_context: dict = {}
     candidates: list[dict] = []
     action_scope: list[dict] = []
 
+    # 投資候補になりうる保有だけを context に載せる。現金・MMF・投信の
+    # 疑似ティッカーは候補にも明細にも出さない。
     held_tickers: list[str] = []
-    if isinstance(holdings, dict):
-        for key, row in holdings.items():
-            projected = _holding_projection(str(key), row)
-            if projected:
-                held_tickers.append(projected["canonical_instrument_id"])
-                portfolio_context.setdefault("holdings", []).append(projected)
+    for key, row in (holdings.items() if isinstance(holdings, dict) else []):
+        if not isinstance(row, dict):
+            continue
+        ticker = str(row.get("ticker") or key or "").strip()
+        if not _is_investable(ticker, row):
+            continue
+        projected = _holding_projection(ticker, row)
+        if projected:
+            held_tickers.append(ticker)
+            portfolio_context.setdefault("holdings", []).append(projected)
+    held_tickers = list(dict.fromkeys(held_tickers))
 
     if mode == "default":
-        # 保有 + 直近の正式分析が挙げた銘柄。
-        analysis = load_json(base_dir / "ai_portfolio_analysis.json", {})
-        source_hashes["ai_portfolio_analysis"] = _file_hash(
-            base_dir / "ai_portfolio_analysis.json")
-        proposed: list[str] = []
+        analysis, analysis_hash = read_hashed_json(
+            base_dir / "ai_portfolio_analysis.json", {})
+        source_hashes["ai_portfolio_analysis"] = analysis_hash
         synthesis = analysis.get("synthesis", {}) if isinstance(analysis, dict) else {}
-        for act in (synthesis.get("priority_actions") or []):
-            if isinstance(act, dict) and act.get("ticker"):
-                proposed.append(str(act["ticker"]))
         portfolio_context["overall_stance"] = synthesis.get("overall_stance")
-        universe = list(dict.fromkeys(held_tickers + proposed))[:MAX_CANDIDATES]
-        for ticker in universe:
-            tech = _technical_projection(tech_rows.get(ticker))
+
+        official = _official_actions(analysis)
+        for ticker, verdict in official.items():
+            tech = _technical_projection(tech_rows.get(ticker), now=now)
+            scope = _scope_for_official(ticker, verdict, tech)
+            action_scope.append(scope)
             candidates.append({
-                "candidate_id": f"candidate:{ticker}",
+                "candidate_id": scope["candidate_id"],
                 "canonical_instrument_id": ticker,
                 "held": ticker in held_tickers,
+                "official_action_type": verdict["action_type"],
+                "official_readiness": verdict["readiness"],
                 "technical": tech,
-            })
-            action_scope.append({
-                "candidate_id": f"candidate:{ticker}",
-                "canonical_instrument_id": ticker,
-                "allowed_actions": (
-                    ["trim", "add", "hold", "watch"] if ticker in held_tickers
-                    else ["buy", "watch"]
-                ),
-                "max_actionability": _actionability_for(tech),
             })
 
     elif mode == "risk":
-        # リスク集中の分析。テクニカルは載せない (この判断に使わない)。
         for name in ("guard_state", "macro_state"):
-            source_hashes[name] = _file_hash(base_dir / f"{name}.json")
-        guard = load_json(base_dir / "guard_state.json", {})
-        macro = load_json(base_dir / "macro_state.json", {})
-        if isinstance(guard, dict):
-            market_context["guardrails"] = {
-                k: guard.get(k) for k in
-                ("daily_pnl_pct", "monthly_pnl_pct", "portfolio_value")
-                if k in guard
-            }
-        if isinstance(macro, dict):
-            market_context["macro"] = {
-                k: macro.get(k) for k in ("fed_rate", "yield_10y", "unemp_rate")
-                if k in macro
-            }
-        # ⚠️ 同じ ticker が複数の holdings 行を持つことがある
-        # (特定口座と一般口座で別行になる)。candidate_id は銘柄単位なので
-        # 必ず重複排除する。
-        for ticker in list(dict.fromkeys(held_tickers))[:MAX_CANDIDATES]:
+            payload, digest = read_hashed_json(base_dir / f"{name}.json", {})
+            source_hashes[name] = digest
+            if not isinstance(payload, dict):
+                continue
+            if name == "guard_state":
+                market_context["guardrails"] = {
+                    k: payload.get(k) for k in
+                    ("daily_pnl_pct", "monthly_pnl_pct", "portfolio_value")
+                    if k in payload
+                }
+            else:
+                market_context["macro"] = {
+                    k: payload.get(k) for k in ("fed_rate", "yield_10y", "unemp_rate")
+                    if k in payload
+                }
+        # 集中リスクを論じるには数量だけでは足りない (Codex レビュー
+        # round 12)。評価額と構成比を projection 側で計算して渡す。
+        exposures = _exposure_rows(held_tickers, holdings, tech_rows)
+        if exposures:
+            portfolio_context["exposures"] = exposures
+            portfolio_context["currency_mix_pct"] = _currency_mix(exposures)
+        for row in exposures:
+            ticker = row["canonical_instrument_id"]
+            action_scope.append({
+                "candidate_id": f"candidate:{ticker}:risk",
+                "canonical_instrument_id": ticker,
+                # リスク側は縮小方向と見送りだけ。増やす提案はさせない。
+                "allowed_actions": ["trim", "hold", "watch"],
+                "max_actionability": "review",
+            })
             candidates.append({
-                "candidate_id": f"candidate:{ticker}",
+                "candidate_id": f"candidate:{ticker}:risk",
                 "canonical_instrument_id": ticker,
                 "held": True,
             })
-            action_scope.append({
-                "candidate_id": f"candidate:{ticker}",
-                "canonical_instrument_id": ticker,
-                "allowed_actions": ["trim", "hedge", "hold", "watch"],
-                "max_actionability": "review",
-            })
 
     else:  # nisa
-        source_hashes["nisa_portfolio"] = _file_hash(base_dir / "nisa_portfolio.json")
-        nisa = load_json(base_dir / "nisa_portfolio.json", {})
-        if isinstance(nisa, dict):
-            # owner ごとの内訳も **名前も** 出さない。Agent が枠の消化を
-            # 論じるのに要るのは「何人分の枠があるか」だけで、誰かは要らない。
-            portfolio_context["nisa"] = {
-                "last_updated": nisa.get("last_updated"),
-                "owner_count": len([k for k in nisa.keys() if k != "last_updated"]),
-            }
-        screen = load_json(base_dir / "long_term_screen_results.json", {})
-        source_hashes["long_term_screen_results"] = _file_hash(
-            base_dir / "long_term_screen_results.json")
-        # long_term_screener の合格リストは "passed"。"candidates" では無い
-        # —— 名前を間違えても load_json は既定値を返すだけで、候補が丸ごと
-        # 空になっても誰も気づかない (508e948 / screen_results_us.json と
-        # 同じ静かな取りこぼし)。実データで件数を確認して配線すること。
+        nisa, nisa_hash = read_hashed_json(base_dir / "nisa_portfolio.json", {})
+        source_hashes["nisa_portfolio"] = nisa_hash
+        portfolio_context["nisa"] = _nisa_capacity(nisa)
+        screen, screen_hash = read_hashed_json(
+            base_dir / "long_term_screen_results.json", {})
+        source_hashes["long_term_screen_results"] = screen_hash
+        # 合格リストのキーは "passed" ("candidates" ではない)。名前を
+        # 間違えても既定値が返るだけで候補が丸ごと空になる。
         rows = screen.get("passed") if isinstance(screen, dict) else None
         for row in (rows or [])[:MAX_CANDIDATES]:
             if not isinstance(row, dict):
                 continue
             ticker = str(row.get("ticker") or "").strip()
-            if not ticker:
+            if not _is_investable(ticker, row):
                 continue
-            tech = _technical_projection(tech_rows.get(ticker))
+            tech = _technical_projection(tech_rows.get(ticker), now=now)
+            cid = f"candidate:{ticker}:nisa"
             candidates.append({
-                "candidate_id": f"candidate:{ticker}",
+                "candidate_id": cid,
                 "canonical_instrument_id": ticker,
                 "held": ticker in held_tickers,
                 "technical": tech,
             })
             action_scope.append({
-                "candidate_id": f"candidate:{ticker}",
+                "candidate_id": cid,
                 "canonical_instrument_id": ticker,
                 "allowed_actions": ["buy", "watch"],
                 "max_actionability": _actionability_for(tech),
@@ -314,7 +555,6 @@ def build_agent_projection(
     }
     validate_projection(projection)
     return projection
-
 
 # ──────────────────────────────────────────────────────────────
 #  projection の検証
@@ -526,6 +766,7 @@ def validate_agent_output(
         raise AgentOutputError("bad actions")
 
     seen_ranks: set[int] = set()
+    seen_candidates: set[str] = set()
     resolved: list[dict] = []
     for action in actions:
         if not isinstance(action, dict):
@@ -545,6 +786,11 @@ def validate_agent_output(
         entry = scope.get(cid)
         if entry is None:
             raise AgentOutputError(f"candidate_id not in action_scope: {cid!r}")
+        # 同じ候補について複数の提案を出させない。相反する方向を並べられると
+        # どちらを採るかがホスト側で決まらない (Codex レビュー round 12)。
+        if cid in seen_candidates:
+            raise AgentOutputError(f"duplicate candidate: {cid!r}")
+        seen_candidates.add(cid)
 
         action_type = action.get("action_type")
         if action_type not in entry["allowed_actions"]:
@@ -573,6 +819,11 @@ def validate_agent_output(
             "actionability": actionability,
             "reason": reason,
         })
+
+    # rank は 1..N の連番。1, 99 のような飛びを許すと「順位」ではなく
+    # 任意のラベルになり、表示側の並びが意味を持たなくなる。
+    if seen_ranks and seen_ranks != set(range(1, len(seen_ranks) + 1)):
+        raise AgentOutputError(f"ranks must be 1..N without gaps: {sorted(seen_ranks)}")
 
     if base_dir is not None:
         _assert_sources_unchanged(projection, base_dir)
@@ -622,7 +873,11 @@ def build_agent_options():
         allowed_tools=[],
         disallowed_tools=["Read", "Write", "Edit", "Bash", "Glob", "Grep"],
         setting_sources=[],
-        output_format=OUTPUT_SCHEMA,
+        # ⚠️ SDK は {"type": "json_schema", "schema": ...} の形でしか
+        # --json-schema を CLI へ渡さない。素のスキーマを渡すと **黙って
+        # 無視され**、本番だけ自由形式出力になる
+        # (Codex レビュー round 12: 生成コマンドに --json-schema が無かった)。
+        output_format={"type": "json_schema", "schema": OUTPUT_SCHEMA},
         max_turns=1,
     )
 
@@ -631,13 +886,32 @@ class AgentProtocolViolation(AgentOutputError):
     """Agent がツールを使おうとした。ツールは与えていないので契約違反。"""
 
 
-def parse_agent_result(raw: object) -> dict:
-    """ResultMessage.result を JSON として取り出す。"""
-    if isinstance(raw, dict):
-        return raw
-    if not isinstance(raw, str) or not raw.strip():
-        raise AgentOutputError("agent returned no structured output")
-    try:
-        return json.loads(raw)
-    except json.JSONDecodeError as exc:
-        raise AgentOutputError(f"agent output is not valid JSON: {exc}") from exc
+def parse_agent_result(message: object) -> dict:
+    """ResultMessage から構造化出力を取り出す。
+
+    ⚠️ structured_output を優先し、無ければ fail-closed。result 文字列を
+    当てにすると、スキーマが効いていないとき (SDK へ渡す形を間違えている
+    等) に自由形式のテキストをそのまま受け入れてしまう
+    (Codex レビュー round 12)。
+    後方互換のため dict / JSON 文字列も受けるが、それはテスト用の経路で、
+    本番は structured_output を通る。
+    """
+    structured = getattr(message, "structured_output", None)
+    if isinstance(structured, dict):
+        return structured
+    if structured is not None:
+        raise AgentOutputError(
+            f"structured_output has unexpected type: {type(structured).__name__}")
+
+    if isinstance(message, dict):
+        return message
+    if isinstance(message, str):
+        if not message.strip():
+            raise AgentOutputError("agent returned no structured output")
+        try:
+            return json.loads(message)
+        except json.JSONDecodeError as exc:
+            raise AgentOutputError(f"agent output is not valid JSON: {exc}") from exc
+
+    raise AgentOutputError(
+        "agent returned no structured output (structured_output is missing)")
