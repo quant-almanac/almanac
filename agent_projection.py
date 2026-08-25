@@ -61,8 +61,8 @@ MODES = ("default", "risk", "nisa")
 #:   - risk: 証券会社評価額が 2026-07-28 時点で、行単位の最新価格/NAV・
 #:     評価基準日・評価完全性を持たない。今日の集中リスクとして扱えない。
 #:   - nisa: 残枠が owner 別 attestation・基準日後の約定/注文・
-#:     owner×broker×currency wallet・積立予約・名義間移動禁止を反映して
-#:     いない。到達可能額としては attestation まで 0 扱いが正しい。
+#:     wallet 制約・積立予約・名義間移動禁止を反映していない。
+#:     到達可能額としては attestation まで 0 扱いが正しい。
 #: 直るまでは **実行させない**。projection が作れてしまうと、いずれ
 #: 誰かが呼ぶ。
 ENABLED_MODES = ("default",)
@@ -277,7 +277,7 @@ def _exposure_rows(held: list[str], holdings: object, tech_rows: object,
     """銘柄ごとの **JPY 建て** 評価額と構成比。
 
     ⚠️ 通貨を混ぜて合計してはならない。以前は USD の shares×USD価格 と
-    JPY の shares×円価格 をそのまま足しており、1489.T が 94.75% という
+    JPY の shares×円価格 をそのまま足しており、ある1銘柄が 94% 超という
     無意味な比率になっていた (Codex レビュー round 13)。
 
     評価額は証券会社照合済みの `broker_position_value_jpy` を第一候補に
@@ -305,21 +305,26 @@ def _exposure_rows(held: list[str], holdings: object, tech_rows: object,
             "_jpy": 0.0,
             "_value_rows": 0,
             "_rows_without_value": 0,
+            "_rows_without_as_of": 0,
+            "_broker_rows": 0,
+            "_other_rows": 0,
             "_oldest_as_of": None,
         })
         # 同じ銘柄が複数口座に分かれている場合は合算する (口座名は出さない)。
         entry["shares"] += shares
         # ⚠️ 口座ごとに JPY 評価額のフィールドが違う。片方だけ見ると、
-        # 同一銘柄の別口座ぶんが丸ごと分母から落ちる (Codex レビュー
-        # round 14: 1489.T / SLIM_SP500 / SLIM_ORCAN で計 ¥1,680,243 が欠落)。
+        # 同一銘柄の別口座ぶんが丸ごと分母から落ちる (レビューで、
+        # 複数銘柄にわたる百万円規模の欠落を実測)。
         # 行ごとに「JPY 額を持っているか」を数え、持たない行があれば
         # 完全性フラグを落とす。
         row_jpy = None
+        used_field = None
         for field in ("broker_position_value_jpy", "current_value_jpy"):
             try:
                 value = row.get(field)
                 if value is not None:
                     row_jpy = float(value)
+                    used_field = field
                     break
             except (TypeError, ValueError):
                 continue
@@ -328,28 +333,45 @@ def _exposure_rows(held: list[str], holdings: object, tech_rows: object,
         else:
             entry["_jpy"] += row_jpy
             entry["_value_rows"] += 1
+            if used_field == "broker_position_value_jpy":
+                entry["_broker_rows"] += 1
+            else:
+                entry["_other_rows"] += 1
             as_of = row.get("broker_cost_basis_as_of") or row.get("source_as_of")
             if as_of:
                 previous = entry.get("_oldest_as_of")
                 entry["_oldest_as_of"] = (
                     min(previous, str(as_of)) if previous else str(as_of))
+            else:
+                entry["_rows_without_as_of"] += 1
 
     tech = tech_rows if isinstance(tech_rows, dict) else {}
     for ticker, entry in rows.items():
         value_rows = entry.pop("_value_rows")
         missing_rows = entry.pop("_rows_without_value")
+        rows_without_as_of = entry.pop("_rows_without_as_of")
+        broker_rows = entry.pop("_broker_rows")
+        other_rows = entry.pop("_other_rows")
         jpy_total = entry.pop("_jpy")
         oldest_as_of = entry.pop("_oldest_as_of")
         if value_rows:
             entry["market_value_jpy"] = round(jpy_total, 2)
-            entry["valuation_source"] = "broker_reconciled"
             entry["valuation_available"] = True
-            # 評価基準日と「全口座ぶん揃っているか」を必ず添える。
-            # 揃っていない銘柄の比率は下振れするので、読む側が分かる必要がある。
+            # ⚠️ 金額の完全性・時点の完全性・source を **分けて** 持つ。
+            # 一括の valuation_complete だと、評価基準日が欠けている行を
+            # 検知できず、混在した source も一律に見えてしまう
+            # (レビューで指摘)。
+            entry["valuation_source"] = (
+                "broker_reconciled" if broker_rows and not other_rows
+                else "mixed" if broker_rows and other_rows
+                else "position_value")
             entry["valuation_as_of"] = oldest_as_of
-            entry["valuation_complete"] = missing_rows == 0
+            entry["amount_complete"] = missing_rows == 0
+            entry["as_of_complete"] = rows_without_as_of == 0
             if missing_rows:
                 entry["rows_without_valuation"] = missing_rows
+            if rows_without_as_of:
+                entry["rows_without_as_of"] = rows_without_as_of
             continue
         price = None
         raw = tech.get(ticker)
@@ -374,7 +396,8 @@ def _exposure_rows(held: list[str], holdings: object, tech_rows: object,
         entry["valuation_available"] = True
         entry["valuation_as_of"] = (
             raw.get("data_as_of") if isinstance(raw, dict) else None)
-        entry["valuation_complete"] = True
+        entry["amount_complete"] = True
+        entry["as_of_complete"] = entry["valuation_as_of"] is not None
 
     valued = [e for e in rows.values() if e.get("valuation_available")]
     total = sum(e["market_value_jpy"] for e in valued) or 0.0
@@ -471,10 +494,9 @@ def _assert_fresh_enough(payload: object, *, now: datetime, label: str,
     except ValueError as exc:
         raise RequiredInputError(f"{label}: unreadable as_of {raw!r}") from exc
     if stamp.tzinfo is None:
-        # ⚠️ 本番の as_of は "2026-08-26 06:24" のような **JST の naive 時刻**。
-        # UTC として解釈すると9時間ぶん未来にずれ、25時間前の分析が
-        # 16時間前に見えて 24h 制限を素通りする (Codex レビュー round 14 で
-        # 実測: 25h36m 前の分析が受理された)。
+        # ⚠️ 本番の as_of は "YYYY-MM-DD HH:MM" 形式の **JST の naive 時刻**。
+        # UTC として解釈すると9時間ぶん未来にずれ、24h を超えた分析が
+        # 制限を素通りする (レビューで実測)。
         stamp = stamp.replace(tzinfo=ZoneInfo("Asia/Tokyo"))
     age_hours = (now - stamp).total_seconds() / 3600.0
     if age_hours > max_age_hours:
@@ -490,7 +512,7 @@ def _assert_fresh_enough(payload: object, *, now: datetime, label: str,
 def _is_cash_like(ticker: str, row: object) -> bool:
     """現金相当（現金ウォレット・MMF）か。
 
-    これだけが projection から完全に外れる。口座経路名 (CASH_JPY_SBI_WIFE 等)
+    これだけが projection から完全に外れる。口座経路名
     と残高が Agent のプロンプトへ出るのを防ぐ (Codex レビュー round 12)。
 
     判定は行の型で行う。ticker 名のパターンに頼ると、新しい現金経路が
@@ -509,9 +531,9 @@ def _has_market_data(ticker: str) -> bool:
     """テクニカル指標を引ける銘柄か。
 
     ⚠️ これは「投資対象か」ではない。`is_pseudo_market_ticker` は
-    「yfinance へ送れない」という意味で、投信 (SLIM_SP500 等) も True を
-    返す。以前これを投資対象の判定に流用しており、実在する約443万円の
-    コア投信が risk 集計から丸ごと消えていた (Codex レビュー round 13)。
+    「yfinance へ送れない」という意味で、投信も True を返す。以前これを
+    投資対象の判定に流用しており、実在するコア投信が risk 集計から
+    丸ごと消えて比率が狂っていた (レビューで再現)。
     テクニカルを引くかどうかだけに使うこと。
     """
     from pseudo_tickers import is_pseudo_market_ticker
@@ -1119,13 +1141,15 @@ AGENT_RUN_LOCK_TIMEOUT_SECONDS = 5.0
 def resolve_agent_model() -> str:
     """Agent が使うモデル ID を model_router から解決する。
 
-    ⚠️ ここへ直接 ID を書かない。以前 "claude-sonnet-4-5" を固定していたが、
-    router の sonnet は claude-sonnet-5 で、意図せず旧モデルを使っていた
-    (Codex レビュー round 14)。モデル ID の一元管理は MODEL_REGISTRY。
+    ⚠️ ここへ直接 ID を書かない。以前 ID を固定しており、router が指す
+    モデルと食い違って意図せず旧モデルを使っていた (レビューで指摘)。
+    モデル ID の一元管理は model_router。
     """
     try:
-        from model_router import MODEL_REGISTRY
-        return MODEL_REGISTRY["sonnet"]
+        from model_router import get_model
+        # ⚠️ MODEL_REGISTRY を直接引かない。eco/premium プロファイルと
+        # role override を迂回してしまう (レビューで指摘)。
+        return get_model("agent_sdk_run")
     except Exception:
         # router を引けない環境では固定せず SDK 既定へ落とさず、
         # 明示的に失敗させる —— 課金経路で「どのモデルか不明」は許さない。

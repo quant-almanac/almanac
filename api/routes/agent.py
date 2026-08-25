@@ -149,6 +149,7 @@ async def _run_agent_locked(mode: str) -> AsyncIterator[str]:
     })
 
     result_payload = None
+    cost = None
     try:
         async for message in query(prompt=prompt, options=options):
             if isinstance(message, AssistantMessage):
@@ -163,16 +164,16 @@ async def _run_agent_locked(mode: str) -> AsyncIterator[str]:
                     if isinstance(block, TextBlock):
                         continue
             elif isinstance(message, ResultMessage):
+                # ⚠️ ここでは記録しない。検証を通るまで結果は確定しない ——
+                # 先に success を書くと、その後 output_rejected になっても
+                # 会計ログには2行残り、最終状態が読めない
+                # (レビューで success → output_rejected の2行を再現)。
                 cost = getattr(message, "total_cost_usd", None)
-                _log_agent_result(
-                    mode=mode,
-                    prompt=prompt,
-                    started=started,
-                    status=message.subtype,
-                    cost_usd=cost,
-                )
                 if message.subtype != "success":
-                    yield _sse("done", {"success": False, "error": message.subtype})
+                    _log_agent_result(mode=mode, prompt=prompt, started=started,
+                                      status=message.subtype, cost_usd=cost)
+                    yield _sse("done", {"success": False, "error": message.subtype,
+                                        "cost_usd": cost})
                     return
                 result_payload = message
             await asyncio.sleep(0)  # イベントループに制御を返す
@@ -195,18 +196,24 @@ async def _run_agent_locked(mode: str) -> AsyncIterator[str]:
         verified = validate_agent_output(raw, projection, base_dir=BASE_DIR)
     except AgentOutputError as e:
         _log_agent_result(mode=mode, prompt=prompt, started=started,
-                          status="output_rejected", error=e)
+                          status="output_rejected", cost_usd=cost, error=e)
         yield _sse("error", {"message": f"出力の検証に失敗、保存しません: {e}"})
         return
 
     saved = save_verified_result(BASE_DIR / OUTPUT_FILES[mode], verified,
                                  as_of=now.isoformat())
+    # 検証を通ってから、最終 status と実コストを1行だけ記録する。
+    _log_agent_result(mode=mode, prompt=prompt, started=started,
+                      status="success" if saved else "skipped_stale_write",
+                      cost_usd=cost)
     yield _sse("done", {
         "success": True,
         "saved": OUTPUT_FILES[mode] if saved else None,
         "skipped_stale_write": not saved,
         "actions": len(verified["actions"]),
         "projection_sha256": verified["projection_sha256"],
+        # UI の費用表示はこれを読む。以前は done に載っておらず発火しなかった。
+        "cost_usd": cost,
     })
 
 
@@ -235,9 +242,29 @@ async def run_agent(mode: str = "default"):
     )
 
 
+@router.get("/api/agent/enabled-modes")
+async def get_enabled_modes():
+    """UI がタブを組み立てるための権威。
+
+    画面側に候補を直書きすると、backend で無効化しても表示だけ残る
+    (レビューで実際にそうなっていた)。
+    """
+    return {"enabled_modes": list(ENABLED_MODES), "all_modes": list(MODES)}
+
+
 @router.get("/api/agent/result")
 async def get_agent_result(mode: str = "default"):
     """最後の Agent 分析結果を返す。agent_briefing.json が古い場合は ai_portfolio_analysis.json にフォールバック"""
+    # ⚠️ 閲覧も無効モードでは拒否する。実行だけ止めても、以前保存された
+    # 信頼できない結果を読めてしまう。未知モードを default へ倒すのも
+    # 危険 —— 利用者は risk を見たつもりで総合分析を読む
+    # (レビューで GET mode=unknown が総合分析を返すのを再現)。
+    if mode not in ENABLED_MODES:
+        return JSONResponse(
+            status_code=409,
+            content={"error": f"mode {mode!r} is currently disabled or unknown",
+                     "enabled_modes": list(ENABLED_MODES)},
+        )
     path = BASE_DIR / OUTPUT_FILES.get(mode, "agent_briefing.json")
 
     # defaultモードの場合、両方の実時刻を比較して新しい方を返す。

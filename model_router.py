@@ -81,6 +81,11 @@ def is_anthropic(model_key: str) -> bool:
 # Role → Model Key のマッピング
 # ─────────────────────────────────────────────────────────────
 ROLE_ROUTING: dict[str, str] = {
+    # Agent SDK 経路 (portfolio_agent.py / api/routes/agent.py)。
+    # ここへ登録しておかないと呼び出し側が MODEL_REGISTRY を直接引くことに
+    # なり、eco/premium プロファイルと role override を迂回する
+    # (レビューで指摘)。
+    "agent_sdk_run": "sonnet",
     # ── Anthropic (Opus / Sonnet / Haiku) ───────────────────
     "final_synthesis":         "opus",     # 最重要：全ティア合成 + Extended Thinking
     "dca_tranche_selector":    "opus",     # DCA 発動時の tranche 銘柄選定（高頻度ではない）

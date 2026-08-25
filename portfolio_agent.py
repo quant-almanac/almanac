@@ -107,6 +107,7 @@ async def _run_locked(mode: str) -> int:
     print("─" * 50)
 
     result_payload = None
+    cost_usd = None
     try:
         async for message in query(prompt=prompt, options=options):
             if isinstance(message, AssistantMessage):
@@ -126,12 +127,13 @@ async def _run_locked(mode: str) -> int:
                 # ⚠️ CLI もコストを記録・表示する。隔離ライブで
                 # 「どのモデルにいくら使ったか」を検証できるようにする
                 # (Codex レビュー round 14)。
+                # ⚠️ 検証を通るまで記録しない (API と同じ理由)。
                 cost_usd = getattr(message, "total_cost_usd", None)
-                _log_agent_result(mode=mode, prompt=prompt, started=started,
-                                  status=message.subtype, cost_usd=cost_usd)
                 if cost_usd is not None:
                     print(f"💴 コスト: ${cost_usd:.4f} (model={resolve_agent_model()})")
                 if message.subtype != "success":
+                    _log_agent_result(mode=mode, prompt=prompt, started=started,
+                                      status=message.subtype, cost_usd=cost_usd)
                     print(f"❌ エラー: {message.subtype}")
                     return 1
                 result_payload = message
@@ -149,11 +151,17 @@ async def _run_locked(mode: str) -> int:
         raw = parse_agent_result(result_payload)
         verified = validate_agent_output(raw, projection, base_dir=BASE_DIR)
     except AgentOutputError as exc:
+        _log_agent_result(mode=mode, prompt=prompt, started=started,
+                          status="output_rejected", cost_usd=cost_usd, error=exc)
         print(f"\n❌ 出力の検証に失敗、保存しません: {exc}")
         return 2
 
     path = BASE_DIR / OUTPUT_FILES[mode]
-    if not save_verified_result(path, verified, as_of=now.isoformat()):
+    saved = save_verified_result(path, verified, as_of=now.isoformat())
+    _log_agent_result(mode=mode, prompt=prompt, started=started,
+                      status="success" if saved else "skipped_stale_write",
+                      cost_usd=cost_usd)
+    if not saved:
         print(f"\n⚠️ より新しい結果が既に保存済み。この run は書きません: {path.name}")
         return 0
     print(f"\n✅ 検証済みの結果を保存: {path.name}")

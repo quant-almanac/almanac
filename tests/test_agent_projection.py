@@ -47,21 +47,26 @@ def base_dir(tmp_path):
             "ticker": "VT", "shares": 10.0, "currency": "USD",
             "asset_type": "fund", "investment_type": "long",
             # ↓ どれも projection へ出てはいけない
-            "note": "楽天CSV保有同期 2026-08-24",
-            "owner": "husband", "broker": "楽天証券", "account": "特定",
+            # ⚠️ 実在の証券会社名・世帯区分・口座種別は書かない
+            # (このリポジトリは公開ミラーへも流れる)。形だけ同じ合成値を使う。
+            "note": "BROKERNOTEMARKER",
+            "owner": "OWNERMARKER", "broker": "BROKERMARKER",
+            "account": "ACCOUNTMARKER",
             "reconciliation_snapshot_hash": "deadbeef" * 8,
             "broker_total_cost_basis_jpy": 1234567,
         },
         "BAD_row": {"ticker": "BAD", "shares": 1.0, "currency": "USD"},
         # ↓ 本番 holdings.json はこれらを通常の保有行と同じ形で並べる。
         #   fixture に無いと漏洩テストが素通りする (round 12 の実際の見落とし)。
-        "CASH_JPY_SBI_WIFE": {"ticker": "CASH_JPY_SBI_WIFE", "shares": 512345.0,
-                              "currency": "JPY", "investment_type": "cash"},
-        "CASH_JPY_SBI": {"ticker": "CASH_JPY_SBI", "shares": 367891.0,
+        # 判定は ticker 名ではなく行の型 (investment_type / asset_type) で
+        # 行うので、合成名で十分に検査できる。実在のウォレット名は使わない。
+        "CASHWALLET_A": {"ticker": "CASHWALLET_A", "shares": 512345.0,
                          "currency": "JPY", "investment_type": "cash"},
-        "GS_MMF_USD": {"ticker": "GS_MMF_USD", "shares": 1000.0,
-                       "currency": "USD", "asset_type": "money_market_fund"},
-        "SLIM_SP500": {"ticker": "SLIM_SP500", "shares": 100.0, "currency": "JPY"},
+        "CASHWALLET_B": {"ticker": "CASHWALLET_B", "shares": 367891.0,
+                         "currency": "JPY", "investment_type": "cash"},
+        "MMFWALLET": {"ticker": "MMFWALLET", "shares": 1000.0,
+                      "currency": "USD", "asset_type": "money_market_fund"},
+        "FUNDNOMKT": {"ticker": "FUNDNOMKT", "shares": 100.0, "currency": "JPY"},
     })
     _write(tmp_path, "ai_portfolio_analysis.json", {
         # 本番は as_of を持つ。鮮度契約が効くので fixture にも要る。
@@ -76,7 +81,7 @@ def base_dir(tmp_path):
                                           "short_positions": ["secret"]})
     _write(tmp_path, "macro_state.json", {"fed_rate": 4.0, "yield_10y": 4.2,
                                           "unemp_rate": 4.1, "internal_note": "INTERNALNOTEMARKER"})
-    _write(tmp_path, "nisa_portfolio.json", {"husband": {"used": 1}, "wife": {"used": 2},
+    _write(tmp_path, "nisa_portfolio.json", {"OWNER_A": {"used": 1}, "OWNER_B": {"used": 2},
                                              "last_updated": "2026-08-24"})
     _write(tmp_path, "long_term_screen_results.json", {"passed": [{"ticker": "VT"}]})
     return tmp_path
@@ -88,14 +93,13 @@ class TestProjectionLeakage:
         projection = ap.build_agent_projection(mode, base_dir=base_dir, now=NOW)
         blob = ap.canonical_json(projection)
         # 値そのもの (owner 名・broker 名・note 本文・照合ハッシュ・原価)。
-        for forbidden in ("楽天証券", "husband", "wife", "特定",
-                          "保有同期", "deadbeef", "1234567", "secret",
+        # 値そのもの (owner・broker・note 本文・照合ハッシュ・原価・現金残高)。
+        # 投信 (FUNDNOMKT) は投資対象なので **出てよい**。
+        for forbidden in ("BROKERMARKER", "OWNERMARKER", "ACCOUNTMARKER",
+                          "BROKERNOTEMARKER", "deadbeef", "1234567", "secret",
                           "INTERNALNOTEMARKER",
-                          # 現金経路・世帯構成・MMF・投信の疑似ティッカー
-                          # 現金経路・世帯構成・現金残高。投信 (SLIM_SP500) は
-                          # 投資対象なので**出てよい**。
-                          "CASH_JPY_SBI_WIFE", "CASH_JPY_SBI", "GS_MMF_USD",
-                          "SBI", "512345", "367891"):
+                          "CASHWALLET_A", "CASHWALLET_B", "MMFWALLET",
+                          "512345", "367891"):
             assert forbidden not in blob, f"{mode}: leaked value {forbidden!r}"
         # フィールド名も、値を伴う形では出てはいけない。
         for forbidden in ('"note"', '"owner"', '"broker"', '"account"',
@@ -120,14 +124,19 @@ class TestProjectionLeakage:
         for mode in ap.ENABLED_MODES:
             projection = ap.build_agent_projection(mode, base_dir=base_dir, now=NOW)
             blob = ap.canonical_json(projection)
-            for cash_route in ("CASH_JPY_SBI_WIFE", "CASH_JPY_SBI", "GS_MMF_USD"):
+            for cash_route in ("CASHWALLET_A", "CASHWALLET_B", "MMFWALLET"):
                 assert cash_route not in blob, f"{mode}: {cash_route} が projection に出た"
 
     def test_funds_without_market_data_are_still_investable(self, base_dir):
         """risk/nisa は現在無効 (ENABLED_MODES)。判断材料が正しくなったら
         このテストを本来の内容へ戻すこと。ヘルパー単体の検証は
         test_every_jpy_valuation_source_is_summed が担う。"""
-        pytest.skip('risk/nisa modes are disabled pending trustworthy inputs')
+        # ⚠️ 無条件 skip にしない。risk/nisa を再有効化したとき自動で
+        # 復帰しないと、検査されないまま動き出す (レビューで指摘)。
+        if "risk" not in ap.ENABLED_MODES and "nisa" not in ap.ENABLED_MODES:
+            pytest.skip("risk/nisa modes are disabled pending trustworthy inputs")
+        raise AssertionError(
+            "risk/nisa が再有効化された。このテストを本来の内容へ戻すこと")
 
     @pytest.mark.parametrize("mode", ap.ENABLED_MODES)
     def test_the_prompt_carries_no_path_and_no_filename(self, base_dir, mode):
@@ -176,7 +185,12 @@ class TestModeIsolation:
         """risk/nisa は現在無効 (ENABLED_MODES)。判断材料が正しくなったら
         このテストを本来の内容へ戻すこと。ヘルパー単体の検証は
         test_every_jpy_valuation_source_is_summed が担う。"""
-        pytest.skip('risk/nisa modes are disabled pending trustworthy inputs')
+        # ⚠️ 無条件 skip にしない。risk/nisa を再有効化したとき自動で
+        # 復帰しないと、検査されないまま動き出す (レビューで指摘)。
+        if "risk" not in ap.ENABLED_MODES and "nisa" not in ap.ENABLED_MODES:
+            pytest.skip("risk/nisa modes are disabled pending trustworthy inputs")
+        raise AssertionError(
+            "risk/nisa が再有効化された。このテストを本来の内容へ戻すこと")
 
     def test_default_mode_does_not_carry_guardrail_or_nisa_data(self, base_dir):
         projection = ap.build_agent_projection("default", base_dir=base_dir, now=NOW)
@@ -188,7 +202,12 @@ class TestModeIsolation:
         """risk/nisa は現在無効 (ENABLED_MODES)。判断材料が正しくなったら
         このテストを本来の内容へ戻すこと。ヘルパー単体の検証は
         test_every_jpy_valuation_source_is_summed が担う。"""
-        pytest.skip('risk/nisa modes are disabled pending trustworthy inputs')
+        # ⚠️ 無条件 skip にしない。risk/nisa を再有効化したとき自動で
+        # 復帰しないと、検査されないまま動き出す (レビューで指摘)。
+        if "risk" not in ap.ENABLED_MODES and "nisa" not in ap.ENABLED_MODES:
+            pytest.skip("risk/nisa modes are disabled pending trustworthy inputs")
+        raise AssertionError(
+            "risk/nisa が再有効化された。このテストを本来の内容へ戻すこと")
 
     def test_the_same_inputs_and_clock_give_the_same_hash(self, base_dir):
         a = ap.build_agent_projection("default", base_dir=base_dir, now=NOW)
@@ -380,13 +399,23 @@ class TestRound13Blockers:
         """risk/nisa は現在無効 (ENABLED_MODES)。判断材料が正しくなったら
         このテストを本来の内容へ戻すこと。ヘルパー単体の検証は
         test_every_jpy_valuation_source_is_summed が担う。"""
-        pytest.skip('risk/nisa modes are disabled pending trustworthy inputs')
+        # ⚠️ 無条件 skip にしない。risk/nisa を再有効化したとき自動で
+        # 復帰しないと、検査されないまま動き出す (レビューで指摘)。
+        if "risk" not in ap.ENABLED_MODES and "nisa" not in ap.ENABLED_MODES:
+            pytest.skip("risk/nisa modes are disabled pending trustworthy inputs")
+        raise AssertionError(
+            "risk/nisa が再有効化された。このテストを本来の内容へ戻すこと")
 
     def test_the_currency_mix_is_labelled_as_listing_currency(self, base_dir):
         """risk/nisa は現在無効 (ENABLED_MODES)。判断材料が正しくなったら
         このテストを本来の内容へ戻すこと。ヘルパー単体の検証は
         test_every_jpy_valuation_source_is_summed が担う。"""
-        pytest.skip('risk/nisa modes are disabled pending trustworthy inputs')
+        # ⚠️ 無条件 skip にしない。risk/nisa を再有効化したとき自動で
+        # 復帰しないと、検査されないまま動き出す (レビューで指摘)。
+        if "risk" not in ap.ENABLED_MODES and "nisa" not in ap.ENABLED_MODES:
+            pytest.skip("risk/nisa modes are disabled pending trustworthy inputs")
+        raise AssertionError(
+            "risk/nisa が再有効化された。このテストを本来の内容へ戻すこと")
 
     def test_a_blocked_candidate_is_not_relaxed_by_an_unusable_row(self):
         """blocked + technical unusable は blocked のまま。
@@ -616,7 +645,7 @@ def test_every_jpy_valuation_source_is_summed(tmp_path):
     """同一銘柄が複数口座に分かれ、口座ごとに JPY 額のフィールドが違う。
 
     片方だけ見ると別口座ぶんが丸ごと分母から落ちる (Codex レビュー
-    round 14: 計 ¥1,680,243 が欠落)。
+    レビューで百万円規模の欠落を実測)。
     """
     _write(tmp_path, "holdings.json", {
         "A": {"ticker": "X", "shares": 1.0, "currency": "JPY",
@@ -632,7 +661,8 @@ def test_every_jpy_valuation_source_is_summed(tmp_path):
         (tmp_path / "holdings.json").read_text()), {}, fx_usdjpy=None)
     by_id = {r["canonical_instrument_id"]: r for r in rows}
     assert by_id["X"]["market_value_jpy"] == 500.0
-    assert by_id["X"]["valuation_complete"] is True
+    assert by_id["X"]["amount_complete"] is True
+    assert by_id["X"]["as_of_complete"] is False   # B 行に as_of が無い
     assert by_id["X"]["valuation_as_of"] == "2026-07-28"
     # 評価額を持たない銘柄は金額を作らない。
     assert by_id["Y"]["valuation_available"] is False
@@ -665,3 +695,80 @@ def test_both_entrypoints_record_the_resolved_model():
 
     cli_src = inspect.getsource(cli_agent._run_locked)
     assert "total_cost_usd" in cli_src, "CLI がコストを記録していない"
+
+
+class TestRound15Blockers:
+    """round 15 で指摘された残件を固定する。"""
+
+    def test_no_owner_identifying_strings_in_this_module_or_its_tests(self):
+        """公開ミラーへ流れるファイルに、実在の証券会社名・世帯区分・
+        現金ウォレット名を書かない。
+
+        以前これらをコメントと fixture に書いて公開版へ push しており、
+        公開版 README の「保有者を特定できる情報を含めない」契約に反していた
+        (レビューで発覚)。fixture は合成名で同じ形を作れば足りる。
+        """
+        import re as _re
+
+        # ⚠️ パターン自身がこのファイルにマッチしないよう、リテラルを
+        # 分割して組み立てる (素直に書くと自己一致で常に落ちる)。
+        patterns = {
+            "broker name": _re.compile("楽" + "天"),
+            "household role": _re.compile(
+                r"\b(?:" + "hus" + "band|" + "wi" + "fe)\b", _re.IGNORECASE),
+            "cash wallet": _re.compile(r"\b" + "CASH" + r"_(?:JPY|USD)_[A-Z_]+\b"),
+            "mmf wallet": _re.compile(r"\b" + "GS_MMF" + r"_[A-Z]+\b"),
+        }
+        for target in (Path(ap.__file__), Path(__file__)):
+            text = target.read_text(encoding="utf-8")
+            for name, pattern in patterns.items():
+                assert not pattern.search(text), f"{target.name}: {name} が残っている"
+
+    def test_the_result_endpoint_refuses_disabled_and_unknown_modes(self):
+        """閲覧も塞ぐ。実行だけ止めても、以前保存された信頼できない結果を
+        読めてしまう。未知モードを default へ倒すのも危険。
+        """
+        import asyncio
+
+        import api.routes.agent as api_agent
+
+        for mode in ("risk", "nisa", "totally-unknown"):
+            response = asyncio.run(api_agent.get_agent_result(mode))
+            assert getattr(response, "status_code", None) == 409, mode
+
+    def test_the_enabled_modes_endpoint_is_the_ui_authority(self):
+        import asyncio
+
+        import api.routes.agent as api_agent
+
+        payload = asyncio.run(api_agent.get_enabled_modes())
+        assert payload["enabled_modes"] == list(ap.ENABLED_MODES)
+
+    def test_valuation_completeness_is_split_by_dimension(self, tmp_path):
+        """金額の完全性・時点の完全性・source を分けて持つ。
+
+        一括フラグだと、評価基準日が欠けている行を検知できず、
+        混在した source も一律に見える。
+        """
+        _write(tmp_path, "holdings.json", {
+            "A": {"ticker": "X", "shares": 1.0, "currency": "JPY",
+                  "broker_position_value_jpy": 100.0,
+                  "broker_cost_basis_as_of": "2026-07-28"},
+            "B": {"ticker": "X", "shares": 1.0, "currency": "JPY",
+                  "current_value_jpy": 400.0},        # as_of なし・別 source
+        })
+        rows = ap._exposure_rows(["X"], json.loads(
+            (tmp_path / "holdings.json").read_text()), {}, fx_usdjpy=None)
+        entry = rows[0]
+        assert entry["market_value_jpy"] == 500.0
+        assert entry["amount_complete"] is True      # 金額は全行そろっている
+        assert entry["as_of_complete"] is False      # 時点は欠けている
+        assert entry["valuation_source"] == "mixed"  # source が混在
+
+    def test_the_model_resolves_through_role_routing(self):
+        """MODEL_REGISTRY を直接引くと eco/premium と role override を
+        迂回する。"""
+        from model_router import ROLE_ROUTING, get_model
+
+        assert "agent_sdk_run" in ROLE_ROUTING
+        assert ap.resolve_agent_model() == get_model("agent_sdk_run")

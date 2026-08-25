@@ -30,6 +30,9 @@ type AgentResult = {
     candidate_id?: string
   }>
   projection_sha256?: string
+  // ホスト検証が付ける印。true のとき headline / risk_warnings は
+  // scope 外の銘柄に触れうる自由文で、売買指示ではない。
+  commentary_is_non_actionable?: boolean
   // 旧契約。移行期間中は既存の保存物を読めるように残す。
   priority_actions?: Array<{ rank: number; urgency: string; ticker?: string; action: string; reason?: string }>
   risk_warnings?: string[]
@@ -67,11 +70,17 @@ function normaliseActions(result: AgentResult): Array<{
   }))
 }
 
-const MODES: { value: Mode; label: string; icon: string; desc: string }[] = [
+const ALL_MODES: { value: Mode; label: string; icon: string; desc: string }[] = [
   { value: 'default', label: '総合分析', icon: '🤖', desc: '保有・シグナル・マクロを統合' },
   { value: 'risk',    label: 'リスク',   icon: '⚠️', desc: '集中リスク・ガードレール余裕度' },
   { value: 'nisa',    label: 'NISA',     icon: '🏦', desc: '枠消化ペース・長期候補照合' },
 ]
+
+// 表示するタブは backend の /api/agent/enabled-modes を権威にする。
+// ここに直書きすると、backend で無効化しても画面だけ残り、以前保存された
+// 信頼できない結果を閲覧できてしまう (レビューで再現)。
+// 取得前は default だけ —— 未確認のモードを先に見せない。
+const FALLBACK_ENABLED: Mode[] = ['default']
 
 const STANCE_CFG: Record<string, { label: string; color: string }> = {
   defensive:             { label: '守りモード',   color: OPS.blue },
@@ -186,11 +195,13 @@ function ResultCard({ result }: { result: AgentResult }) {
         </div>
       )}
 
-      {/* リスク警告 */}
+      {/* 参考所見 (自由文) — 構造化 action ではない */}
       {(result.risk_warnings ?? []).length > 0 && (
         <div style={{ background: OPS.vermilionBg, border: `1px solid ${OPS.vermilion}33`, borderRadius: 10, padding: '12px 16px', marginBottom: 12 }}>
           <p style={{ color: OPS.vermilion, fontSize: 13, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: 8 }}>
-            ⚠️ リスク警告
+            {result.commentary_is_non_actionable
+              ? '📝 参考所見（売買指示ではありません）'
+              : '⚠️ リスク警告'}
           </p>
           {result.risk_warnings!.map((w, i) => (
             <p key={i} style={{ color: OPS.redSoft, fontSize: 13, lineHeight: 1.6, paddingLeft: 12, position: 'relative' }}>
@@ -216,6 +227,7 @@ function ResultCard({ result }: { result: AgentResult }) {
 // ─── メインページ ─────────────────────────────────────────
 export default function AgentPage() {
   const [mode, setMode] = useState<Mode>('default')
+  const [enabledModes, setEnabledModes] = useState<Mode[]>(FALLBACK_ENABLED)
   const [result, setResult] = useState<AgentResult | null>(null)
   const [loading, setLoading] = useState(true)
   const [running, setRunning] = useState(false)
@@ -237,12 +249,25 @@ export default function AgentPage() {
   }
 
   useEffect(() => { fetchResult(mode) }, [mode])
+  useEffect(() => {
+    // 無効モードのタブを出さない。取得に失敗したら default だけに留める
+    // (fail-closed) —— 失敗時に全部出すと、無効モードが復活してしまう。
+    fetch('/api/agent/enabled-modes')
+      .then(r => (r.ok ? r.json() : null))
+      .then(d => {
+        const list = Array.isArray(d?.enabled_modes) ? d.enabled_modes : null
+        if (list) setEnabledModes(list as Mode[])
+      })
+      .catch(() => setEnabledModes(FALLBACK_ENABLED))
+  }, [])
+
+  const visibleModes = ALL_MODES.filter(m => enabledModes.includes(m.value))
   useEffect(() => () => abortRef.current?.abort(), [])
 
   // 手動再実行（SSE）— P0-1: POST + apiFetch で X-API-Key を付与
   async function startAgent() {
     if (running) return
-    if (!window.confirm(`「${MODES.find(item => item.value === mode)?.label ?? mode}」をLLMで再実行します。API利用料が発生します。続行しますか？`)) return
+    if (!window.confirm(`「${ALL_MODES.find(item => item.value === mode)?.label ?? mode}」をLLMで再実行します。API利用料が発生します。続行しますか？`)) return
     setLogs([])
     setRunning(true)
 
@@ -333,7 +358,7 @@ export default function AgentPage() {
 
       {/* モードタブ */}
       <div style={{ display: 'flex', gap: 8, marginBottom: 20, borderBottom: `1px solid ${OPS.border}`, paddingBottom: 0 }}>
-        {MODES.map(m => (
+        {visibleModes.map(m => (
           <button
             key={m.value}
             onClick={() => !running && setMode(m.value)}
