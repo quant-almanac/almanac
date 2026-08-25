@@ -21,6 +21,8 @@ from fastapi import APIRouter
 from fastapi.responses import StreamingResponse
 
 from agent_projection import (
+    AGENT_RUN_LOCK_NAME,
+    AGENT_RUN_LOCK_TIMEOUT_SECONDS,
     AgentOutputError,
     AgentProtocolViolation,
     MODES,
@@ -29,9 +31,10 @@ from agent_projection import (
     build_agent_prompt,
     parse_agent_result,
     projection_sha256,
+    save_verified_result,
     validate_agent_output,
 )
-from utils import atomic_write_json
+from utils import LockBusy, process_lock
 
 router = APIRouter()
 BASE_DIR = Path(__file__).parent.parent.parent
@@ -88,6 +91,21 @@ def _sse(event: str, data: dict) -> str:
 
 
 async def _run_agent(mode: str) -> AsyncIterator[str]:
+    """projection 生成から保存までを共有ロックの中で行う。
+
+    CLI と同じロック名を取るので、両者が同時に走って二重課金したり、
+    遅く終わった古い run が新しい結果を上書きしたりしない
+    (Codex レビュー round 13)。
+    """
+    try:
+        with process_lock(AGENT_RUN_LOCK_NAME, timeout=AGENT_RUN_LOCK_TIMEOUT_SECONDS):
+            async for chunk in _run_agent_locked(mode):
+                yield chunk
+    except LockBusy:
+        yield _sse("error", {"message": "別の Agent 実行が進行中です。二重起動しません。"})
+
+
+async def _run_agent_locked(mode: str) -> AsyncIterator[str]:
     try:
         from claude_agent_sdk import query, ResultMessage, AssistantMessage
         from claude_agent_sdk.types import TextBlock, ToolUseBlock
@@ -127,8 +145,11 @@ async def _run_agent(mode: str) -> AsyncIterator[str]:
                         # ツールを与えていないので、使おうとした時点で契約違反。
                         raise AgentProtocolViolation(
                             f"agent attempted tool use: {block.name}")
-                    if isinstance(block, TextBlock) and block.text.strip():
-                        yield _sse("text", {"content": block.text})
+                    # ⚠️ TextBlock は配信しない。scope 外の銘柄に触れる
+                    # 自由文が検証前に画面へ出ると、構造化 action を縛った
+                    # 意味が薄れる (Codex レビュー round 13)。
+                    if isinstance(block, TextBlock):
+                        continue
             elif isinstance(message, ResultMessage):
                 cost = getattr(message, "total_cost_usd", None)
                 _log_agent_result(
@@ -166,11 +187,12 @@ async def _run_agent(mode: str) -> AsyncIterator[str]:
         yield _sse("error", {"message": f"出力の検証に失敗、保存しません: {e}"})
         return
 
-    atomic_write_json(BASE_DIR / OUTPUT_FILES[mode],
-                      {**verified, "as_of": now.isoformat()})
+    saved = save_verified_result(BASE_DIR / OUTPUT_FILES[mode], verified,
+                                 as_of=now.isoformat())
     yield _sse("done", {
         "success": True,
-        "saved": OUTPUT_FILES[mode],
+        "saved": OUTPUT_FILES[mode] if saved else None,
+        "skipped_stale_write": not saved,
         "actions": len(verified["actions"]),
         "projection_sha256": verified["projection_sha256"],
     })

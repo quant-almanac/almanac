@@ -64,6 +64,8 @@ def base_dir(tmp_path):
         "SLIM_SP500": {"ticker": "SLIM_SP500", "shares": 100.0, "currency": "JPY"},
     })
     _write(tmp_path, "ai_portfolio_analysis.json", {
+        # 本番は as_of を持つ。鮮度契約が効くので fixture にも要る。
+        "as_of": NOW.isoformat(),
         "synthesis": {"overall_stance": "neutral", "priority_actions": [
             {"ticker": "VT", "type": "buy", "execution_readiness": "review"},
             {"ticker": "BAD", "type": "buy", "execution_readiness": "review"},
@@ -90,8 +92,10 @@ class TestProjectionLeakage:
                           "保有同期", "deadbeef", "1234567", "secret",
                           "INTERNALNOTEMARKER",
                           # 現金経路・世帯構成・MMF・投信の疑似ティッカー
+                          # 現金経路・世帯構成・現金残高。投信 (SLIM_SP500) は
+                          # 投資対象なので**出てよい**。
                           "CASH_JPY_SBI_WIFE", "CASH_JPY_SBI", "GS_MMF_USD",
-                          "SLIM_SP500", "SBI", "512345", "367891"):
+                          "SBI", "512345", "367891"):
             assert forbidden not in blob, f"{mode}: leaked value {forbidden!r}"
         # フィールド名も、値を伴う形では出てはいけない。
         for forbidden in ('"note"', '"owner"', '"broker"', '"account"',
@@ -107,21 +111,30 @@ class TestProjectionLeakage:
         assert str(base_dir) not in blob
         assert ".json" not in blob
 
-    def test_cash_and_fund_pseudo_tickers_are_never_candidates(self, base_dir):
-        """現金ウォレット・MMF・投信の疑似ティッカーは候補にも明細にも出さない。
+    def test_cash_routes_are_never_projected(self, base_dir):
+        """現金相当 (現金ウォレット・MMF) は候補にも明細にも出さない。
 
-        文字列 deny-list ではなく構造 (SKIP_TICKERS / is_pseudo_market_ticker /
-        investment_type / asset_type) で除外していること。
+        判定は行の型 (investment_type / asset_type) で行い、ticker 名の
+        パターンには頼らない —— 新しい現金経路が増えたとき素通りするため。
         """
         for mode in ap.MODES:
             projection = ap.build_agent_projection(mode, base_dir=base_dir, now=NOW)
-            ids = {c["canonical_instrument_id"] for c in projection["candidates"]}
-            for cash_route in ("CASH_JPY_SBI_WIFE", "CASH_JPY_SBI", "GS_MMF_USD",
-                               "SLIM_SP500"):
-                assert cash_route not in ids, f"{mode}: {cash_route} が候補に出た"
-            holdings = projection["portfolio_context"].get("holdings", [])
-            held_ids = {h["canonical_instrument_id"] for h in holdings}
-            assert not (held_ids & {"CASH_JPY_SBI_WIFE", "GS_MMF_USD", "SLIM_SP500"})
+            blob = ap.canonical_json(projection)
+            for cash_route in ("CASH_JPY_SBI_WIFE", "CASH_JPY_SBI", "GS_MMF_USD"):
+                assert cash_route not in blob, f"{mode}: {cash_route} が projection に出た"
+
+    def test_funds_without_market_data_are_still_investable(self, base_dir):
+        """投信は「市場データが無い」だけで投資対象。
+
+        以前 is_pseudo_market_ticker (= yfinance へ送れない) を投資対象の
+        判定に流用しており、実在するコア投信が risk 集計から丸ごと消えて
+        比率が狂っていた (Codex レビュー round 13)。
+        """
+        projection = ap.build_agent_projection("risk", base_dir=base_dir, now=NOW)
+        exposures = projection["portfolio_context"].get("exposures", [])
+        ids = {e["canonical_instrument_id"] for e in exposures}
+        assert "SLIM_SP500" in ids, "投信が集中リスクの分母から消えている"
+        assert not (ids & {"CASH_JPY_SBI_WIFE", "GS_MMF_USD"})
 
     @pytest.mark.parametrize("mode", ap.MODES)
     def test_the_prompt_carries_no_path_and_no_filename(self, base_dir, mode):
@@ -367,3 +380,177 @@ def test_neither_agent_entrypoint_embeds_a_path_or_filename_in_a_prompt():
 
         # 旧プロンプト表そのものが復活していないこと。
         assert "ANALYSIS_PROMPTS" not in source, name
+
+
+class TestRound13Blockers:
+    """round 13 で再現された6件の P1 と2件の P2 を固定する。"""
+
+    def test_valuations_are_normalised_to_jpy(self, base_dir):
+        """通貨を混ぜて合計しない。
+
+        以前は USD の shares×USD価格 と JPY の shares×円価格 をそのまま
+        足しており、比率が無意味になっていた (1489.T が 94.75%)。
+        """
+        _write(base_dir, "account.json", {"fx_rate_usdjpy": 150.0})
+        _write(base_dir, "holdings.json", {
+            "JP": {"ticker": "JPSTOCK", "shares": 100.0, "currency": "JPY"},
+            "US": {"ticker": "USSTOCK", "shares": 100.0, "currency": "USD"},
+        })
+        _write(base_dir, "technical_state.json", {"tickers": {
+            t: {"price": 100.0, "data_quality_status": "ok",
+                "freshness_status": "fresh", "data_as_of": "2026-08-24"}
+            for t in ("JPSTOCK", "USSTOCK")}})
+
+        projection = ap.build_agent_projection("risk", base_dir=base_dir, now=NOW)
+        by_id = {e["canonical_instrument_id"]: e
+                 for e in projection["portfolio_context"]["exposures"]}
+        # 同じ 100株×100 でも、USD 側は FX を掛けた JPY 額になる。
+        assert by_id["JPSTOCK"]["market_value_jpy"] == 10_000
+        assert by_id["USSTOCK"]["market_value_jpy"] == 1_500_000
+        assert by_id["USSTOCK"]["weight_pct"] > by_id["JPSTOCK"]["weight_pct"]
+
+    def test_the_currency_mix_is_labelled_as_listing_currency(self, base_dir):
+        """look-through していないので、名前でそれと分かるようにする。"""
+        projection = ap.build_agent_projection("risk", base_dir=base_dir, now=NOW)
+        pc = projection["portfolio_context"]
+        assert "listing_currency_mix_pct" in pc
+        assert "currency_mix_pct" not in pc
+
+    def test_a_blocked_candidate_is_not_relaxed_by_an_unusable_row(self):
+        """blocked + technical unusable は blocked のまま。
+
+        以前は technical 由来の watch_only で **上書き** しており、
+        blocked が緩和されていた。
+        """
+        unusable = {"usable": False, "reason": "technical_row_missing"}
+        scope = ap._scope_for_official(
+            "X", {"action_type": "buy", "readiness": "blocked",
+                  "recommendation_id": "", "index": 0}, unusable)
+        assert scope["max_actionability"] == "blocked"
+        assert scope["allowed_actions"] == ["watch"]
+
+    def test_a_corrupt_required_input_refuses_to_build(self, base_dir):
+        """破損した必須入力で空の分析を作らない。"""
+        (base_dir / "ai_portfolio_analysis.json").write_text("{ not json",
+                                                            encoding="utf-8")
+        with pytest.raises(ap.RequiredInputError, match="not valid JSON"):
+            ap.build_agent_projection("default", base_dir=base_dir, now=NOW)
+
+    def test_a_stale_analysis_refuses_to_build(self, base_dir):
+        """古い正式分析で default を走らせない。"""
+        from datetime import timedelta
+
+        _write(base_dir, "ai_portfolio_analysis.json", {
+            "as_of": (NOW - timedelta(hours=48)).isoformat(),
+            "synthesis": {"priority_actions": [
+                {"ticker": "VT", "type": "buy", "execution_readiness": "review"}]}})
+        with pytest.raises(ap.RequiredInputError, match="stale"):
+            ap.build_agent_projection("default", base_dir=base_dir, now=NOW)
+
+    def test_an_empty_scope_refuses_to_build(self, base_dir):
+        """候補ゼロの projection を Agent へ渡さない。
+
+        空の分析が保存されると last-known-good が消える。
+        """
+        _write(base_dir, "ai_portfolio_analysis.json", {
+            "as_of": NOW.isoformat(), "synthesis": {"priority_actions": []}})
+        with pytest.raises(ap.RequiredInputError, match="no candidates in scope"):
+            ap.build_agent_projection("default", base_dir=base_dir, now=NOW)
+
+    def test_the_agent_cannot_be_more_aggressive_than_the_official_stance(self, base_dir):
+        """構造化 action を縛っても stance が自由なら意味が薄れる。"""
+        projection = ap.build_agent_projection("default", base_dir=base_dir, now=NOW)
+        scope = projection["action_scope"][0]
+        payload = {
+            "headline": "h", "overall_stance": "aggressive", "risk_warnings": [],
+            "actions": [{"rank": 1, "candidate_id": scope["candidate_id"],
+                         "action_type": scope["allowed_actions"][0],
+                         "actionability": "watch_only", "reason": "r"}],
+        }
+        with pytest.raises(ap.AgentOutputError, match="more aggressive"):
+            ap.validate_agent_output(payload, projection)
+
+        payload["overall_stance"] = "defensive"   # 守り側は通る
+        assert ap.validate_agent_output(payload, projection)
+
+    def test_the_saved_result_marks_free_text_as_non_actionable(self, base_dir):
+        projection = ap.build_agent_projection("default", base_dir=base_dir, now=NOW)
+        scope = projection["action_scope"][0]
+        verified = ap.validate_agent_output({
+            "headline": "h", "overall_stance": "neutral",
+            "risk_warnings": ["NVDA を追加購入すべき"],
+            "actions": [{"rank": 1, "candidate_id": scope["candidate_id"],
+                         "action_type": scope["allowed_actions"][0],
+                         "actionability": "watch_only", "reason": "r"}],
+        }, projection)
+        assert verified["commentary_is_non_actionable"] is True
+
+    def test_two_official_actions_on_one_ticker_are_kept_apart(self, base_dir):
+        """同一 ticker の2判断を1件へ上書きしない。
+
+        実データでは recommendation_id が全件 null なので、入力配列の
+        安定 index を併用する。
+        """
+        _write(base_dir, "ai_portfolio_analysis.json", {
+            "as_of": NOW.isoformat(), "synthesis": {"priority_actions": [
+                {"ticker": "VT", "type": "buy", "execution_readiness": "review"},
+                {"ticker": "VT", "type": "trim", "execution_readiness": "review"},
+            ]}})
+        projection = ap.build_agent_projection("default", base_dir=base_dir, now=NOW)
+        assert len(projection["action_scope"]) == 2
+        assert len({e["candidate_id"] for e in projection["action_scope"]}) == 2
+        directions = {e["allowed_actions"][0] for e in projection["action_scope"]}
+        assert directions == {"buy", "trim"}
+
+    def test_freshness_uses_the_canonical_ticker_not_the_row(self, base_dir):
+        """technical 行は ticker フィールドを持たない (実測 0/72)。
+
+        行から取ると空文字になり、JP 銘柄が NYSE カレンダーで判定される。
+        """
+        import inspect
+
+        src = inspect.getsource(ap._technical_projection)
+        assert "ticker=ticker" in src or "ticker: str" in src
+        # 明示的に渡した ticker が使われること (JP 銘柄で確認)。
+        jp_row = {"price": 100.0, "data_quality_status": "ok",
+                  "freshness_status": "fresh", "data_as_of": "2026-08-24"}
+        out = ap._technical_projection(jp_row, now=NOW, ticker="1489.T")
+        assert "usable" in out
+
+    def test_the_run_uses_an_explicit_model_and_budget(self):
+        options = ap.build_agent_options()
+        assert options.model, "課金経路で model を既定任せにしない"
+        assert options.max_budget_usd is not None
+
+    def test_a_stale_write_is_refused(self, tmp_path):
+        """古い run が新しい保存物を上書きしない (CAS)。"""
+        path = tmp_path / "out.json"
+        newer = {"evaluation_as_of": "2026-08-25T12:00:00+00:00", "headline": "new"}
+        assert ap.save_verified_result(path, newer, as_of="x") is True
+
+        older = {"evaluation_as_of": "2026-08-25T11:00:00+00:00", "headline": "old"}
+        assert ap.save_verified_result(path, older, as_of="y") is False
+        assert json.loads(path.read_text(encoding="utf-8"))["headline"] == "new"
+
+
+def test_neither_entrypoint_displays_unverified_free_text():
+    """TextBlock を検証前に表示しない。
+
+    scope 外の銘柄に触れる自由文が人の目に入ると、構造化 action を縛った
+    意味が薄れる (Codex レビュー round 13)。
+    """
+    root = Path(__file__).resolve().parent.parent
+    for name in ("portfolio_agent.py", "api/routes/agent.py"):
+        source = (root / name).read_text(encoding="utf-8")
+        assert "yield _sse(\"text\"" not in source, name
+        assert "print(block.text" not in source, name
+
+
+def test_both_entrypoints_take_the_same_run_lock():
+    """CLI と API が同じロック名を取る (二重課金・巻き戻しの防止)。"""
+    import api.routes.agent as api_agent
+    import portfolio_agent as cli_agent
+
+    assert api_agent.AGENT_RUN_LOCK_NAME == cli_agent.AGENT_RUN_LOCK_NAME
+    assert api_agent.save_verified_result is ap.save_verified_result
+    assert cli_agent.save_verified_result is ap.save_verified_result

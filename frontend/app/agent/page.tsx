@@ -49,16 +49,15 @@ type AgentResult = {
 // 瞬間に「headline だけ出てアクションが全部消える」状態になる。
 // 移行期間は両方読む。
 function normaliseActions(result: AgentResult): Array<{
-  rank: number; urgency: string; ticker?: string; action: string; reason?: string
+  rank: number; urgency?: string; actionability?: string
+  ticker?: string; action: string; reason?: string
 }> {
   if (Array.isArray(result.actions) && result.actions.length > 0) {
     return result.actions.map((a) => ({
       rank: a.rank,
-      // actionability を既存の緊急度バッジへ写す。review は人間確認つきで
-      // 扱える水準、watch_only/blocked は見るだけ。
-      urgency: a.actionability === 'review' ? 'medium' : 'low',
+      actionability: a.actionability,
       ticker: a.ticker,
-      action: `${a.action_type}（${a.actionability}）`,
+      action: a.action_type,
       reason: a.reason,
     }))
   }
@@ -85,6 +84,15 @@ const URGENCY_CFG: Record<string, { label: string; color: string; bg: string }> 
   high:   { label: 'HIGH',   color: OPS.vermilion, bg: OPS.vermilionBg },
   medium: { label: 'MED',    color: OPS.amber, bg: OPS.amberBg },
   low:    { label: 'LOW',    color: OPS.green, bg: OPS.greenBg },
+}
+
+// actionability は urgency とは別の概念。blocked/watch_only を緑の LOW に
+// 潰すと「安全に流せる低優先度」に見えてしまう (Codex レビュー round 13)。
+// そのまま表示する。
+const ACTIONABILITY_CFG: Record<string, { label: string; color: string; bg: string }> = {
+  review:     { label: 'REVIEW',  color: OPS.amber, bg: OPS.amberBg },
+  watch_only: { label: 'WATCH',   color: OPS.sub, bg: 'transparent' },
+  blocked:    { label: 'BLOCKED', color: OPS.vermilion, bg: OPS.vermilionBg },
 }
 
 // ─── ログ表示（再実行時のみ） ─────────────────────────────
@@ -124,7 +132,7 @@ function ResultCard({ result }: { result: AgentResult }) {
     return (
       <div style={{ background: OPS.panelAlt, border: `1px dashed ${OPS.border}`, borderRadius: 12, padding: 32, textAlign: 'center' }}>
         <p style={{ color: OPS.sub, fontSize: 13 }}>まだ自動分析が実行されていません</p>
-        <p style={{ color: OPS.dim, fontSize: 14, marginTop: 6 }}>毎平日 8:30 に自動実行、または「再実行」ボタンで手動実行できます</p>
+        <p style={{ color: OPS.dim, fontSize: 14, marginTop: 6 }}>「再実行」ボタンでの手動実行のみです（定期実行は無効）</p>
       </div>
     )
   }
@@ -158,7 +166,9 @@ function ResultCard({ result }: { result: AgentResult }) {
           </p>
           <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
             {normaliseActions(result).map((a, i) => {
-              const u = URGENCY_CFG[a.urgency] ?? URGENCY_CFG.low
+              const u = a.actionability
+                ? (ACTIONABILITY_CFG[a.actionability] ?? ACTIONABILITY_CFG.watch_only)
+                : (URGENCY_CFG[a.urgency ?? 'low'] ?? URGENCY_CFG.low)
               return (
                 <div key={i} style={{ display: 'flex', gap: 10, alignItems: 'flex-start' }}>
                   <span style={{ fontSize: 14, padding: '2px 7px', borderRadius: 4, fontWeight: 700, flexShrink: 0, background: u.bg, color: u.color, border: `1px solid ${u.color}40`, marginTop: 1 }}>
@@ -300,7 +310,7 @@ export default function AgentPage() {
       <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 20 }}>
         <div>
           <h2 style={{ color: OPS.text, fontSize: 18, margin: 0 }}>実行コントロール</h2>
-          <p style={{ color: OPS.sub, fontSize: 12, marginTop: 4 }}>毎平日 8:30 自動実行 — 最新結果を表示</p>
+          <p style={{ color: OPS.sub, fontSize: 12, marginTop: 4 }}>手動実行のみ — 最新結果を表示</p>
         </div>
         <button
           onClick={startAgent}

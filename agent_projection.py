@@ -64,6 +64,10 @@ MAX_CANDIDATES = 40
 # actionability の順序。Agent はこれを超えて昇格できない。
 ACTIONABILITY_ORDER = {"blocked": 0, "watch_only": 1, "review": 2}
 
+#: stance の攻撃度。補助 Agent はこれを正式分析より上げられない。
+STANCE_ORDER = {"defensive": 0, "neutral": 1,
+                "moderately_aggressive": 2, "aggressive": 3}
+
 # projection へ載せてよい holdings のフィールド。
 # ⚠️ 明示的な allow-list にすること。deny-list だと holdings.json に
 # フィールドが増えたときに黙って漏れる (note / owner / broker / account /
@@ -78,6 +82,10 @@ _FORBIDDEN_PATTERNS = (
     re.compile(r"\.json\b"),          # 内部ファイル名も渡さない
     re.compile(r"sk-[A-Za-z0-9]"),    # API キー様の文字列
 )
+
+
+#: 正式分析がこれより古ければ default モードを走らせない。
+ANALYSIS_MAX_AGE_HOURS = 24.0
 
 
 class ProjectionError(ValueError):
@@ -109,7 +117,11 @@ def _file_hash(path: Path) -> str | None:
         return None
 
 
-def read_hashed_json(path: Path, default):
+class RequiredInputError(ProjectionError):
+    """必須入力が欠損・破損している。"""
+
+
+def read_hashed_json(path: Path, default, *, required: bool = False):
     """**同じ bytes から** JSON と SHA-256 を作る。
 
     ⚠️ 内容を load_json で読み、ハッシュを別途 read_bytes で取ると、その間に
@@ -121,12 +133,20 @@ def read_hashed_json(path: Path, default):
     """
     try:
         raw = Path(path).read_bytes()
-    except OSError:
+    except OSError as exc:
+        if required:
+            raise RequiredInputError(f"required input missing: {Path(path).name}") from exc
         return default, None
     digest = hashlib.sha256(raw).hexdigest()
     try:
         return json.loads(raw.decode("utf-8")), digest
-    except (UnicodeDecodeError, json.JSONDecodeError):
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        if required:
+            # ⚠️ 破損した bytes の hash だけを残して既定値で続行しては
+            # ならない。空の分析が last-known-good を上書きできてしまう
+            # (Codex レビュー round 13 で再現)。
+            raise RequiredInputError(
+                f"required input is not valid JSON: {Path(path).name}") from exc
         return default, digest
 
 
@@ -134,7 +154,7 @@ def read_hashed_json(path: Path, default):
 #  projection の構築
 # ──────────────────────────────────────────────────────────────
 
-def _recomputed_freshness(row: object, now: datetime) -> str | None:
+def _recomputed_freshness(row: object, now: datetime, *, ticker: str = "") -> str | None:
     """保存済みの freshness_status ではなく、data_as_of から今のラグを引き直す。
 
     ⚠️ 保存値は「その行を計算した時点」の判定で、時間が経っても変わらない。
@@ -154,7 +174,11 @@ def _recomputed_freshness(row: object, now: datetime) -> str | None:
             _freshness_status, _last_completed_session, _session_lag,
         )
 
-        ticker = str(row.get("ticker") or "")
+        # ⚠️ ticker は引数で受け取る。technical_state.json の行は
+        # ticker フィールドを持たない (実測 0/72) ので、行から取ると空文字に
+        # なり _session_lag が既定の NYSE カレンダーで判定してしまう。
+        # JP 銘柄が米国カレンダーで評価され、1日古い行が fresh に見える
+        # (Codex レビュー round 13)。
         lag = _session_lag(
             ticker,
             _date.fromisoformat(str(as_of)[:10]),
@@ -165,12 +189,13 @@ def _recomputed_freshness(row: object, now: datetime) -> str | None:
         return "unknown"
 
 
-def _technical_projection(row: object, *, now: datetime | None = None) -> dict:
+def _technical_projection(row: object, *, now: datetime | None = None,
+                          ticker: str = "") -> dict:
     """テクニカル行を projection 形へ。使えない行には数値を入れない。"""
     verdict, reason = classify_technical_row(row)
     if verdict in (USABLE, DEGRADED) and now is not None:
         # 保存済み判定を通っても、今のラグで見直して stale なら落とす。
-        live = _recomputed_freshness(row, now)
+        live = _recomputed_freshness(row, now, ticker=ticker)
         if live in {"stale", "unknown"}:
             return {
                 "usable": False,
@@ -226,12 +251,18 @@ def _actionability_for(tech: dict) -> str:
     return "review" if tech.get("usable") else "watch_only"
 
 
-def _exposure_rows(held: list[str], holdings: object, tech_rows: object) -> list[dict]:
-    """銘柄ごとの評価額と構成比。集中リスクの判断に数量だけでは足りない。
+def _exposure_rows(held: list[str], holdings: object, tech_rows: object,
+                   *, fx_usdjpy: float | None) -> list[dict]:
+    """銘柄ごとの **JPY 建て** 評価額と構成比。
 
-    価格はテクニカル行から取る (使える行だけ)。取れない銘柄は金額を出さず
-    `valuation_available: false` にする —— 推測値を入れると、Agent が
-    根拠のある比率として読んでしまう。
+    ⚠️ 通貨を混ぜて合計してはならない。以前は USD の shares×USD価格 と
+    JPY の shares×円価格 をそのまま足しており、1489.T が 94.75% という
+    無意味な比率になっていた (Codex レビュー round 13)。
+
+    評価額は証券会社照合済みの `broker_position_value_jpy` を第一候補に
+    する —— これは既に JPY で、投信 (テクニカル行を持たない) にも入って
+    いる。無い行だけ price×shares(×FX) で補い、それも無ければ
+    `valuation_available: false` にして推測値を入れない。
     """
     rows: dict[str, dict] = {}
     for key, row in (holdings.items() if isinstance(holdings, dict) else []):
@@ -247,13 +278,30 @@ def _exposure_rows(held: list[str], holdings: object, tech_rows: object) -> list
         entry = rows.setdefault(ticker, {
             "canonical_instrument_id": ticker,
             "shares": 0.0,
-            "currency": row.get("currency"),
+            # 上場・決済通貨。経済的な通貨エクスポージャ (look-through)
+            # ではない —— 例えば米国株を組み入れた円建て投信は JPY と出る。
+            "listing_currency": row.get("currency"),
+            "_broker_jpy": 0.0,
+            "_broker_seen": False,
         })
         # 同じ銘柄が複数口座に分かれている場合は合算する (口座名は出さない)。
         entry["shares"] += shares
+        try:
+            broker_jpy = row.get("broker_position_value_jpy")
+            if broker_jpy is not None:
+                entry["_broker_jpy"] += float(broker_jpy)
+                entry["_broker_seen"] = True
+        except (TypeError, ValueError):
+            pass
 
     tech = tech_rows if isinstance(tech_rows, dict) else {}
     for ticker, entry in rows.items():
+        if entry.pop("_broker_seen"):
+            entry["market_value_jpy"] = round(entry.pop("_broker_jpy"), 2)
+            entry["valuation_source"] = "broker_reconciled"
+            entry["valuation_available"] = True
+            continue
+        entry.pop("_broker_jpy", None)
         price = None
         raw = tech.get(ticker)
         if isinstance(raw, dict) and classify_technical_row(raw)[0] in (USABLE, DEGRADED):
@@ -261,29 +309,43 @@ def _exposure_rows(held: list[str], holdings: object, tech_rows: object) -> list
                 price = float(raw.get("price"))
             except (TypeError, ValueError):
                 price = None
+        currency = str(entry.get("listing_currency") or "").upper()
         if price is None:
             entry["valuation_available"] = False
+            continue
+        if currency == "JPY":
+            entry["market_value_jpy"] = round(entry["shares"] * price, 2)
+        elif currency == "USD" and fx_usdjpy:
+            entry["market_value_jpy"] = round(entry["shares"] * price * fx_usdjpy, 2)
         else:
-            entry["valuation_available"] = True
-            entry["market_value_native"] = round(entry["shares"] * price, 2)
+            # 換算レートが無い通貨は金額を出さない。混ぜるより欠く方が安全。
+            entry["valuation_available"] = False
+            continue
+        entry["valuation_source"] = "price_times_shares"
+        entry["valuation_available"] = True
 
     valued = [e for e in rows.values() if e.get("valuation_available")]
-    total = sum(e["market_value_native"] for e in valued) or 0.0
+    total = sum(e["market_value_jpy"] for e in valued) or 0.0
     for entry in valued:
-        entry["weight_pct_of_valued"] = (
-            round(entry["market_value_native"] / total * 100.0, 2) if total else None
+        entry["weight_pct"] = (
+            round(entry["market_value_jpy"] / total * 100.0, 2) if total else None
         )
     return sorted(rows.values(), key=lambda e: e["canonical_instrument_id"])
 
 
-def _currency_mix(exposures: list[dict]) -> dict:
-    """通貨別の構成比。世帯・口座ではなく通貨だけで集計する。"""
+def _listing_currency_mix(exposures: list[dict]) -> dict:
+    """**上場・決済通貨**ベースの構成比 (JPY 換算額で按分)。
+
+    ⚠️ 経済的な通貨エクスポージャではない。円建てで米国株を持つ投信は
+    JPY に数えられる。look-through を実装していないので、名前で
+    そうと分かるようにしてある (Codex レビュー round 13)。
+    """
     totals: dict[str, float] = {}
     for entry in exposures:
         if not entry.get("valuation_available"):
             continue
-        currency = str(entry.get("currency") or "unknown")
-        totals[currency] = totals.get(currency, 0.0) + entry["market_value_native"]
+        currency = str(entry.get("listing_currency") or "unknown")
+        totals[currency] = totals.get(currency, 0.0) + entry["market_value_jpy"]
     grand = sum(totals.values())
     if not grand:
         return {}
@@ -300,18 +362,28 @@ _NISA_NON_OWNER_KEYS = {"last_updated", "as_of", "generated_at", "version",
 def _nisa_capacity(nisa: object) -> dict:
     """枠の残量を世帯合算で。owner 名も口座経路も出さない。
 
-    枠消化戦略を立てるには残枠が要る。owner_count だけでは何も決められない
-    (Codex レビュー round 12)。金額は合算値のみで、誰の枠かは出さない。
+    ⚠️ フィールド名は本番の nisa_portfolio.json に実在するものだけを読む。
+    以前は tsumitate_remaining / growth_remaining / lifetime_remaining を
+    探しており、実ファイルには1つも無いので owner_count だけが渡っていた
+    (Codex レビュー round 13)。**予定を差し引いた後の残枠** を使う ——
+    予定分を二重に使える額として見せない。
     """
     if not isinstance(nisa, dict):
         return {}
     owners = [k for k in nisa if k not in _NISA_NON_OWNER_KEYS
               and isinstance(nisa.get(k), dict)]
-    out: dict = {"last_updated": nisa.get("last_updated"), "owner_count": len(owners)}
+    out: dict = {
+        "last_updated": nisa.get("last_updated"),
+        "owner_count": len(owners),
+        "basis": "after_planned",
+    }
     buckets = {
-        "annual_tsumitate_remaining_jpy": ("tsumitate_remaining", "annual_tsumitate_remaining"),
-        "annual_growth_remaining_jpy": ("growth_remaining", "annual_growth_remaining"),
-        "lifetime_remaining_jpy": ("lifetime_remaining", "remaining_lifetime"),
+        "tsumitate_remaining_after_planned_jpy": (
+            "tsumitate_remaining_after_planned",),
+        "growth_remaining_after_planned_jpy": (
+            "growth_remaining_after_planned",),
+        "lifetime_remaining_jpy": (
+            "lifetime_remaining_screen", "growth_lifetime_remaining_screen"),
     }
     for out_key, source_keys in buckets.items():
         total = 0.0
@@ -331,32 +403,71 @@ def _nisa_capacity(nisa: object) -> dict:
     return out
 
 
-def _is_investable(ticker: str, row: object) -> bool:
-    """この行を「投資候補」として扱ってよいか。
+def _assert_fresh_enough(payload: object, *, now: datetime, label: str,
+                         max_age_hours: float) -> None:
+    """入力の as_of が古すぎないこと。読めなければ古いものとして扱う。"""
+    raw = None
+    if isinstance(payload, dict):
+        for key in ("as_of", "generated_at", "updated_at", "last_updated"):
+            if payload.get(key):
+                raw = payload[key]
+                break
+    if not raw:
+        raise RequiredInputError(f"{label}: no as_of timestamp to check freshness")
+    try:
+        stamp = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise RequiredInputError(f"{label}: unreadable as_of {raw!r}") from exc
+    if stamp.tzinfo is None:
+        stamp = stamp.replace(tzinfo=timezone.utc)
+    age_hours = (now - stamp).total_seconds() / 3600.0
+    if age_hours > max_age_hours:
+        raise RequiredInputError(
+            f"{label} is stale: {age_hours:.1f}h old (limit {max_age_hours:.0f}h)")
 
-    ⚠️ 文字列の deny-list ではなく構造で判定する。holdings.json には現金
-    ウォレット (CASH_JPY_SBI_WIFE 等)・MMF・投信の疑似ティッカーが通常の
-    保有行と同じ形で並んでおり、素通しすると口座経路・世帯構成・現金残高が
-    そのまま Agent のプロンプトへ出る (Codex レビュー round 12 で全3モード
-    から CASH_JPY_SBI_WIFE / SBI / GS_MMF_USD の漏洩を再現)。
 
-    判定は既存の権威ある集合をそのまま使う —— ここで独自の一覧を作ると、
-    新しい現金経路が増えたときにこちらだけ更新漏れになる。
+def _is_cash_like(ticker: str, row: object) -> bool:
+    """現金相当（現金ウォレット・MMF）か。
+
+    これだけが projection から完全に外れる。口座経路名 (CASH_JPY_SBI_WIFE 等)
+    と残高が Agent のプロンプトへ出るのを防ぐ (Codex レビュー round 12)。
+
+    判定は行の型で行う。ticker 名のパターンに頼ると、新しい現金経路が
+    増えたときに素通りする。
     """
-    from pseudo_tickers import is_pseudo_market_ticker
-    from technical_signals import SKIP_TICKERS
-
-    if not ticker or ticker in SKIP_TICKERS or is_pseudo_market_ticker(ticker):
-        return False
     if isinstance(row, dict):
         if row.get("investment_type") == "cash":
-            return False
+            return True
         if str(row.get("asset_type") or "") in {"cash", "money_market_fund"}:
-            return False
-    return True
+            return True
+    # 行が無い文脈 (正式 action の ticker だけを見るとき) 用の保険。
+    return bool(ticker) and (ticker.startswith("CASH_") or "MMF" in ticker)
 
 
-def _official_actions(analysis: object) -> dict[str, dict]:
+def _has_market_data(ticker: str) -> bool:
+    """テクニカル指標を引ける銘柄か。
+
+    ⚠️ これは「投資対象か」ではない。`is_pseudo_market_ticker` は
+    「yfinance へ送れない」という意味で、投信 (SLIM_SP500 等) も True を
+    返す。以前これを投資対象の判定に流用しており、実在する約443万円の
+    コア投信が risk 集計から丸ごと消えていた (Codex レビュー round 13)。
+    テクニカルを引くかどうかだけに使うこと。
+    """
+    from pseudo_tickers import is_pseudo_market_ticker
+
+    return bool(ticker) and not is_pseudo_market_ticker(ticker)
+
+
+def _is_investable(ticker: str, row: object) -> bool:
+    """投資対象として projection に載せてよい行か。
+
+    現金相当だけを外す。市場データを引けない投信は**投資対象**なので
+    残す —— 集中リスクの分母から落ちると比率が全部狂う。
+    """
+    return bool(ticker) and not _is_cash_like(ticker, row)
+
+
+def _official_actions(analysis: object) -> list[dict]:
     """正式分析の priority_actions を ticker -> 判断 に。
 
     Agent の action_scope はこれを土台にする。保有しているだけの銘柄へ
@@ -364,18 +475,24 @@ def _official_actions(analysis: object) -> dict[str, dict]:
     Agent が売買方向を出せてしまう (Codex レビュー round 12)。
     """
     synthesis = analysis.get("synthesis", {}) if isinstance(analysis, dict) else {}
-    out: dict[str, dict] = {}
-    for act in (synthesis.get("priority_actions") or []):
+    out: list[dict] = []
+    for index, act in enumerate(synthesis.get("priority_actions") or []):
         if not isinstance(act, dict):
             continue
         ticker = str(act.get("ticker") or "").strip()
         if not ticker or not _is_investable(ticker, None):
             continue
-        out[ticker] = {
+        out.append({
+            "ticker": ticker,
             "action_type": str(act.get("type") or act.get("action_type") or "").lower(),
             "readiness": str(act.get("execution_readiness") or "review").lower(),
+            # ⚠️ 実データでは recommendation_id が全件 null なので、
+            # 入力配列の安定 index を併用する。ticker を dict キーにすると
+            # 同一銘柄の2判断が1件へ **上書き** される
+            # (Codex レビュー round 13)。
             "recommendation_id": str(act.get("id") or act.get("recommendation_id") or ""),
-        }
+            "index": index,
+        })
     return out
 
 
@@ -394,7 +511,10 @@ def _scope_for_official(ticker: str, verdict: dict, tech: dict) -> dict:
     allowed = [a for a in (direction, "watch", "hold") if a]
     ceiling = _READINESS_TO_CEILING.get(verdict["readiness"], "blocked")
     if not tech.get("usable"):
-        ceiling = "watch_only"
+        # ⚠️ 上書きではなく **厳しい方** を採る。以前は無条件代入で、
+        # blocked の候補が watch_only へ **緩和** されていた
+        # (Codex レビュー round 13 で再現: blocked + unusable -> watch_only)。
+        ceiling = min(ceiling, "watch_only", key=lambda c: ACTIONABILITY_ORDER[c])
     if ceiling == "blocked":
         # blocked は提案そのものを許さない。見るだけ。
         allowed = ["watch"]
@@ -402,8 +522,8 @@ def _scope_for_official(ticker: str, verdict: dict, tech: dict) -> dict:
         # candidate_id は ticker ではなく **正式判断の識別子**。同じ銘柄に
         # 複数の推奨がある場合に取り違えないため。
         "candidate_id": (f"candidate:{verdict['recommendation_id']}"
-                         if verdict["recommendation_id"]
-                         else f"candidate:{ticker}:{direction or 'na'}"),
+                         if verdict.get("recommendation_id")
+                         else f"candidate:{verdict.get('index', 0)}:{ticker}:{direction or 'na'}"),
         "canonical_instrument_id": ticker,
         "allowed_actions": list(dict.fromkeys(allowed)),
         "max_actionability": ceiling,
@@ -424,8 +544,10 @@ def build_agent_projection(
     now = now or datetime.now(timezone.utc)
 
     # 内容とハッシュは必ず同じ bytes から作る (read_hashed_json 参照)。
-    tech_state, tech_hash = read_hashed_json(base_dir / "technical_state.json", {})
-    holdings, holdings_hash = read_hashed_json(base_dir / "holdings.json", {})
+    tech_state, tech_hash = read_hashed_json(
+        base_dir / "technical_state.json", {}, required=True)
+    holdings, holdings_hash = read_hashed_json(
+        base_dir / "holdings.json", {}, required=True)
     tech_rows = tech_state.get("tickers", {}) if isinstance(tech_state, dict) else {}
 
     source_hashes = {"technical_state": tech_hash, "holdings": holdings_hash}
@@ -451,16 +573,29 @@ def build_agent_projection(
     held_tickers = list(dict.fromkeys(held_tickers))
 
     if mode == "default":
+        # 正式分析は default モードの唯一の判断材料。欠損・破損・stale の
+        # まま進むと、空の scope で「アクション無し」を保存して
+        # last-known-good を消す (Codex レビュー round 13)。
         analysis, analysis_hash = read_hashed_json(
-            base_dir / "ai_portfolio_analysis.json", {})
+            base_dir / "ai_portfolio_analysis.json", {}, required=True)
         source_hashes["ai_portfolio_analysis"] = analysis_hash
+        _assert_fresh_enough(analysis, now=now, label="ai_portfolio_analysis",
+                             max_age_hours=ANALYSIS_MAX_AGE_HOURS)
         synthesis = analysis.get("synthesis", {}) if isinstance(analysis, dict) else {}
         portfolio_context["overall_stance"] = synthesis.get("overall_stance")
+        # Agent はこれより攻撃側の stance を返せない (validate_agent_output)。
+        portfolio_context["max_overall_stance"] = synthesis.get("overall_stance")
 
         official = _official_actions(analysis)
-        for ticker, verdict in official.items():
-            tech = _technical_projection(tech_rows.get(ticker), now=now)
+        for verdict in official:
+            ticker = verdict["ticker"]
+            tech = _technical_projection(tech_rows.get(ticker), now=now, ticker=ticker)
             scope = _scope_for_official(ticker, verdict, tech)
+            if any(e["candidate_id"] == scope["candidate_id"] for e in action_scope):
+                # 安定 index を入れてもなお衝突するなら入力が壊れている。
+                # 上書きせず失敗させる。
+                raise RequiredInputError(
+                    f"duplicate candidate_id from official actions: {scope['candidate_id']}")
             action_scope.append(scope)
             candidates.append({
                 "candidate_id": scope["candidate_id"],
@@ -490,10 +625,17 @@ def build_agent_projection(
                 }
         # 集中リスクを論じるには数量だけでは足りない (Codex レビュー
         # round 12)。評価額と構成比を projection 側で計算して渡す。
-        exposures = _exposure_rows(held_tickers, holdings, tech_rows)
+        account, account_hash = read_hashed_json(base_dir / "account.json", {})
+        source_hashes["account"] = account_hash
+        try:
+            fx = float((account or {}).get("fx_rate_usdjpy") or 0.0) or None
+        except (TypeError, ValueError):
+            fx = None
+        exposures = _exposure_rows(held_tickers, holdings, tech_rows, fx_usdjpy=fx)
         if exposures:
             portfolio_context["exposures"] = exposures
-            portfolio_context["currency_mix_pct"] = _currency_mix(exposures)
+            portfolio_context["listing_currency_mix_pct"] = _listing_currency_mix(exposures)
+            portfolio_context["fx_usdjpy_used"] = fx
         for row in exposures:
             ticker = row["canonical_instrument_id"]
             action_scope.append({
@@ -525,7 +667,7 @@ def build_agent_projection(
             ticker = str(row.get("ticker") or "").strip()
             if not _is_investable(ticker, row):
                 continue
-            tech = _technical_projection(tech_rows.get(ticker), now=now)
+            tech = _technical_projection(tech_rows.get(ticker), now=now, ticker=ticker)
             cid = f"candidate:{ticker}:nisa"
             candidates.append({
                 "candidate_id": cid,
@@ -554,6 +696,11 @@ def build_agent_projection(
         "action_scope": action_scope,
     }
     validate_projection(projection)
+    if not projection["action_scope"]:
+        # 候補ゼロの projection を Agent へ渡しても、返るのは空の分析だけで、
+        # それが保存されると last-known-good を消す。入力側の異常として扱う。
+        raise RequiredInputError(
+            f"{mode}: no candidates in scope — refusing to run the agent")
     return projection
 
 # ──────────────────────────────────────────────────────────────
@@ -748,6 +895,15 @@ def validate_agent_output(
     stance = output.get("overall_stance")
     if stance not in OUTPUT_SCHEMA["properties"]["overall_stance"]["enum"]:
         raise AgentOutputError(f"bad overall_stance: {stance!r}")
+    # ⚠️ 補助 Agent は正式分析より攻撃側へ上げられない。構造化 action を
+    # 縛っても stance が自由なら、そこから攻撃的な解釈が下流へ伝わる
+    # (Codex レビュー round 13)。
+    official_stance = (projection.get("portfolio_context") or {}).get("max_overall_stance")
+    if official_stance in STANCE_ORDER and stance in STANCE_ORDER:
+        if STANCE_ORDER[stance] > STANCE_ORDER[official_stance]:
+            raise AgentOutputError(
+                f"overall_stance {stance!r} is more aggressive than the official "
+                f"{official_stance!r}")
 
     headline = output.get("headline")
     if not isinstance(headline, str) or len(headline) > MAX_STRING_CHARS:
@@ -830,6 +986,9 @@ def validate_agent_output(
 
     return {
         "schema_version": SCHEMA_VERSION,
+        # headline と risk_warnings は自由文で、scope の外の銘柄に触れうる。
+        # 構造化 action へ昇格させないことを、読む側が分かる形で残す。
+        "commentary_is_non_actionable": True,
         "mode": projection["mode"],
         "evaluation_as_of": projection["evaluation_as_of"],
         "projection_sha256": projection_sha256(projection),
@@ -838,6 +997,28 @@ def validate_agent_output(
         "actions": sorted(resolved, key=lambda a: a["rank"]),
         "risk_warnings": list(warnings),
     }
+
+
+def save_verified_result(path: Path, verified: dict, *, as_of: str) -> bool:
+    """検証済み結果を保存する。既存が新しければ書かない (CAS)。
+
+    CLI と API が同時に走ると、遅く終わった **古い** run が新しい結果を
+    上書きしうる (Codex レビュー round 13)。保存直前に既存の
+    evaluation_as_of を読み、自分の方が古ければ書かずに False を返す。
+    """
+    from utils import atomic_write_json
+
+    path = Path(path)
+    try:
+        existing = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        existing = None
+    if isinstance(existing, dict):
+        previous = existing.get("evaluation_as_of")
+        if previous and str(previous) >= str(verified.get("evaluation_as_of") or ""):
+            return False
+    atomic_write_json(path, {**verified, "as_of": as_of})
+    return True
 
 
 def _assert_sources_unchanged(projection: dict, base_dir: Path) -> None:
@@ -857,6 +1038,15 @@ def _assert_sources_unchanged(projection: dict, base_dir: Path) -> None:
 # ──────────────────────────────────────────────────────────────
 #  Agent 実行 (CLI/API 共通)
 # ──────────────────────────────────────────────────────────────
+
+#: CLI と API が同じ名前で取る。projection 生成から保存までを直列化する。
+AGENT_RUN_LOCK_NAME = "agent_run"
+AGENT_RUN_LOCK_TIMEOUT_SECONDS = 5.0
+
+#: 明示しないと SDK の既定に流れる。課金を伴う経路なので必ず固定する。
+AGENT_MODEL = "claude-sonnet-4-5"
+AGENT_MAX_BUDGET_USD = 0.50
+
 
 def build_agent_options():
     """ツールを一切与えない ClaudeAgentOptions。
@@ -879,6 +1069,10 @@ def build_agent_options():
         # (Codex レビュー round 12: 生成コマンドに --json-schema が無かった)。
         output_format={"type": "json_schema", "schema": OUTPUT_SCHEMA},
         max_turns=1,
+        # 課金経路なので model と上限を明示する。既定任せにしない
+        # (Codex レビュー round 13: model=None / max_budget_usd=None だった)。
+        model=AGENT_MODEL,
+        max_budget_usd=AGENT_MAX_BUDGET_USD,
     )
 
 

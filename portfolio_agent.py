@@ -32,6 +32,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from agent_projection import (
+    AGENT_RUN_LOCK_NAME,
+    AGENT_RUN_LOCK_TIMEOUT_SECONDS,
     AgentOutputError,
     AgentProtocolViolation,
     MODES,
@@ -39,9 +41,10 @@ from agent_projection import (
     build_agent_projection,
     build_agent_prompt,
     parse_agent_result,
+    save_verified_result,
     validate_agent_output,
 )
-from utils import atomic_write_json
+from utils import LockBusy, process_lock
 
 BASE_DIR = Path(__file__).parent
 
@@ -54,6 +57,20 @@ OUTPUT_FILES = {
 
 
 async def run_analysis(mode: str = "default") -> int:
+    """projection 生成から保存までを共有ロックの中で行う。
+
+    CLI と API が同時に走ると二重課金になり、遅く終わった古い run が
+    新しい結果を上書きしうる (Codex レビュー round 13)。
+    """
+    try:
+        with process_lock(AGENT_RUN_LOCK_NAME, timeout=AGENT_RUN_LOCK_TIMEOUT_SECONDS):
+            return await _run_locked(mode)
+    except LockBusy:
+        print("⚠️ 別の Agent 実行が進行中です。二重起動しません。")
+        return 1
+
+
+async def _run_locked(mode: str) -> int:
     try:
         from claude_agent_sdk import query, AssistantMessage, ResultMessage
         from claude_agent_sdk.types import TextBlock, ToolUseBlock
@@ -84,8 +101,12 @@ async def run_analysis(mode: str = "default") -> int:
                         # ツールを与えていないので、使おうとした時点で契約違反。
                         raise AgentProtocolViolation(
                             f"agent attempted tool use: {block.name}")
-                    if isinstance(block, TextBlock) and block.text.strip():
-                        print(block.text, end="", flush=True)
+                    # ⚠️ TextBlock は表示しない。scope 外の銘柄に触れる
+                    # 自由文が検証前に人の目に入ると、構造化 action を
+                    # 縛った意味が薄れる (Codex レビュー round 13)。
+                    # 表示するのは検証済みの結果だけ。
+                    if isinstance(block, TextBlock):
+                        continue
             elif isinstance(message, ResultMessage):
                 print()
                 if message.subtype != "success":
@@ -110,7 +131,9 @@ async def run_analysis(mode: str = "default") -> int:
         return 2
 
     path = BASE_DIR / OUTPUT_FILES[mode]
-    atomic_write_json(path, {**verified, "as_of": now.isoformat()})
+    if not save_verified_result(path, verified, as_of=now.isoformat()):
+        print(f"\n⚠️ より新しい結果が既に保存済み。この run は書きません: {path.name}")
+        return 0
     print(f"\n✅ 検証済みの結果を保存: {path.name}")
     for action in verified["actions"][:5]:
         print(f"   {action['rank']}. {action['ticker']} "

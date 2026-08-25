@@ -85,9 +85,12 @@ def sandbox(tmp_path, monkeypatch):
     _write("holdings.json", {"VT_row": {"ticker": "VT", "shares": 10.0}})
     # default モードの action_scope は正式 priority_actions から作られる。
     # 空にすると候補ゼロになり、Agent へ渡すものが無くなる。
-    _write("ai_portfolio_analysis.json", {"synthesis": {"priority_actions": [
-        {"ticker": "VT", "type": "buy", "execution_readiness": "review"},
-    ]}})
+    from datetime import datetime, timezone
+    _write("ai_portfolio_analysis.json", {
+        "as_of": datetime.now(timezone.utc).isoformat(),
+        "synthesis": {"overall_stance": "neutral", "priority_actions": [
+            {"ticker": "VT", "type": "buy", "execution_readiness": "review"},
+        ]}})
     monkeypatch.setattr(agent, "BASE_DIR", tmp_path)
     return tmp_path
 
