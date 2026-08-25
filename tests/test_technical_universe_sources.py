@@ -1586,3 +1586,83 @@ resolved=[], missing=["OLD"], base_dir=tmp_path, rebuild_coverage=1.0)
         row = _read_state(tmp_path)["tickers"]["MDB"]
         assert row["price"] == 999.0, "競合中に書かれた正常行を上書きした"
         assert report["added"] == []
+
+    def test_a_failed_state_write_does_not_advance_the_grace_counter(
+        self, tmp_path, monkeypatch
+    ):
+        """レジストリ更新と state 確定は同じロック内で、state を先に確定する。
+
+        以前は compute_technical_state の中でレジストリを更新し、state は
+        その後 get_technical_context が書いていた。state 書込みだけが失敗
+        すると「失敗カウンタだけ進み、state には未マークの旧 topup 行が
+        残る」という不整合になり、分析入口は technical refresh の例外を
+        警告だけで続行するため、その旧行が ready 判定に使われうる
+        (Codex レビュー round 8 で state_marker=None /
+        registry_missed_rebuilds=1 を再現)。
+        """
+        import datetime as _dt
+
+        _write_base(tmp_path, rows={
+            "XLF": {"price": 50.0, "freshness_status": "fresh",
+                    "data_quality_status": "ok", "data_as_of": "2026-08-21"},
+            "MDB": {"price": 1.0, "freshness_status": "fresh",
+                    "data_quality_status": "ok", "data_as_of": "2026-08-20",
+                    "coverage_source": technical_signals.COVERAGE_SOURCE_TOPUP},
+        })
+        (tmp_path / "holdings.json").write_text("{}", encoding="utf-8")
+        (tmp_path / "scenario_playbook.json").write_text("{}", encoding="utf-8")
+        _today_iso = _dt.date.today().isoformat()
+        (tmp_path / "proposed_ticker_candidates.json").write_text(json.dumps({
+            "version": 1, "candidates": [
+                {"ticker": "MDB", "first_seen": _today_iso, "last_seen": _today_iso,
+                 "seen_count": 1, "source": "ai_proposal", "missed_rebuilds": 0},
+            ],
+        }), encoding="utf-8")
+
+        monkeypatch.setattr(technical_signals, "BASE_DIR", tmp_path)
+        monkeypatch.setattr(technical_signals, "CACHE_FILE", tmp_path / "technical_state.json")
+        monkeypatch.setattr(
+            technical_signals, "_load_ohlcv",
+            lambda tickers: {t: _frame() for t in tickers if t != "MDB"},
+        )
+
+        def _failing_write(path, payload):
+            raise OSError("simulated state write failure")
+
+        monkeypatch.setattr(technical_signals, "atomic_write_json", _failing_write)
+
+        with pytest.raises(OSError):
+            technical_signals.get_technical_context(force=True)
+
+        registry = json.loads(
+            (tmp_path / "proposed_ticker_candidates.json").read_text())
+        mdb = {c["ticker"]: c for c in registry["candidates"]}["MDB"]
+        assert mdb["missed_rebuilds"] == 0, (
+            "state を書けなかったのに失敗カウンタだけが進んだ"
+        )
+        # 旧行も未マークのまま残っている (state 自体が更新されていない)。
+        state = _read_state(tmp_path)
+        assert technical_signals.REBUILD_UNRESOLVED_KEY not in state["tickers"]["MDB"]
+
+    def test_the_reconcile_payload_never_reaches_the_written_state(
+        self, tmp_path, monkeypatch
+    ):
+        """照合材料は technical_state.json のスキーマに載せない。"""
+        _write_base(tmp_path, rows={
+            "XLF": {"price": 50.0, "freshness_status": "fresh",
+                    "data_quality_status": "ok", "data_as_of": "2026-08-21"},
+        })
+        (tmp_path / "holdings.json").write_text("{}", encoding="utf-8")
+        (tmp_path / "scenario_playbook.json").write_text("{}", encoding="utf-8")
+
+        monkeypatch.setattr(technical_signals, "BASE_DIR", tmp_path)
+        monkeypatch.setattr(technical_signals, "CACHE_FILE", tmp_path / "technical_state.json")
+        monkeypatch.setattr(
+            technical_signals, "_load_ohlcv",
+            lambda tickers: {t: _frame() for t in tickers},
+        )
+
+        returned = technical_signals.get_technical_context(force=True)
+
+        assert technical_signals.REBUILD_RECONCILE_KEY not in _read_state(tmp_path)
+        assert technical_signals.REBUILD_RECONCILE_KEY not in returned

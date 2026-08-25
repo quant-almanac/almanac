@@ -23,6 +23,45 @@ from vix_classification import format_vix_level_ja
 from pseudo_tickers import is_non_earnings_ticker
 
 
+def technical_snapshot_for_ai(tech_state: object, ticker: str | None) -> dict:
+    """scenario の action / sell trigger に添えるテクニカル要約を返す。
+
+    このスナップショットは AI プロンプトへ入る。analyst._fmt_technical_state
+    側で指標を伏せても、ここが素通しなら凍結値が売却・配分判断に届く
+    (Codex レビュー round 8 で再現)。判定に使えない行
+    (data_quality_status=blocked / rebuild_unresolved) は数値を出さず、
+    使えない事実と基準日だけを返す。
+
+    gather_data の内側のクロージャではなくモジュール関数にしてあるのは、
+    この品質契約を振る舞いとして直接テストできるようにするため。
+    """
+    if not ticker:
+        return {}
+    tickers = tech_state.get("tickers", {}) if isinstance(tech_state, dict) else {}
+    raw = tickers.get(str(ticker), {}) if isinstance(tickers, dict) else {}
+    if not isinstance(raw, dict) or not raw:
+        return {}
+
+    from scenario_engine import technical_row_is_usable
+
+    if not technical_row_is_usable(raw):
+        return {
+            "usable": False,
+            "reason": ("data_quality_blocked"
+                       if raw.get("data_quality_status") == "blocked"
+                       else "rebuild_unresolved"),
+            "data_as_of": raw.get("data_as_of"),
+        }
+    return {
+        "price": raw.get("price"),
+        "change_5d_pct": raw.get("change_5d_pct"),
+        "change_20d_pct": raw.get("change_20d_pct"),
+        "rsi": raw.get("rsi"),
+        "volume_ratio": raw.get("volume_ratio"),
+        "composite_signal": raw.get("composite_signal"),
+    }
+
+
 def _load_short_candidate_source(base_dir: Path = BASE_DIR) -> tuple[dict, str, str]:
     """Return the newest valid short scan, preferring morning only on ties."""
     sources = [
@@ -1752,24 +1791,7 @@ def gather_data() -> dict:
             return out
 
         def _technical_snapshot(ticker: str | None) -> dict:
-            if not ticker:
-                return {}
-            tickers = (
-                tech_state_for_scenario.get("tickers", {})
-                if isinstance(tech_state_for_scenario, dict)
-                else {}
-            )
-            raw = tickers.get(str(ticker), {}) if isinstance(tickers, dict) else {}
-            if not isinstance(raw, dict) or not raw:
-                return {}
-            return {
-                "price": raw.get("price"),
-                "change_5d_pct": raw.get("change_5d_pct"),
-                "change_20d_pct": raw.get("change_20d_pct"),
-                "rsi": raw.get("rsi"),
-                "volume_ratio": raw.get("volume_ratio"),
-                "composite_signal": raw.get("composite_signal"),
-            }
+            return technical_snapshot_for_ai(tech_state_for_scenario, ticker)
 
         def _is_restricted_scenario_ticker(ticker: object) -> bool:
             return bool(ticker) and is_restricted_ticker(ticker)

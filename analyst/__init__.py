@@ -1793,6 +1793,8 @@ def _fmt_technical_state(tickers: list[str], technical_state: dict) -> str:
             # 読み、売却判断の根拠にしてしまう (Codex レビュー round 7 で
             # 「RSI=10 (oversold)」が現在値として渡るのを再現)。
             # 指標は出さず、再取得に失敗した事実と基準日だけを渡す。
+            # 判定条件は scenario_engine.technical_row_is_usable と同一
+            # (増える読み手が片方だけ忘れないよう1箇所に集約してある)。
             lines.append(
                 f"  {ticker}: 指標判定不能（直近の再計算で価格を再取得できず"
                 f"、基準日 {td.get('data_as_of') or '不明'} の取得分のまま）"

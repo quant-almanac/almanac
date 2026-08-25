@@ -36,6 +36,35 @@ SCENARIO_STATE_PATH = BASE_DIR / "scenario_state.json"
 
 INCONCLUSIVE_DETAIL = "データ未取得"
 
+
+def technical_row_is_usable(row: object) -> bool:
+    """テクニカル行を条件判定の根拠にしてよいか。
+
+    2つの不可条件を1箇所にまとめる。読む側が増えるたびに片方だけ忘れる
+    (実際、特殊条件ハンドラは data_quality_status すら見ていなかった —
+    Codex レビュー round 8) ので、行を読むすべての経路はこれを通すこと。
+
+    - data_quality_status == "blocked": 未調整の分割・併合候補があり、
+      長期窓の指標が信用できない
+    - rebuild_unresolved: 直近の全再計算がこの銘柄を取得できず、前回取得分の
+      行をそのまま引き継いでいる。指標値は取得できた時点のもので現在値ではない
+    """
+    if not isinstance(row, dict):
+        return False
+    if row.get("data_quality_status") == "blocked":
+        return False
+    if row.get("rebuild_unresolved"):
+        return False
+    return True
+
+
+def usable_technical_row(tickers_data: object, ticker: object) -> dict:
+    """判定に使える行だけを返す。使えなければ空 dict。"""
+    if not isinstance(tickers_data, dict) or not ticker:
+        return {}
+    row = tickers_data.get(str(ticker))
+    return row if technical_row_is_usable(row) else {}
+
 # シグナルタイプ別の重み（indicator が最重要、news と technical が補完）
 SIGNAL_WEIGHTS = {
     "news":       0.30,
@@ -513,8 +542,12 @@ def _resolve_ticker_change(ind_key: str, cond: dict, tech_state: dict) -> float 
     }
     ticker = aliases.get(ind_key.lower())
     if ticker and ticker in tickers_data:
-        t = tickers_data[ticker]
-        if t.get("data_quality_status") == "blocked":
+        # blocked と rebuild_unresolved の両方をここで弾く。以前は blocked
+        # しか見ておらず、引き継がれた行の凍結済み change_5d_pct 等が
+        # 現在値として条件を成立させていた (Codex レビュー round 8 で
+        # 「ITA rebuild_unresolved + 5日-20% → matched=True」を再現)。
+        t = usable_technical_row(tickers_data, ticker)
+        if not t:
             return None
         condition_type = cond.get("condition", "")
         if condition_type in ("drop_pct_5d", "drop_pct", "spike_pct", "rise_pct_5d"):
@@ -718,8 +751,12 @@ def _eval_special_technical(key: str, cond: dict, market_state: dict | None,
     if key == "ewj_outperforms_spy_20d":
         tickers = (tech_state or {}).get("tickers", {}) if isinstance(tech_state, dict) else {}
         m = market_state or {}
-        ewj = tickers.get("EWJ", {}) or m.get("EWJ", {}) or {}
-        spy = tickers.get("SPY", {}) or m.get("SPY", {}) or {}
+        # 使えない行 (blocked / rebuild_unresolved) は market_state 側へ
+        # フォールバックし、そちらも無ければ inconclusive になる。
+        # 以前はどちらのチェックも無く、引き継がれた EWJ の凍結済み
+        # change_20d_pct がそのまま比較に使われていた (Codex レビュー round 8)。
+        ewj = usable_technical_row(tickers, "EWJ") or m.get("EWJ", {}) or {}
+        spy = usable_technical_row(tickers, "SPY") or m.get("SPY", {}) or {}
         ewj_ret = _to_float(_first_present(ewj, "change_20d_pct", "return_20d"))
         spy_ret = _to_float(_first_present(spy, "change_20d_pct", "return_20d"))
         entry = {"type": "technical", "key": key, "matched": False, "detail": ""}
@@ -744,7 +781,11 @@ def _eval_special_technical(key: str, cond: dict, market_state: dict | None,
 
         def _index_above_ma50(keys: tuple) -> tuple[bool | None, str]:
             for k_ in keys:
-                obj = m.get(k_) or tickers.get(k_) or {}
+                # tickers 側は使える行だけ (blocked / rebuild_unresolved を
+                # 弾く)。以前はどちらのチェックも無く、引き継がれた 1306.T の
+                # 凍結済み ma50 乖離が条件を成立させていた
+                # (Codex レビュー round 8 で再現)。
+                obj = m.get(k_) or usable_technical_row(tickers, k_) or {}
                 if not obj:
                     continue
                 diff = _to_float(_first_present(obj, "ma50_diff", "vs_ma50_pct"))
@@ -820,19 +861,15 @@ def _eval_technical(scenario: dict, tech_state: dict,
             entry["detail"] = f"{ticker} データなし"
             results.append(entry)
             continue
-        if t_data.get("data_quality_status") == "blocked":
+        if not technical_row_is_usable(t_data):
+            # blocked (未調整の分割・併合候補) と rebuild_unresolved
+            # (直近の全再計算が取得できず前回取得分を引き継いだ行) はどちらも
+            # 「現在値ではない」ので条件成立の根拠にしない。
             entry["detail"] = INCONCLUSIVE_DETAIL
-            entry["data_quality_status"] = "blocked"
-            results.append(entry)
-            continue
-        if t_data.get("rebuild_unresolved"):
-            # 直近の全再計算がこの銘柄を取得できず、前回取得分の行を
-            # そのまま引き継いでいる。指標値は取得できた時点のもので現在値
-            # ではないので、条件成立の根拠にしてはならない (Codex レビュー
-            # round 7 で「RSI 10 < 20 → matched=True」を再現)。
-            # data_quality_status=blocked と同じ inconclusive 扱いにする。
-            entry["detail"] = INCONCLUSIVE_DETAIL
-            entry["rebuild_unresolved"] = True
+            if t_data.get("data_quality_status") == "blocked":
+                entry["data_quality_status"] = "blocked"
+            if t_data.get("rebuild_unresolved"):
+                entry["rebuild_unresolved"] = True
             results.append(entry)
             continue
 

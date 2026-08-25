@@ -173,3 +173,101 @@ def test_ai_input_omits_indicator_values_for_an_unresolved_row():
     assert "判定不能" in with_marker
     assert "oversold" not in with_marker, "凍結された指標シグナルがAIへ渡っている"
     assert "2026-08-01" in with_marker, "基準日は示すべき"
+
+
+def test_indicator_alias_path_rejects_an_unresolved_row():
+    """_eval_indicators → _resolve_ticker_change 経由も未解決行を弾くこと。
+
+    _eval_technical だけを直しても、指標エイリアス経由 (defense_etf_ita 等)
+    は別関数なので素通りしていた (Codex レビュー round 8 で
+    「ITA rebuild_unresolved + 5日-20% → matched=True」を再現)。
+    """
+    cond = {"condition": "drop_pct_5d", "threshold": -10}
+    stale = {"change_5d_pct": -20.0, "data_quality_status": "ok"}
+
+    # 印が無ければ値が返る = 対照群。
+    assert scenario_engine._resolve_ticker_change(
+        "defense_etf_ita", cond, {"tickers": {"ITA": dict(stale)}}) == -20.0
+
+    assert scenario_engine._resolve_ticker_change(
+        "defense_etf_ita", cond,
+        {"tickers": {"ITA": {**stale, "rebuild_unresolved": True}}}) is None
+
+
+def test_special_conditions_reject_unresolved_and_blocked_rows():
+    """特殊条件ハンドラも同じ品質契約に従うこと。
+
+    ewj_outperforms_spy_20d / nikkei_or_topix_above_ma50 は
+    data_quality_status=blocked すら見ておらず、引き継がれた凍結値で
+    条件が成立していた (Codex レビュー round 8)。
+    """
+    scenario = {"detect": {"technical": {
+        "ewj_outperforms_spy_20d": {"condition": "true"},
+    }}}
+    ewj_good = {"change_20d_pct": 20.0, "data_quality_status": "ok"}
+    spy_flat = {"change_20d_pct": 0.0, "data_quality_status": "ok"}
+
+    # 対照群: 印が無ければ成立する。
+    ok = scenario_engine._eval_technical(
+        scenario, {"tickers": {"EWJ": dict(ewj_good), "SPY": dict(spy_flat)}})
+    assert ok[0]["matched"] is True
+
+    # 引き継がれた EWJ 行では成立させない (market_state にも無いので
+    # inconclusive)。
+    unresolved = scenario_engine._eval_technical(
+        scenario,
+        {"tickers": {"EWJ": {**ewj_good, "rebuild_unresolved": True},
+                     "SPY": dict(spy_flat)}})
+    assert unresolved[0]["matched"] is False
+    assert unresolved[0]["detail"] == scenario_engine.INCONCLUSIVE_DETAIL
+
+    # blocked も同様に弾かれる (以前は見ていなかった)。
+    blocked = scenario_engine._eval_technical(
+        scenario,
+        {"tickers": {"EWJ": {**ewj_good, "data_quality_status": "blocked"},
+                     "SPY": dict(spy_flat)}})
+    assert blocked[0]["matched"] is False
+
+
+def test_nikkei_ma50_condition_rejects_an_unresolved_index_row():
+    scenario = {"detect": {"technical": {
+        "nikkei_or_topix_above_ma50": {"condition": "true"},
+    }}}
+    above = {"ma50_diff": 10.0, "data_quality_status": "ok"}
+
+    ok = scenario_engine._eval_technical(
+        scenario, {"tickers": {"1306.T": dict(above)}})
+    assert ok[0]["matched"] is True
+
+    unresolved = scenario_engine._eval_technical(
+        scenario,
+        {"tickers": {"1306.T": {**above, "rebuild_unresolved": True}}})
+    assert unresolved[0]["matched"] is False
+
+
+def test_the_ai_scenario_snapshot_omits_values_for_an_unusable_row():
+    """scenario action / sell trigger に付く技術スナップショットも、
+    使えない行では数値を出さないこと。_fmt_technical_state を直しても
+    こちらが素通しなら凍結値が AI へ届く (Codex レビュー round 8)。
+    """
+    from analyst.data_gatherer import technical_snapshot_for_ai
+
+    row = {"price": 100.0, "rsi": 10.0, "change_5d_pct": -20.0,
+           "composite_signal": "bearish", "data_quality_status": "ok",
+           "data_as_of": "2026-08-01"}
+
+    # 対照群: 使える行なら従来どおり数値が出る。
+    ok = technical_snapshot_for_ai({"tickers": {"MDB": dict(row)}}, "MDB")
+    assert ok["rsi"] == 10.0 and ok["price"] == 100.0
+
+    for bad, expected_reason in [
+        ({**row, "rebuild_unresolved": True}, "rebuild_unresolved"),
+        ({**row, "data_quality_status": "blocked"}, "data_quality_blocked"),
+    ]:
+        snap = technical_snapshot_for_ai({"tickers": {"MDB": bad}}, "MDB")
+        assert snap["usable"] is False
+        assert snap["reason"] == expected_reason
+        assert snap["data_as_of"] == "2026-08-01"
+        # 指標値が1つも漏れていないこと。
+        for leaked in ("price", "rsi", "change_5d_pct", "composite_signal"):
+            assert leaked not in snap, f"{leaked} が AI スナップショットへ漏れている"

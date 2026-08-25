@@ -574,6 +574,11 @@ COVERAGE_SOURCE_TOPUP = "topup"
 #      eviction が効かなくなる)
 REBUILD_UNRESOLVED_KEY = "rebuild_unresolved"
 
+# compute_technical_state が「この再計算で何が解決でき・できなかったか」を
+# get_technical_context へ渡すための一時キー。state を書き出す直前に取り除く
+# ので technical_state.json には現れない。
+REBUILD_RECONCILE_KEY = "_rebuild_reconcile"
+
 
 def ensure_technical_coverage(
     tickers,
@@ -1055,20 +1060,18 @@ def compute_technical_state() -> dict:
     # 非連続の失敗3回で健全な銘柄が追い出されていた (Codex レビュー
     # round 7 で再現)。cron の全再計算は record() を呼ばないので、
     # 猶予を戻す経路はここしかない。
+    # ⚠️ ここでレジストリを更新してはならない。この関数はまだ
+    # technical_state.json を書いておらず (書くのは get_technical_context の
+    # 共有ロック内)、ここで更新すると「レジストリの失敗カウンタだけ進み、
+    # state には未マークの旧 topup 行が残る」という不整合が state 書込みの
+    # 失敗時に残る (Codex レビュー round 8 で state_marker=None /
+    # registry_missed_rebuilds=1 を再現)。分析入口は technical refresh の
+    # 例外を警告だけで続行するため、その旧行が ready 判定に使われうる。
+    # 判定材料だけを返し、実際の更新は state を確定させた後に同じロックの
+    # 中で行う (topup 側とは逆順: あちらは行が単独で存在すると次の再計算に
+    # 消されるので registry 先、こちらは state が権威なので state 先)。
     _missing = sorted(set(tickers) - set(tickers_result))
     _resolved = sorted(set(tickers_result))
-    if _missing or _resolved:
-        try:
-            import proposed_ticker_registry
-
-            proposed_ticker_registry.reconcile_rebuild(
-                resolved=_resolved,
-                missing=_missing,
-                base_dir=BASE_DIR,
-                rebuild_coverage=(len(tickers_result) / len(tickers)) if tickers else 0.0,
-            )
-        except Exception as exc:
-            logger.warning("提案銘柄レジストリの整理に失敗: %s", exc)
 
     breadth = _calc_market_breadth(tickers_result, ohlcv, holdings_tickers)
 
@@ -1098,6 +1101,14 @@ def compute_technical_state() -> dict:
             "missing_tickers": sorted(set(tickers) - set(tickers_result))[:30],
         },
         "cached_at": datetime.now(timezone.utc).isoformat(),
+        # レジストリ照合の材料。get_technical_context が state を確定させた
+        # 後に同じロック内で使い、書き出す前に取り除く (state のスキーマを
+        # 汚さないため)。ここで照合そのものを行わない理由は上の注記参照。
+        REBUILD_RECONCILE_KEY: {
+            "resolved": _resolved,
+            "missing": _missing,
+            "coverage": (len(tickers_result) / len(tickers)) if tickers else 0.0,
+        },
     }
 
 
@@ -1230,7 +1241,39 @@ def get_technical_context(*, force: bool = False) -> dict:
                         "全再計算: 競合窓で追加された topup 行を引き継ぎ (%s)",
                         ", ".join(sorted(carried)),
                     )
+            # 照合材料は state のスキーマに載せない。
+            reconcile = state.pop(REBUILD_RECONCILE_KEY, None)
             atomic_write_json(CACHE_FILE, state)
+            # state を書き終えてから、同じロックの中でレジストリを更新する。
+            # 逆順 (レジストリ先) だと、state 書込みに失敗したときに
+            # 「失敗カウンタだけ進み、state には未マークの旧 topup 行が残る」
+            # という不整合が残り、その旧行が ready 判定に使われうる
+            # (Codex レビュー round 8 で再現)。state が権威なので、
+            # 書けなかった再計算は「無かったこと」にするのが正しい。
+            #
+            # なお引き継いだ行 (carried) は定義上 missing に含まれる
+            # (tickers_result に無いから引き継ぎ対象になった)。行を残しても
+            # 猶予は進むので、追い出しは正しく機能する。
+            if isinstance(reconcile, dict):
+                try:
+                    import proposed_ticker_registry
+
+                    _result = proposed_ticker_registry.reconcile_rebuild_already_locked(
+                        resolved=reconcile.get("resolved") or [],
+                        missing=reconcile.get("missing") or [],
+                        base_dir=BASE_DIR,
+                        rebuild_coverage=float(reconcile.get("coverage") or 0.0),
+                    )
+                    _status = str((_result or {}).get("status") or "unknown")
+                    if _status not in {"ok", "noop"}:
+                        # state は既に確定済み。レジストリだけが遅れる形になる
+                        # が、次の再計算で追いつく。黙って進まないよう記録する。
+                        logger.warning(
+                            "提案銘柄レジストリの照合が %s: %s",
+                            _status, (_result or {}).get("error"),
+                        )
+                except Exception as exc:
+                    logger.warning("提案銘柄レジストリの整理に失敗: %s", exc)
     logger.info("technical_state.json 更新完了")
     return state
 
