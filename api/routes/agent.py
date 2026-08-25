@@ -18,11 +18,12 @@ from pathlib import Path
 from typing import AsyncIterator
 
 from fastapi import APIRouter
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 
 from agent_projection import (
     AGENT_RUN_LOCK_NAME,
     AGENT_RUN_LOCK_TIMEOUT_SECONDS,
+    ENABLED_MODES,
     AgentOutputError,
     AgentProtocolViolation,
     MODES,
@@ -31,6 +32,7 @@ from agent_projection import (
     build_agent_prompt,
     parse_agent_result,
     projection_sha256,
+    resolve_agent_model,
     save_verified_result,
     validate_agent_output,
 )
@@ -64,10 +66,17 @@ def _log_agent_result(
     cost_usd=None,
     error: Exception | None = None,
 ) -> None:
+    # ⚠️ model は実際の ID を記録する。"claude-agent-sdk" という総称だと
+    # 「どのモデルにいくら使ったか」を後から検証できない
+    # (Codex レビュー round 14)。
+    try:
+        model = resolve_agent_model()
+    except Exception:
+        model = "unresolved"
     row = {
         "ts": time.strftime("%Y-%m-%dT%H:%M:%S"),
         "role": "agent_sdk_run",
-        "model": "claude-agent-sdk",
+        "model": model,
         "use_tool": False,  # ツールは与えていない (round 11 以降)
         "max_turns": 1,
         "elapsed_sec": round(time.monotonic() - started, 2),
@@ -98,7 +107,10 @@ async def _run_agent(mode: str) -> AsyncIterator[str]:
     (Codex レビュー round 13)。
     """
     try:
-        with process_lock(AGENT_RUN_LOCK_NAME, timeout=AGENT_RUN_LOCK_TIMEOUT_SECONDS):
+        # ⚠️ timeout=0。process_lock の待機は同期 time.sleep で、
+        # FastAPI の event loop ごと止めてしまう (Codex レビュー round 14)。
+        # API 側は即座に LockBusy にして呼び出し元へ返す。
+        with process_lock(AGENT_RUN_LOCK_NAME, timeout=0):
             async for chunk in _run_agent_locked(mode):
                 yield chunk
     except LockBusy:
@@ -205,8 +217,14 @@ async def run_agent(mode: str = "default"):
     認証 middleware が POST のみ X-API-Key を要求するため、未認証ブラウザ CSRF で
     Agent SDK を起動されるリスクを塞ぐ。SSE のレスポンスは POST でも問題なく返せる。
     """
-    if mode not in MODES:
-        mode = "default"
+    if mode not in ENABLED_MODES:
+        # risk / nisa は projection の判断材料がまだ正しくないので拒否する。
+        # 黙って default へ倒すと、利用者は risk を見たつもりになる。
+        return JSONResponse(
+            status_code=409,
+            content={"error": f"mode {mode!r} is currently disabled",
+                     "enabled_modes": list(ENABLED_MODES)},
+        )
     return StreamingResponse(
         _run_agent(mode),
         media_type="text/event-stream",

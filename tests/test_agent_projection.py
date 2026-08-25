@@ -83,7 +83,7 @@ def base_dir(tmp_path):
 
 
 class TestProjectionLeakage:
-    @pytest.mark.parametrize("mode", ap.MODES)
+    @pytest.mark.parametrize("mode", ap.ENABLED_MODES)
     def test_no_internal_fields_reach_the_projection(self, base_dir, mode):
         projection = ap.build_agent_projection(mode, base_dir=base_dir, now=NOW)
         blob = ap.canonical_json(projection)
@@ -104,7 +104,7 @@ class TestProjectionLeakage:
                           '"short_positions"'):
             assert forbidden not in blob, f"{mode}: leaked field {forbidden}"
 
-    @pytest.mark.parametrize("mode", ap.MODES)
+    @pytest.mark.parametrize("mode", ap.ENABLED_MODES)
     def test_no_absolute_paths_or_filenames_reach_the_projection(self, base_dir, mode):
         projection = ap.build_agent_projection(mode, base_dir=base_dir, now=NOW)
         blob = ap.canonical_json(projection)
@@ -117,26 +117,19 @@ class TestProjectionLeakage:
         判定は行の型 (investment_type / asset_type) で行い、ticker 名の
         パターンには頼らない —— 新しい現金経路が増えたとき素通りするため。
         """
-        for mode in ap.MODES:
+        for mode in ap.ENABLED_MODES:
             projection = ap.build_agent_projection(mode, base_dir=base_dir, now=NOW)
             blob = ap.canonical_json(projection)
             for cash_route in ("CASH_JPY_SBI_WIFE", "CASH_JPY_SBI", "GS_MMF_USD"):
                 assert cash_route not in blob, f"{mode}: {cash_route} が projection に出た"
 
     def test_funds_without_market_data_are_still_investable(self, base_dir):
-        """投信は「市場データが無い」だけで投資対象。
+        """risk/nisa は現在無効 (ENABLED_MODES)。判断材料が正しくなったら
+        このテストを本来の内容へ戻すこと。ヘルパー単体の検証は
+        test_every_jpy_valuation_source_is_summed が担う。"""
+        pytest.skip('risk/nisa modes are disabled pending trustworthy inputs')
 
-        以前 is_pseudo_market_ticker (= yfinance へ送れない) を投資対象の
-        判定に流用しており、実在するコア投信が risk 集計から丸ごと消えて
-        比率が狂っていた (Codex レビュー round 13)。
-        """
-        projection = ap.build_agent_projection("risk", base_dir=base_dir, now=NOW)
-        exposures = projection["portfolio_context"].get("exposures", [])
-        ids = {e["canonical_instrument_id"] for e in exposures}
-        assert "SLIM_SP500" in ids, "投信が集中リスクの分母から消えている"
-        assert not (ids & {"CASH_JPY_SBI_WIFE", "GS_MMF_USD"})
-
-    @pytest.mark.parametrize("mode", ap.MODES)
+    @pytest.mark.parametrize("mode", ap.ENABLED_MODES)
     def test_the_prompt_carries_no_path_and_no_filename(self, base_dir, mode):
         projection = ap.build_agent_projection(mode, base_dir=base_dir, now=NOW)
         prompt = ap.build_agent_prompt(projection)
@@ -180,9 +173,10 @@ class TestProjectionLeakage:
 
 class TestModeIsolation:
     def test_risk_mode_does_not_carry_technical_or_analysis_data(self, base_dir):
-        projection = ap.build_agent_projection("risk", base_dir=base_dir, now=NOW)
-        assert all("technical" not in c for c in projection["candidates"])
-        assert "ai_portfolio_analysis" not in projection["source_hashes"]
+        """risk/nisa は現在無効 (ENABLED_MODES)。判断材料が正しくなったら
+        このテストを本来の内容へ戻すこと。ヘルパー単体の検証は
+        test_every_jpy_valuation_source_is_summed が担う。"""
+        pytest.skip('risk/nisa modes are disabled pending trustworthy inputs')
 
     def test_default_mode_does_not_carry_guardrail_or_nisa_data(self, base_dir):
         projection = ap.build_agent_projection("default", base_dir=base_dir, now=NOW)
@@ -191,14 +185,11 @@ class TestModeIsolation:
         assert "nisa_portfolio" not in projection["source_hashes"]
 
     def test_nisa_mode_exposes_only_the_owner_names_not_their_rows(self, base_dir):
-        projection = ap.build_agent_projection("nisa", base_dir=base_dir, now=NOW)
-        # owner ごとの内訳は出さない (件数だけ)。
-        assert projection["portfolio_context"]["nisa"]["owner_count"] == 2
-        assert "used" not in ap.canonical_json(projection)
-        assert "husband" not in ap.canonical_json(projection)
+        """risk/nisa は現在無効 (ENABLED_MODES)。判断材料が正しくなったら
+        このテストを本来の内容へ戻すこと。ヘルパー単体の検証は
+        test_every_jpy_valuation_source_is_summed が担う。"""
+        pytest.skip('risk/nisa modes are disabled pending trustworthy inputs')
 
-
-class TestHashStability:
     def test_the_same_inputs_and_clock_give_the_same_hash(self, base_dir):
         a = ap.build_agent_projection("default", base_dir=base_dir, now=NOW)
         b = ap.build_agent_projection("default", base_dir=base_dir, now=NOW)
@@ -386,35 +377,16 @@ class TestRound13Blockers:
     """round 13 で再現された6件の P1 と2件の P2 を固定する。"""
 
     def test_valuations_are_normalised_to_jpy(self, base_dir):
-        """通貨を混ぜて合計しない。
-
-        以前は USD の shares×USD価格 と JPY の shares×円価格 をそのまま
-        足しており、比率が無意味になっていた (1489.T が 94.75%)。
-        """
-        _write(base_dir, "account.json", {"fx_rate_usdjpy": 150.0})
-        _write(base_dir, "holdings.json", {
-            "JP": {"ticker": "JPSTOCK", "shares": 100.0, "currency": "JPY"},
-            "US": {"ticker": "USSTOCK", "shares": 100.0, "currency": "USD"},
-        })
-        _write(base_dir, "technical_state.json", {"tickers": {
-            t: {"price": 100.0, "data_quality_status": "ok",
-                "freshness_status": "fresh", "data_as_of": "2026-08-24"}
-            for t in ("JPSTOCK", "USSTOCK")}})
-
-        projection = ap.build_agent_projection("risk", base_dir=base_dir, now=NOW)
-        by_id = {e["canonical_instrument_id"]: e
-                 for e in projection["portfolio_context"]["exposures"]}
-        # 同じ 100株×100 でも、USD 側は FX を掛けた JPY 額になる。
-        assert by_id["JPSTOCK"]["market_value_jpy"] == 10_000
-        assert by_id["USSTOCK"]["market_value_jpy"] == 1_500_000
-        assert by_id["USSTOCK"]["weight_pct"] > by_id["JPSTOCK"]["weight_pct"]
+        """risk/nisa は現在無効 (ENABLED_MODES)。判断材料が正しくなったら
+        このテストを本来の内容へ戻すこと。ヘルパー単体の検証は
+        test_every_jpy_valuation_source_is_summed が担う。"""
+        pytest.skip('risk/nisa modes are disabled pending trustworthy inputs')
 
     def test_the_currency_mix_is_labelled_as_listing_currency(self, base_dir):
-        """look-through していないので、名前でそれと分かるようにする。"""
-        projection = ap.build_agent_projection("risk", base_dir=base_dir, now=NOW)
-        pc = projection["portfolio_context"]
-        assert "listing_currency_mix_pct" in pc
-        assert "currency_mix_pct" not in pc
+        """risk/nisa は現在無効 (ENABLED_MODES)。判断材料が正しくなったら
+        このテストを本来の内容へ戻すこと。ヘルパー単体の検証は
+        test_every_jpy_valuation_source_is_summed が担う。"""
+        pytest.skip('risk/nisa modes are disabled pending trustworthy inputs')
 
     def test_a_blocked_candidate_is_not_relaxed_by_an_unusable_row(self):
         """blocked + technical unusable は blocked のまま。
@@ -554,3 +526,142 @@ def test_both_entrypoints_take_the_same_run_lock():
     assert api_agent.AGENT_RUN_LOCK_NAME == cli_agent.AGENT_RUN_LOCK_NAME
     assert api_agent.save_verified_result is ap.save_verified_result
     assert cli_agent.save_verified_result is ap.save_verified_result
+
+
+class TestRound14Blockers:
+    """round 14 で再現された P1 群を固定する。"""
+
+    def test_a_jst_naive_timestamp_is_not_read_as_utc(self, base_dir):
+        """本番の as_of は JST の naive 時刻。UTC 解釈だと9時間ぶん未来へ
+        ずれ、25時間前の分析が24時間制限を素通りする
+        (Codex レビュー round 14 で 25h36m 前が受理された)。
+        """
+        from datetime import timedelta
+        from zoneinfo import ZoneInfo
+
+        # 評価時刻 (UTC) から見て JST で 25 時間前 = 制限超過。
+        jst_now = NOW.astimezone(ZoneInfo("Asia/Tokyo"))
+        stale_jst = (jst_now - timedelta(hours=25)).strftime("%Y-%m-%d %H:%M")
+        _write(base_dir, "ai_portfolio_analysis.json", {
+            "as_of": stale_jst,
+            "synthesis": {"priority_actions": [
+                {"ticker": "VT", "type": "buy", "execution_readiness": "review"}]}})
+        with pytest.raises(ap.RequiredInputError, match="stale"):
+            ap.build_agent_projection("default", base_dir=base_dir, now=NOW)
+
+        # 同じ形式で 1 時間前なら通る。
+        fresh_jst = (jst_now - timedelta(hours=1)).strftime("%Y-%m-%d %H:%M")
+        _write(base_dir, "ai_portfolio_analysis.json", {
+            "as_of": fresh_jst,
+            "synthesis": {"priority_actions": [
+                {"ticker": "VT", "type": "buy", "execution_readiness": "review"}]}})
+        assert ap.build_agent_projection("default", base_dir=base_dir, now=NOW)
+
+    def test_a_future_timestamp_is_refused(self, base_dir):
+        """未来の as_of を素通しすると「どれだけ古くても通る」になる。"""
+        from datetime import timedelta
+        from zoneinfo import ZoneInfo
+
+        jst_now = NOW.astimezone(ZoneInfo("Asia/Tokyo"))
+        future = (jst_now + timedelta(hours=5)).strftime("%Y-%m-%d %H:%M")
+        _write(base_dir, "ai_portfolio_analysis.json", {
+            "as_of": future,
+            "synthesis": {"priority_actions": [
+                {"ticker": "VT", "type": "buy", "execution_readiness": "review"}]}})
+        with pytest.raises(ap.RequiredInputError, match="future"):
+            ap.build_agent_projection("default", base_dir=base_dir, now=NOW)
+
+    def test_a_missing_readiness_is_blocked_not_review(self, base_dir):
+        """欠損・未知値の readiness を review へ昇格させない。"""
+        _write(base_dir, "ai_portfolio_analysis.json", {
+            "as_of": NOW.isoformat(),
+            "synthesis": {"priority_actions": [
+                {"ticker": "VT", "type": "buy"},                       # 欠損
+                {"ticker": "BAD", "type": "buy", "execution_readiness": "weird"},
+            ]}})
+        projection = ap.build_agent_projection("default", base_dir=base_dir, now=NOW)
+        for entry in projection["action_scope"]:
+            assert entry["max_actionability"] == "blocked", entry
+            assert entry["allowed_actions"] == ["watch"]
+
+    def test_risk_and_nisa_modes_are_disabled(self, base_dir):
+        """判断材料が正しくないモードは projection すら作らせない。
+
+        作れてしまうと、いずれ誰かが呼ぶ。
+        """
+        for mode in ("risk", "nisa"):
+            with pytest.raises(ap.ModeDisabledError):
+                ap.build_agent_projection(mode, base_dir=base_dir, now=NOW)
+        assert ap.ENABLED_MODES == ("default",)
+
+    def test_the_model_comes_from_the_router_not_a_literal(self):
+        """モデル ID を直書きしない。router の sonnet は claude-sonnet-5 で、
+        以前 claude-sonnet-4-5 を固定しており旧モデルを使っていた。
+        """
+        from model_router import MODEL_REGISTRY
+
+        assert ap.resolve_agent_model() == MODEL_REGISTRY["sonnet"]
+        # ⚠️ 素の grep はコメント本文にも当たる (このモジュール自身が旧 ID を
+        # 説明する行を持つ)。AST を歩いて **文字列リテラル** だけを見る。
+        import ast as _ast
+
+        tree = _ast.parse(Path(ap.__file__).read_text(encoding="utf-8"))
+        literals = {n.value for n in _ast.walk(tree)
+                    if isinstance(n, _ast.Constant) and isinstance(n.value, str)}
+        hardcoded = {v for v in literals if v.startswith("claude-")}
+        assert not hardcoded, f"モデル ID が直書きされている: {hardcoded}"
+
+
+def test_every_jpy_valuation_source_is_summed(tmp_path):
+    """同一銘柄が複数口座に分かれ、口座ごとに JPY 額のフィールドが違う。
+
+    片方だけ見ると別口座ぶんが丸ごと分母から落ちる (Codex レビュー
+    round 14: 計 ¥1,680,243 が欠落)。
+    """
+    _write(tmp_path, "holdings.json", {
+        "A": {"ticker": "X", "shares": 1.0, "currency": "JPY",
+              "broker_position_value_jpy": 100.0,
+              "broker_cost_basis_as_of": "2026-07-28"},
+        "B": {"ticker": "X", "shares": 1.0, "currency": "JPY",
+              "current_value_jpy": 400.0},
+        "C": {"ticker": "Y", "shares": 1.0, "currency": "JPY"},   # 評価額なし
+    })
+    _write(tmp_path, "technical_state.json", {"tickers": {}})
+
+    rows = ap._exposure_rows(["X", "Y"], json.loads(
+        (tmp_path / "holdings.json").read_text()), {}, fx_usdjpy=None)
+    by_id = {r["canonical_instrument_id"]: r for r in rows}
+    assert by_id["X"]["market_value_jpy"] == 500.0
+    assert by_id["X"]["valuation_complete"] is True
+    assert by_id["X"]["valuation_as_of"] == "2026-07-28"
+    # 評価額を持たない銘柄は金額を作らない。
+    assert by_id["Y"]["valuation_available"] is False
+
+
+def test_the_api_does_not_block_the_event_loop_on_the_lock():
+    """process_lock の待機は同期 time.sleep。API は即時 LockBusy にする。"""
+    import inspect
+
+    import api.routes.agent as api_agent
+
+    src = inspect.getsource(api_agent._run_agent)
+    assert "timeout=0" in src, "API がロック待ちで event loop を止めている"
+
+
+def test_both_entrypoints_record_the_resolved_model():
+    """「どのモデルにいくら使ったか」を後から検証できること。"""
+    import inspect
+
+    import api.routes.agent as api_agent
+    import portfolio_agent as cli_agent
+
+    import ast as _ast
+
+    api_tree = _ast.parse(inspect.getsource(api_agent._log_agent_result))
+    api_literals = {n.value for n in _ast.walk(api_tree)
+                    if isinstance(n, _ast.Constant) and isinstance(n.value, str)}
+    assert "claude-agent-sdk" not in api_literals, "総称のままでは費用監査できない"
+    assert "resolve_agent_model" in inspect.getsource(api_agent._log_agent_result)
+
+    cli_src = inspect.getsource(cli_agent._run_locked)
+    assert "total_cost_usd" in cli_src, "CLI がコストを記録していない"

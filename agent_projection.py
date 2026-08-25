@@ -46,12 +46,30 @@ import json
 import re
 from datetime import datetime, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 from technical_quality import DEGRADED, USABLE, classify_technical_row
 from utils import load_json
 
 SCHEMA_VERSION = "agent_projection_v1"
 MODES = ("default", "risk", "nisa")
+
+#: 現時点で実行してよいモード。
+#:
+#: risk と NISA は projection の判断材料がまだ正しくない (Codex レビュー
+#: round 14)。
+#:   - risk: 証券会社評価額が 2026-07-28 時点で、行単位の最新価格/NAV・
+#:     評価基準日・評価完全性を持たない。今日の集中リスクとして扱えない。
+#:   - nisa: 残枠が owner 別 attestation・基準日後の約定/注文・
+#:     owner×broker×currency wallet・積立予約・名義間移動禁止を反映して
+#:     いない。到達可能額としては attestation まで 0 扱いが正しい。
+#: 直るまでは **実行させない**。projection が作れてしまうと、いずれ
+#: 誰かが呼ぶ。
+ENABLED_MODES = ("default",)
+
+
+class ModeDisabledError(ValueError):
+    """このモードは現在無効。"""
 
 # Agent 出力の上限。長大な文字列でプロンプト/保存を膨らませない。
 MAX_STRING_CHARS = 2000
@@ -86,6 +104,9 @@ _FORBIDDEN_PATTERNS = (
 
 #: 正式分析がこれより古ければ default モードを走らせない。
 ANALYSIS_MAX_AGE_HOURS = 24.0
+
+#: 時計ずれの許容幅。これを超えて未来の as_of は壊れているとみなす。
+FUTURE_TOLERANCE_HOURS = 1.0
 
 
 class ProjectionError(ValueError):
@@ -281,27 +302,55 @@ def _exposure_rows(held: list[str], holdings: object, tech_rows: object,
             # 上場・決済通貨。経済的な通貨エクスポージャ (look-through)
             # ではない —— 例えば米国株を組み入れた円建て投信は JPY と出る。
             "listing_currency": row.get("currency"),
-            "_broker_jpy": 0.0,
-            "_broker_seen": False,
+            "_jpy": 0.0,
+            "_value_rows": 0,
+            "_rows_without_value": 0,
+            "_oldest_as_of": None,
         })
         # 同じ銘柄が複数口座に分かれている場合は合算する (口座名は出さない)。
         entry["shares"] += shares
-        try:
-            broker_jpy = row.get("broker_position_value_jpy")
-            if broker_jpy is not None:
-                entry["_broker_jpy"] += float(broker_jpy)
-                entry["_broker_seen"] = True
-        except (TypeError, ValueError):
-            pass
+        # ⚠️ 口座ごとに JPY 評価額のフィールドが違う。片方だけ見ると、
+        # 同一銘柄の別口座ぶんが丸ごと分母から落ちる (Codex レビュー
+        # round 14: 1489.T / SLIM_SP500 / SLIM_ORCAN で計 ¥1,680,243 が欠落)。
+        # 行ごとに「JPY 額を持っているか」を数え、持たない行があれば
+        # 完全性フラグを落とす。
+        row_jpy = None
+        for field in ("broker_position_value_jpy", "current_value_jpy"):
+            try:
+                value = row.get(field)
+                if value is not None:
+                    row_jpy = float(value)
+                    break
+            except (TypeError, ValueError):
+                continue
+        if row_jpy is None:
+            entry["_rows_without_value"] += 1
+        else:
+            entry["_jpy"] += row_jpy
+            entry["_value_rows"] += 1
+            as_of = row.get("broker_cost_basis_as_of") or row.get("source_as_of")
+            if as_of:
+                previous = entry.get("_oldest_as_of")
+                entry["_oldest_as_of"] = (
+                    min(previous, str(as_of)) if previous else str(as_of))
 
     tech = tech_rows if isinstance(tech_rows, dict) else {}
     for ticker, entry in rows.items():
-        if entry.pop("_broker_seen"):
-            entry["market_value_jpy"] = round(entry.pop("_broker_jpy"), 2)
+        value_rows = entry.pop("_value_rows")
+        missing_rows = entry.pop("_rows_without_value")
+        jpy_total = entry.pop("_jpy")
+        oldest_as_of = entry.pop("_oldest_as_of")
+        if value_rows:
+            entry["market_value_jpy"] = round(jpy_total, 2)
             entry["valuation_source"] = "broker_reconciled"
             entry["valuation_available"] = True
+            # 評価基準日と「全口座ぶん揃っているか」を必ず添える。
+            # 揃っていない銘柄の比率は下振れするので、読む側が分かる必要がある。
+            entry["valuation_as_of"] = oldest_as_of
+            entry["valuation_complete"] = missing_rows == 0
+            if missing_rows:
+                entry["rows_without_valuation"] = missing_rows
             continue
-        entry.pop("_broker_jpy", None)
         price = None
         raw = tech.get(ticker)
         if isinstance(raw, dict) and classify_technical_row(raw)[0] in (USABLE, DEGRADED):
@@ -323,6 +372,9 @@ def _exposure_rows(held: list[str], holdings: object, tech_rows: object,
             continue
         entry["valuation_source"] = "price_times_shares"
         entry["valuation_available"] = True
+        entry["valuation_as_of"] = (
+            raw.get("data_as_of") if isinstance(raw, dict) else None)
+        entry["valuation_complete"] = True
 
     valued = [e for e in rows.values() if e.get("valuation_available")]
     total = sum(e["market_value_jpy"] for e in valued) or 0.0
@@ -419,11 +471,20 @@ def _assert_fresh_enough(payload: object, *, now: datetime, label: str,
     except ValueError as exc:
         raise RequiredInputError(f"{label}: unreadable as_of {raw!r}") from exc
     if stamp.tzinfo is None:
-        stamp = stamp.replace(tzinfo=timezone.utc)
+        # ⚠️ 本番の as_of は "2026-08-26 06:24" のような **JST の naive 時刻**。
+        # UTC として解釈すると9時間ぶん未来にずれ、25時間前の分析が
+        # 16時間前に見えて 24h 制限を素通りする (Codex レビュー round 14 で
+        # 実測: 25h36m 前の分析が受理された)。
+        stamp = stamp.replace(tzinfo=ZoneInfo("Asia/Tokyo"))
     age_hours = (now - stamp).total_seconds() / 3600.0
     if age_hours > max_age_hours:
         raise RequiredInputError(
             f"{label} is stale: {age_hours:.1f}h old (limit {max_age_hours:.0f}h)")
+    if age_hours < -FUTURE_TOLERANCE_HOURS:
+        # 未来の as_of は時計ずれか壊れた書き込み。素通しすると
+        # 「どれだけ古くても通る」状態になる。
+        raise RequiredInputError(
+            f"{label} is in the future by {-age_hours:.1f}h — refusing to trust it")
 
 
 def _is_cash_like(ticker: str, row: object) -> bool:
@@ -485,7 +546,10 @@ def _official_actions(analysis: object) -> list[dict]:
         out.append({
             "ticker": ticker,
             "action_type": str(act.get("type") or act.get("action_type") or "").lower(),
-            "readiness": str(act.get("execution_readiness") or "review").lower(),
+            # ⚠️ 欠損・未知値は blocked。review へ昇格させると、正式分析が
+            # 判定していない候補に Agent が提案を出せる (Codex レビュー
+            # round 14)。実データは4件とも明示値を持つが契約として閉じる。
+            "readiness": str(act.get("execution_readiness") or "blocked").lower(),
             # ⚠️ 実データでは recommendation_id が全件 null なので、
             # 入力配列の安定 index を併用する。ticker を dict キーにすると
             # 同一銘柄の2判断が1件へ **上書き** される
@@ -501,6 +565,11 @@ def _official_actions(analysis: object) -> list[dict]:
 _READINESS_TO_CEILING = {"ready": "review", "review": "review", "blocked": "blocked"}
 
 
+def _ceiling_for_readiness(readiness: str) -> str:
+    """未知の readiness 値も blocked にする (allow-list)。"""
+    return _READINESS_TO_CEILING.get(readiness, "blocked")
+
+
 def _scope_for_official(ticker: str, verdict: dict, tech: dict) -> dict:
     """正式判断1件ぶんの action_scope エントリ。
 
@@ -509,7 +578,7 @@ def _scope_for_official(ticker: str, verdict: dict, tech: dict) -> dict:
     """
     direction = verdict["action_type"]
     allowed = [a for a in (direction, "watch", "hold") if a]
-    ceiling = _READINESS_TO_CEILING.get(verdict["readiness"], "blocked")
+    ceiling = _ceiling_for_readiness(verdict["readiness"])
     if not tech.get("usable"):
         # ⚠️ 上書きではなく **厳しい方** を採る。以前は無条件代入で、
         # blocked の候補が watch_only へ **緩和** されていた
@@ -540,6 +609,10 @@ def build_agent_projection(
     """mode ごとの sanitized projection を作る。CLI/API 共通の唯一の入口。"""
     if mode not in MODES:
         raise ProjectionError(f"unknown mode: {mode!r}")
+    if mode not in ENABLED_MODES:
+        raise ModeDisabledError(
+            f"mode {mode!r} is disabled: its projection inputs are not yet "
+            f"trustworthy (see ENABLED_MODES)")
     base_dir = Path(base_dir)
     now = now or datetime.now(timezone.utc)
 
@@ -1043,8 +1116,20 @@ def _assert_sources_unchanged(projection: dict, base_dir: Path) -> None:
 AGENT_RUN_LOCK_NAME = "agent_run"
 AGENT_RUN_LOCK_TIMEOUT_SECONDS = 5.0
 
-#: 明示しないと SDK の既定に流れる。課金を伴う経路なので必ず固定する。
-AGENT_MODEL = "claude-sonnet-4-5"
+def resolve_agent_model() -> str:
+    """Agent が使うモデル ID を model_router から解決する。
+
+    ⚠️ ここへ直接 ID を書かない。以前 "claude-sonnet-4-5" を固定していたが、
+    router の sonnet は claude-sonnet-5 で、意図せず旧モデルを使っていた
+    (Codex レビュー round 14)。モデル ID の一元管理は MODEL_REGISTRY。
+    """
+    try:
+        from model_router import MODEL_REGISTRY
+        return MODEL_REGISTRY["sonnet"]
+    except Exception:
+        # router を引けない環境では固定せず SDK 既定へ落とさず、
+        # 明示的に失敗させる —— 課金経路で「どのモデルか不明」は許さない。
+        raise ProjectionError("cannot resolve the agent model from model_router")
 AGENT_MAX_BUDGET_USD = 0.50
 
 
@@ -1071,7 +1156,7 @@ def build_agent_options():
         max_turns=1,
         # 課金経路なので model と上限を明示する。既定任せにしない
         # (Codex レビュー round 13: model=None / max_budget_usd=None だった)。
-        model=AGENT_MODEL,
+        model=resolve_agent_model(),
         max_budget_usd=AGENT_MAX_BUDGET_USD,
     )
 

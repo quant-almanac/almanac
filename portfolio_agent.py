@@ -28,12 +28,14 @@ import argparse
 import asyncio
 import json
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
 from agent_projection import (
     AGENT_RUN_LOCK_NAME,
     AGENT_RUN_LOCK_TIMEOUT_SECONDS,
+    ENABLED_MODES,
     AgentOutputError,
     AgentProtocolViolation,
     MODES,
@@ -41,12 +43,23 @@ from agent_projection import (
     build_agent_projection,
     build_agent_prompt,
     parse_agent_result,
+    resolve_agent_model,
     save_verified_result,
     validate_agent_output,
 )
 from utils import LockBusy, process_lock
 
 BASE_DIR = Path(__file__).parent
+
+
+def _log_agent_result(**kwargs) -> None:
+    """API 経路と同じ会計ログへ書く。CLI だけ記録が抜けると、
+    費用の全体像が追えない (Codex レビュー round 14)。"""
+    try:
+        from api.routes.agent import _log_agent_result as _log
+        _log(**kwargs)
+    except Exception:
+        pass
 
 # ホストが書く。Agent には触らせない。
 OUTPUT_FILES = {
@@ -87,6 +100,7 @@ async def _run_locked(mode: str) -> int:
 
     prompt = build_agent_prompt(projection)
     options = build_agent_options()
+    started = time.monotonic()
 
     print(f"🤖 Portfolio Agent 起動 [モード: {mode}]")
     print(f"   候補 {len(projection['candidates'])} 件 / ツールなし / 構造化出力")
@@ -109,6 +123,14 @@ async def _run_locked(mode: str) -> int:
                         continue
             elif isinstance(message, ResultMessage):
                 print()
+                # ⚠️ CLI もコストを記録・表示する。隔離ライブで
+                # 「どのモデルにいくら使ったか」を検証できるようにする
+                # (Codex レビュー round 14)。
+                cost_usd = getattr(message, "total_cost_usd", None)
+                _log_agent_result(mode=mode, prompt=prompt, started=started,
+                                  status=message.subtype, cost_usd=cost_usd)
+                if cost_usd is not None:
+                    print(f"💴 コスト: ${cost_usd:.4f} (model={resolve_agent_model()})")
                 if message.subtype != "success":
                     print(f"❌ エラー: {message.subtype}")
                     return 1
@@ -143,8 +165,8 @@ async def _run_locked(mode: str) -> int:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="ALMANAC Portfolio Agent")
-    parser.add_argument("--mode", choices=list(MODES), default="default",
-                        help="分析モード（default/risk/nisa）")
+    parser.add_argument("--mode", choices=list(ENABLED_MODES), default="default",
+                        help=f"分析モード（現在有効: {', '.join(ENABLED_MODES)}）")
     parser.add_argument("--print-projection", action="store_true",
                         help="Agent を呼ばず、渡す projection だけを表示する")
     args = parser.parse_args()
