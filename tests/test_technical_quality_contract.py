@@ -188,3 +188,45 @@ class TestConsumersUseTheContract:
             {"detect": {"technical": {"nikkei_or_topix_above_ma50": {"condition": "true"}}}},
             {"tickers": {"1306.T": {**degraded, "ma50_diff": 10.0}}})
         assert nikkei[0]["matched"] is False
+
+
+class TestAxesAreIndependent:
+    """品質軸と鮮度軸を別々に問える必要がある。
+
+    execution_readiness は引き継ぎ行 (rebuild_unresolved) で保存済みの鮮度
+    だけを無視し、品質軸は必ず評価する。合成判定しか無いと軸を分けられず、
+    品質 block が一緒に消える (Codex レビュー round 11 で再現)。
+    """
+
+    def test_the_quality_axis_ignores_freshness_and_the_marker(self):
+        assert tq.classify_quality_axis(
+            {"data_quality_status": "ok", "freshness_status": "stale"}) == (tq.USABLE, None)
+        assert tq.classify_quality_axis(
+            {"data_quality_status": "ok", "rebuild_unresolved": True}) == (tq.USABLE, None)
+        assert tq.classify_quality_axis(
+            {"data_quality_status": "blocked", "rebuild_unresolved": True}) == (
+                tq.UNUSABLE, "data_quality_blocked")
+        assert tq.classify_quality_axis({"freshness_status": "fresh"}) == (
+            tq.UNUSABLE, "data_quality_unknown")
+
+    def test_the_freshness_axis_ignores_quality_and_the_marker(self):
+        assert tq.classify_freshness_axis(
+            {"freshness_status": "fresh", "data_quality_status": "blocked"}) == (tq.USABLE, None)
+        assert tq.classify_freshness_axis(
+            {"freshness_status": "degraded"}) == (tq.DEGRADED, "technical_data_degraded")
+        assert tq.classify_freshness_axis(
+            {"freshness_status": "stale"}) == (tq.UNUSABLE, "technical_data_stale")
+        assert tq.classify_freshness_axis({}) == (tq.UNUSABLE, "technical_row_missing")
+
+    def test_the_combined_verdict_reports_quality_before_the_marker(self):
+        """引き継ぎ行でも、品質軸の方が重い問題ならそちらを理由に出す
+        (理由コードの取り違えを防ぐ)。"""
+        verdict, reason = tq.classify_technical_row({
+            "data_quality_status": "blocked", "freshness_status": "fresh",
+            "rebuild_unresolved": True})
+        assert (verdict, reason) == (tq.UNUSABLE, "data_quality_blocked")
+
+        verdict, reason = tq.classify_technical_row({
+            "data_quality_status": "ok", "freshness_status": "fresh",
+            "rebuild_unresolved": True})
+        assert (verdict, reason) == (tq.UNUSABLE, "rebuild_unresolved")

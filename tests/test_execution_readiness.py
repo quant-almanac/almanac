@@ -1388,6 +1388,94 @@ def test_the_caller_actually_applies_the_unresolved_level_rule(monkeypatch, tmp_
     }
 
 
+def _technical_levels(result):
+    """technical_* 理由が実際に付与されたレベル。
+
+    総合 readiness だけでは、他の理由が先に blocked を立てていると個別
+    理由の寄与レベルが観測できず、レベル取り違えのバグをテストが素通しする
+    (Codex レビュー round 11)。add() が行へ残す level を直接見る。
+    """
+    return {row["code"]: row.get("level")
+            for row in result["execution_block_reasons"]
+            if str(row.get("code", "")).startswith("technical_")}
+
+
+def _worst(levels):
+    if "blocked" in levels.values():
+        return "blocked"
+    return "review" if "review" in levels.values() else "ready"
+
+
+def test_quality_and_freshness_axes_are_evaluated_independently(tmp_path):
+    """rebuild_unresolved が独立した品質 block を無効化しないこと。
+
+    「corporate action で blocked → 次の再計算が取得失敗 → その行が
+    carry-forward」は実際に起きうる並びで、以前は品質軸ごとスキップして
+    いたため review だけになっていた (Codex レビュー round 11 で再現)。
+    引き継ぎ行で無視してよいのは保存済みの freshness_status だけ。
+    """
+    now = datetime(2026, 7, 14, 6, 0, tzinfo=JST)
+
+    def _judge(**fields):
+        _write_base(tmp_path, now)
+        row = {"price": 210.0,
+               "data_as_of": fields.pop("data_as_of", "2026-07-13"), **fields}
+        (tmp_path / "technical_state.json").write_text(
+            json.dumps({"tickers": {"JPM": row}}), encoding="utf-8")
+        return _technical_levels(
+            classify_execution_readiness(_buy(), base_dir=tmp_path, now=now))
+
+    # blocked + unresolved/fresh -> blocked (品質軸が生きている)
+    levels = _judge(data_quality_status="blocked", freshness_status="fresh",
+                    rebuild_unresolved=True)
+    assert levels.get("technical_data_degraded") == "blocked"
+    assert _worst(levels) == "blocked"
+
+    # unknown + unresolved/fresh -> blocked
+    levels = _judge(freshness_status="fresh", rebuild_unresolved=True)
+    assert levels.get("technical_data_quality_unknown") == "blocked"
+    assert _worst(levels) == "blocked"
+
+    # ok + unresolved/fresh -> review (引き継ぎのみ)
+    levels = _judge(data_quality_status="ok", freshness_status="fresh",
+                    rebuild_unresolved=True)
+    assert levels == {"technical_rebuild_unresolved": "review"}
+
+    # ok + unresolved/stale -> blocked (現在ラグで引き直した結果)
+    levels = _judge(data_quality_status="ok", freshness_status="fresh",
+                    rebuild_unresolved=True, data_as_of="2026-06-01")
+    assert levels.get("technical_rebuild_unresolved") == "blocked"
+
+
+def test_the_unresolved_reason_carries_the_level_the_rule_returned(monkeypatch, tmp_path):
+    """caller が unresolved_row_level の戻り値を実際に適用していること。
+
+    round 10 で書いたテストは総合 readiness と理由コードの存在しか見て
+    おらず、本体を `_level = "review"` に固定するミューテーションが全テストを
+    通過した (Codex レビュー round 11)。理由行に残る level を直接見る。
+    """
+    import execution_readiness as er
+
+    now = datetime(2026, 7, 14, 6, 0, tzinfo=JST)
+    _write_base(tmp_path, now)
+    _write_technical(tmp_path, "JPM", coverage_source="topup",
+                     data_as_of="2026-07-13", freshness_status="fresh",
+                     data_quality_status="ok", rebuild_unresolved=True)
+
+    # 素の実装ではラグ 0 = fresh なので review。
+    baseline = _technical_levels(
+        classify_execution_readiness(_buy(), base_dir=tmp_path, now=now))
+    assert baseline["technical_rebuild_unresolved"] == "review"
+
+    # 判定関数を差し替えると、理由行のレベルが追従すること。
+    monkeypatch.setattr(er, "unresolved_row_level", lambda _f: "blocked")
+    forced = _technical_levels(
+        classify_execution_readiness(_buy(), base_dir=tmp_path, now=now))
+    assert forced["technical_rebuild_unresolved"] == "blocked", (
+        "caller が unresolved_row_level の戻り値を無視している"
+    )
+
+
 def test_the_coverage_marker_does_not_change_the_verdict(tmp_path):
     """AI 提案であること自体にペナルティも優遇も設けない (方針①)。
 

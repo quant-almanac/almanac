@@ -42,22 +42,30 @@ UNUSABLE = "unusable"
 _NUMERIC_OK = {USABLE, DEGRADED}
 
 
-def classify_technical_row(row: object) -> tuple[str, str | None]:
-    """(分類, 理由コード) を返す。理由コードは unusable/degraded のときだけ。"""
+def classify_quality_axis(row: object) -> tuple[str, str | None]:
+    """**品質軸だけ**を見る。rebuild_unresolved も freshness も見ない。
+
+    軸を分けてあるのは、引き継ぎ行 (rebuild_unresolved) で無視してよいのが
+    「保存済みの freshness_status」だけだから。品質軸まで一緒に飛ばすと、
+    「corporate action で blocked → 次の再計算が取得失敗 → その行が
+    carry-forward」という並びで独立した品質 block が消える
+    (Codex レビュー round 11 で再現)。
+    """
     if not isinstance(row, dict) or not row:
         return UNUSABLE, "technical_row_missing"
-
-    if row.get("rebuild_unresolved"):
-        # 行はあるが、直近の全再計算はこの銘柄を取得できていない。
-        return UNUSABLE, "rebuild_unresolved"
-
     quality = row.get("data_quality_status")
     if quality != "ok":
         # "blocked" だけでなく、欠損・未知値もここで落とす。
         return UNUSABLE, (
             "data_quality_blocked" if quality == "blocked" else "data_quality_unknown"
         )
+    return USABLE, None
 
+
+def classify_freshness_axis(row: object) -> tuple[str, str | None]:
+    """**保存済みの鮮度軸だけ**を見る。品質も rebuild_unresolved も見ない。"""
+    if not isinstance(row, dict) or not row:
+        return UNUSABLE, "technical_row_missing"
     freshness = row.get("freshness_status")
     if freshness == "fresh":
         return USABLE, None
@@ -66,6 +74,31 @@ def classify_technical_row(row: object) -> tuple[str, str | None]:
     return UNUSABLE, (
         "technical_data_stale" if freshness == "stale" else "technical_freshness_unknown"
     )
+
+
+def classify_technical_row(row: object) -> tuple[str, str | None]:
+    """(分類, 理由コード) を返す。理由コードは unusable/degraded のときだけ。
+
+    両軸 + rebuild_unresolved を合成した「この行の数値を使ってよいか」の
+    総合判定。個別に評価したい呼び出し元 (execution_readiness) は
+    classify_quality_axis / classify_freshness_axis を直接使うこと。
+    """
+    if not isinstance(row, dict) or not row:
+        return UNUSABLE, "technical_row_missing"
+
+    if row.get("rebuild_unresolved"):
+        # 行はあるが、直近の全再計算はこの銘柄を取得できていない。
+        # 品質軸の方が重い問題なので、そちらが unusable ならそれを優先して
+        # 報告する (理由コードを取り違えないため)。
+        _q_verdict, _q_reason = classify_quality_axis(row)
+        if _q_verdict == UNUSABLE:
+            return UNUSABLE, _q_reason
+        return UNUSABLE, "rebuild_unresolved"
+
+    quality_verdict, quality_reason = classify_quality_axis(row)
+    if quality_verdict == UNUSABLE:
+        return UNUSABLE, quality_reason
+    return classify_freshness_axis(row)
 
 
 def technical_row_is_usable(row: object, *, allow_degraded: bool = True) -> bool:
