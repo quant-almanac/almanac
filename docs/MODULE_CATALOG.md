@@ -69,7 +69,7 @@ The large orchestration implementation lives in the `analyst/` package; see §15
 
 | Lifecycle | Modules | Boundary |
 |---|---|---|
-| live | `data_fetcher.py`, `technical_signals.py`, `chart_analyzer.py`, `options_fetcher.py`, `proposed_ticker_registry.py` | Price history, technicals, decision chart, options context and model-proposed-ticker coverage tracking |
+| live | `data_fetcher.py`, `technical_signals.py`, `technical_quality.py`, `chart_analyzer.py`, `options_fetcher.py`, `proposed_ticker_registry.py` | Price history, technicals, the shared usability contract for technical rows, decision chart, options context and model-proposed-ticker coverage tracking |
 | live | `macro_fetcher.py`, `macro_event_calendar.py`, `event_calendar.py`, `follow_rate_analyzer.py` | Macro/rates and event calendars |
 | live | `news_fetcher.py`, `geopolitical_monitor.py`, `earnings_proximity_manager.py`, `earnings_season.py` | News/geopolitics and earnings blackouts |
 | live | `sector_rotation.py`, `sector_strength_updater.py` | Sector state |
