@@ -21,6 +21,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+from technical_quality import DEGRADED, UNUSABLE, classify_technical_row
+
 BASE_DIR = Path(__file__).parent.parent
 sys.path.insert(0, str(BASE_DIR))
 
@@ -1779,27 +1781,39 @@ def _fmt_technical_state(tickers: list[str], technical_state: dict) -> str:
         if not td:
             continue
         found = True
-        if td.get("data_quality_status") == "blocked":
-            reasons = td.get("data_quality_reasons") or []
-            dates = ",".join(str(row.get("date")) for row in reasons[:3] if isinstance(row, dict))
-            lines.append(
-                f"  {ticker}: 指標無効（未調整の分割・併合候補{f' {dates}' if dates else ''}）"
-            )
+        # ⚠️ 判定は必ず共通契約 (technical_quality) から導く。ここは
+        # Long/Medium/Swing すべての Sonnet プロンプトが通る唯一の
+        # テクニカル要約なので、独自判定を書くと契約の抜け穴がそのまま
+        # 本体プロンプトへ出る。実際 round 9 までは blocked と
+        # rebuild_unresolved しか見ておらず、品質欠損や freshness=stale の
+        # 行が「RSI=10(oversold)」として渡っていた
+        # (Codex レビュー round 10 で再現)。
+        _verdict, _reason = classify_technical_row(td)
+        if _verdict == UNUSABLE:
+            if _reason == "data_quality_blocked":
+                reasons = td.get("data_quality_reasons") or []
+                dates = ",".join(
+                    str(row.get("date")) for row in reasons[:3] if isinstance(row, dict))
+                lines.append(
+                    f"  {ticker}: 指標無効（未調整の分割・併合候補{f' {dates}' if dates else ''}）"
+                )
+            elif _reason == "rebuild_unresolved":
+                lines.append(
+                    f"  {ticker}: 指標判定不能（直近の再計算で価格を再取得できず"
+                    f"、基準日 {td.get('data_as_of') or '不明'} の取得分のまま）"
+                )
+            else:
+                # 品質欠損・未知値・stale・鮮度不明。数値は出さず、
+                # 理由コードと基準日だけを渡す。
+                lines.append(
+                    f"  {ticker}: 指標判定不能（{_reason}"
+                    f"、基準日 {td.get('data_as_of') or '不明'}）"
+                )
             continue
-        if td.get("rebuild_unresolved"):
-            # 直近の全再計算がこの銘柄を取得できず、前回取得分の行を
-            # そのまま引き継いでいる。指標値は取得できた時点のもので、
-            # 現在値ではない。数値を出すとモデルが現在の RSI/MACD として
-            # 読み、売却判断の根拠にしてしまう (Codex レビュー round 7 で
-            # 「RSI=10 (oversold)」が現在値として渡るのを再現)。
-            # 指標は出さず、再取得に失敗した事実と基準日だけを渡す。
-            # 判定条件は scenario_engine.technical_row_is_usable と同一
-            # (増える読み手が片方だけ忘れないよう1箇所に集約してある)。
-            lines.append(
-                f"  {ticker}: 指標判定不能（直近の再計算で価格を再取得できず"
-                f"、基準日 {td.get('data_as_of') or '不明'} の取得分のまま）"
-            )
-            continue
+        _degraded_note = (
+            f" ※1セッション遅延(基準日 {td.get('data_as_of') or '不明'})"
+            if _verdict == DEGRADED else ""
+        )
         rsi = td.get("rsi")
         rsi_sig = td.get("rsi_signal", "")
         macd_h = td.get("macd_histogram")
@@ -1824,7 +1838,7 @@ def _fmt_technical_state(tickers: list[str], technical_state: dict) -> str:
             parts.append(f"1d={chg1d:+.1f}%")
         if chg5d is not None:
             parts.append(f"5d={chg5d:+.1f}%")
-        lines.append(f"  {ticker}: " + " / ".join(parts))
+        lines.append(f"  {ticker}: " + " / ".join(parts) + _degraded_note)
     return "\n".join(lines) if found else ""
 
 

@@ -529,7 +529,7 @@ def _resolve_ticker_change(ind_key: str, cond: dict, tech_state: dict) -> float 
         # しか見ておらず、引き継がれた行の凍結済み change_5d_pct 等が
         # 現在値として条件を成立させていた (Codex レビュー round 8 で
         # 「ITA rebuild_unresolved + 5日-20% → matched=True」を再現)。
-        t = usable_technical_row(tickers_data, ticker)
+        t = usable_technical_row(tickers_data, ticker, allow_degraded=False)
         if not t:
             return None
         condition_type = cond.get("condition", "")
@@ -738,8 +738,8 @@ def _eval_special_technical(key: str, cond: dict, market_state: dict | None,
         # フォールバックし、そちらも無ければ inconclusive になる。
         # 以前はどちらのチェックも無く、引き継がれた EWJ の凍結済み
         # change_20d_pct がそのまま比較に使われていた (Codex レビュー round 8)。
-        ewj = usable_technical_row(tickers, "EWJ") or m.get("EWJ", {}) or {}
-        spy = usable_technical_row(tickers, "SPY") or m.get("SPY", {}) or {}
+        ewj = usable_technical_row(tickers, "EWJ", allow_degraded=False) or m.get("EWJ", {}) or {}
+        spy = usable_technical_row(tickers, "SPY", allow_degraded=False) or m.get("SPY", {}) or {}
         ewj_ret = _to_float(_first_present(ewj, "change_20d_pct", "return_20d"))
         spy_ret = _to_float(_first_present(spy, "change_20d_pct", "return_20d"))
         entry = {"type": "technical", "key": key, "matched": False, "detail": ""}
@@ -768,7 +768,7 @@ def _eval_special_technical(key: str, cond: dict, market_state: dict | None,
                 # 弾く)。以前はどちらのチェックも無く、引き継がれた 1306.T の
                 # 凍結済み ma50 乖離が条件を成立させていた
                 # (Codex レビュー round 8 で再現)。
-                obj = m.get(k_) or usable_technical_row(tickers, k_) or {}
+                obj = m.get(k_) or usable_technical_row(tickers, k_, allow_degraded=False) or {}
                 if not obj:
                     continue
                 diff = _to_float(_first_present(obj, "ma50_diff", "vs_ma50_pct"))
@@ -844,7 +844,7 @@ def _eval_technical(scenario: dict, tech_state: dict,
             entry["detail"] = f"{ticker} データなし"
             results.append(entry)
             continue
-        if not technical_row_is_usable(t_data):
+        if not technical_row_is_usable(t_data, allow_degraded=False):
             # blocked (未調整の分割・併合候補) と rebuild_unresolved
             # (直近の全再計算が取得できず前回取得分を引き継いだ行) はどちらも
             # 「現在値ではない」ので条件成立の根拠にしない。

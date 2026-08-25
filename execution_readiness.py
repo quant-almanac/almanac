@@ -10,6 +10,7 @@ import re
 
 from macro_event_calendar import evaluate_macro_event_gate, load_macro_event_state
 from discretionary_funding import evaluate_discretionary_funding, load_execution_plan_state
+from technical_quality import DEGRADED, UNUSABLE, classify_technical_row
 
 
 RISK_INCREASING = {"buy", "add", "dca", "margin_buy", "short", "short_sell"}
@@ -178,7 +179,15 @@ def unresolved_row_level(recomputed_freshness: str) -> str:
     fixture では position/cash の identity 不足で総合判定が常に blocked に
     なり、この理由の寄与レベルが観測できなかった (Codex レビュー round 9)。
     """
-    return "blocked" if recomputed_freshness in {"stale", "unknown"} else "review"
+    # ⚠️ 許可リストで判定する。以前は `in {"stale","unknown"}` の否定形で、
+    # None・空文字・未知の値・将来増える値がすべて review へ fail-open して
+    # いた (Codex レビュー round 10)。既知の安全な2値だけを review にする。
+    # 型も守る —— 呼び出し元は必ず str を渡すが、`in {...}` は非ハッシュ型で
+    # TypeError になる。安全側の判定関数が例外で落ちると、呼び出し元の
+    # try/except の形次第で判定ごと消えうるので、ここで吸収する。
+    if not isinstance(recomputed_freshness, str):
+        return "blocked"
+    return "review" if recomputed_freshness in {"fresh", "degraded"} else "blocked"
 
 
 def _positive_number(value: object) -> float | None:
@@ -1428,20 +1437,48 @@ def classify_execution_readiness(
             if tech is None:
                 add("blocked", "technical_data_missing", f"{ticker} のテクニカル基準日を確認できない")
             else:
-                status = str(tech.get("freshness_status") or "unknown")
-                quality_status = str(tech.get("data_quality_status") or "ok")
-                if quality_status == "blocked":
-                    add(
-                        "blocked",
-                        "technical_data_degraded",
-                        f"{ticker} の価格系列に未調整の分割・併合候補があるためテクニカル指標を無効化",
-                        data_as_of=tech.get("data_as_of"),
-                        data_quality_reasons=tech.get("data_quality_reasons") or [],
-                    )
-                elif status in {"stale", "unknown"}:
-                    add("blocked", "technical_data_stale", f"{ticker} の最終足が古い", data_as_of=tech.get("data_as_of"))
-                elif status == "degraded":
-                    add("review", "technical_data_degraded", f"{ticker} の最終足が1セッション遅延", data_as_of=tech.get("data_as_of"))
+                # 判定は共通契約 (technical_quality) から導出する。
+                # 以前はここで `str(tech.get("data_quality_status") or "ok")` と
+                # していたため、品質フィールドの欠損・未知値が **"ok" へ昇格**
+                # され、共通契約が unusable とする行をテクニカル安全ゲートが
+                # 素通ししていた (Codex レビュー round 10 で再現)。
+                #
+                # rebuild_unresolved だけは下の分岐で別扱いにする —— あちらは
+                # 保存済みの freshness ではなく data_as_of から引き直した
+                # 現在のラグで review/blocked を決めるため。
+                if not tech.get("rebuild_unresolved"):
+                    _verdict, _reason = classify_technical_row(tech)
+                    if _verdict == UNUSABLE:
+                        # 既存の理由コードを保つ (この経路の挙動は変わらない)。
+                        # 新しく捕まるのは品質の欠損・未知値だけで、そこには
+                        # 専用コードを与える。
+                        _code = {
+                            "data_quality_blocked": "technical_data_degraded",
+                            "technical_data_stale": "technical_data_stale",
+                            "technical_freshness_unknown": "technical_data_stale",
+                            "data_quality_unknown": "technical_data_quality_unknown",
+                            "technical_row_missing": "technical_data_missing",
+                        }.get(_reason or "", "technical_data_stale")
+                        _message = {
+                            "technical_data_degraded": (
+                                f"{ticker} の価格系列に未調整の分割・併合候補があるため"
+                                "テクニカル指標を無効化"
+                            ),
+                            "technical_data_stale": f"{ticker} の最終足が古い",
+                            "technical_data_quality_unknown": (
+                                f"{ticker} のテクニカル品質状態を確認できない"
+                                f"（data_quality_status={tech.get('data_quality_status')!r}）"
+                            ),
+                            "technical_data_missing": f"{ticker} のテクニカル行が空",
+                        }[_code]
+                        _extra = {"data_as_of": tech.get("data_as_of")}
+                        if _code == "technical_data_degraded":
+                            _extra["data_quality_reasons"] = tech.get("data_quality_reasons") or []
+                        add("blocked", _code, _message, **_extra)
+                    elif _verdict == DEGRADED:
+                        add("review", "technical_data_degraded",
+                            f"{ticker} の最終足が1セッション遅延",
+                            data_as_of=tech.get("data_as_of"))
                 # 直近の全再計算がこの銘柄を取得できず、前回の補完行を
                 # 引き継いだだけの行。freshness_status は補完時点の値で
                 # 凍結されているため、上の分岐では "fresh" として素通りする

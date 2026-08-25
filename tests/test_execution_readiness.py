@@ -26,8 +26,15 @@ def _write_base(tmp_path, now, *, snapshot_hours=1, ticker="XLF", tech_status="f
         "source_as_of": stamp,
         "positions": [],
     }), encoding="utf-8")
+    # 本番の technical_state.json は全行が data_quality_status と
+    # freshness_status を持つ (実測 72/72)。品質契約が fail-closed に
+    # なったので、共有 fixture も本番形に合わせる —— 省略すると
+    # data_quality_unknown として正しく blocked され、この fixture を使う
+    # 無関係なテストまで巻き込む (Codex レビュー round 10)。
     (tmp_path / "technical_state.json").write_text(json.dumps({
-        "tickers": {ticker: {"freshness_status": tech_status, "data_as_of": "2026-07-13"}}
+        "tickers": {ticker: {"freshness_status": tech_status,
+                             "data_quality_status": "ok",
+                             "data_as_of": "2026-07-13"}}
     }), encoding="utf-8")
     (tmp_path / "macro_event_state.json").write_text(json.dumps({
         "status": "ok", "refreshed_at": now.isoformat(), "events": []
@@ -1276,6 +1283,15 @@ def test_the_unresolved_level_rule_maps_lag_to_review_or_blocked():
     assert unresolved_row_level("stale") == "blocked"
     assert unresolved_row_level("unknown") == "blocked"
 
+    # ⚠️ 既知4値だけでは不足。旧実装は `in {"stale","unknown"}` の否定形で、
+    # この4値に対しては同じ答えを返しつつ、None・空文字・未知の値・将来
+    # 増える値をすべて review へ fail-open していた (Codex レビュー round 10)。
+    # 許可リストであることを、それらの値で固定する。
+    for unexpected in (None, "", "weird", "FRESH", "degraded ", 0, [], {}):
+        assert unresolved_row_level(unexpected) == "blocked", (
+            f"未知の鮮度値 {unexpected!r} が review へ fail-open した"
+        )
+
 
 def test_an_unresolved_row_is_judged_on_recomputed_lag_not_the_frozen_label(tmp_path):
     """保存済みの freshness_status を信じず、data_as_of からラグを引き直す
@@ -1301,6 +1317,75 @@ def test_an_unresolved_row_is_judged_on_recomputed_lag_not_the_frozen_label(tmp_
     assert _recomputed("2026-06-01") == "stale", (
         "数週間前の行が、保存済みラベル fresh のまま素通りした"
     )
+
+
+def test_a_row_with_missing_or_unknown_quality_is_blocked(tmp_path):
+    """品質フィールドの欠損・未知値を "ok" へ昇格させないこと。
+
+    以前は `str(tech.get("data_quality_status") or "ok")` としており、
+    共通契約が unusable とする行をテクニカル安全ゲートが素通ししていた
+    (Codex レビュー round 10 で「missing_quality -> technical理由なし」を再現)。
+    """
+    now = datetime(2026, 7, 14, 6, 0, tzinfo=JST)
+    _write_base(tmp_path, now)
+
+    # 対照群: ok + fresh なら技術的理由は出ない。
+    _write_technical(tmp_path, "JPM", data_quality_status="ok",
+                     freshness_status="fresh")
+    assert _technical_codes(
+        classify_execution_readiness(_buy(), base_dir=tmp_path, now=now)) == set()
+
+    # 品質フィールドが無い行。
+    row = {"price": 210.0, "data_as_of": "2026-07-13", "freshness_status": "fresh"}
+    (tmp_path / "technical_state.json").write_text(
+        json.dumps({"tickers": {"JPM": row}}), encoding="utf-8")
+    missing = classify_execution_readiness(_buy(), base_dir=tmp_path, now=now)
+    assert "technical_data_quality_unknown" in _technical_codes(missing)
+
+    # 未知値も同じ。
+    _write_technical(tmp_path, "JPM", data_quality_status="weird",
+                     freshness_status="fresh")
+    weird = classify_execution_readiness(_buy(), base_dir=tmp_path, now=now)
+    assert "technical_data_quality_unknown" in _technical_codes(weird)
+
+
+def test_a_row_with_missing_freshness_is_blocked(tmp_path):
+    now = datetime(2026, 7, 14, 6, 0, tzinfo=JST)
+    _write_base(tmp_path, now)
+    row = {"price": 210.0, "data_as_of": "2026-07-13", "data_quality_status": "ok"}
+    (tmp_path / "technical_state.json").write_text(
+        json.dumps({"tickers": {"JPM": row}}), encoding="utf-8")
+
+    result = classify_execution_readiness(_buy(), base_dir=tmp_path, now=now)
+
+    assert "technical_data_stale" in _technical_codes(result)
+
+
+def test_the_caller_actually_applies_the_unresolved_level_rule(monkeypatch, tmp_path):
+    """純関数を固定するだけでは、caller がその戻り値を使っているかまでは
+    保証されない (Codex レビュー round 10)。関数を差し替えて、readiness に
+    その値が反映されることを確認する。
+    """
+    import execution_readiness as er
+
+    now = datetime(2026, 7, 14, 6, 0, tzinfo=JST)
+    _write_base(tmp_path, now)
+    # ラグ的には fresh (通常なら review) な引き継ぎ行。
+    _write_technical(tmp_path, "JPM", coverage_source="topup",
+                     data_as_of="2026-07-13", freshness_status="fresh",
+                     rebuild_unresolved=True)
+
+    monkeypatch.setattr(er, "unresolved_row_level", lambda _f: "blocked")
+    forced = classify_execution_readiness(_buy(), base_dir=tmp_path, now=now)
+    assert forced["execution_readiness"] == "blocked"
+
+    # 逆向きにも効くことを見る: この fixture 由来の blocked 理由が無い
+    # 状態を作れないので、理由行が付くこと自体で適用を確認する。
+    monkeypatch.setattr(er, "unresolved_row_level", lambda _f: "review")
+    relaxed = classify_execution_readiness(_buy(), base_dir=tmp_path, now=now)
+    assert "technical_rebuild_unresolved" in {
+        r["code"] for r in relaxed["execution_block_reasons"]
+    }
 
 
 def test_the_coverage_marker_does_not_change_the_verdict(tmp_path):

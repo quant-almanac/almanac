@@ -108,3 +108,83 @@ def test_the_module_stays_free_of_heavy_imports():
         cwd=root, capture_output=True, text=True, check=True,
     )
     assert result.stdout.strip() == "0", "technical_quality が重い依存を引いている"
+
+
+class TestConsumersUseTheContract:
+    """契約は「読む側すべてが通る」ことで初めて意味を持つ。
+
+    round 9 までは technical_quality.py 自体は正しかったのに、本体AIプロンプトと
+    execution_readiness が旧判定のまま残っていた (Codex レビュー round 10)。
+    consumer ごとに、契約が拒否する行が実際に拒否されることを固定する。
+    """
+
+    def test_the_core_ai_prompt_omits_numbers_for_every_unusable_row(self):
+        """Long/Medium/Swing 全プロンプトが通る唯一のテクニカル要約。"""
+        import analyst
+
+        numbers = {"rsi": 10.0, "rsi_signal": "oversold", "macd_histogram": -1.0,
+                   "composite_score": -80.0}
+        for bad in [
+            {**numbers},                                                    # 品質欠損
+            {**numbers, "data_quality_status": "weird"},                    # 未知値
+            {**numbers, "data_quality_status": "ok", "freshness_status": "stale"},
+            {**numbers, "data_quality_status": "ok"},                       # 鮮度欠損
+            {**numbers, "data_quality_status": "ok", "freshness_status": "fresh",
+             "rebuild_unresolved": True},
+        ]:
+            text = analyst._fmt_technical_state(["MDB"], {"MDB": bad})
+            assert "RSI=10" not in text, f"数値が漏れた: {bad} -> {text}"
+            assert "oversold" not in text, f"シグナルが漏れた: {bad} -> {text}"
+
+    def test_the_core_ai_prompt_flags_a_degraded_row_but_keeps_numbers(self):
+        import analyst
+
+        text = analyst._fmt_technical_state(["MDB"], {"MDB": {
+            "rsi": 10.0, "rsi_signal": "oversold",
+            "data_quality_status": "ok", "freshness_status": "degraded",
+            "data_as_of": "2026-08-20",
+        }})
+        assert "RSI=10" in text
+        assert "1セッション遅延" in text
+        assert "2026-08-20" in text
+
+    def test_scenarios_do_not_fire_on_a_degraded_row(self):
+        """シナリオ発火は決定論的買付を生む。しかもシグナル銘柄と購入銘柄は
+        別のことがある (credit_crisis: SPY/XLF 観測 -> GLD 購入) ので、
+        購入銘柄側の readiness では degraded を検知できない。発火根拠に
+        しないのが唯一の fail-closed な扱い (Codex レビュー round 10)。
+        """
+        import scenario_engine as se
+
+        scenario = {"detect": {"technical": {"MDB_rsi": {
+            "condition": "below", "threshold": 20,
+            "ticker": "MDB", "indicator": "rsi"}}}}
+        degraded = {"rsi": 10.0, "data_quality_status": "ok",
+                    "freshness_status": "degraded", "data_as_of": "2026-08-20"}
+
+        assert se._eval_technical(scenario, {"tickers": {"MDB": degraded}})[0]["matched"] is False
+        # fresh なら従来どおり成立する = 対照群。
+        fresh = {**degraded, "freshness_status": "fresh"}
+        assert se._eval_technical(scenario, {"tickers": {"MDB": fresh}})[0]["matched"] is True
+
+    def test_every_scenario_read_site_rejects_degraded(self):
+        """4経路すべてが allow_degraded=False を通ること。"""
+        import scenario_engine as se
+
+        degraded = {"data_quality_status": "ok", "freshness_status": "degraded"}
+
+        # エイリアス経由
+        assert se._resolve_ticker_change(
+            "defense_etf_ita", {"condition": "drop_pct_5d"},
+            {"tickers": {"ITA": {**degraded, "change_5d_pct": -20.0}}}) is None
+        # EWJ 相対
+        ewj = se._eval_technical(
+            {"detect": {"technical": {"ewj_outperforms_spy_20d": {"condition": "true"}}}},
+            {"tickers": {"EWJ": {**degraded, "change_20d_pct": 20.0},
+                         "SPY": {**degraded, "change_20d_pct": 0.0}}})
+        assert ewj[0]["matched"] is False
+        # 日経/TOPIX
+        nikkei = se._eval_technical(
+            {"detect": {"technical": {"nikkei_or_topix_above_ma50": {"condition": "true"}}}},
+            {"tickers": {"1306.T": {**degraded, "ma50_diff": 10.0}}})
+        assert nikkei[0]["matched"] is False
