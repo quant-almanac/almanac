@@ -10,7 +10,7 @@
 
 | Lifecycle | Modules | 境界 |
 |---|---|---|
-| live | `portfolio_analyst.py`, `portfolio_agent.py`, `bot_commands.py`, `telegram_bot.py`, `generate_dashboard.py`, `weekly_report.py` | 日次CLI/API向け分析と人への表示 |
+| live | `portfolio_analyst.py`, `portfolio_agent.py`, `agent_projection.py`, `bot_commands.py`, `telegram_bot.py`, `generate_dashboard.py`, `weekly_report.py` | 日次CLI/API向け分析と人への表示、およびAgentへ渡すsanitized projection |
 | live | `daily_health_check.py`, `watchdog.py`, `alert.py`, `nightly_recheck.py`, `post_run_verify.py` | health、stale出力検知、実行後整合 |
 | optional | `decision_support.py` | 主Next.js console外のon-demand判断支援 |
 | shared | `utils.py` | atomic I/O、secrets、heartbeat、FX cache、共通処理 |

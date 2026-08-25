@@ -10,7 +10,7 @@ This is an ownership map, not a claim that every file is live. The lifecycle col
 
 | Lifecycle | Modules | Boundary |
 |---|---|---|
-| live | `portfolio_analyst.py`, `portfolio_agent.py`, `bot_commands.py`, `telegram_bot.py`, `generate_dashboard.py`, `weekly_report.py` | Daily CLI/API-facing analysis and human presentation |
+| live | `portfolio_analyst.py`, `portfolio_agent.py`, `agent_projection.py`, `bot_commands.py`, `telegram_bot.py`, `generate_dashboard.py`, `weekly_report.py` | Daily CLI/API-facing analysis and human presentation, including the sanitized projection the agent paths are given in place of raw state files |
 | live | `daily_health_check.py`, `watchdog.py`, `alert.py`, `nightly_recheck.py`, `post_run_verify.py` | Health, stale-output detection and post-run consistency |
 | optional | `decision_support.py` | On-demand decision support outside the primary Next.js console |
 | shared | `utils.py` | Atomic I/O, secrets, heartbeats, FX cache and common utilities |
