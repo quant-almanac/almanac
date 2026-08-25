@@ -38,6 +38,23 @@ FORBIDDEN_TEXT = {
     "former employer ticker": "63" + "26",
     "local username": "ik" + "ura",
 }
+#: 保有者を特定できる情報・household identity map。
+#:
+#: 公開版 README の契約は「保有者を特定できる情報や household identity map を
+#: 含めない」だが、以前この検査には勤務先・ユーザー名・秘密鍵しか無く、
+#: 実在の証券会社名・世帯区分 (husband/wife)・現金ウォレット名が公開版へ
+#: 入っても検査が通っていた (レビューで発覚)。
+#:
+#: ⚠️ ここは **新しいコードの混入を止める** ための検査。既存の公開スナップ
+#: ショット由来の出現は別途の棚卸しが要る (履歴書換えを伴うため、判断は人間)。
+IDENTITY_PATTERNS = {
+    "broker name (ja)": re.compile("楽" + "天証券"),
+    "broker name (en)": re.compile(r"\bRakuten\s+Securities\b", re.IGNORECASE),
+    "household role": re.compile(r"\b(?:husband|wife)\b", re.IGNORECASE),
+    "cash wallet route": re.compile(r"\bCASH_(?:JPY|USD)_[A-Z_]+\b"),
+    "mmf wallet": re.compile(r"\bGS_MMF_[A-Z]+\b"),
+}
+
 SECRET_PATTERNS = {
     "Anthropic key": re.compile(r"sk-ant-[A-Za-z0-9_-]{16,}"),
     "OpenAI key": re.compile(r"sk-proj-[A-Za-z0-9_-]{16,}"),
@@ -74,6 +91,44 @@ def _scan_text(label: str, text: str, failures: list[str]) -> None:
     for name, pattern in SECRET_PATTERNS.items():
         if pattern.search(text):
             failures.append(f"{label}: contains {name}")
+
+
+#: 既に保有者特定情報を含んでいるファイル (初回の公開スナップショット由来)。
+#: アプリ本体は世帯2名ぶんの owner と特定のウォレット経路をモデル化して
+#: いるので、これらの文字列は **機能上必要** で、単純に消すことはできない。
+#:
+#: この baseline の目的は「新しい混入を止める」ことだけ。公開ミラーが
+#: そもそもこれらを含んでよいのか、履歴を書き換えるのかは、履歴書換え
+#: (force-push) を伴う人間の判断なので、この検査は決めない。
+IDENTITY_BASELINE_PATH = ROOT / "scripts" / "public_identity_baseline.txt"
+
+
+def _identity_baseline() -> set[str]:
+    try:
+        return {
+            line.strip()
+            for line in IDENTITY_BASELINE_PATH.read_text(encoding="utf-8").splitlines()
+            if line.strip() and not line.startswith("#")
+        }
+    except OSError:
+        return set()
+
+
+def _scan_identities(label: str, text: str, failures: list[str],
+                     baseline: set[str]) -> None:
+    """保有者を特定できる情報を **作業ツリーに対して** 検査する。
+
+    baseline に載っていないファイルで見つかったら失敗させる。履歴には
+    初回スナップショット由来の出現が多数あり、そこまで失敗にすると検査が
+    恒久的に赤くなって役に立たなくなる。
+    """
+    if label in baseline:
+        return
+    for name, pattern in IDENTITY_PATTERNS.items():
+        if pattern.search(text):
+            failures.append(
+                f"{label}: contains {name} (owner-identifying; not in "
+                f"{IDENTITY_BASELINE_PATH.name})")
 
 
 def _history_objects(ref: str) -> list[tuple[str, str]]:
@@ -185,6 +240,7 @@ def main() -> int:
 
     failures: list[str] = []
     skipped: list[str] = []
+    identity_baseline = _identity_baseline()
     _validate_short_defaults(failures)
     _validate_broad_route_example(failures)
     for path in tracked_files():
@@ -199,6 +255,7 @@ def main() -> int:
             failures.append(rel + f" (cannot read tracked file: {exc})")
             continue
         _scan_text(rel, text, failures)
+        _scan_identities(rel, text, failures, identity_baseline)
     if args.history:
         _scan_history(args.history, failures, skipped)
         _scan_history_identities(args.history, failures)
