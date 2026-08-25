@@ -163,6 +163,24 @@ def _merge(current: str, incoming: str) -> str:
     return incoming if SEVERITY.get(incoming, 0) > SEVERITY.get(current, 0) else current
 
 
+def unresolved_row_level(recomputed_freshness: str) -> str:
+    """rebuild_unresolved 行に与える readiness レベル。
+
+    保存済みの freshness_status ではなく、data_as_of から引き直したラグに
+    基づく (引き継ぎが続けば行は何週間でも残るため)。境界は既存の
+    freshness ポリシーと同じ:
+      lag 0〜1 セッション (fresh/degraded) -> review (人間確認付きで扱える)
+      lag 2 以上・日付不明 (stale/unknown) -> blocked
+
+    ⚠️ 純関数として切り出してあるのはテスト可能性のため。以前この判定は
+    classify_execution_readiness の中にインラインで書かれており、
+    review/blocked を逆転させても総合判定テストが通ってしまった —— 最小
+    fixture では position/cash の identity 不足で総合判定が常に blocked に
+    なり、この理由の寄与レベルが観測できなかった (Codex レビュー round 9)。
+    """
+    return "blocked" if recomputed_freshness in {"stale", "unknown"} else "review"
+
+
 def _positive_number(value: object) -> float | None:
     try:
         number = float(value)
@@ -1456,7 +1474,7 @@ def classify_execution_readiness(
                         _live_status = _freshness_status(_lag)
                     except Exception:
                         _live_status = "unknown"
-                    _level = "blocked" if _live_status in {"stale", "unknown"} else "review"
+                    _level = unresolved_row_level(_live_status)
                     add(
                         _level,
                         "technical_rebuild_unresolved",

@@ -130,10 +130,14 @@ def test_indicator_resolvers_use_ma200_and_smh_volume_ratio() -> None:
             }
         }
     }
+    # 品質フィールドは本番の technical_state.json では全行に必ず入る
+    # (実測 72/72)。品質契約が fail-closed になったので、fixture も
+    # 本番と同じ形にする (Codex レビュー round 9)。
+    _ok = {"data_quality_status": "ok", "freshness_status": "fresh"}
     tech_state = {
         "tickers": {
-            "QQQ": {"ma200_diff_pct": 1.25},
-            "SMH": {"volume_ratio": 1.7},
+            "QQQ": {"ma200_diff_pct": 1.25, **_ok},
+            "SMH": {"volume_ratio": 1.7, **_ok},
         }
     }
 

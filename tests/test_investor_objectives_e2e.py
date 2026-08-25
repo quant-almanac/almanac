@@ -238,13 +238,19 @@ def test_objective_14_fx_regime_yen_carry_unwind_reaches_safe_haven_candidates(
             ["USDJPY below 140", "yen carry trade unwind", "yen surge"],
         ),
         vix={"vix": {"level": 28.0, "change_5d": 35.0}},
+        # 品質フィールドは本番の technical_state.json では全行に必ず入る
+        # (実測 72/72)。品質契約が fail-closed になったので、fixture も
+        # 本番と同じ形にする (Codex レビュー round 9)。
         tech={
             "tickers": {
-                "EWJ": {"change_5d_pct": -10.0},
-                "GLD": {"change_5d_pct": 4.0},
-                "EEM": {"rsi": 40},
-                "QQQ": {"macd_crossover": "bearish"},
-                "TLT": {"rsi": 60},
+                t: {**row, "data_quality_status": "ok", "freshness_status": "fresh"}
+                for t, row in {
+                    "EWJ": {"change_5d_pct": -10.0},
+                    "GLD": {"change_5d_pct": 4.0},
+                    "EEM": {"rsi": 40},
+                    "QQQ": {"macd_crossover": "bearish"},
+                    "TLT": {"rsi": 60},
+                }.items()
             }
         },
     )

@@ -3427,10 +3427,17 @@ def _fmt_scenario_monitoring(sm: dict | None) -> str:
                     tech = act.get("technical") if isinstance(act, dict) else {}
                     tech_txt = ""
                     if isinstance(tech, dict) and tech:
-                        tech_txt = (
-                            f" | tech price={tech.get('price')} RSI={tech.get('rsi')} "
-                            f"5d={tech.get('change_5d_pct')}% 20d={tech.get('change_20d_pct')}% "
-                            f"vol={tech.get('volume_ratio')} signal={tech.get('composite_signal')}"
+                        # 使えない行は数値が無い代わりに理由と基準日を持つ。
+                        # 個別に f-string を組むと "price=None RSI=None" に
+                        # 化けて理由が消えるので、整形済みテキストを優先する
+                        # (Codex レビュー round 9)。
+                        tech_txt = " | tech " + str(
+                            tech.get("prompt_text")
+                            or f"price={tech.get('price')} RSI={tech.get('rsi')} "
+                               f"5d={tech.get('change_5d_pct')}% "
+                               f"20d={tech.get('change_20d_pct')}% "
+                               f"vol={tech.get('volume_ratio')} "
+                               f"signal={tech.get('composite_signal')}"
                         )
                     lines.append(
                         f"      - {act.get('phase','?')} {ticker}{alloc_txt}: "

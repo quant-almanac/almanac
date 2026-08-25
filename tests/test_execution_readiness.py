@@ -1261,15 +1261,31 @@ def test_a_carried_forward_row_the_rebuild_could_not_refetch_is_not_ready(tmp_pa
     }
 
 
+def test_the_unresolved_level_rule_maps_lag_to_review_or_blocked():
+    """review/blocked の対応そのものを純関数で固定する。
+
+    以前は classify_execution_readiness の総合判定で検証しようとしていたが、
+    最小 fixture は position/cash の identity を満たさず総合が常に blocked に
+    なるため、review と blocked を逆転させてもテストが通ってしまった
+    (Codex レビュー round 9)。判定関数を直接見る。
+    """
+    from execution_readiness import unresolved_row_level
+
+    assert unresolved_row_level("fresh") == "review"
+    assert unresolved_row_level("degraded") == "review"
+    assert unresolved_row_level("stale") == "blocked"
+    assert unresolved_row_level("unknown") == "blocked"
+
+
 def test_an_unresolved_row_is_judged_on_recomputed_lag_not_the_frozen_label(tmp_path):
-    """引き継ぎが続けば行は何週間でも残る。保存済みの "fresh" を信じず、
-    data_as_of から現在のラグを引き直して判定すること (Codex レビュー
-    round 7)。境界は既存ポリシーと同じ: lag 0〜1 は review、2以上は blocked。
+    """保存済みの freshness_status を信じず、data_as_of からラグを引き直す
+    こと (Codex レビュー round 7)。上の純関数テストがレベル対応を固定して
+    いるので、ここではラグの引き直しが実際に行われているかだけを見る。
     """
     now = datetime(2026, 7, 14, 6, 0, tzinfo=JST)
     _write_base(tmp_path, now)
 
-    def _unresolved(data_as_of):
+    def _recomputed(data_as_of):
         _write_technical(tmp_path, "JPM", coverage_source="topup",
                          data_as_of=data_as_of, freshness_status="fresh",
                          rebuild_unresolved=True)
@@ -1277,49 +1293,14 @@ def test_an_unresolved_row_is_judged_on_recomputed_lag_not_the_frozen_label(tmp_
         rows = [r for r in result["execution_block_reasons"]
                 if r["code"] == "technical_rebuild_unresolved"]
         assert rows, f"data_as_of={data_as_of} で未解決の理由が出ていない"
-        return result, rows[0]
+        return rows[0]["recomputed_freshness"]
 
-    # この最小フィクスチャは position/cash の identity を満たさないため
-    # 総合 readiness は常に blocked で、そこからはラグ判定の差が見えない。
-    # そこで (a) 判定を駆動する recomputed_freshness と、(b) この理由が
-    # 実際に readiness へ与えたレベルの両方を見る。(b) が無いと、
-    # review/blocked を逆転させてもテストが通ってしまう
-    # (Codex レビュー round 8 の指摘)。
-    #
-    # (b) は「同じ行から未解決マーカーだけを外したときの総合判定」を
-    # ベースラインにして測る: 未解決マーカーが blocked を足すなら
-    # ベースラインが review でも総合は blocked になる。
-    def _baseline_without_marker(data_as_of):
-        _write_technical(tmp_path, "JPM", coverage_source="topup",
-                         data_as_of=data_as_of, freshness_status="fresh")
-        return classify_execution_readiness(_buy(), base_dir=tmp_path, now=now)
-
-    # 保存済みラベルは3ケースとも "fresh" のまま。差は data_as_of だけ。
-    for as_of, expected_freshness, expected_level in [
-        ("2026-07-13", "fresh", "review"),
-        ("2026-07-10", "degraded", "review"),
-        ("2026-06-01", "stale", "blocked"),
-    ]:
-        result, reason = _unresolved(as_of)
-        assert reason["recomputed_freshness"] == expected_freshness, (
-            f"data_as_of={as_of}: ラグの引き直しが期待と違う"
-        )
-        # レベルの実効を測る: この理由が blocked を足すなら、マーカー無しの
-        # ベースラインに blocked 理由が無くても総合は blocked になる。
-        baseline = _baseline_without_marker(as_of)
-        baseline_codes = {r["code"] for r in baseline["execution_block_reasons"]}
-        if expected_level == "blocked":
-            assert result["execution_readiness"] == "blocked", (
-                f"data_as_of={as_of}: blocked であるべき未解決行が blocked になっていない"
-            )
-        else:
-            # review 相当なら、総合判定はベースラインと同じ水準に留まる
-            # (このフィクスチャ由来の blocked 以上には上がらない)。
-            assert result["execution_readiness"] == baseline["execution_readiness"], (
-                f"data_as_of={as_of}: review 相当の未解決行が判定を悪化させた "
-                f"(baseline={baseline['execution_readiness']} / "
-                f"actual={result['execution_readiness']}, baseline_codes={baseline_codes})"
-            )
+    # 保存済みラベルは3ケースとも "fresh"。差は data_as_of だけ。
+    assert _recomputed("2026-07-13") == "fresh"
+    assert _recomputed("2026-07-10") == "degraded"
+    assert _recomputed("2026-06-01") == "stale", (
+        "数週間前の行が、保存済みラベル fresh のまま素通りした"
+    )
 
 
 def test_the_coverage_marker_does_not_change_the_verdict(tmp_path):

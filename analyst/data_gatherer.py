@@ -42,16 +42,16 @@ def technical_snapshot_for_ai(tech_state: object, ticker: str | None) -> dict:
     if not isinstance(raw, dict) or not raw:
         return {}
 
-    from scenario_engine import technical_row_is_usable
+    from technical_quality import (
+        describe_unusable, format_for_prompt, technical_row_is_usable,
+    )
 
     if not technical_row_is_usable(raw):
-        return {
-            "usable": False,
-            "reason": ("data_quality_blocked"
-                       if raw.get("data_quality_status") == "blocked"
-                       else "rebuild_unresolved"),
-            "data_as_of": raw.get("data_as_of"),
-        }
+        # 数値は出さない。理由と基準日、そして整形済みテキストを載せる ——
+        # プロンプト整形側が個別に f-string を組むと、この dict が truthy な
+        # まま "price=None RSI=None" に化けて理由が消える
+        # (Codex レビュー round 9 で実データ経路として再現)。
+        return {**describe_unusable(raw), "prompt_text": format_for_prompt(raw)}
     return {
         "price": raw.get("price"),
         "change_5d_pct": raw.get("change_5d_pct"),
@@ -59,6 +59,7 @@ def technical_snapshot_for_ai(tech_state: object, ticker: str | None) -> dict:
         "rsi": raw.get("rsi"),
         "volume_ratio": raw.get("volume_ratio"),
         "composite_signal": raw.get("composite_signal"),
+        "prompt_text": format_for_prompt(raw),
     }
 
 
@@ -1836,9 +1837,14 @@ def gather_data() -> dict:
                     continue
                 tech = _technical_snapshot(ticker)
                 if tech:
+                    # 売却トリガー側も同じ契約。使えない行では数値ではなく
+                    # 理由と基準日が出る (Codex レビュー round 9)。
                     out.append(
-                        f"{ticker} (price={tech.get('price')}, RSI={tech.get('rsi')}, "
-                        f"20d={tech.get('change_20d_pct')}%)"
+                        f"{ticker} (" + str(
+                            tech.get("prompt_text")
+                            or f"price={tech.get('price')}, RSI={tech.get('rsi')}, "
+                               f"20d={tech.get('change_20d_pct')}%"
+                        ) + ")"
                     )
                 else:
                     out.append(ticker)

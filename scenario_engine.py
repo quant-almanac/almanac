@@ -37,33 +37,16 @@ SCENARIO_STATE_PATH = BASE_DIR / "scenario_state.json"
 INCONCLUSIVE_DETAIL = "データ未取得"
 
 
-def technical_row_is_usable(row: object) -> bool:
-    """テクニカル行を条件判定の根拠にしてよいか。
-
-    2つの不可条件を1箇所にまとめる。読む側が増えるたびに片方だけ忘れる
-    (実際、特殊条件ハンドラは data_quality_status すら見ていなかった —
-    Codex レビュー round 8) ので、行を読むすべての経路はこれを通すこと。
-
-    - data_quality_status == "blocked": 未調整の分割・併合候補があり、
-      長期窓の指標が信用できない
-    - rebuild_unresolved: 直近の全再計算がこの銘柄を取得できず、前回取得分の
-      行をそのまま引き継いでいる。指標値は取得できた時点のもので現在値ではない
-    """
-    if not isinstance(row, dict):
-        return False
-    if row.get("data_quality_status") == "blocked":
-        return False
-    if row.get("rebuild_unresolved"):
-        return False
-    return True
-
-
-def usable_technical_row(tickers_data: object, ticker: object) -> dict:
-    """判定に使える行だけを返す。使えなければ空 dict。"""
-    if not isinstance(tickers_data, dict) or not ticker:
-        return {}
-    row = tickers_data.get(str(ticker))
-    return row if technical_row_is_usable(row) else {}
+# テクニカル行の品質契約は technical_quality.py に集約してある。
+# ここに置いていた時期があったが、このモジュールは import 時に alert 経由で
+# yfinance を読みグローバル timeout を書き換えるため、「どこからでも安全に
+# import できる述語」の置き場として不適切だった (Codex レビュー round 9)。
+# 後方互換のため名前はここからも引ける。
+from technical_quality import (  # noqa: F401
+    classify_technical_row,
+    technical_row_is_usable,
+    usable_technical_row,
+)
 
 # シグナルタイプ別の重み（indicator が最重要、news と technical が補完）
 SIGNAL_WEIGHTS = {

@@ -134,7 +134,7 @@ def test_an_unresolved_technical_row_cannot_satisfy_a_condition():
         "detect": {"technical": {"MDB_rsi": {"condition": "below", "threshold": 20,
                                              "ticker": "MDB", "indicator": "rsi"}}},
     }
-    stale_row = {"rsi": 10.0, "data_quality_status": "ok", "data_as_of": "2026-08-01"}
+    stale_row = {"rsi": 10.0, "data_quality_status": "ok", "freshness_status": "fresh", "data_as_of": "2026-08-01"}
 
     # 印が無ければ従来どおり成立する = 対照群。
     without_marker = scenario_engine._eval_technical(
@@ -161,7 +161,7 @@ def test_ai_input_omits_indicator_values_for_an_unresolved_row():
     stale_row = {
         "rsi": 10.0, "rsi_signal": "oversold", "macd_histogram": -1.0,
         "bb_pct_b": 0.02, "volume_ratio": 1.0, "composite_score": -80,
-        "data_quality_status": "ok", "data_as_of": "2026-08-01",
+        "data_quality_status": "ok", "freshness_status": "fresh", "data_as_of": "2026-08-01",
     }
 
     # 印が無ければ従来どおり数値が出る = 対照群。
@@ -183,7 +183,7 @@ def test_indicator_alias_path_rejects_an_unresolved_row():
     「ITA rebuild_unresolved + 5日-20% → matched=True」を再現)。
     """
     cond = {"condition": "drop_pct_5d", "threshold": -10}
-    stale = {"change_5d_pct": -20.0, "data_quality_status": "ok"}
+    stale = {"change_5d_pct": -20.0, "data_quality_status": "ok", "freshness_status": "fresh"}
 
     # 印が無ければ値が返る = 対照群。
     assert scenario_engine._resolve_ticker_change(
@@ -204,8 +204,8 @@ def test_special_conditions_reject_unresolved_and_blocked_rows():
     scenario = {"detect": {"technical": {
         "ewj_outperforms_spy_20d": {"condition": "true"},
     }}}
-    ewj_good = {"change_20d_pct": 20.0, "data_quality_status": "ok"}
-    spy_flat = {"change_20d_pct": 0.0, "data_quality_status": "ok"}
+    ewj_good = {"change_20d_pct": 20.0, "data_quality_status": "ok", "freshness_status": "fresh"}
+    spy_flat = {"change_20d_pct": 0.0, "data_quality_status": "ok", "freshness_status": "fresh"}
 
     # 対照群: 印が無ければ成立する。
     ok = scenario_engine._eval_technical(
@@ -233,7 +233,7 @@ def test_nikkei_ma50_condition_rejects_an_unresolved_index_row():
     scenario = {"detect": {"technical": {
         "nikkei_or_topix_above_ma50": {"condition": "true"},
     }}}
-    above = {"ma50_diff": 10.0, "data_quality_status": "ok"}
+    above = {"ma50_diff": 10.0, "data_quality_status": "ok", "freshness_status": "fresh"}
 
     ok = scenario_engine._eval_technical(
         scenario, {"tickers": {"1306.T": dict(above)}})
@@ -253,7 +253,7 @@ def test_the_ai_scenario_snapshot_omits_values_for_an_unusable_row():
     from analyst.data_gatherer import technical_snapshot_for_ai
 
     row = {"price": 100.0, "rsi": 10.0, "change_5d_pct": -20.0,
-           "composite_signal": "bearish", "data_quality_status": "ok",
+           "composite_signal": "bearish", "data_quality_status": "ok", "freshness_status": "fresh",
            "data_as_of": "2026-08-01"}
 
     # 対照群: 使える行なら従来どおり数値が出る。

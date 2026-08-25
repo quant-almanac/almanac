@@ -571,8 +571,10 @@ class TestF2JapanResolverRealDataShape:
     def test_ewj_from_technical_state_tickers(self):
         from scenario_engine import _eval_special_technical
         tech = {"tickers": {
-            "EWJ": {"change_20d_pct": 0.71},
-            "SPY": {"change_20d_pct": -0.86},
+            "EWJ": {"change_20d_pct": 0.71, "data_quality_status": "ok",
+                    "freshness_status": "fresh"},
+            "SPY": {"change_20d_pct": -0.86, "data_quality_status": "ok",
+                    "freshness_status": "fresh"},
         }}
         market = {}  # market_snapshot に EWJ は無い
         r = _eval_special_technical("ewj_outperforms_spy_20d", {"condition": "true"},
@@ -1083,7 +1085,9 @@ class TestR2ZeroNotMissing:
     def test_ewj_zero_pct_is_value_not_missing(self):
         import scenario_engine as se
         from scenario_engine import INCONCLUSIVE_DETAIL
-        tech = {"tickers": {"EWJ": {"change_20d_pct": 0.0}, "SPY": {"change_20d_pct": 0.0}}}
+        _ok = {"data_quality_status": "ok", "freshness_status": "fresh"}
+        tech = {"tickers": {"EWJ": {"change_20d_pct": 0.0, **_ok},
+                            "SPY": {"change_20d_pct": 0.0, **_ok}}}
         r = se._eval_special_technical("ewj_outperforms_spy_20d", {"condition": "true"},
                                        {}, None, tech)
         assert r["detail"] != INCONCLUSIVE_DETAIL
