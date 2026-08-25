@@ -173,8 +173,8 @@ def test_an_uncached_registry_entry_forces_one_rebuild_then_self_heals(monkeypat
 
     # 再計算が連続して ZZQQXX を解決できなければ追い出される = ユニバースから消える。
     for _ in range(proposed_ticker_registry.MISSED_REBUILDS_BEFORE_EVICTION):
-        proposed_ticker_registry.evict_unresolved(
-            ["ZZQQXX"], base_dir=tmp_path, rebuild_coverage=0.99)
+        proposed_ticker_registry.reconcile_rebuild(
+resolved=[], missing=["ZZQQXX"], base_dir=tmp_path, rebuild_coverage=0.99)
     assert proposed_ticker_registry.load_registered(tmp_path) == {}
 
     monkeypatch.setattr(ts, "_build_ticker_universe", lambda: ["SPY"])

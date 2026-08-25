@@ -825,6 +825,16 @@ def _eval_technical(scenario: dict, tech_state: dict,
             entry["data_quality_status"] = "blocked"
             results.append(entry)
             continue
+        if t_data.get("rebuild_unresolved"):
+            # 直近の全再計算がこの銘柄を取得できず、前回取得分の行を
+            # そのまま引き継いでいる。指標値は取得できた時点のもので現在値
+            # ではないので、条件成立の根拠にしてはならない (Codex レビュー
+            # round 7 で「RSI 10 < 20 → matched=True」を再現)。
+            # data_quality_status=blocked と同じ inconclusive 扱いにする。
+            entry["detail"] = INCONCLUSIVE_DETAIL
+            entry["rebuild_unresolved"] = True
+            results.append(entry)
+            continue
 
         if indicator == "rsi":
             val = _to_float(_first_present(t_data, "rsi", "rsi_14"))

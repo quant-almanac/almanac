@@ -298,90 +298,129 @@ def record_already_locked(
         return {"status": "error", "error": f"{type(exc).__name__}: {exc}"}
 
 
-def evict_unresolved(
-    missing,
+def reconcile_rebuild(
     *,
+    resolved,
+    missing,
     base_dir: Path,
     rebuild_coverage: float,
     now: datetime | None = None,
 ) -> dict:
-    """evict_unresolved_already_locked() を REGISTRY_LOCK_NAME 取得の上で呼ぶ。
+    """reconcile_rebuild_already_locked() を REGISTRY_LOCK_NAME 取得の上で呼ぶ。
 
     record() と共通のロックを取ることで、両者の read-modify-write が
     互いの更新を上書きしないようにする (Codex レビュー round 5 で再現済み)。
     """
     try:
         with process_lock(REGISTRY_LOCK_NAME, timeout=REGISTRY_LOCK_TIMEOUT_SECONDS):
-            return evict_unresolved_already_locked(
-                missing, base_dir=base_dir, rebuild_coverage=rebuild_coverage, now=now)
+            return reconcile_rebuild_already_locked(
+                resolved=resolved, missing=missing, base_dir=base_dir,
+                rebuild_coverage=rebuild_coverage, now=now)
     except LockBusy:
-        return {"status": "lock_busy", "evicted": []}
+        return {"status": "lock_busy", "evicted": [], "reset": []}
 
 
-def evict_unresolved_already_locked(
-    missing,
+def reconcile_rebuild_already_locked(
     *,
+    resolved,
+    missing,
     base_dir: Path,
     rebuild_coverage: float,
     now: datetime | None = None,
 ) -> dict:
-    """evict_unresolved() のロックフリーな本体。呼び出し元が
-    REGISTRY_LOCK_NAME を既に保持していることを前提とする。
+    """1回の全再計算の結果をレジストリの猶予カウンタへ反映する。
 
-    例外は投げない。1回の再計算で欠けただけでは追い出さない —— yfinance の
-    一時的な単一銘柄不調と、本当の上場廃止を区別できないため
-    (MISSED_REBUILDS_BEFORE_EVICTION 参照)。連続してこの回数を欠けて
-    初めて追い出す。record() が成功のたびに猶予を 0 へ戻すので、
-    間に1回でも解決できればカウントは積み上がらない。
+    呼び出し元が REGISTRY_LOCK_NAME を既に保持していることを前提とする。
+    例外は投げない。
 
-    上場廃止・改称された銘柄をユニバースに残し続けると
+    - resolved (当回行を作れた登録銘柄): missed_rebuilds を 0 へ戻す
+    - missing  (当回行を作れなかった登録銘柄): missed_rebuilds を +1 し、
+      MISSED_REBUILDS_BEFORE_EVICTION に達したら追い出す
+
+    **seen_count / last_seen は触らない。** それらは「AI が提案した」記録で
+    あって「再計算が取得できた」記録ではない。ここで動かすと、提案されて
+    いない銘柄が再計算のたびに TTL を更新し続けて永久に居座る。
+
+    resolved の反映が必須な理由 (Codex レビュー round 7 で再現):
+    以前は missing だけを受け取り、成功した銘柄には何もしていなかった。
+    その結果 missed_rebuilds は「連続失敗回数」ではなく「累計失敗回数」に
+    なり、成功を挟んだ非連続の失敗3回で健全な銘柄が追い出されていた
+    (失敗→1、成功→1のまま、失敗→2、成功→2のまま、失敗→3で追い出し)。
+    record() が 0 へ戻していたのは AI が再提案した銘柄だけで、cron の
+    全再計算は record() を呼ばないため、この経路では一度も戻らなかった。
+
+    1回の再計算で欠けただけでは追い出さない —— yfinance の一時的な単一銘柄
+    不調と、本当の上場廃止を区別できないため (MISSED_REBUILDS_BEFORE_EVICTION
+    参照)。上場廃止・改称された銘柄をユニバースに残し続けると
     _ensure_technical_state_fresh の universe_is_complete が恒久的に false に
-    なり、毎回の強制再計算が無警告で走る。猶予を使い切るまでの最悪ケースは
-    「強制再計算が数回余分に走ってから自己修復」で、それ以上悪化しない。
+    なり、毎回の強制再計算が無警告で走る。
     """
     try:
         coverage = float(rebuild_coverage)
     except (TypeError, ValueError):
         coverage = 0.0
-    if coverage < MIN_REBUILD_COVERAGE_FOR_EVICTION:
-        # 全面障害の日に追い出すと、翌日には復活する銘柄まで消える。
-        return {"status": "skipped_low_coverage", "rebuild_coverage": coverage, "evicted": []}
 
     try:
         today = _today(now)
         drop = {str(t or "").strip().upper() for t in (missing or [])}
         drop.discard("")
+        ok = {str(t or "").strip().upper() for t in (resolved or [])}
+        ok.discard("")
         rows = _read_rows(base_dir)
         if not rows:
-            return {"status": "noop", "evicted": []}
+            return {"status": "noop", "evicted": [], "reset": []}
 
-        touched = {row["ticker"] for row in rows} & drop
+        # 全面障害の日に追い出すと、翌日には復活する銘柄まで消える。
+        # ただし「成功した銘柄の猶予を戻す」方は安全側の操作なので、
+        # カバレッジが低い日でも行う。
+        evicting = coverage >= MIN_REBUILD_COVERAGE_FOR_EVICTION
 
         survivors = []
         evicted = []
+        reset = []
+        changed = False
         for row in rows:
-            if row["ticker"] not in drop:
+            ticker = row["ticker"]
+            current = int(row.get("missed_rebuilds") or 0)
+            if ticker in ok:
+                if current != 0:
+                    row = dict(row)
+                    row["missed_rebuilds"] = 0
+                    reset.append(ticker)
+                    changed = True
                 survivors.append(row)
                 continue
-            missed = int(row.get("missed_rebuilds") or 0) + 1
-            if missed >= MISSED_REBUILDS_BEFORE_EVICTION:
-                evicted.append(row["ticker"])
+            if ticker in drop and evicting:
+                missed = current + 1
+                if missed >= MISSED_REBUILDS_BEFORE_EVICTION:
+                    evicted.append(ticker)
+                    changed = True
+                    continue
+                row = dict(row)
+                row["missed_rebuilds"] = missed
+                changed = True
+                survivors.append(row)
                 continue
-            row = dict(row)
-            row["missed_rebuilds"] = missed
             survivors.append(row)
         evicted = sorted(evicted)
+        reset = sorted(reset)
 
         ordered = _prune_and_order(survivors, today=today)
-        if not touched and len(ordered) == len(rows):
-            # このレジストリの銘柄は1件もこの再計算で欠けておらず、
-            # TTL でも何も落ちていない。カウンタも件数も変わらないので
-            # 書かない (mtime を動かさない)。touched が非空なら、
-            # 追い出しに至らなくても missed_rebuilds の増分を必ず書く —
-            # ここを省くと猶予を跨いだカウントアップが失われ、
-            # 実質「1回の欠落で即追い出し」の旧挙動へ戻ってしまう。
-            return {"status": "noop", "evicted": []}
+        if not changed and len(ordered) == len(rows):
+            # カウンタも件数も変わらない。書かない (mtime を動かさない)。
+            # eviction_skipped_low_coverage は「何も変わらなかった理由」を
+            # 呼び出し元・テストが区別するために noop でも必ず載せる。
+            return {
+                "status": "noop", "evicted": [], "reset": [],
+                "eviction_skipped_low_coverage": not evicting,
+            }
         _write(base_dir, ordered, now=now)
-        return {"status": "ok", "evicted": evicted, "entries": len(ordered)}
+        return {
+            "status": "ok",
+            "evicted": evicted,
+            "reset": reset,
+            "entries": len(ordered),
+            "eviction_skipped_low_coverage": not evicting,
+        }
     except Exception as exc:
         return {"status": "error", "error": f"{type(exc).__name__}: {exc}"}

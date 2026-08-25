@@ -1261,6 +1261,37 @@ def test_a_carried_forward_row_the_rebuild_could_not_refetch_is_not_ready(tmp_pa
     }
 
 
+def test_an_unresolved_row_is_judged_on_recomputed_lag_not_the_frozen_label(tmp_path):
+    """引き継ぎが続けば行は何週間でも残る。保存済みの "fresh" を信じず、
+    data_as_of から現在のラグを引き直して判定すること (Codex レビュー
+    round 7)。境界は既存ポリシーと同じ: lag 0〜1 は review、2以上は blocked。
+    """
+    now = datetime(2026, 7, 14, 6, 0, tzinfo=JST)
+    _write_base(tmp_path, now)
+
+    def _unresolved_reason(data_as_of):
+        _write_technical(tmp_path, "JPM", coverage_source="topup",
+                         data_as_of=data_as_of, freshness_status="fresh",
+                         rebuild_unresolved=True)
+        result = classify_execution_readiness(_buy(), base_dir=tmp_path, now=now)
+        rows = [r for r in result["execution_block_reasons"]
+                if r["code"] == "technical_rebuild_unresolved"]
+        assert rows, f"data_as_of={data_as_of} で未解決の理由が出ていない"
+        return rows[0]
+
+    # 判定の分岐そのものを検証する。この最小フィクスチャは position/cash の
+    # identity を満たさないため総合判定は常に blocked で、そこからは
+    # ラグ判定の差が見えない —— 判定を駆動している recomputed_freshness を
+    # 直接見る (fresh/degraded -> review、stale/unknown -> blocked)。
+    #
+    # 保存済みラベルはどちらも "fresh" のまま。差は data_as_of だけ。
+    assert _unresolved_reason("2026-07-13")["recomputed_freshness"] == "fresh"
+    assert _unresolved_reason("2026-07-10")["recomputed_freshness"] == "degraded"
+    assert _unresolved_reason("2026-06-01")["recomputed_freshness"] == "stale", (
+        "数週間前の行が、保存済みラベル fresh のまま素通りした"
+    )
+
+
 def test_the_coverage_marker_does_not_change_the_verdict(tmp_path):
     """AI 提案であること自体にペナルティも優遇も設けない (方針①)。
 

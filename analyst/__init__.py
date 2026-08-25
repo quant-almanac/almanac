@@ -1786,6 +1786,18 @@ def _fmt_technical_state(tickers: list[str], technical_state: dict) -> str:
                 f"  {ticker}: 指標無効（未調整の分割・併合候補{f' {dates}' if dates else ''}）"
             )
             continue
+        if td.get("rebuild_unresolved"):
+            # 直近の全再計算がこの銘柄を取得できず、前回取得分の行を
+            # そのまま引き継いでいる。指標値は取得できた時点のもので、
+            # 現在値ではない。数値を出すとモデルが現在の RSI/MACD として
+            # 読み、売却判断の根拠にしてしまう (Codex レビュー round 7 で
+            # 「RSI=10 (oversold)」が現在値として渡るのを再現)。
+            # 指標は出さず、再取得に失敗した事実と基準日だけを渡す。
+            lines.append(
+                f"  {ticker}: 指標判定不能（直近の再計算で価格を再取得できず"
+                f"、基準日 {td.get('data_as_of') or '不明'} の取得分のまま）"
+            )
+            continue
         rsi = td.get("rsi")
         rsi_sig = td.get("rsi_signal", "")
         macd_h = td.get("macd_histogram")

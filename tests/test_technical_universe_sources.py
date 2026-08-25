@@ -567,8 +567,8 @@ class TestProposedTickerRegistry:
         """
         proposed_ticker_registry.record(["MDB"], resolved={"MDB"}, base_dir=tmp_path)
         for _ in range(2):
-            proposed_ticker_registry.evict_unresolved(
-                ["MDB"], base_dir=tmp_path, rebuild_coverage=0.99)
+            proposed_ticker_registry.reconcile_rebuild(
+resolved=[], missing=["MDB"], base_dir=tmp_path, rebuild_coverage=0.99)
         before = proposed_ticker_registry.load_registered(tmp_path)["MDB"]
         assert before["missed_rebuilds"] == 2
 
@@ -602,8 +602,8 @@ class TestProposedTickerRegistry:
         proposed_ticker_registry.record(
             ["JPM", "MDB"], resolved={"JPM", "MDB"}, base_dir=tmp_path)
 
-        report = proposed_ticker_registry.evict_unresolved(
-            ["MDB"], base_dir=tmp_path, rebuild_coverage=0.99)
+        report = proposed_ticker_registry.reconcile_rebuild(
+resolved=[], missing=["MDB"], base_dir=tmp_path, rebuild_coverage=0.99)
 
         assert report["status"] == "ok"
         assert report["evicted"] == []
@@ -617,14 +617,14 @@ class TestProposedTickerRegistry:
             ["MDB"], resolved={"MDB"}, base_dir=tmp_path)
 
         for i in range(proposed_ticker_registry.MISSED_REBUILDS_BEFORE_EVICTION - 1):
-            proposed_ticker_registry.evict_unresolved(
-                ["MDB"], base_dir=tmp_path, rebuild_coverage=0.99)
+            proposed_ticker_registry.reconcile_rebuild(
+resolved=[], missing=["MDB"], base_dir=tmp_path, rebuild_coverage=0.99)
             assert "MDB" in proposed_ticker_registry.load_registered(tmp_path), (
                 f"{i + 1}回目の欠落で追い出された (閾値未満のはず)"
             )
 
-        report = proposed_ticker_registry.evict_unresolved(
-            ["MDB"], base_dir=tmp_path, rebuild_coverage=0.99)
+        report = proposed_ticker_registry.reconcile_rebuild(
+resolved=[], missing=["MDB"], base_dir=tmp_path, rebuild_coverage=0.99)
 
         assert report["evicted"] == ["MDB"]
         assert proposed_ticker_registry.load_registered(tmp_path) == {}
@@ -634,8 +634,8 @@ class TestProposedTickerRegistry:
         proposed_ticker_registry.record(
             ["MDB"], resolved={"MDB"}, base_dir=tmp_path)
 
-        proposed_ticker_registry.evict_unresolved(
-            ["MDB"], base_dir=tmp_path, rebuild_coverage=0.99)
+        proposed_ticker_registry.reconcile_rebuild(
+resolved=[], missing=["MDB"], base_dir=tmp_path, rebuild_coverage=0.99)
         assert proposed_ticker_registry.load_registered(tmp_path)["MDB"]["missed_rebuilds"] == 1
 
         # 次の再計算では解決できた (継続提案としての record() 呼び出し)。
@@ -649,8 +649,8 @@ class TestProposedTickerRegistry:
 
         # 再び欠けても、猶予は 1 からやり直しになる (2 からの続きではない)。
         for _ in range(proposed_ticker_registry.MISSED_REBUILDS_BEFORE_EVICTION - 1):
-            proposed_ticker_registry.evict_unresolved(
-                ["MDB"], base_dir=tmp_path, rebuild_coverage=0.99)
+            proposed_ticker_registry.reconcile_rebuild(
+resolved=[], missing=["MDB"], base_dir=tmp_path, rebuild_coverage=0.99)
         assert "MDB" in proposed_ticker_registry.load_registered(tmp_path)
 
     def test_a_ticker_the_rebuild_could_not_resolve_is_evicted(self, tmp_path):
@@ -659,8 +659,8 @@ class TestProposedTickerRegistry:
             ["JPM", "MDB"], resolved={"JPM", "MDB"}, base_dir=tmp_path)
 
         for _ in range(proposed_ticker_registry.MISSED_REBUILDS_BEFORE_EVICTION):
-            proposed_ticker_registry.evict_unresolved(
-                ["MDB"], base_dir=tmp_path, rebuild_coverage=0.95)
+            proposed_ticker_registry.reconcile_rebuild(
+resolved=[], missing=["MDB"], base_dir=tmp_path, rebuild_coverage=0.95)
 
         assert set(proposed_ticker_registry.load_registered(tmp_path)) == {"JPM"}
 
@@ -669,11 +669,19 @@ class TestProposedTickerRegistry:
         proposed_ticker_registry.record(
             ["JPM", "MDB"], resolved={"JPM", "MDB"}, base_dir=tmp_path)
 
-        report = proposed_ticker_registry.evict_unresolved(
-            ["JPM", "MDB"], base_dir=tmp_path, rebuild_coverage=0.1)
+        report = proposed_ticker_registry.reconcile_rebuild(
+            resolved=[], missing=["JPM", "MDB"],
+            base_dir=tmp_path, rebuild_coverage=0.1)
 
-        assert report["status"] == "skipped_low_coverage"
+        # 猶予リセットと追い出しは別々に扱う: 追い出しだけがカバレッジで
+        # ゲートされ、リセット (安全側の操作) はカバレッジが低い日でも行う。
+        assert report.get("eviction_skipped_low_coverage") is True
+        assert report["evicted"] == []
         assert set(proposed_ticker_registry.load_registered(tmp_path)) == {"JPM", "MDB"}
+        # missed_rebuilds も進んでいないこと (全面障害を失敗として数えない)。
+        registered = proposed_ticker_registry.load_registered(tmp_path)
+        assert registered["MDB"]["missed_rebuilds"] == 0
+        assert registered["JPM"]["missed_rebuilds"] == 0
 
     def test_the_registry_capacity_matches_the_consumer_slice(self):
         assert (proposed_ticker_registry.MAX_ENTRIES
@@ -1104,8 +1112,8 @@ class TestConcurrentRebuildMerge:
             # OLD は missed_rebuilds=2+1=3 で MISSED_REBUILDS_BEFORE_EVICTION
             # に到達し追い出される (evict 自身の計算は読み込み後、足止め解除
             # まで進まない)。
-            results["evict"] = registry_mod.evict_unresolved(
-                ["OLD"], base_dir=tmp_path, rebuild_coverage=1.0)
+            results["evict"] = registry_mod.reconcile_rebuild(
+resolved=[], missing=["OLD"], base_dir=tmp_path, rebuild_coverage=1.0)
 
         t_evict = threading.Thread(target=_run_evict)
         t_evict.start()
@@ -1426,3 +1434,155 @@ class TestConcurrentRebuildMerge:
         assert result["b"]["cached_at"] == result["a"]["cached_at"], (
             "BがAの結果を再利用していない"
         )
+
+    def test_a_successful_rebuild_resets_the_grace_counter(self, tmp_path, monkeypatch):
+        """cron の全再計算は record() を呼ばないので、成功時に猶予を戻す
+        経路はここしかない。以前は missing だけを渡しており、成功しても
+        戻らなかったため missed_rebuilds が「連続失敗回数」ではなく
+        「累計失敗回数」になっていた —— 成功を挟んだ非連続の失敗3回で
+        健全な銘柄が追い出される (Codex レビュー round 7 で
+        「失敗→1、成功→1のまま」を再現)。
+        """
+        import datetime as _dt
+
+        _write_base(tmp_path, rows={
+            "XLF": {"price": 50.0, "freshness_status": "fresh",
+                    "data_quality_status": "ok", "data_as_of": "2026-08-21"},
+        })
+        (tmp_path / "holdings.json").write_text("{}", encoding="utf-8")
+        (tmp_path / "scenario_playbook.json").write_text("{}", encoding="utf-8")
+        _today_iso = _dt.date.today().isoformat()
+        (tmp_path / "proposed_ticker_candidates.json").write_text(json.dumps({
+            "version": 1, "candidates": [
+                {"ticker": "MDB", "first_seen": _today_iso, "last_seen": _today_iso,
+                 "seen_count": 1, "source": "ai_proposal", "missed_rebuilds": 0},
+            ],
+        }), encoding="utf-8")
+
+        monkeypatch.setattr(technical_signals, "BASE_DIR", tmp_path)
+        monkeypatch.setattr(technical_signals, "CACHE_FILE", tmp_path / "technical_state.json")
+
+        resolvable = {"n": False}
+
+        def _fake_load_ohlcv(tickers):
+            return {
+                t: _frame() for t in tickers
+                if t != "MDB" or resolvable["n"]
+            }
+
+        monkeypatch.setattr(technical_signals, "_load_ohlcv", _fake_load_ohlcv)
+
+        def _missed():
+            payload = json.loads(
+                (tmp_path / "proposed_ticker_candidates.json").read_text())
+            return {c["ticker"]: c for c in payload["candidates"]}["MDB"]["missed_rebuilds"]
+
+        # 1回目: MDB 取得失敗 -> 猶予 1
+        technical_signals.get_technical_context(force=True)
+        assert _missed() == 1
+
+        # 2回目: MDB 取得成功 -> 猶予は 0 へ戻らねばならない
+        resolvable["n"] = True
+        technical_signals.get_technical_context(force=True)
+        assert _missed() == 0, (
+            "全再計算が成功したのに猶予が戻らず、累計失敗回数として積み上がっている"
+        )
+
+    def test_a_registry_that_drops_the_new_entry_is_not_reported_as_success(
+        self, tmp_path, loader, monkeypatch
+    ):
+        """status=ok でも registered に載っていなければ登録成功ではない。
+
+        レジストリが MAX_ENTRIES で満杯かつ既存エントリの優先度が高いと、
+        _prune_and_order の切り捨てで新規銘柄が dropped になるが status は
+        ok のまま (Codex レビュー round 7 で「status=ok / added=[MDB] なのに
+        registry に MDB 無し」を再現)。
+        """
+        import proposed_ticker_registry as registry_mod
+
+        _write_base(tmp_path)
+        loader({"MDB": _frame()})
+        before = (tmp_path / "technical_state.json").read_bytes()
+
+        monkeypatch.setattr(
+            registry_mod, "record_already_locked",
+            lambda *a, **k: {"status": "ok", "registered": [], "dropped": ["MDB"]},
+        )
+
+        report = technical_signals.ensure_technical_coverage(["MDB"], base_dir=tmp_path)
+
+        assert report["status"] == "registry_failed"
+        assert report["added"] == []
+        assert (tmp_path / "technical_state.json").read_bytes() == before, (
+            "レジストリに載らなかった銘柄の行が書き込まれた"
+        )
+
+    def test_an_unresolved_row_can_be_refetched_by_a_targeted_topup(
+        self, tmp_path, loader
+    ):
+        """引き継ぎで review になった行は、その分析の中で回復できること。
+
+        「行がある」だけで補完対象から外すと、rebuild_unresolved 行は
+        永久に再取得されず、review をその分析内で解消できない
+        (Codex レビュー round 7)。
+        """
+        _write_base(tmp_path, rows={
+            "MDB": {"price": 1.0, "freshness_status": "fresh",
+                    "data_quality_status": "ok", "data_as_of": "2026-08-01",
+                    "coverage_source": technical_signals.COVERAGE_SOURCE_TOPUP,
+                    technical_signals.REBUILD_UNRESOLVED_KEY: True},
+        })
+        fake = loader({"MDB": _frame()})
+
+        report = technical_signals.ensure_technical_coverage(["MDB"], base_dir=tmp_path)
+
+        assert "MDB" in fake.requested, "未解決行が再取得の対象にならなかった"
+        assert report["added"] == ["MDB"]
+        row = _read_state(tmp_path)["tickers"]["MDB"]
+        assert not row.get(technical_signals.REBUILD_UNRESOLVED_KEY), (
+            "再取得に成功したのに未解決マーカーが残っている"
+        )
+
+    def test_a_healthy_row_written_during_the_race_is_not_overwritten(
+        self, tmp_path, loader
+    ):
+        """未解決行の置換は「まだ誰も現在値を取れていない」場合だけ。
+
+        ロック待ちの間に別の全再計算が正常な行を作っていたら、その行を
+        topup の結果で上書きしてはならない。
+        """
+        _write_base(tmp_path, rows={
+            "MDB": {"price": 1.0, "freshness_status": "fresh",
+                    "data_quality_status": "ok", "data_as_of": "2026-08-01",
+                    "coverage_source": technical_signals.COVERAGE_SOURCE_TOPUP,
+                    technical_signals.REBUILD_UNRESOLVED_KEY: True},
+        })
+        loader({"MDB": _frame()})
+
+        # 取得は済ませたが、ロック取得の直前に別の再計算が正常行を書いた、
+        # という状況をファイル差し替えで作る。
+        real_process_lock = technical_signals.process_lock
+
+        import contextlib
+
+        @contextlib.contextmanager
+        def _lock_with_interleaved_write(name, **kwargs):
+            healthy = {"price": 999.0, "freshness_status": "fresh",
+                       "data_quality_status": "ok", "data_as_of": "2026-08-24"}
+            state = json.loads((tmp_path / "technical_state.json").read_text())
+            state["tickers"]["MDB"] = healthy
+            (tmp_path / "technical_state.json").write_text(
+                json.dumps(state), encoding="utf-8")
+            with real_process_lock(name, **kwargs) as handle:
+                yield handle
+
+        technical_signals.process_lock = _lock_with_interleaved_write
+        try:
+            report = technical_signals.ensure_technical_coverage(
+                ["MDB"], base_dir=tmp_path)
+        finally:
+            technical_signals.process_lock = real_process_lock
+
+        row = _read_state(tmp_path)["tickers"]["MDB"]
+        assert row["price"] == 999.0, "競合中に書かれた正常行を上書きした"
+        assert report["added"] == []

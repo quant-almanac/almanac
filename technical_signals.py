@@ -650,7 +650,18 @@ def ensure_technical_coverage(
         state = load_json(base_dir / "technical_state.json", {})
         if not isinstance(state, dict) or not isinstance(state.get("tickers"), dict):
             return {**report, "status": "no_base_state"}
-        existing = set(state["tickers"].keys())
+        # 「行がある」= 補完不要、ではない。直近の全再計算が取得に失敗して
+        # 前回取得分を引き継いだだけの行 (rebuild_unresolved) は、指標値が
+        # 現在値ではないので readiness を review へ落としている。これを
+        # 補完対象から外すと、その分析の中で review を解消する手段が無く
+        # なる (Codex レビュー round 7)。未解決行だけは再取得を試みる。
+        existing = {
+            t for t, row in state["tickers"].items()
+            if not (isinstance(row, dict) and row.get(REBUILD_UNRESOLVED_KEY))
+        }
+        unresolved_rows = {
+            t for t in state["tickers"] if t not in existing
+        }
 
         # 3) 要求の正規化。
         targets: list[str] = []
@@ -796,8 +807,18 @@ def ensure_technical_coverage(
                     # 再計算が正しく stale と判定した保有銘柄を数銘柄の取得が
                     # 「stale解除」してしまい、fail-closed だったものが ready に
                     # 化ける。
-                    if ticker in rows:
-                        continue
+                    #
+                    # 唯一の例外が rebuild_unresolved 行 (直近の全再計算が
+                    # 取得できず前回取得分を引き継いだだけの行)。これは
+                    # 「まだ誰も現在値を取れていない」印なので、取得できたなら
+                    # 置き換えてよい —— むしろ置き換えないと review を解消できない。
+                    # ⚠️ ロック取得までの間に別の全再計算が正常な行を作って
+                    # いた場合は上書きしない。印が消えているかどうかで判定する。
+                    existing_row = rows.get(ticker)
+                    if existing_row is not None:
+                        if not (isinstance(existing_row, dict)
+                                and existing_row.get(REBUILD_UNRESOLVED_KEY)):
+                            continue
                     rows[ticker] = row
                     inserted.append(ticker)
                 if not inserted:
@@ -854,17 +875,44 @@ def ensure_technical_coverage(
                     )
                     registry_status = str(
                         (_registry_result or {}).get("status") or "unknown")
+                    registered_ok = {
+                        str(t or "").strip().upper()
+                        for t in ((_registry_result or {}).get("registered") or [])
+                    }
                 except Exception as exc:
                     logger.warning("テクニカル補完: レジストリ即時登録に失敗 %s", exc)
                     registry_status = "error"
-                if registry_status not in {"ok", "noop"}:
+                    registered_ok = set()
+                # ⚠️ status だけでは足りない。レジストリが MAX_ENTRIES で
+                # 満杯かつ既存エントリの優先度が高いと、_prune_and_order の
+                # 切り捨てで新規銘柄が dropped になるが status は ok のまま
+                # (Codex レビュー round 7 で「status=ok / added=[MDB] なのに
+                # registry に MDB 無し」を再現)。実際に registered に載った
+                # 銘柄だけを受け入れる。
+                accepted = [t for t in inserted if t.upper() in registered_ok]
+                if registry_status not in {"ok", "noop"} or not accepted:
                     # レジストリに載らない行を書いても、次の全再計算で確実に
                     # 消える。書かずに報告だけ返し、次回の実行に委ねる。
                     logger.warning(
-                        "テクニカル補完: レジストリ登録が %s のため行を書き込まない (%s)",
-                        registry_status, ", ".join(sorted(inserted)),
+                        "テクニカル補完: レジストリ登録が %s / 登録済み %s のため"
+                        "行を書き込まない (%s)",
+                        registry_status, sorted(registered_ok), ", ".join(sorted(inserted)),
                     )
                     return {**report, "status": "registry_failed"}
+                if len(accepted) != len(inserted):
+                    # 一部だけ登録できた場合は、登録できた分だけを書く。
+                    rejected = sorted(set(inserted) - set(accepted))
+                    logger.warning(
+                        "テクニカル補完: レジストリに載らなかった銘柄の行は書かない (%s)",
+                        ", ".join(rejected),
+                    )
+                    for ticker in rejected:
+                        rows.pop(ticker, None)
+                    merged["tickers"] = rows
+                    merged["coverage_topup"]["added"] = sorted(accepted)
+                    merged["coverage_topup"]["rows_outside_rebuild"] = max(
+                        0, len(rows) - analyzed)
+                    inserted = accepted
                 atomic_write_json(path, merged)
                 # 呼び出し元 (analyst/__init__.py) が同じ銘柄をもう一度
                 # record() すると seen_count が二重に増える。seen_count は
@@ -995,18 +1043,27 @@ def compute_technical_state() -> dict:
                 except Exception as exc:
                     logger.warning("価格sanityログ記録失敗 %s: %s", ticker, exc)
 
-    # 再計算が行を作れなかった登録銘柄をレジストリから追い出す。
+    # この再計算の成否をレジストリの猶予カウンタへ反映する。
     # 解決不能な銘柄をユニバースに残すと _ensure_technical_state_fresh の
     # universe_is_complete が恒久的に false になり、分析のたびに全銘柄の
     # 強制再計算が無警告で走り続ける。この位置は既に副作用を持つ
     # (append_price_sanity_flags) ので新種の挙動ではない。
+    #
+    # ⚠️ 成功した銘柄 (resolved) も必ず渡すこと。以前は missing だけを
+    # 渡しており、成功しても猶予が戻らなかったため missed_rebuilds が
+    # 「連続失敗回数」ではなく「累計失敗回数」になり、成功を挟んだ
+    # 非連続の失敗3回で健全な銘柄が追い出されていた (Codex レビュー
+    # round 7 で再現)。cron の全再計算は record() を呼ばないので、
+    # 猶予を戻す経路はここしかない。
     _missing = sorted(set(tickers) - set(tickers_result))
-    if _missing:
+    _resolved = sorted(set(tickers_result))
+    if _missing or _resolved:
         try:
             import proposed_ticker_registry
 
-            proposed_ticker_registry.evict_unresolved(
-                _missing,
+            proposed_ticker_registry.reconcile_rebuild(
+                resolved=_resolved,
+                missing=_missing,
                 base_dir=BASE_DIR,
                 rebuild_coverage=(len(tickers_result) / len(tickers)) if tickers else 0.0,
             )

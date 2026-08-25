@@ -1,7 +1,7 @@
 """Deterministic execution-readiness classification for AI recommendations."""
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 import json
@@ -1427,15 +1427,43 @@ def classify_execution_readiness(
                 # 直近の全再計算がこの銘柄を取得できず、前回の補完行を
                 # 引き継いだだけの行。freshness_status は補完時点の値で
                 # 凍結されているため、上の分岐では "fresh" として素通りする
-                # (Codex レビュー round 6 で fail-open を再現)。取得できて
-                # いない事実そのものを理由に、最低でも review へ落とす。
+                # (Codex レビュー round 6 で fail-open を再現)。
+                #
+                # 保存済みの freshness_status を信じず、data_as_of から
+                # 現在のラグを引き直して判定する —— 引き継ぎが続けば行は
+                # 何週間でも残りうるので、「印がある = 一律 review」では
+                # 数週間前のデータまで review 止まりになってしまう
+                # (Codex レビュー round 7)。既存ポリシーと同じ境界を使う:
+                #   lag 0〜1 セッション -> review (人間確認付きで扱える)
+                #   lag 2 セッション以上・日付不明 -> blocked
                 if tech.get("rebuild_unresolved"):
+                    try:
+                        from technical_signals import (
+                            _freshness_status, _last_completed_session, _session_lag,
+                        )
+
+                        _as_of = tech.get("data_as_of")
+                        # ⚠️ expected を明示的に渡す。省略すると
+                        # _last_completed_session が実時刻を使い、呼び出し元が
+                        # 注入した now を無視してしまう (判定が実行時刻依存に
+                        # なり、テストも過去日付の分析も正しく評価できない)。
+                        _lag = _session_lag(
+                            ticker,
+                            date.fromisoformat(str(_as_of)[:10]) if _as_of else None,
+                            expected=_last_completed_session(
+                                ticker, now=now.astimezone(timezone.utc)),
+                        )
+                        _live_status = _freshness_status(_lag)
+                    except Exception:
+                        _live_status = "unknown"
+                    _level = "blocked" if _live_status in {"stale", "unknown"} else "review"
                     add(
-                        "review",
+                        _level,
                         "technical_rebuild_unresolved",
                         f"{ticker} は直近の全再計算で価格を取得できず、前回取得分をそのまま参照している",
                         data_as_of=tech.get("data_as_of"),
                         rebuild_unresolved_at=tech.get("rebuild_unresolved_at"),
+                        recomputed_freshness=_live_status,
                     )
 
         event_result = evaluate_macro_event_gate(

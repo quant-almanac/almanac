@@ -118,3 +118,58 @@ def test_evaluate_scenarios_uses_market_snapshot_and_regime_state(tmp_path, monk
     assert bull["recommended_actions"]["phase_1"] == [{"ticker": "SPY"}]
     assert bull["recommended_actions"]["phase_2"] == [{"ticker": "NVDA"}]
     assert bull["recommended_actions"]["phase_3"] == [{"ticker": "TQQQ"}]
+
+
+def test_an_unresolved_technical_row_cannot_satisfy_a_condition():
+    """引き継がれた行 (rebuild_unresolved) の指標値は現在値ではない。
+
+    直近の全再計算がその銘柄を取得できず、前回取得分の行をそのまま
+    引き継いだ場合、RSI/MACD 等は取得できた時点の値で凍結されている。
+    それで条件を成立させると、数日前の oversold で今日の scenario が
+    発火する (Codex レビュー round 7 で「RSI 10 < 20 → matched=True」を再現)。
+    data_quality_status=blocked と同じ inconclusive 扱いになること。
+    """
+    scenario = {
+        "id": "oversold_entry",
+        "detect": {"technical": {"MDB_rsi": {"condition": "below", "threshold": 20,
+                                             "ticker": "MDB", "indicator": "rsi"}}},
+    }
+    stale_row = {"rsi": 10.0, "data_quality_status": "ok", "data_as_of": "2026-08-01"}
+
+    # 印が無ければ従来どおり成立する = 対照群。
+    without_marker = scenario_engine._eval_technical(
+        scenario, {"tickers": {"MDB": dict(stale_row)}})
+    assert without_marker[0]["matched"] is True
+
+    # 同じ値でも、引き継ぎ行なら成立させない。
+    with_marker = scenario_engine._eval_technical(
+        scenario, {"tickers": {"MDB": {**stale_row, "rebuild_unresolved": True}}})
+    assert with_marker[0]["matched"] is False
+    assert with_marker[0]["detail"] == scenario_engine.INCONCLUSIVE_DETAIL
+    assert with_marker[0]["rebuild_unresolved"] is True
+
+
+def test_ai_input_omits_indicator_values_for_an_unresolved_row():
+    """AI へ渡すテクニカル要約も、引き継ぎ行の指標値を現在値として出さない。
+
+    execution_readiness は risk-increasing 注文しか止めないので、AI の
+    売却判断や配分判断はこの入力を通じて古い値の影響を受ける
+    (Codex レビュー round 7: 「MDB: RSI=10(oversold)」がそのまま渡っていた)。
+    """
+    import analyst
+
+    stale_row = {
+        "rsi": 10.0, "rsi_signal": "oversold", "macd_histogram": -1.0,
+        "bb_pct_b": 0.02, "volume_ratio": 1.0, "composite_score": -80,
+        "data_quality_status": "ok", "data_as_of": "2026-08-01",
+    }
+
+    # 印が無ければ従来どおり数値が出る = 対照群。
+    without_marker = analyst._fmt_technical_state(["MDB"], {"MDB": dict(stale_row)})
+    assert "10" in without_marker
+
+    with_marker = analyst._fmt_technical_state(
+        ["MDB"], {"MDB": {**stale_row, "rebuild_unresolved": True}})
+    assert "判定不能" in with_marker
+    assert "oversold" not in with_marker, "凍結された指標シグナルがAIへ渡っている"
+    assert "2026-08-01" in with_marker, "基準日は示すべき"
