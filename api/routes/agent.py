@@ -1,72 +1,46 @@
 """
 Agent SDK SSE ストリーミングエンドポイント
-GET /api/agent/run?mode=default  → text/event-stream でリアルタイム出力
+POST /api/agent/run?mode=default  → text/event-stream でリアルタイム出力
+
+⚠️ 2026-08-25 の再設計 (Codex レビュー round 11):
+以前はプロンプトに作業ディレクトリの絶対パスと読むべきファイル名を書き、
+allowed_tools=["Read"] を渡していた。プロンプトからファイル名を消しても
+Read が残っていれば Agent は raw ファイルへ戻れるので、入力を
+sanitized projection にし、ツール自体を外した。CLI (portfolio_agent.py) と
+同じ agent_projection の builder / renderer / validator を使う。
 """
 
 import asyncio
 import json
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import AsyncIterator
 
 from fastapi import APIRouter
 from fastapi.responses import StreamingResponse
 
+from agent_projection import (
+    AgentOutputError,
+    AgentProtocolViolation,
+    MODES,
+    build_agent_options,
+    build_agent_projection,
+    build_agent_prompt,
+    parse_agent_result,
+    projection_sha256,
+    validate_agent_output,
+)
+from utils import atomic_write_json
+
 router = APIRouter()
 BASE_DIR = Path(__file__).parent.parent.parent
-AGENT_MAX_TURNS = 10
 
-ANALYSIS_PROMPTS = {
-    "default": f"""\
-あなたは ALMANAC ポートフォリオ AI です。
-作業ディレクトリ: {BASE_DIR}
-
-以下のファイルを順番に読み込み、統合分析を行ってください:
-1. ai_portfolio_analysis.json - 現在の正式な統合分析
-2. technical_state.json       - 現在のテクニカル状態とカバレッジ
-3. holdings.json              - 現在の保有ポジション
-
-分析後、以下の構造で agent_briefing.json に書き出してください:
-{{
-  "as_of": "ISO日時",
-  "overall_stance": "defensive/neutral/moderately_aggressive/aggressive",
-  "headline": "今日の戦略を1行で",
-  "priority_actions": [
-    {{"rank": 1, "urgency": "high/medium/low", "ticker": "銘柄", "action": "具体的アクション", "reason": "根拠"}}
-  ],
-  "risk_warnings": ["警告1", "警告2"],
-  "opportunity": "今週の注目機会"
-}}
-""",
-    "risk": f"""\
-あなたは ALMANAC リスク管理 AI です。
-作業ディレクトリ: {BASE_DIR}
-
-以下を読み込んでリスク集中を分析してください:
-1. holdings.json      - ポジション一覧
-2. guard_state.json   - 現在のガードレール状態
-3. macro_state.json   - マクロ指標
-
-分析観点:
-- 通貨別集中リスク（USD/JPY 比率）
-- セクター別集中リスク
-- 単一銘柄の比率超過（>20% 警告）
-- ガードレール発動リスク（日次/月次損益が基準に近いか）
-
-結果を risk_agent_report.json に書き出してください。
-""",
-    "nisa": f"""\
-あなたは ALMANAC NISA 戦略 AI です。
-作業ディレクトリ: {BASE_DIR}
-
-以下を読み込んで NISA 最適化戦略を立案してください:
-1. nisa_portfolio.json - NISA 保有・枠使用状況
-2. long_term_screen_results.json - 長期スクリーニング結果
-3. macro_state.json - マクロ指標
-
-結果を nisa_agent_strategy.json に書き出してください。
-""",
+# ホストが書く。Agent には触らせない (CLI と同じ表)。
+OUTPUT_FILES = {
+    "default": "agent_briefing.json",
+    "risk": "risk_agent_report.json",
+    "nisa": "nisa_agent_strategy.json",
 }
 
 
@@ -92,7 +66,7 @@ def _log_agent_result(
         "role": "agent_sdk_run",
         "model": "claude-agent-sdk",
         "use_tool": True,
-        "max_turns": AGENT_MAX_TURNS,
+        "max_turns": 1,
         "elapsed_sec": round(time.monotonic() - started, 2),
         "prompt_chars": len(prompt),
         "mode": mode,
@@ -115,36 +89,46 @@ def _sse(event: str, data: dict) -> str:
 
 async def _run_agent(mode: str) -> AsyncIterator[str]:
     try:
-        from claude_agent_sdk import query, ClaudeAgentOptions, ResultMessage, AssistantMessage
+        from claude_agent_sdk import query, ResultMessage, AssistantMessage
         from claude_agent_sdk.types import TextBlock, ToolUseBlock
     except ImportError:
         yield _sse("error", {"message": "claude-agent-sdk が未インストールです"})
         return
 
-    prompt = ANALYSIS_PROMPTS.get(mode, ANALYSIS_PROMPTS["default"])
+    now = datetime.now(timezone.utc)
+    try:
+        projection = build_agent_projection(mode, base_dir=BASE_DIR, now=now)
+    except Exception as exc:
+        yield _sse("error", {"message": f"projection の生成に失敗: {exc}"})
+        return
+
+    prompt = build_agent_prompt(projection)
     started = time.monotonic()
-    # P0-1: allowed_tools を Read のみに削減。
-    # 旧設定は Write/Bash を許可しており、未認証 GET エンドポイントと組み合わさって
-    # ブラウザ CSRF からホームディレクトリ全域への書き込みが可能だった。
-    # Agent SDK の出力は別経路（Telegram or 専用 POST endpoint）で永続化する想定。
-    options = ClaudeAgentOptions(
-        allowed_tools=["Read"],
-        max_turns=AGENT_MAX_TURNS,
-    )
+    # ツールを一切与えない。以前は allowed_tools=["Read"] で、プロンプトから
+    # ファイル名を消しても Agent は raw ファイルへ戻れた
+    # (Codex レビュー round 11)。入力は projection だけ、出力は構造化スキーマ。
+    options = build_agent_options()
 
-    yield _sse("start", {"mode": mode, "message": f"Agent 分析開始 [モード: {mode}]"})
+    yield _sse("start", {
+        "mode": mode,
+        "message": f"Agent 分析開始 [モード: {mode}]",
+        # request_id 等の実行固有情報は payload hash の外。hash 自体は
+        # 「どの projection を見て出した結論か」の監査に必要なので出す。
+        "projection_sha256": projection_sha256(projection),
+        "candidates": len(projection["candidates"]),
+    })
 
+    result_payload = None
     try:
         async for message in query(prompt=prompt, options=options):
             if isinstance(message, AssistantMessage):
                 for block in message.content:
+                    if isinstance(block, ToolUseBlock):
+                        # ツールを与えていないので、使おうとした時点で契約違反。
+                        raise AgentProtocolViolation(
+                            f"agent attempted tool use: {block.name}")
                     if isinstance(block, TextBlock) and block.text.strip():
                         yield _sse("text", {"content": block.text})
-                    elif isinstance(block, ToolUseBlock):
-                        yield _sse("tool", {
-                            "name": block.name,
-                            "input": str(block.input)[:200],
-                        })
             elif isinstance(message, ResultMessage):
                 cost = getattr(message, "total_cost_usd", None)
                 _log_agent_result(
@@ -154,27 +138,42 @@ async def _run_agent(mode: str) -> AsyncIterator[str]:
                     status=message.subtype,
                     cost_usd=cost,
                 )
-                if message.subtype == "success":
-                    yield _sse("done", {
-                        "success": True,
-                        "cost_usd": cost,
-                        "result": (message.result or "")[:500],
-                    })
-                else:
-                    yield _sse("done", {
-                        "success": False,
-                        "error": message.subtype,
-                    })
+                if message.subtype != "success":
+                    yield _sse("done", {"success": False, "error": message.subtype})
+                    return
+                result_payload = message.result
             await asyncio.sleep(0)  # イベントループに制御を返す
+    except AgentProtocolViolation as e:
+        _log_agent_result(mode=mode, prompt=prompt, started=started,
+                          status="protocol_violation", error=e)
+        yield _sse("error", {"message": f"プロトコル違反: {e}"})
+        return
     except Exception as e:
-        _log_agent_result(
-            mode=mode,
-            prompt=prompt,
-            started=started,
-            status="error",
-            error=e,
-        )
+        _log_agent_result(mode=mode, prompt=prompt, started=started,
+                          status="error", error=e)
         yield _sse("error", {"message": str(e)})
+        return
+
+    # ── ホスト側の検証と保存 ──
+    # 検証に落ちたら **保存しない**。last-known-good をそのまま残し、
+    # 監査ログへ隔離する。
+    try:
+        raw = parse_agent_result(result_payload)
+        verified = validate_agent_output(raw, projection, base_dir=BASE_DIR)
+    except AgentOutputError as e:
+        _log_agent_result(mode=mode, prompt=prompt, started=started,
+                          status="output_rejected", error=e)
+        yield _sse("error", {"message": f"出力の検証に失敗、保存しません: {e}"})
+        return
+
+    atomic_write_json(BASE_DIR / OUTPUT_FILES[mode],
+                      {**verified, "as_of": now.isoformat()})
+    yield _sse("done", {
+        "success": True,
+        "saved": OUTPUT_FILES[mode],
+        "actions": len(verified["actions"]),
+        "projection_sha256": verified["projection_sha256"],
+    })
 
 
 @router.post("/api/agent/run")
@@ -184,7 +183,7 @@ async def run_agent(mode: str = "default"):
     認証 middleware が POST のみ X-API-Key を要求するため、未認証ブラウザ CSRF で
     Agent SDK を起動されるリスクを塞ぐ。SSE のレスポンスは POST でも問題なく返せる。
     """
-    if mode not in ANALYSIS_PROMPTS:
+    if mode not in MODES:
         mode = "default"
     return StreamingResponse(
         _run_agent(mode),
@@ -199,12 +198,7 @@ async def run_agent(mode: str = "default"):
 @router.get("/api/agent/result")
 async def get_agent_result(mode: str = "default"):
     """最後の Agent 分析結果を返す。agent_briefing.json が古い場合は ai_portfolio_analysis.json にフォールバック"""
-    file_map = {
-        "default": "agent_briefing.json",
-        "risk": "risk_agent_report.json",
-        "nisa": "nisa_agent_strategy.json",
-    }
-    path = BASE_DIR / file_map.get(mode, "agent_briefing.json")
+    path = BASE_DIR / OUTPUT_FILES.get(mode, "agent_briefing.json")
 
     # defaultモードの場合、両方の実時刻を比較して新しい方を返す。
     if mode == "default":
