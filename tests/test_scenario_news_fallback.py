@@ -315,3 +315,24 @@ def test_scenario_data_health_weekend_grace_is_independent_of_host_timezone():
 
     assert health["scenario"]["stale_after_hours"] == 24, (
         "ホストが UTC のとき、JST 基準の週末猶予判定が崩れている")
+
+
+def test_scenario_data_health_future_timestamp_is_fail_closed_to_stale():
+    """dashboard.py と全く同じ fail-open バグ・同じ修正 (api/routes/scenario.py
+    の _state_file_health も age_hours の符号を見ずに stale 判定していた)。
+    """
+    now = datetime(2026, 5, 25, 10, 0, tzinfo=timezone.utc)
+    future = (now + timedelta(hours=6)).isoformat()
+
+    health = _build_data_health(
+        {"evaluated_at": future},
+        {"cached_at": future, "news_items": [{"headline": "x"}]},
+        {"cached_at": future},
+        {"cached_at": future},
+        {"cached_at": future},
+        now=now,
+    )
+
+    assert health["scenario"]["age_hours"] == -6.0
+    assert health["scenario"]["stale"] is True, "未来の timestamp が fresh 扱いされている"
+    assert health["scenario"].get("future_timestamp") is True

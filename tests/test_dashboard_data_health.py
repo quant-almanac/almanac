@@ -152,3 +152,35 @@ def test_weekend_grace_decision_is_independent_of_host_timezone(tmp_path, monkey
     assert health["sources"]["scenario"]["stale_after_hours"] == 24, (
         "ホストが UTC のとき、JST 基準の週末猶予判定が崩れている")
     assert health["sources"]["scenario"]["stale"] is True
+
+
+def test_a_future_timestamp_is_fail_closed_to_stale(tmp_path):
+    """時計ずれ・壊れた state で未来の timestamp が書かれても fresh 扱いしない。
+
+    以前は age_hours が負になると `age_hours > effective_stale_after` が
+    常に False で stale=False (fresh) になっていた
+    (レビューで実測: 6時間未来の timestamp が stale=False)。
+    """
+    now = datetime(2026, 5, 25, 10, 0, tzinfo=timezone.utc)
+    future = (now + timedelta(hours=6)).isoformat()
+    fresh = (now - timedelta(hours=1)).isoformat()
+
+    for name, key in (
+        ("guard_state.json", "updated_at"), ("regime_state.json", "updated"),
+        ("ai_portfolio_analysis.json", "as_of"), ("scenario_state.json", "evaluated_at"),
+        ("vix_state.json", "cached_at"), ("technical_state.json", "cached_at"),
+        ("macro_state.json", "cached_at"), ("news_sentiment_summary.json", "as_of"),
+    ):
+        _write_json(tmp_path / name, {key: future})
+
+    health = _build_data_health(base_dir=tmp_path, now=now)
+    guard = health["sources"]["guard"]
+    assert guard["age_hours"] == -6.0
+    assert guard["stale"] is True, "未来の timestamp が fresh 扱いされている"
+    assert guard.get("future_timestamp") is True
+
+    # 正当な fresh timestamp (過去) は影響を受けないこと。
+    _write_json(tmp_path / "guard_state.json", {"updated_at": fresh})
+    health2 = _build_data_health(base_dir=tmp_path, now=now)
+    assert health2["sources"]["guard"]["stale"] is False
+    assert "future_timestamp" not in health2["sources"]["guard"]

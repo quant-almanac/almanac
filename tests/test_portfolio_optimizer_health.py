@@ -2,6 +2,7 @@ import math
 
 import numpy as np
 import pandas as pd
+import pytest
 
 import portfolio_optimizer as optimizer
 
@@ -111,3 +112,31 @@ class TestReadOnlyCovarianceIsHandled:
         result = optimizer.optimize_pypfopt(returns)
         assert isinstance(result, dict)
         assert result.get("error") is None or "read-only" not in str(result.get("error"))
+
+    def test_bl_optimize_survives_a_read_only_covariance_view(self, monkeypatch, tmp_path):
+        """bl_optimize() 側の同じ修正 (line 336付近) を固定する。
+
+        ⚠️ この行は BlackLittermanModel の try/except の **外側** にある
+        (import の失敗だけを捕まえる try/except ImportError の後、
+        本体の try/except Exception の前)。回帰すると ValueError が
+        bl_optimize() の外へそのまま漏れる (レビューで指摘: optimize_pypfopt
+        だけにテストがあり、こちらには無かった)。
+        """
+        pytest.importorskip("pypfopt.black_litterman")
+        returns = self._read_only_returns()
+
+        real_values = pd.DataFrame.values
+
+        def _readonly_values(self):
+            arr = real_values.fget(self).copy()
+            arr.flags.writeable = False
+            return arr
+
+        monkeypatch.setattr(pd.DataFrame, "values", property(_readonly_values))
+
+        # holdings.json / bl_views.json が無い最小構成 (views_used=0 の
+        # 市場均衡のみのパス) で、read-only な cov だけを問題にする。
+        result = optimizer.bl_optimize(
+            returns, bl_views_path=tmp_path / "no_such_bl_views.json")
+        assert isinstance(result, dict)
+        assert "read-only" not in str(result.get("error", ""))

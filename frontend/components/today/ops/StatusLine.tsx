@@ -3,6 +3,7 @@ import { useEffect, useState } from 'react'
 import { OPS, fmtAge } from './tokens'
 import type { AlmanacSession, Command, TodayOps } from './types'
 import FreshnessDots from './FreshnessDots'
+import { jstHHMM, jstMinutesOfDay, jstMonthDay } from './jstTime'
 
 /**
  * MARKET RAIL — 画面最上部の市場ステータス帯。
@@ -27,12 +28,12 @@ function inSession(nowMin: number, start: string, end: string): boolean {
 
 type MarketState = { label: string; status: string; tone: string; note?: string }
 
-function marketState(sessions: AlmanacSession[], market: string, jp: string, now: Date | null): MarketState {
+export function marketState(sessions: AlmanacSession[], market: string, jp: string, now: Date | null): MarketState {
   const mine = sessions.filter(s => s.market === market)
   if (mine.length === 0) return { label: jp, status: '—', tone: OPS.dim }
 
   if (now) {
-    const nowMin = now.getHours() * 60 + now.getMinutes()
+    const nowMin = jstMinutesOfDay(now)
     const live = mine
       .filter(s => s.is_open_day !== false && inSession(nowMin, s.start, s.end))
       .sort((a, b) => Number(b.phase === 'regular') - Number(a.phase === 'regular'))[0]
@@ -52,7 +53,8 @@ function marketState(sessions: AlmanacSession[], market: string, jp: string, now
   if (nextIso) {
     const d = new Date(nextIso)
     if (!Number.isNaN(d.getTime())) {
-      note = `次 ${d.getMonth() + 1}/${d.getDate()} ${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`
+      const { month, date } = jstMonthDay(d)
+      note = `次 ${month}/${date} ${jstHHMM(d)}`
     }
   }
   return { label: jp, status: holiday ? 'CLOSED' : 'OFF-HOURS', tone: OPS.dim, note }

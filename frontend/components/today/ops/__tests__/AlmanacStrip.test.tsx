@@ -1,7 +1,8 @@
 import { cleanup, fireEvent, render, screen, within } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
-import AlmanacStrip, { jstHHMM, jstMinutesOfDay } from '../AlmanacStrip'
+import AlmanacStrip from '../AlmanacStrip'
+import { jstHHMM, jstMinutesOfDay } from '../jstTime'
 import type { AlmanacData, ExecutionPlan } from '../types'
 
 const plan: ExecutionPlan = {

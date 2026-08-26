@@ -5,6 +5,7 @@ import { Fragment, useEffect, useMemo, useState, type CSSProperties } from 'reac
 import { OPS, fmtJpy } from './tokens'
 import { Seal } from './ornament'
 import { SectionHead } from './Shell'
+import { jstHHMM, jstMinutesOfDay } from './jstTime'
 import { ExecutionPlanModal } from './PlanRail'
 import { scopeMismatchLine, scopeMismatchView } from './scopeMismatch'
 import type { AlmanacData, AlmanacEvent, ExecutionPlan, PastTrade } from './types'
@@ -590,20 +591,6 @@ function durationLabel(totalMinutes: number): string {
   const hours = Math.floor(totalMinutes / 60)
   const minutes = totalMinutes % 60
   return hours > 0 ? `${hours}時間${minutes ? `${minutes}分` : ''}` : `${minutes}分`
-}
-
-// ⚠️ Date.getHours()/getMinutes() はブラウザのローカルタイムゾーンを使う。
-// この画面は「JST」と明示ラベルしているが、ホストのタイムゾーン設定が
-// JST でない環境 (UTC 設定の CI, 海外設定の端末) では表示も
-// セッション判定もずれる。日本は DST が無いので UTC+9 固定として扱える。
-export function jstMinutesOfDay(date: Date): number {
-  const jst = new Date(date.getTime() + 9 * 60 * 60 * 1000)
-  return jst.getUTCHours() * 60 + jst.getUTCMinutes()
-}
-
-export function jstHHMM(date: Date): string {
-  const jst = new Date(date.getTime() + 9 * 60 * 60 * 1000)
-  return `${String(jst.getUTCHours()).padStart(2, '0')}:${String(jst.getUTCMinutes()).padStart(2, '0')}`
 }
 
 function clockSegments(start: string, end: string): Array<{ start: number; end: number }> {

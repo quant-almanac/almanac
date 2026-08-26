@@ -1157,6 +1157,39 @@ def resolve_agent_model() -> str:
 AGENT_MAX_BUDGET_USD = 0.50
 
 
+def build_agent_options_kwargs() -> dict:
+    """ClaudeAgentOptions へ渡す kwargs を素の dict として組み立てる。
+
+    ⚠️ 安全契約 (ツール禁止・構造化出力の強制・model/予算の明示) を
+    検証するテストが、この dict を直接検査できるようにするために
+    `ClaudeAgentOptions(...)` の呼び出しから分離してある。
+
+    claude-agent-sdk は 0.1.8 以降 macOS 専用のプラットフォーム別
+    wheel になり、CI (ubuntu-latest) にインストールできる Linux wheel が
+    存在しない。以前は4件の安全契約テストが `pytest.importorskip` で
+    SDK 未インストール環境ではまるごと skip されており、CI ではこの
+    契約が一度も検証されていなかった (レビューで指摘: Round 11-13 で
+    塞いだはずの核心的な安全契約が CI 上は無検証だった)。
+    ここを純粋な dict 構築にしておけば、SDK 無しでも contents を検証できる。
+    """
+    return {
+        "tools": [],
+        "allowed_tools": [],
+        "disallowed_tools": ["Read", "Write", "Edit", "Bash", "Glob", "Grep"],
+        "setting_sources": [],
+        # ⚠️ SDK は {"type": "json_schema", "schema": ...} の形でしか
+        # --json-schema を CLI へ渡さない。素のスキーマを渡すと **黙って
+        # 無視され**、本番だけ自由形式出力になる
+        # (Codex レビュー round 12: 生成コマンドに --json-schema が無かった)。
+        "output_format": {"type": "json_schema", "schema": OUTPUT_SCHEMA},
+        "max_turns": 1,
+        # 課金経路なので model と上限を明示する。既定任せにしない
+        # (Codex レビュー round 13: model=None / max_budget_usd=None だった)。
+        "model": resolve_agent_model(),
+        "max_budget_usd": AGENT_MAX_BUDGET_USD,
+    }
+
+
 def build_agent_options():
     """ツールを一切与えない ClaudeAgentOptions。
 
@@ -1167,22 +1200,7 @@ def build_agent_options():
     """
     from claude_agent_sdk import ClaudeAgentOptions
 
-    return ClaudeAgentOptions(
-        tools=[],
-        allowed_tools=[],
-        disallowed_tools=["Read", "Write", "Edit", "Bash", "Glob", "Grep"],
-        setting_sources=[],
-        # ⚠️ SDK は {"type": "json_schema", "schema": ...} の形でしか
-        # --json-schema を CLI へ渡さない。素のスキーマを渡すと **黙って
-        # 無視され**、本番だけ自由形式出力になる
-        # (Codex レビュー round 12: 生成コマンドに --json-schema が無かった)。
-        output_format={"type": "json_schema", "schema": OUTPUT_SCHEMA},
-        max_turns=1,
-        # 課金経路なので model と上限を明示する。既定任せにしない
-        # (Codex レビュー round 13: model=None / max_budget_usd=None だった)。
-        model=resolve_agent_model(),
-        max_budget_usd=AGENT_MAX_BUDGET_USD,
-    )
+    return ClaudeAgentOptions(**build_agent_options_kwargs())
 
 
 class AgentProtocolViolation(AgentOutputError):

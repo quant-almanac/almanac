@@ -14,6 +14,9 @@ from zoneinfo import ZoneInfo
 # 「月曜 10:00 JST」が「月曜 01:00 UTC」として評価されて週末猶予が
 # 誤って発動していた (レビューが導入した CI 分離で初めて実行され発覚)。
 _JST = ZoneInfo("Asia/Tokyo")
+
+#: 時計ずれの許容幅。これを超えて未来の timestamp は壊れているとみなす。
+_FUTURE_TOLERANCE_HOURS = 1.0
 from pathlib import Path
 from fastapi import APIRouter
 
@@ -134,6 +137,13 @@ def _state_file_health(
     if dt:
         age_hours = round(((now or datetime.now(timezone.utc)) - dt).total_seconds() / 3600, 1)
 
+    # ⚠️ 時計ずれ・壊れた state・タイムゾーンの取り違えで未来のタイムスタンプ
+    # が書き込まれると、age_hours が負になり `age_hours > effective_stale_after`
+    # が常に False で fresh 扱いされていた (レビューで実測: 6時間未来の
+    # timestamp が stale=False になる)。負の age は許容幅を超えたら stale へ
+    # fail-closed する —— 「新しすぎる」も「壊れている」の一種として扱う。
+    is_future = age_hours is not None and age_hours < -_FUTURE_TOLERANCE_HOURS
+
     return {
         "source_file": filename,
         "exists": True,
@@ -141,7 +151,8 @@ def _state_file_health(
         "timestamp_source": timestamp_source,
         "age_hours": age_hours,
         "stale_after_hours": effective_stale_after,
-        "stale": age_hours is None or age_hours > effective_stale_after,
+        "stale": age_hours is None or is_future or age_hours > effective_stale_after,
+        **({"future_timestamp": True} if is_future else {}),
     }
 
 

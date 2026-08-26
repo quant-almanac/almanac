@@ -237,34 +237,43 @@ class TestModeIsolation:
 
 
 class TestAgentOptionsHaveNoTools:
+    """安全契約 (ツール禁止・構造化出力の強制) を検証する。
+
+    ⚠️ 以前はここが `claude_agent_sdk` のインストールに依存しており、
+    CI の軽量依存セット (SDK 無し) では importorskip で丸ごと skip されて
+    いた。claude-agent-sdk は 0.1.8 以降 macOS 専用のプラットフォーム別
+    wheel になり、CI (ubuntu-latest) にインストールできる Linux wheel が
+    無い —— 古い互換バージョン (0.1.7 以下) を入れる手もあるが、本番が
+    実際に使う 0.1.50 と40件以上のパッチ差があり、そちらで契約テストを
+    通しても本番の挙動を保証したことにならない (レビューで指摘)。
+
+    Round 11-13 で塞いだはずのこの安全契約が CI 上は一度も検証されて
+    いなかった、という指摘に対する修正: `build_agent_options_kwargs()`
+    (SDK 非依存の純粋な dict 構築) を直接検査することで、SDK の有無に
+    関わらず常に実行されるようにする。
+    """
+
     def test_no_tools_are_granted(self):
-        # ⚠️ claude_agent_sdk は CI の軽量依存セットに含まれない
-        # (torch 等と同様、意図的に除外されている実行時専用パッケージ)。
-        # 未インストール環境ではこの3件を skip する (レビューでの実測:
-        # CI で ModuleNotFoundError として落ちていた)。
-        pytest.importorskip("claude_agent_sdk")
-        options = ap.build_agent_options()
-        assert options.tools == []
-        assert options.allowed_tools == []
-        assert options.setting_sources == []
-        assert options.max_turns == 1
+        kwargs = ap.build_agent_options_kwargs()
+        assert kwargs["tools"] == []
+        assert kwargs["allowed_tools"] == []
+        assert kwargs["setting_sources"] == []
+        assert kwargs["max_turns"] == 1
 
     def test_file_tools_are_explicitly_denied(self):
         """allowed_tools が空であることの二重の担保。SDK の既定が将来
         変わってもファイル系ツールは効かない。"""
-        pytest.importorskip("claude_agent_sdk")
-        options = ap.build_agent_options()
+        kwargs = ap.build_agent_options_kwargs()
         for tool in ("Read", "Write", "Edit", "Bash", "Glob", "Grep"):
-            assert tool in options.disallowed_tools
+            assert tool in kwargs["disallowed_tools"]
 
     def test_a_structured_output_schema_is_required(self):
-        pytest.importorskip("claude_agent_sdk")
-        options = ap.build_agent_options()
-        assert options.output_format is not None
+        kwargs = ap.build_agent_options_kwargs()
+        assert kwargs["output_format"] is not None
         # SDK は {"type": "json_schema", "schema": ...} でしか --json-schema を
         # 渡さない。素のスキーマだと黙って無視される (round 12)。
-        assert options.output_format["type"] == "json_schema"
-        assert options.output_format["schema"]["additionalProperties"] is False
+        assert kwargs["output_format"]["type"] == "json_schema"
+        assert kwargs["output_format"]["schema"]["additionalProperties"] is False
 
 
 class TestOutputValidation:
@@ -527,10 +536,9 @@ class TestRound13Blockers:
         assert "usable" in out
 
     def test_the_run_uses_an_explicit_model_and_budget(self):
-        pytest.importorskip("claude_agent_sdk")
-        options = ap.build_agent_options()
-        assert options.model, "課金経路で model を既定任せにしない"
-        assert options.max_budget_usd is not None
+        kwargs = ap.build_agent_options_kwargs()
+        assert kwargs["model"], "課金経路で model を既定任せにしない"
+        assert kwargs["max_budget_usd"] is not None
 
     def test_a_stale_write_is_refused(self, tmp_path):
         """古い run が新しい保存物を上書きしない (CAS)。"""
@@ -814,27 +822,26 @@ def test_the_identity_baseline_is_occurrence_count_not_file_exemption():
     assert "findall" in checker_src, "出現回数で比較していない"
 
 
-def test_the_agent_options_tests_declare_the_sdk_as_optional():
-    """claude_agent_sdk 依存のテストが importorskip を持つこと。
+def test_build_agent_options_wraps_the_kwargs_unchanged():
+    """SDK ありの統合テスト (1件のみ)。
 
-    以前は素の import 依存で、CI の軽量依存セット (claude_agent_sdk 無し)
-    では ModuleNotFoundError による collection error になり、それ以降の
-    テストが一切実行されなかった (レビューで実測)。
-    importorskip なら未インストール環境で正しく skip になる —— pytest 自身の
-    十分にテストされた挙動なので、ここでは「呼んでいるか」だけを検査する。
+    安全契約そのものは TestAgentOptionsHaveNoTools が SDK 非依存で常に
+    検証する。ここでは「`ClaudeAgentOptions(**kwargs)` が
+    `build_agent_options_kwargs()` の値をそのまま反映しているか」という
+    配線だけを、SDK が実際にインストールされている環境で確認する
+    (ローカル開発機・本番では claude-agent-sdk 0.1.50 が入っている)。
+    SDK 未インストールの CI では skip されるが、安全契約自体は
+    TestAgentOptionsHaveNoTools が別途担保しているので、CI がこの契約を
+    無検証で通すことはない。
     """
-    import ast as _ast
-
-    tree = _ast.parse(Path(__file__).read_text(encoding="utf-8"))
-    target_names = {
-        "test_no_tools_are_granted", "test_file_tools_are_explicitly_denied",
-        "test_a_structured_output_schema_is_required",
-        "test_the_run_uses_an_explicit_model_and_budget",
-    }
-    found = set()
-    for node in _ast.walk(tree):
-        if isinstance(node, _ast.FunctionDef) and node.name in target_names:
-            src = _ast.dump(node)
-            if "importorskip" in src and "claude_agent_sdk" in src:
-                found.add(node.name)
-    assert found == target_names, f"importorskip が抜けている: {target_names - found}"
+    pytest.importorskip("claude_agent_sdk")
+    kwargs = ap.build_agent_options_kwargs()
+    options = ap.build_agent_options()
+    assert options.tools == kwargs["tools"]
+    assert options.allowed_tools == kwargs["allowed_tools"]
+    assert options.disallowed_tools == kwargs["disallowed_tools"]
+    assert options.setting_sources == kwargs["setting_sources"]
+    assert options.output_format == kwargs["output_format"]
+    assert options.max_turns == kwargs["max_turns"]
+    assert options.model == kwargs["model"]
+    assert options.max_budget_usd == kwargs["max_budget_usd"]
