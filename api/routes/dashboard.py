@@ -4,6 +4,16 @@ guard_state.json + regime_state.json を返す
 """
 import sys
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
+
+# ⚠️ ホストの実行環境ローカルタイムゾーンではなく明示的に JST を使う。
+# この平日 cron / 週末猶予の判定は日本市場・日本の実行スケジュールが
+# 前提で、bare .astimezone() (引数無し) はホストの OS 設定タイムゾーンに
+# 依存する。開発機 (JST 設定) では意図通り動くが、CI ランナー (UTC 設定)
+# では同じ injected now でも weekday()/hour の判定結果が変わり、
+# 「月曜 10:00 JST」が「月曜 01:00 UTC」として評価されて週末猶予が
+# 誤って発動していた (レビューが導入した CI 分離で初めて実行され発覚)。
+_JST = ZoneInfo("Asia/Tokyo")
 from pathlib import Path
 from fastapi import APIRouter
 
@@ -53,8 +63,7 @@ def _parse_datetime(value: str | None) -> datetime | None:
         text = str(value).replace("Z", "+00:00")
         dt = datetime.fromisoformat(text)
         if dt.tzinfo is None:
-            local_tz = datetime.now().astimezone().tzinfo or timezone.utc
-            return dt.replace(tzinfo=local_tz).astimezone(timezone.utc)
+            return dt.replace(tzinfo=_JST).astimezone(timezone.utc)
         return dt.astimezone(timezone.utc)
     except Exception:
         return None
@@ -79,7 +88,7 @@ def _effective_stale_after_hours(
     """週末をまたぐ平日 cron source の false stale を避ける。"""
     if weekend_grace_hours is None:
         return stale_after_hours
-    local_now = (now or datetime.now(timezone.utc)).astimezone()
+    local_now = (now or datetime.now(timezone.utc)).astimezone(_JST)
     is_weekend = local_now.weekday() in (5, 6)
     is_monday_before_first_run = local_now.weekday() == 0 and local_now.hour < 9
     if is_weekend or is_monday_before_first_run:

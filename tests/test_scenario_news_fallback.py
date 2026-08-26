@@ -280,3 +280,38 @@ def test_recommended_actions_preserve_phase3_sell_triggers_and_confirmations():
     assert actions["phase_3"][0]["ticker"] == "TQQQ"
     assert actions["sell_on_trigger"] == ["GLD", "TLT"]
     assert actions["confirmation_required"]["phase_3"] == ["momentum acceleration"]
+
+
+def test_scenario_data_health_weekend_grace_is_independent_of_host_timezone():
+    """dashboard.py と全く同じ重複バグ・同じ修正 (api/routes/scenario.py の
+    _effective_stale_after_hours も bare .astimezone() を使っていた)。
+    """
+    jst = timezone(timedelta(hours=9))
+    monday_after_run = datetime(2026, 5, 25, 10, 0, tzinfo=jst)
+    friday_evening = (monday_after_run - timedelta(hours=61)).isoformat()
+    fresh = (monday_after_run - timedelta(hours=1)).isoformat()
+
+    import os as _os
+    import time as _time
+
+    original_tz = _os.environ.get("TZ")
+    _os.environ["TZ"] = "UTC"
+    _time.tzset()
+    try:
+        health = _build_data_health(
+            {"evaluated_at": friday_evening},
+            {"cached_at": friday_evening, "news_items": [{"headline": "x"}]},
+            {"cached_at": friday_evening},
+            {"cached_at": fresh},
+            {"cached_at": fresh},
+            now=monday_after_run,
+        )
+    finally:
+        if original_tz is None:
+            _os.environ.pop("TZ", None)
+        else:
+            _os.environ["TZ"] = original_tz
+        _time.tzset()
+
+    assert health["scenario"]["stale_after_hours"] == 24, (
+        "ホストが UTC のとき、JST 基準の週末猶予判定が崩れている")

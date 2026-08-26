@@ -8,6 +8,14 @@ import json
 import subprocess
 import sys
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
+
+# ⚠️ dashboard.py と全く同じ関数が重複していた (api/routes/dashboard.py 参照)。
+# ホストのローカルタイムゾーンではなく明示的に JST を使う —— CI ランナー
+# (UTC 設定) では bare .astimezone() が injected now を UTC 側へ変換し、
+# 月曜朝の判定がずれて週末猶予が誤って発動していた
+# (レビューが導入した CI 分離で発覚)。
+_JST = ZoneInfo("Asia/Tokyo")
 from pathlib import Path
 from fastapi import APIRouter
 
@@ -58,8 +66,7 @@ def _parse_datetime(value: str | None) -> datetime | None:
         text = str(value).replace("Z", "+00:00")
         dt = datetime.fromisoformat(text)
         if dt.tzinfo is None:
-            local_tz = datetime.now().astimezone().tzinfo or timezone.utc
-            return dt.replace(tzinfo=local_tz).astimezone(timezone.utc)
+            return dt.replace(tzinfo=_JST).astimezone(timezone.utc)
         return dt.astimezone(timezone.utc)
     except Exception:
         return None
@@ -74,7 +81,7 @@ def _effective_stale_after_hours(
     """平日 cron source の週末 false stale を避ける。"""
     if weekend_grace_hours is None:
         return stale_after_hours
-    local_now = (now or datetime.now(timezone.utc)).astimezone()
+    local_now = (now or datetime.now(timezone.utc)).astimezone(_JST)
     is_weekend = local_now.weekday() in (5, 6)
     is_monday_before_first_run = local_now.weekday() == 0 and local_now.hour < 9
     if is_weekend or is_monday_before_first_run:

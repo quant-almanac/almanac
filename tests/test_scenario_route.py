@@ -147,15 +147,19 @@ def test_effective_stale_sunday_returns_grace() -> None:
 
 
 def test_effective_stale_monday_before_9_returns_grace() -> None:
-    """Monday 07:00 in the *local* timezone → hour < 9 → grace applies.
+    """Monday 07:00 JST → hour < 9 → grace applies.
 
-    The function converts `now` via .astimezone() so we must build the
-    datetime in local time directly to avoid UTC-offset ambiguity.
+    ⚠️ The function now converts `now` via .astimezone(_JST) — an explicit
+    JST, not the host's OS-configured local timezone (that was the actual
+    bug: on a UTC-configured CI runner, the old bare .astimezone() gave a
+    different weekday/hour than on a JST-configured dev machine for the
+    same wall-clock instant). Build the datetime in explicit JST so this
+    test's result no longer depends on what timezone the host happens to be
+    running under.
     """
-    import datetime as _dt
-    local_tz = _dt.datetime.now().astimezone().tzinfo
-    # 2026-05-25 is a Monday; 07:00 local is before the 09:00 first-run cutoff
-    monday_before_9 = _dt.datetime(2026, 5, 25, 7, 0, 0, tzinfo=local_tz)
+    jst = timezone(timedelta(hours=9))
+    # 2026-05-25 is a Monday; 07:00 JST is before the 09:00 first-run cutoff
+    monday_before_9 = datetime(2026, 5, 25, 7, 0, 0, tzinfo=jst)
     result = _effective_stale_after_hours(24.0, weekend_grace_hours=72.0, now=monday_before_9)
     assert result == 72.0
 
