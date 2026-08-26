@@ -220,3 +220,51 @@ def test_a_missing_structured_output_is_fail_closed(monkeypatch, sandbox):
     assert any("event: error" in chunk for chunk in chunks)
     assert rows[-1]["status"] == "output_rejected"
     assert not (sandbox / "agent_briefing.json").exists()
+
+
+def test_a_known_cost_survives_being_logged_alongside_an_error(monkeypatch, sandbox):
+    """判明済みのコストを、エラー記録が 0.0 で上書きしない。
+
+    output_rejected は ResultMessage の後なので実コストを持つ。以前は
+    error 引数がある行を無条件で cost_usd=0.0 に上書きしており、
+    「不明」と「既知の0円」の区別も、既知のコスト自体も失っていた
+    (レビューで実測)。
+    """
+    rows: list[dict] = []
+    _install_fake_sdk(
+        monkeypatch, blocks=[_TextBlock("analysis")], cost=0.0456,
+        # projection に無い銘柄を提案してくる → output_rejected。
+        result=json.dumps({
+            "headline": "h", "overall_stance": "neutral", "risk_warnings": [],
+            "actions": [{"rank": 1, "candidate_id": "candidate:FABRICATED",
+                         "action_type": "buy", "actionability": "review",
+                         "reason": "r"}],
+        }),
+    )
+    monkeypatch.setattr(agent, "_append_llm_call_log", lambda row: rows.append(row),
+                        raising=False)
+
+    asyncio.run(_collect_agent_chunks("default"))
+
+    row = rows[-1]
+    assert row["status"] == "output_rejected"
+    assert row["cost_usd"] == 0.0456, "判明済みのコストが 0.0 へ上書きされた"
+
+
+def test_a_cost_unknown_before_any_result_is_not_reported_as_zero(monkeypatch, sandbox):
+    """ResultMessage が届く前の失敗はコスト不明。0円と断定しない。"""
+    rows: list[dict] = []
+    _install_fake_sdk(
+        monkeypatch,
+        blocks=[_TextBlock("analysis"), _ToolUseBlock("Read", {"file": "x"})],
+        result=_valid_agent_output(sandbox),
+    )
+    monkeypatch.setattr(agent, "_append_llm_call_log", lambda row: rows.append(row),
+                        raising=False)
+
+    asyncio.run(_collect_agent_chunks("default"))
+
+    row = rows[-1]
+    assert row["status"] == "protocol_violation"
+    assert "cost_usd" not in row
+    assert row.get("cost_status") == "unknown"

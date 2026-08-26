@@ -1,111 +1,182 @@
+# path	pattern_name	allowed_count
+#
 # 初回の公開スナップショット由来で、保有者を特定できる文字列を既に含む
-# ファイル。アプリ本体は世帯2名ぶんの owner と特定のウォレット経路を
-# モデル化しており、これらは機能上必要なため単純には消せない。
+# ファイル・パターンごとの許容出現数。ファイル単位の免除ではない ——
+# 同じファイルでも、記録した回数を超えて新たに出現したら検査は失敗する。
+# 行を書き換えるときは、本当に増加が必要か毎回確認すること。
 #
 # この一覧の目的は「新しい混入を止める」ことだけ。公開ミラーがそもそも
 # これらを含んでよいのか、履歴を書き換えるのかは人間の判断。
-# ⚠️ このファイルへ行を足すときは、本当に必要か毎回確認すること。
-almanac/observability/outcome_updater.py
-analyst/__init__.py
-analyst/data_gatherer.py
-analyst/order_strategy.py
-api/routes/actions.py
-api/routes/admin.py
-api/routes/cash.py
-api/routes/contributions.py
-api/routes/decision.py
-api/routes/nisa.py
-api/routes/today.py
-broker_balance_import.py
-broker_position_import.py
-broker_reconcile.py
-capital_deployment.py
-credit_card_investment.py
-data_fetcher.py
-decision_support.py
-event_ledger_backfill.py
-examples/private_state/credit_card_plans.example.json
-examples/private_state/nisa_portfolio.example.json
-execution_plan_engine.py
-execution_readiness.py
-execution_safety.py
-factor_attribution.py
-frontend/app/admin/page.tsx
-frontend/app/cash/page.tsx
-frontend/app/decision/page.tsx
-frontend/app/nisa/page.tsx
-frontend/components/today/ops/ActionSection.tsx
-frontend/components/today/ops/ExecutionForm.tsx
-frontend/components/today/ops/PlanRail.tsx
-frontend/components/today/ops/TrustSection.tsx
-frontend/components/today/ops/__tests__/AlmanacStrip.test.tsx
-frontend/components/today/ops/__tests__/CommandDeck.test.tsx
-frontend/components/today/ops/__tests__/ExecutionForm.test.tsx
-frontend/components/today/ops/__tests__/fundingRoutes.test.tsx
-frontend/components/today/ops/types.ts
-frontend/lib/api.ts
-fx_exposure.py
-ledger_trade_corrections.py
-nav_backfill.py
-nexus_mcp/nexustrader_server.py
-nisa_allocator.py
-nisa_migration_planner.py
-parquet_rebuilder.py
-portfolio_manager.py
-portfolio_risk_returns.py
-position_identity.py
-pseudo_tickers.py
-scripts/check_public_safety.py
-sync_broker_short_us_index.py
-tax_optimizer.py
-technical_signals.py
-tests/test_action_stage_log_routing.py
-tests/test_action_state_dedup.py
-tests/test_actions_ledger_safety.py
-tests/test_actions_save_execution.py
-tests/test_actions_schema.py
-tests/test_alert_state_freshness.py
-tests/test_broker_balance_import.py
-tests/test_broker_cost_basis.py
-tests/test_broker_position_import.py
-tests/test_broker_reconcile.py
-tests/test_broker_short_us_index_e2e.py
-tests/test_capital_allocator.py
-tests/test_capital_deployment.py
-tests/test_cash_movement_confirmations.py
-tests/test_cash_rollforward.py
-tests/test_cash_route.py
-tests/test_cash_route_safety.py
-tests/test_cash_wallet_projection.py
-tests/test_contribution_ledger.py
-tests/test_contribution_schedule_cash_routes.py
-tests/test_contributions_api.py
-tests/test_credit_card_purchase_undo.py
-tests/test_event_ledger_backfill.py
-tests/test_execution_invalidation.py
-tests/test_execution_plan_engine.py
-tests/test_execution_quality.py
-tests/test_execution_readiness.py
-tests/test_execution_reconciliation.py
-tests/test_execution_safety.py
-tests/test_exit_sizing.py
-tests/test_factor_attribution_extended.py
-tests/test_fx_exposure.py
-tests/test_fx_hedge_policy.py
-tests/test_holdings_freshness.py
-tests/test_investment_policy.py
-tests/test_kelly_shadow.py
-tests/test_nisa_2024.py
-tests/test_phase1_post_filter.py
-tests/test_portfolio_snapshot_cash.py
-tests/test_position_identity.py
-tests/test_post_run_verify.py
-tests/test_pseudo_ticker_skips.py
-tests/test_rebalance_engine.py
-tests/test_synthesis_failure.py
-tests/test_system_hardening_bps.py
-tests/test_system_hardening_model_validation.py
-tests/test_tax_harvest_scanner.py
-tests/test_tax_lot.py
-tests/test_technical_universe_sources.py
-tests/test_today_cash_status.py
+action_state_tracker.py	household role (ja)	1
+almanac/observability/outcome_updater.py	cash wallet route	2
+analyst/__init__.py	broker name (ja: rakuten)	6
+analyst/__init__.py	household role (en)	7
+analyst/data_gatherer.py	cash wallet route	2
+analyst/data_gatherer.py	household role (en)	2
+analyst/data_gatherer.py	mmf wallet	1
+analyst/order_strategy.py	broker name (ja: rakuten)	1
+api/routes/actions.py	broker name (ja: rakuten)	2
+api/routes/actions.py	broker name (ja: sbi)	4
+api/routes/actions.py	cash wallet route	3
+api/routes/actions.py	household role (en)	13
+api/routes/admin.py	household role (en)	10
+api/routes/cash.py	cash wallet route	9
+api/routes/cash.py	household role (en)	20
+api/routes/contributions.py	household role (en)	5
+api/routes/decision.py	household role (en)	1
+api/routes/nisa.py	household role (en)	2
+api/routes/today.py	household role (en)	25
+broker_balance_import.py	broker name (ja: rakuten)	1
+broker_balance_import.py	cash wallet route	9
+broker_balance_import.py	mmf wallet	6
+broker_position_import.py	broker name (ja: rakuten)	3
+broker_position_import.py	household role (en)	1
+broker_position_import.py	mmf wallet	2
+broker_reconcile.py	broker name (ja: rakuten)	2
+broker_reconcile.py	household role (en)	2
+capital_deployment.py	household role (en)	2
+credit_card_investment.py	household role (en)	71
+data_fetcher.py	cash wallet route	2
+data_fetcher.py	mmf wallet	1
+decision_support.py	household role (en)	6
+event_ledger_backfill.py	cash wallet route	2
+event_ledger_backfill.py	mmf wallet	1
+examples/private_state/credit_card_plans.example.json	household role (en)	4
+examples/private_state/nisa_portfolio.example.json	household role (en)	2
+execution_plan_engine.py	cash wallet route	2
+execution_plan_engine.py	household role (en)	8
+execution_readiness.py	cash wallet route	2
+execution_readiness.py	household role (en)	4
+execution_safety.py	household role (en)	10
+factor_attribution.py	cash wallet route	1
+factor_attribution.py	mmf wallet	1
+frontend/app/admin/page.tsx	household role (en)	11
+frontend/app/cash/page.tsx	broker name (ja: rakuten)	3
+frontend/app/cash/page.tsx	broker name (ja: sbi)	3
+frontend/app/decision/page.tsx	household role (en)	3
+frontend/app/nisa/page.tsx	household role (en)	4
+frontend/components/today/ops/ActionSection.tsx	household role (en)	2
+frontend/components/today/ops/ExecutionForm.tsx	broker name (ja: rakuten)	2
+frontend/components/today/ops/ExecutionForm.tsx	broker name (ja: sbi)	1
+frontend/components/today/ops/ExecutionForm.tsx	household role (en)	2
+frontend/components/today/ops/PlanRail.tsx	broker name (ja: rakuten)	1
+frontend/components/today/ops/PlanRail.tsx	broker name (ja: sbi)	1
+frontend/components/today/ops/PlanRail.tsx	household role (en)	8
+frontend/components/today/ops/TrustSection.tsx	household role (en)	11
+frontend/components/today/ops/__tests__/AlmanacStrip.test.tsx	household role (en)	1
+frontend/components/today/ops/__tests__/CommandDeck.test.tsx	household role (en)	9
+frontend/components/today/ops/__tests__/ExecutionForm.test.tsx	household role (en)	7
+frontend/components/today/ops/__tests__/fundingRoutes.test.tsx	household role (en)	16
+frontend/components/today/ops/types.ts	household role (en)	4
+frontend/lib/api.ts	household role (en)	2
+fx_exposure.py	mmf wallet	2
+generate_dashboard.py	broker name (ja: monex)	1
+ledger_trade_corrections.py	broker name (ja: sbi)	2
+ledger_trade_corrections.py	household role (en)	194
+nav_backfill.py	cash wallet route	2
+nav_backfill.py	mmf wallet	1
+nexus_mcp/nexustrader_server.py	household role (en)	3
+nisa_allocator.py	household role (en)	2
+nisa_migration_planner.py	household role (en)	2
+parquet_rebuilder.py	cash wallet route	2
+parquet_rebuilder.py	mmf wallet	1
+portfolio_manager.py	broker name (ja: rakuten)	2
+portfolio_manager.py	broker name (ja: sbi)	2
+portfolio_manager.py	cash wallet route	2
+portfolio_manager.py	mmf wallet	1
+portfolio_risk_returns.py	cash wallet route	2
+portfolio_risk_returns.py	mmf wallet	1
+position_identity.py	cash wallet route	1
+position_identity.py	household role (en)	3
+pseudo_tickers.py	cash wallet route	2
+pseudo_tickers.py	mmf wallet	1
+scripts/check_public_safety.py	broker name (ja: monex)	1
+scripts/check_public_safety.py	broker name (ja: sbi)	1
+scripts/check_public_safety.py	cash wallet route	1
+scripts/check_public_safety.py	household role (en)	5
+scripts/check_public_safety.py	household role (ja)	6
+sync_broker_short_us_index.py	broker name (ja: rakuten)	2
+tax_optimizer.py	household role (en)	14
+technical_signals.py	cash wallet route	2
+technical_signals.py	mmf wallet	1
+tests/test_action_stage_log_routing.py	household role (en)	2
+tests/test_action_state_dedup.py	household role (en)	16
+tests/test_actions_ledger_safety.py	household role (en)	8
+tests/test_actions_save_execution.py	broker name (ja: rakuten)	2
+tests/test_actions_save_execution.py	broker name (ja: sbi)	1
+tests/test_actions_save_execution.py	cash wallet route	15
+tests/test_actions_save_execution.py	household role (en)	25
+tests/test_actions_schema.py	broker name (ja: sbi)	1
+tests/test_actions_schema.py	household role (en)	1
+tests/test_agent_projection.py	household role (en)	1
+tests/test_alert_state_freshness.py	cash wallet route	2
+tests/test_broker_balance_import.py	cash wallet route	4
+tests/test_broker_balance_import.py	mmf wallet	2
+tests/test_broker_cost_basis.py	broker name (ja: rakuten)	1
+tests/test_broker_cost_basis.py	household role (en)	5
+tests/test_broker_position_import.py	broker name (ja: sbi)	1
+tests/test_broker_position_import.py	household role (en)	2
+tests/test_broker_position_import.py	mmf wallet	5
+tests/test_broker_reconcile.py	household role (en)	4
+tests/test_broker_short_us_index_e2e.py	broker name (ja: rakuten)	1
+tests/test_capital_allocator.py	household role (en)	2
+tests/test_capital_deployment.py	broker name (ja: rakuten)	1
+tests/test_capital_deployment.py	broker name (ja: sbi)	1
+tests/test_capital_deployment.py	household role (en)	8
+tests/test_cash_movement_confirmations.py	cash wallet route	5
+tests/test_cash_movement_confirmations.py	household role (en)	2
+tests/test_cash_rollforward.py	cash wallet route	1
+tests/test_cash_route.py	cash wallet route	19
+tests/test_cash_route.py	household role (en)	23
+tests/test_cash_route_safety.py	cash wallet route	1
+tests/test_cash_wallet_projection.py	cash wallet route	5
+tests/test_cash_wallet_projection.py	household role (en)	24
+tests/test_contribution_ledger.py	household role (en)	1
+tests/test_contribution_schedule_cash_routes.py	cash wallet route	4
+tests/test_contribution_schedule_cash_routes.py	household role (en)	7
+tests/test_contributions_api.py	household role (en)	3
+tests/test_credit_card_purchase_undo.py	household role (en)	16
+tests/test_event_ledger_backfill.py	mmf wallet	1
+tests/test_execution_invalidation.py	household role (en)	1
+tests/test_execution_plan_engine.py	cash wallet route	2
+tests/test_execution_plan_engine.py	household role (en)	12
+tests/test_execution_quality.py	household role (en)	1
+tests/test_execution_readiness.py	broker name (ja: rakuten)	2
+tests/test_execution_readiness.py	broker name (ja: sbi)	1
+tests/test_execution_readiness.py	cash wallet route	22
+tests/test_execution_readiness.py	household role (en)	20
+tests/test_execution_reconciliation.py	household role (en)	8
+tests/test_execution_safety.py	broker name (ja: rakuten)	1
+tests/test_execution_safety.py	broker name (ja: sbi)	1
+tests/test_execution_safety.py	household role (en)	21
+tests/test_exit_sizing.py	household role (en)	1
+tests/test_factor_attribution_extended.py	cash wallet route	2
+tests/test_fx_exposure.py	household role (en)	1
+tests/test_fx_hedge_policy.py	household role (en)	3
+tests/test_holdings_freshness.py	broker name (ja: rakuten)	3
+tests/test_holdings_freshness.py	household role (en)	3
+tests/test_investment_policy.py	household role (en)	3
+tests/test_kelly_shadow.py	household role (en)	5
+tests/test_nisa_2024.py	household role (en)	4
+tests/test_phase1_post_filter.py	broker name (ja: rakuten)	5
+tests/test_phase1_post_filter.py	broker name (ja: sbi)	3
+tests/test_phase1_post_filter.py	household role (en)	38
+tests/test_portfolio_snapshot_cash.py	cash wallet route	5
+tests/test_position_identity.py	broker name (ja: monex)	1
+tests/test_position_identity.py	broker name (ja: rakuten)	8
+tests/test_position_identity.py	broker name (ja: sbi)	1
+tests/test_position_identity.py	household role (en)	28
+tests/test_post_run_verify.py	household role (en)	1
+tests/test_pseudo_ticker_skips.py	cash wallet route	12
+tests/test_pseudo_ticker_skips.py	mmf wallet	9
+tests/test_rebalance_engine.py	household role (en)	4
+tests/test_synthesis_failure.py	household role (en)	2
+tests/test_system_hardening_bps.py	broker name (ja: rakuten)	28
+tests/test_system_hardening_bps.py	broker name (ja: sbi)	19
+tests/test_system_hardening_bps.py	household role (en)	56
+tests/test_system_hardening_model_validation.py	broker name (ja: rakuten)	1
+tests/test_tax_harvest_scanner.py	household role (en)	1
+tests/test_tax_lot.py	household role (en)	8
+tests/test_technical_universe_sources.py	mmf wallet	1
+tests/test_today_cash_status.py	cash wallet route	2
+tests/test_today_cash_status.py	household role (en)	20

@@ -87,11 +87,14 @@ def _log_agent_result(
     if cost_usd is not None:
         row["cost_usd"] = cost_usd
     if error is not None:
-        row.update({
-            "error_type": type(error).__name__,
-            "error": str(error)[:500],
-            "cost_usd": 0.0,
-        })
+        row["error_type"] = type(error).__name__
+        row["error"] = str(error)[:500]
+        # ⚠️ cost_usd を無条件に 0.0 で上書きしない。判明済みのコストがある
+        # 呼び出し (例えば output_rejected は ResultMessage 後なので実コスト
+        # を持つ) でそれを消してしまっていた (レビューで再現)。既知なら保持、
+        # 未知なら 0 円と断定せず欠損のままにする。
+        if cost_usd is None:
+            row.setdefault("cost_status", "unknown")
     _append_llm_call_log(row)
 
 

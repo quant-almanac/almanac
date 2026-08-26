@@ -513,9 +513,10 @@ class TestRound13Blockers:
         src = inspect.getsource(ap._technical_projection)
         assert "ticker=ticker" in src or "ticker: str" in src
         # 明示的に渡した ticker が使われること (JP 銘柄で確認)。
+        # 合成の JP ティッカー。実在銘柄を書かない (公開ミラーへ流れるため)。
         jp_row = {"price": 100.0, "data_quality_status": "ok",
                   "freshness_status": "fresh", "data_as_of": "2026-08-24"}
-        out = ap._technical_projection(jp_row, now=NOW, ticker="1489.T")
+        out = ap._technical_projection(jp_row, now=NOW, ticker="9999.T")
         assert "usable" in out
 
     def test_the_run_uses_an_explicit_model_and_budget(self):
@@ -772,3 +773,34 @@ class TestRound15Blockers:
 
         assert "agent_sdk_run" in ROLE_ROUTING
         assert ap.resolve_agent_model() == get_model("agent_sdk_run")
+
+
+class TestRound17Blockers:
+    """round 17 で指摘された残件を固定する。"""
+
+    def test_no_real_ticker_survives_in_this_test_file(self):
+        """公開ミラーへ流れるこのファイルに、実在銘柄のティッカーを
+        書かない。以前 実在の JP ETF (自分の追加分) が残っていた。"""
+        source = Path(__file__).read_text(encoding="utf-8")
+        # リテラルを断片から組み立てる —— そのまま書くとこの assert 自身が
+        # 自分にマッチして常に失敗する (このファイルで複数回踏んだ罠)。
+        real_ticker = "14" + "89.T"
+        assert real_ticker not in source
+
+
+
+def test_the_identity_baseline_is_occurrence_count_not_file_exemption():
+    """baseline はファイル単位の免除であってはならない。
+
+    以前は baseline に載ったファイルを丸ごと検査から除外しており、
+    既にパターンを含むファイルへの **新規追記** を検出できなかった
+    (レビューで実測: baseline 済みファイルへ "husband" を追記しても素通り)。
+    """
+    root = Path(__file__).resolve().parent.parent
+    checker_src = (root / "scripts" / "check_public_safety.py").read_text(
+        encoding="utf-8") if (root / "scripts" / "check_public_safety.py").exists() else None
+    if checker_src is None:
+        pytest.skip("check_public_safety.py is public-mirror only")
+    assert "if label in baseline:" not in checker_src, (
+        "ファイル単位の丸ごと免除に戻っている")
+    assert "findall" in checker_src, "出現回数で比較していない"

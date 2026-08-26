@@ -48,11 +48,18 @@ FORBIDDEN_TEXT = {
 #: ⚠️ ここは **新しいコードの混入を止める** ための検査。既存の公開スナップ
 #: ショット由来の出現は別途の棚卸しが要る (履歴書換えを伴うため、判断は人間)。
 IDENTITY_PATTERNS = {
-    "broker name (ja)": re.compile("楽" + "天証券"),
-    "broker name (en)": re.compile(r"\bRakuten\s+Securities\b", re.IGNORECASE),
-    "household role": re.compile(r"\b(?:husband|wife)\b", re.IGNORECASE),
-    "cash wallet route": re.compile(r"\bCASH_(?:JPY|USD)_[A-Z_]+\b"),
-    "mmf wallet": re.compile(r"\bGS_MMF_[A-Z]+\b"),
+    "broker name (ja: rakuten)": re.compile("楽" + "天証券"),
+    "broker name (en: rakuten)": re.compile(r"\bRakuten\s+Securities\b", re.IGNORECASE),
+    "broker name (ja: sbi)": re.compile("SBI証券"),
+    "broker name (ja: monex)": re.compile("マネックス証券"),
+    "household role (en)": re.compile(r"\b(?:husband|wife)\b", re.IGNORECASE),
+    # ⚠️ 裸の 夫/妻 単体は 夫婦・工夫・大丈夫 等の日常語に大量に false-positive
+    # する (レビューで指摘される前に実測: 夫婦8件・工夫2件)。実際の利用形
+    # (夫の/夫名義/夫側/妻の/妻名義/妻側) に絞る。
+    "household role (ja)": re.compile(r"[夫妻](?:の|名義|側|口座)"),
+    # 英数字どちらも続きうる (CASH_JPY_NEWROUTE2 のような版番号付きも拾う)。
+    "cash wallet route": re.compile(r"\bCASH_(?:JPY|USD)_[A-Z0-9_]+\b"),
+    "mmf wallet": re.compile(r"\bGS_MMF_[A-Z0-9_]+\b"),
 }
 
 SECRET_PATTERNS = {
@@ -103,32 +110,55 @@ def _scan_text(label: str, text: str, failures: list[str]) -> None:
 IDENTITY_BASELINE_PATH = ROOT / "scripts" / "public_identity_baseline.txt"
 
 
-def _identity_baseline() -> set[str]:
+def _identity_baseline() -> dict[tuple[str, str], int]:
+    """``{(path, pattern_name): allowed_count}``。
+
+    ⚠️ 以前はファイル単位の許可リストで、baseline に載ったファイルは
+    **内容を一切検査せず** 丸ごと exempt していた。同じ事故 (既存ファイルへ
+    識別子を追記) を再現できてしまう検査だった (レビューで実測:
+    baseline 済みファイルへ新規に "husband" を足しても素通り)。
+
+    ここでは baseline を「ファイル × パターン ごとの出現回数の上限」として
+    持つ。既存の出現数までは許すが、**それを超えたら失敗**にする —— 同じ
+    ファイルへの新規追記も、超過分として検出できる。
+    """
+    counts: dict[tuple[str, str], int] = {}
     try:
-        return {
-            line.strip()
-            for line in IDENTITY_BASELINE_PATH.read_text(encoding="utf-8").splitlines()
-            if line.strip() and not line.startswith("#")
-        }
+        lines = IDENTITY_BASELINE_PATH.read_text(encoding="utf-8").splitlines()
     except OSError:
-        return set()
+        return counts
+    for line in lines:
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        try:
+            path, pattern_name, count = line.split("	")
+            counts[(path, pattern_name)] = int(count)
+        except ValueError:
+            continue
+    return counts
 
 
 def _scan_identities(label: str, text: str, failures: list[str],
-                     baseline: set[str]) -> None:
-    """保有者を特定できる情報を **作業ツリーに対して** 検査する。
+                     baseline: dict[tuple[str, str], int]) -> None:
+    """保有者を特定できる情報を **作業ツリーに対して**、出現回数で検査する。
 
-    baseline に載っていないファイルで見つかったら失敗させる。履歴には
-    初回スナップショット由来の出現が多数あり、そこまで失敗にすると検査が
-    恒久的に赤くなって役に立たなくなる。
+    ファイルが baseline に載っていても、パターンごとの出現数が記録値を
+    超えたら失敗させる —— 既存ファイルへの新規追記を捕まえるため。
+    履歴は対象外 (別途 _scan_history_identities が info として報告する):
+    履歴には初回スナップショット由来の出現が多数あり、そこまで失敗にすると
+    検査が恒久的に赤くなって役に立たなくなる。
     """
-    if label in baseline:
-        return
     for name, pattern in IDENTITY_PATTERNS.items():
-        if pattern.search(text):
+        actual = len(pattern.findall(text))
+        if actual == 0:
+            continue
+        allowed = baseline.get((label, name), 0)
+        if actual > allowed:
             failures.append(
-                f"{label}: contains {name} (owner-identifying; not in "
-                f"{IDENTITY_BASELINE_PATH.name})")
+                f"{label}: contains {name} ({actual} occurrences, "
+                f"{allowed} allowed by {IDENTITY_BASELINE_PATH.name}; "
+                f"owner-identifying)")
 
 
 def _history_objects(ref: str) -> list[tuple[str, str]]:
@@ -163,6 +193,30 @@ def _scan_history(ref: str, failures: list[str], skipped: list[str]) -> None:
             failures.append(label + f" (cannot read blob: {exc.returncode})")
             continue
         _scan_text(label, text, failures)
+
+
+def _report_history_identity_hits(ref: str, info: list[str]) -> None:
+    """履歴中の保有者特定情報を **info として** 数える (failure にしない)。
+
+    履歴には初回スナップショット由来の出現が既知の量あるので、そのまま
+    failure にすると検査が恒久的に赤くなる。履歴を清浄にするかどうかは
+    force-push を伴う人間の判断なので、ここでは可視化だけする
+    (レビュー: 「--history もPASSし、report された『履歴では警告』も
+    未実装だった」への対応)。
+    """
+    totals: dict[str, int] = {}
+    for sha, path in _history_objects(ref):
+        try:
+            text = _git("cat-file", "-p", sha).decode("utf-8")
+        except (UnicodeDecodeError, subprocess.CalledProcessError):
+            continue
+        for name, pattern in IDENTITY_PATTERNS.items():
+            hit = len(pattern.findall(text))
+            if hit:
+                totals[name] = totals.get(name, 0) + hit
+    for name, count in sorted(totals.items()):
+        info.append(f"history contains {count} occurrence(s) of {name} "
+                    f"(not blocking — history rewrite is a human decision)")
 
 
 def _scan_history_identities(ref: str, failures: list[str]) -> None:
@@ -240,6 +294,7 @@ def main() -> int:
 
     failures: list[str] = []
     skipped: list[str] = []
+    info: list[str] = []
     identity_baseline = _identity_baseline()
     _validate_short_defaults(failures)
     _validate_broad_route_example(failures)
@@ -259,9 +314,14 @@ def main() -> int:
     if args.history:
         _scan_history(args.history, failures, skipped)
         _scan_history_identities(args.history, failures)
+        _report_history_identity_hits(args.history, info)
     if args.strict_unreadable and skipped:
         failures.extend("unreadable: " + item for item in skipped)
 
+    if info:
+        print("Public-snapshot safety check — informational (not blocking):")
+        for item in info:
+            print(f"- {item}")
     if failures:
         print("Public-snapshot safety check failed:")
         for failure in failures:

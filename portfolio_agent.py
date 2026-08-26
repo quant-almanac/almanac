@@ -138,9 +138,17 @@ async def _run_locked(mode: str) -> int:
                     return 1
                 result_payload = message
     except AgentProtocolViolation as exc:
+        # ⚠️ 以前はここで会計ログを残していなかった。プロトコル違反や
+        # query() の例外が「何も記録されない run」として消えていた
+        # (レビューで指摘)。API 側は _run_agent_locked の except で記録して
+        # いるのに、CLI 側だけ抜けていた。
+        _log_agent_result(mode=mode, prompt=prompt, started=started,
+                          status="protocol_violation", cost_usd=cost_usd, error=exc)
         print(f"\n❌ プロトコル違反: {exc}")
         return 1
     except Exception as exc:
+        _log_agent_result(mode=mode, prompt=prompt, started=started,
+                          status="error", cost_usd=cost_usd, error=exc)
         print(f"\n❌ Agent エラー: {exc}")
         print("ヒント: ANTHROPIC_API_KEY が設定されているか確認してください")
         return 1

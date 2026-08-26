@@ -252,7 +252,7 @@ export default function AgentPage() {
   useEffect(() => {
     // 無効モードのタブを出さない。取得に失敗したら default だけに留める
     // (fail-closed) —— 失敗時に全部出すと、無効モードが復活してしまう。
-    fetch('/api/agent/enabled-modes')
+    fetch(`${API_BASE}/api/agent/enabled-modes`)
       .then(r => (r.ok ? r.json() : null))
       .then(d => {
         const list = Array.isArray(d?.enabled_modes) ? d.enabled_modes : null
