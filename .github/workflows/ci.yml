@@ -71,18 +71,18 @@ jobs:
           cache-dependency-path: requirements.txt
 
       # 重い ML パッケージ（torch/transformers/vectorbt）を除いたCI用依存を先にインストール
+      # ⚠️ 以前は手作業で列挙した未固定バージョンの一覧を pip install して
+      # おり、requirements.txt の固定 (numpy~=1.26.0 等) から乖離していた。
+      # 未固定の numpy/scipy 最新版で portfolio_optimizer.py の in-place 演算
+      # が real bug (ValueError: output array is read-only) を踏んで初めて
+      # CI がテストを実行するようになった今回、発覚した (レビューで指摘)。
+      # requirements.txt からインストールし、重い ML パッケージ
+      # (torch/transformers/vectorbt) だけを除外する。
       - name: Install CI dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install \
-            fastapi uvicorn \
-            anthropic \
-            yfinance feedparser \
-            pandas numpy pyarrow requests \
-            scipy scikit-learn pyportfolioopt \
-            quantstats \
-            fredapi \
-            pytest
+          grep -viE '^(vectorbt|transformers|torch)' requirements.txt > /tmp/ci-requirements.txt
+          pip install -r /tmp/ci-requirements.txt
 
       # ── インポートチェック ─────────────────────────────
       - name: Import smoke test

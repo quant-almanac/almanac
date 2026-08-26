@@ -151,7 +151,11 @@ def optimize_pypfopt(
 
     # 安定した共分散行列（pandas + 微小正則化でApple Silicon互換）
     cov_df = returns.cov() * 252
-    cov_arr = cov_df.values
+    # ⚠️ .values は pandas の内部表現によっては書き込み不可な view を
+    # 返すことがあり、in-place の += がバージョンによって落ちる
+    # (レビューで実測: numpy 2.5.x で ValueError: output array is
+    # read-only)。防御的に copy してから足す。
+    cov_arr = cov_df.values.copy()
     cov_arr += np.eye(len(cov_arr)) * 1e-8   # 正定値保証
     cov = pd.DataFrame(cov_arr, index=cov_df.index, columns=cov_df.columns)
 
@@ -325,7 +329,11 @@ def bl_optimize(
 
     prices = (1 + returns).cumprod()
     cov_df = returns.cov() * 252
-    cov_arr = cov_df.values
+    # ⚠️ .values は pandas の内部表現によっては書き込み不可な view を
+    # 返すことがあり、in-place の += がバージョンによって落ちる
+    # (レビューで実測: numpy 2.5.x で ValueError: output array is
+    # read-only)。防御的に copy してから足す。
+    cov_arr = cov_df.values.copy()
     cov_arr += np.eye(len(cov_arr)) * 1e-8
     cov = pd.DataFrame(cov_arr, index=cov_df.index, columns=cov_df.columns)
 
