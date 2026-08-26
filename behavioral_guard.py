@@ -852,7 +852,6 @@ def _print_status():
 
     ok  = '✅'
     ng  = '🔴'
-    warn = '⚠️'
 
     print(f'\n=== 行動ガードレール状況 {datetime.now().strftime("%Y-%m-%d %H:%M")} ===')
     print(

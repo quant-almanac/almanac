@@ -287,8 +287,12 @@ def get_fx_rate_cached(pair: str = 'USDJPY=X',
                         acc['fx_rate_usdjpy'] = rate
                         acc['fx_rate_usdjpy_as_of'] = now
                         try:
-                            jpy = float(acc.get('balance', 0) or 0)
-                            usd = float(acc.get('usd_balance', 0) or 0)
+                            # ⚠️ 値そのものは使わない。「両方 float に
+                            # できるか」を確かめる parse 検証で、
+                            # 成功したときだけ else で正規化する。
+                            # 削除すると正規化が無条件になる。
+                            _jpy = float(acc.get('balance', 0) or 0)
+                            _usd = float(acc.get('usd_balance', 0) or 0)
                         except (TypeError, ValueError):
                             pass
                         else:

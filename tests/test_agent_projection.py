@@ -828,12 +828,16 @@ def test_build_agent_options_wraps_the_kwargs_unchanged():
     値をそのまま反映しているか、という配線を検証する。
 
     安全契約の中身そのものは TestAgentOptionsHaveNoTools が SDK 非依存で
-    直接検証する。claude-agent-sdk は requirements.txt に含まれており
-    CI にも実際にインストールされるので、この importorskip は通常
-    skip されない (SDK 未インストールという万一の環境でのみ発動する
-    防御的なガードであって、CI を通すための skip ではない)。
+    直接検証する。
+
+    ⚠️ ここは importorskip にしない。claude-agent-sdk は requirements.txt
+    に載った正式な実行時依存なので、入っていない環境は「skip してよい
+    環境」ではなく「壊れた環境」。importorskip のままだと、将来
+    requirements.txt から落ちる等の依存設定ミスを緑で通してしまう
+    (レビューで指摘)。素の import にして、欠損したら失敗させる。
     """
-    pytest.importorskip("claude_agent_sdk")
+    import claude_agent_sdk  # noqa: F401  — 欠損を skip ではなく失敗にする
+
     kwargs = ap.build_agent_options_kwargs()
     options = ap.build_agent_options()
     assert options.tools == kwargs["tools"]

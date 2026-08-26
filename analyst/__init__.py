@@ -33,7 +33,7 @@ from analyst.cache import (
 )
 from analyst.llm_client import (
     call_claude, call_tier_analysis, fetch_web_search_news,
-    _SUBMIT_TOOL, _SYSTEM_SONNET, _GEO_KEYWORDS, _append_llm_call_log,
+    _SUBMIT_TOOL, _SYSTEM_SONNET, _append_llm_call_log,
 )
 from analyst.data_gatherer import (
     gather_data, fmt_news_section, fmt_earnings_section,
@@ -1214,7 +1214,8 @@ def _ensure_technical_state_fresh(
         return False
     if refresher is None:
         import technical_signals
-        refresher = lambda: technical_signals.get_technical_context(force=True)
+        def refresher():
+            return technical_signals.get_technical_context(force=True)
     refresher()
     return True
 
@@ -1246,7 +1247,8 @@ def _ensure_macro_event_state_fresh(
         return False
     if refresher is None:
         from macro_event_calendar import refresh_macro_event_state
-        refresher = lambda: refresh_macro_event_state(state_file=path)
+        def refresher():
+            return refresh_macro_event_state(state_file=path)
     refresher()
     return True
 
@@ -1310,7 +1312,6 @@ def _compute_data_freshness() -> str:
             ("geopolitical_state.json",      ("cached_at",),                "geopolitical_state",        12,  24, 0.05),
         ]
 
-        scores = []
         lines = ["【データ鮮度スコア】"]
         overall_score = 0.0
         total_weight  = 0.0
@@ -1857,12 +1858,10 @@ def _fmt_social_sentiment(tickers: list[str], social_data: dict) -> str:
 
     # --- StockTwits 感情（対象ティッカーのみ） ---
     ticker_set = set(tickers)
-    found_st = False
     for t in tickers:
         d = stocktwits.get(t)
         if not d:
             continue
-        found_st = True
         bull = d.get("bullish_pct", 0)
         bear = d.get("bearish_pct", 0)
         sig  = d.get("sentiment", "")
@@ -8123,8 +8122,10 @@ def _phase1_post_filter(
 
         _nisa_raw_for_routes, _nisa_profiles_for_routes = load_nisa_profiles(state_dir)
     except Exception:
-        canonical_broker = lambda value: str(value or "").strip().lower()  # type: ignore
-        canonical_owner = lambda value: str(value or "").strip().lower()  # type: ignore
+        def canonical_broker(value):  # type: ignore
+            return str(value or "").strip().lower()
+        def canonical_owner(value):  # type: ignore
+            return str(value or "").strip().lower()
         _nisa_profiles_for_routes = {}
 
     def _add_holding_lot(pos: dict) -> None:
@@ -8249,8 +8250,6 @@ def _phase1_post_filter(
         _min_action_jpy *= 0.7
         _min_action_pct *= 0.6
     threshold = max(float(portfolio_total or 0) * _min_action_pct, _min_action_jpy / 3)
-    # H2: stance に関わらず固定（aggressiveでも単発金額の上限は緩めない）。
-    max_single_action_cap_jpy = min(float(portfolio_total or 0) * _max_single_action_pct, 1_500_000.0)
 
     _CORE_ETF_TICKERS = {
         "GLD", "IAU", "SPY", "VOO", "VTI", "VT", "QQQ",
@@ -9082,7 +9081,8 @@ def _phase1_post_filter(
     scenario_cap_used: dict[str, float] = {}
     for a in actions:
         if not isinstance(a, dict):
-            kept.append(a); continue
+            kept.append(a)
+            continue
         a = dict(a)
         try:
             from execution_safety import (
@@ -9142,7 +9142,8 @@ def _phase1_post_filter(
         noop_reason = _intrinsic_filtered_reason(a)
         if noop_reason:
             a["filtered_reason"] = noop_reason
-            filtered.append(a); continue
+            filtered.append(a)
+            continue
 
         # observe_only source の AI 昇格: 生 observe_only=True は上の intrinsic で落とす。
         # ここに来るのは source_observe_only=true / provisional_decision=true の昇格済み action だけ。
@@ -9158,7 +9159,8 @@ def _phase1_post_filter(
                     f"source_observe_only: {ticker} は observe_only 由来だが "
                     "provisional_decision/source_lane/ai_override_reason が欠落"
                 )
-                filtered.append(a); continue
+                filtered.append(a)
+                continue
             base_cap = float(portfolio_total or 0) * 0.01
             scenario_id = str(a.get("scenario_id") or a.get("source_event_id") or "")
             if scenario_id:
@@ -9173,7 +9175,8 @@ def _phase1_post_filter(
             )
             if not ok:
                 a["filtered_reason"] = cap_reason
-                filtered.append(a); continue
+                filtered.append(a)
+                continue
             if scenario_id:
                 scenario_cap_used[scenario_id] = scenario_cap_used.get(scenario_id, 0.0) + max(0.0, amt)
 
@@ -9192,13 +9195,15 @@ def _phase1_post_filter(
                 )
                 if not ok:
                     a["filtered_reason"] = cap_reason
-                    filtered.append(a); continue
+                    filtered.append(a)
+                    continue
             else:
                 a["filtered_reason"] = (
                     f"earnings_blackout: {ticker} は決算 5 営業日以内。"
                     "earnings_event_trade と専用理由が無いため buy 推奨を抑制"
                 )
-                filtered.append(a); continue
+                filtered.append(a)
+                continue
 
         # (3.4) 推奨は terminal だが linked execution が ordered のままなら、
         # 再提案は可視化する一方で再発注は broker 状態確認まで止める。
@@ -9221,14 +9226,16 @@ def _phase1_post_filter(
                     f"{existing.get('id') or '?'} が ordered のまま。証券会社で取消/約定を確認するまで再発注不可"
                 ),
             })
-            deferred.append(a); continue
+            deferred.append(a)
+            continue
 
         # (3.5) DONE_LIST — 直近 7 日に同 ticker × 同 direction が ordered/executed 済み
         if ticker and direction in ("buy", "sell", "short", "cover") and (ticker, direction) in done_set:
             intent_rows = done_intents.get((ticker, direction)) or []
             if not intent_rows:
                 a["filtered_reason"] = f"already_executed: {ticker} {direction} は直近 7 日に発注/約定済み（DONE_LIST）"
-                filtered.append(a); continue
+                filtered.append(a)
+                continue
             intent_decision = _classify_order_intent(
                 a,
                 done_intents,
@@ -9242,13 +9249,15 @@ def _phase1_post_filter(
                 pass
             elif decision in {"keep_existing_order", "amend_existing_order"}:
                 a.update(intent_decision)
-                deferred.append(a); continue
+                deferred.append(a)
+                continue
             else:
                 a.update(intent_decision)
                 a["filtered_reason"] = intent_decision.get("filtered_reason") or (
                     f"already_executed: {ticker} {direction} は直近 7 日に発注/約定済み（DONE_LIST）"
                 )
-                filtered.append(a); continue
+                filtered.append(a)
+                continue
 
         # (3.6) 未完了の反対方向 action_state がある場合は fail-closed。
         # 例: stale pending trim が残ったまま add を出すと、ユーザーには売買反転に見える。
@@ -9292,7 +9301,8 @@ def _phase1_post_filter(
                     a["opposite_open_action_id"] = existing_id
                     a["opposite_open_action_status"] = existing_status
                     a["opposite_open_action_type"] = existing_type
-                    filtered.append(a); continue
+                    filtered.append(a)
+                    continue
 
         # (3.7) tax-loss harvest 矛盾解消: 損出し候補に buy/add/dca を出すのは矛盾
         if direction == "buy" and ticker in loss_set:
@@ -9306,13 +9316,15 @@ def _phase1_post_filter(
                 )
                 if not ok:
                     a["filtered_reason"] = cap_reason
-                    filtered.append(a); continue
+                    filtered.append(a)
+                    continue
             else:
                 a["filtered_reason"] = (
                     f"tax_loss_harvest_conflict: {ticker} は損出し候補（含み損 ¥{_loss_min:,.0f}+）。"
                     "buy/add/dca と矛盾するため除去。AI が税効果を上回る理由を専用フィールドで示す必要あり。"
                 )
-                filtered.append(a); continue
+                filtered.append(a)
+                continue
 
         # (3.8) 全体統一: disable_stop_loss_recommendations=true なら
         # 全銘柄の stop_loss / 逆指値発注的アクションを除去（type 偽装も含む）
@@ -9329,7 +9341,8 @@ def _phase1_post_filter(
                     f"disable_stop_loss_recommendations: {ticker} stop_loss / 逆指値推奨は "
                     f"全体設定で禁止 (tunable_params: disable_stop_loss_recommendations=true)"
                 )
-                filtered.append(a); continue
+                filtered.append(a)
+                continue
 
         # (3.9) 全体統一: disable_cumulative_recommendations=true なら
         # 買い側の定期/自動積立アクション（type=dca / 自動積立/クレカ/毎月 文言）を除去。
@@ -9342,7 +9355,8 @@ def _phase1_post_filter(
                     f"disable_cumulative_recommendations: {ticker} 定期/自動積立アクションは "
                     f"broker で自動設定済み (tunable_params: disable_cumulative_recommendations=true)"
                 )
-                filtered.append(a); continue
+                filtered.append(a)
+                continue
 
         # (3.10) 6 soft constraint 強制（urgency 1段下げ程度の soft enforcement）
         # long_max_single_pct / medium_max_single_pct: 既存ポジ追加 buy で上限超過なら urgency 下げ
@@ -9417,13 +9431,15 @@ def _phase1_post_filter(
                         f"current={_lh_state.get('current_leverage')}x cap={_lh_state.get('leverage_cap')}x "
                         f"({_lh_state.get('action','?')}) → 新規 buy 抑制"
                     )
-                    filtered.append(a); continue
+                    filtered.append(a)
+                    continue
                 if not _margin_ok and atype_lc == "margin_buy":
                     a["filtered_reason"] = (
                         f"leverage_health: margin_buy_allowed=False "
                         f"(VIX={_lh_state.get('vix','?')}, status={_lh_state.get('status','?')}) → 信用買い禁止"
                     )
-                    filtered.append(a); continue
+                    filtered.append(a)
+                    continue
         except Exception:
             pass
 
@@ -9489,7 +9505,8 @@ def _phase1_post_filter(
                         f"¥{threshold/10000:.0f}万の90%以上だが未達。自動増額条件を満たさないため要確認"
                     ),
                 })
-                deferred.append(a); continue
+                deferred.append(a)
+                continue
             elif (
                 a.get("small_notional_exception") is True
                 and _has_ai_bounded_reason(a, "small_notional_exception_reason", "ai_override_reason", "bounded_decision_reason")
@@ -9503,14 +9520,16 @@ def _phase1_post_filter(
                 )
                 if not ok:
                     a["filtered_reason"] = cap_reason
-                    filtered.append(a); continue
+                    filtered.append(a)
+                    continue
             else:
                 a["filtered_reason"] = (
                     f"too_small: 推定 ¥{amt/10000:.1f}万 < 最小 ¥{threshold/10000:.0f}万 "
                     f"(細切れリバランス抑制)。AI が small_notional_exception と専用理由を示せば例外可"
                 )
                 _mark_kabu_mini_verification_needed(a, reason="too_small", estimated_jpy=amt)
-                filtered.append(a); continue
+                filtered.append(a)
+                continue
 
         # (1b) 最大取引額（単発ハードキャップ・AI上書き不可。H2）
         # 既存の絶対金額capはsource_observe_only/earnings_blackout/tax_loss_harvest_conflict
@@ -9535,7 +9554,8 @@ def _phase1_post_filter(
                     "のため fail-closed で reject。AI上書き不可。"
                 )
                 _mark_kabu_mini_verification_needed(a, reason="amount_unparseable", estimated_jpy=amt)
-                filtered.append(a); continue
+                filtered.append(a)
+                continue
             if amt > cap_jpy:
                 a["filtered_reason"] = (
                     f"max_single_action_cap: 推定 ¥{amt/10000:.1f}万 が単発上限 "
@@ -9547,7 +9567,8 @@ def _phase1_post_filter(
                 a["single_action_cap_class"] = cap_profile["label"]
                 a["single_action_cap_jpy"] = round(cap_jpy)
                 _mark_kabu_mini_verification_needed(a, reason="max_single_action_cap", estimated_jpy=amt)
-                filtered.append(a); continue
+                filtered.append(a)
+                continue
 
         # (1c) execution_plan — 週次/月次計画との整合。
         # H2 hard cap / DONE_LIST / blackout / tax など既存ガードを緩めないため、
@@ -9560,7 +9581,8 @@ def _phase1_post_filter(
             ok_plan, plan_reason = _apply_execution_plan_gate(a, amt, cap_profile_for_plan["cap_jpy"])
             if not ok_plan:
                 a["filtered_reason"] = plan_reason or "execution_plan: non-executable by plan"
-                filtered.append(a); continue
+                filtered.append(a)
+                continue
 
         # (2) cooldown — 直近 7 日同方向
         if ticker and direction in ("buy", "sell", "short", "cover") and (ticker, direction) in past_dir_7d:
@@ -10781,27 +10803,35 @@ def _inject_playbook_actions(synthesis: dict, data: dict) -> dict:
                 skipped.append({"scenario_id": sid, "ticker": ticker, "reason": reason})
 
             if ticker in restricted:
-                _skip("insider_restricted"); continue
+                _skip("insider_restricted")
+                continue
             if ticker in existing_tickers:
-                _skip("already_in_priority_actions"); continue
+                _skip("already_in_priority_actions")
+                continue
             if ticker in recent_buy_tickers:
-                _skip(f"buy 実行/発注済みが直近{_PLAYBOOK_REPROPOSE_DAYS}日以内に存在"); continue
+                _skip(f"buy 実行/発注済みが直近{_PLAYBOOK_REPROPOSE_DAYS}日以内に存在")
+                continue
             if ticker.endswith(".T"):
                 if not isinstance(jp_pct, (int, float)) or not isinstance(jp_target, (int, float)):
-                    _skip("JP動的目標データ不足"); continue
+                    _skip("JP動的目標データ不足")
+                    continue
                 if jp_pct >= jp_target:
-                    _skip(f"jp_equity_ex_employer {jp_pct:.1f}% >= 目標 {jp_target:.0f}%"); continue
+                    _skip(f"jp_equity_ex_employer {jp_pct:.1f}% >= 目標 {jp_target:.0f}%")
+                    continue
 
             if entry.get("allocation_jpy") is not None:
                 amt_jpy = float(entry.get("allocation_jpy") or 0) * scale
             elif entry.get("allocation_usd") is not None:
                 amt_jpy = float(entry.get("allocation_usd") or 0) * fx_rate * scale
             else:
-                _skip("allocation 未定義"); continue
+                _skip("allocation 未定義")
+                continue
             if amt_jpy <= 0:
-                _skip("allocation 0 以下"); continue
+                _skip("allocation 0 以下")
+                continue
             if used_jpy + amt_jpy > total_cap_jpy:
-                _skip(f"注入合計上限 {_PLAYBOOK_INJECT_TOTAL_CAP_PCT*100:.0f}% 超過"); continue
+                _skip(f"注入合計上限 {_PLAYBOOK_INJECT_TOTAL_CAP_PCT*100:.0f}% 超過")
+                continue
 
             used_after_jpy = used_jpy + amt_jpy
 

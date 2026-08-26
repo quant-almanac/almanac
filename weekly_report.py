@@ -95,7 +95,10 @@ def generate_weekly_report():
         with open(holdings_path) as f:
             holdings = json.load(f)
 
-    report = f"""📊 <b>週次パフォーマンスレポート</b>
+    # ⚠️ 意図的に未使用。下の通り Telegram 送信は廃止済みで、内容は
+    # /risk (QuantStats HTML) 側で確認する。レポート本文の組み立て
+    # 自体は再開できる状態で残してある。
+    _report = f"""📊 <b>週次パフォーマンスレポート</b>
 {week_ago.strftime('%m/%d')} 〜 {today.strftime('%m/%d')}
 ━━━━━━━━━━━━━━
 📈 売買回数: 買{len(buys)}回 / 売{len(sells)}回

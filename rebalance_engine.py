@@ -6,7 +6,6 @@ ALMANAC v4.0 - リバランスエンジン
 import json
 from datetime import datetime, date
 from pathlib import Path
-from typing import Optional
 
 from utils import atomic_write_json
 
@@ -1066,4 +1065,4 @@ if __name__ == '__main__':
     report   = calculate_rebalance_actions(snapshot, available_cash=cash)
     _print_report(report)
     save_rebalance_report(report)
-    print(f'\nレポート保存: rebalance_report.json')
+    print('\nレポート保存: rebalance_report.json')
