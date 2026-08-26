@@ -268,3 +268,29 @@ def test_a_cost_unknown_before_any_result_is_not_reported_as_zero(monkeypatch, s
     assert row["status"] == "protocol_violation"
     assert "cost_usd" not in row
     assert row.get("cost_status") == "unknown"
+
+
+def test_a_persistence_failure_after_a_known_cost_still_logs_a_row(monkeypatch, sandbox):
+    """検証を通った後の保存失敗も、既知のコストを持つ run として記録する。
+
+    以前は save_verified_result() の例外を素通しにしており、課金確定後の
+    保存失敗が「何も記録されない run」として消えていた
+    (レビューで OSError 注入により再現)。
+    """
+    rows: list[dict] = []
+    _install_fake_sdk(monkeypatch, blocks=[_TextBlock("analysis")],
+                      result=_valid_agent_output(sandbox), cost=0.0789)
+    monkeypatch.setattr(agent, "_append_llm_call_log", lambda row: rows.append(row),
+                        raising=False)
+    monkeypatch.setattr(
+        agent, "save_verified_result",
+        lambda *a, **k: (_ for _ in ()).throw(OSError("disk full")))
+
+    chunks = asyncio.run(_collect_agent_chunks("default"))
+
+    assert any("event: error" in chunk for chunk in chunks)
+    assert not any("event: done" in chunk for chunk in chunks)
+    assert rows, "保存失敗が会計ログに1行も残らなかった"
+    row = rows[-1]
+    assert row["status"] == "persistence_error"
+    assert row["cost_usd"] == 0.0789, "確定済みのコストが保存失敗で失われた"

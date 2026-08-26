@@ -164,6 +164,16 @@ function ResultCard({ result }: { result: AgentResult }) {
           <p style={{ color: OPS.text, fontSize: 15, fontWeight: 600, lineHeight: 1.65 }}>
             {result.headline ?? result.summary ?? result.strategy ?? ''}
           </p>
+          {/* headline も risk_warnings と同じ自由文チャネル。
+              risk_warnings が空でも、headline 単独で scope 外の売買っぽい
+              表現に触れうる。以前は risk_warnings のブロック内にしか
+              注記が無く、headline だけのケースで一度も表示されなかった
+              (レビューで指摘)。 */}
+          {result.commentary_is_non_actionable && (
+            <p style={{ color: OPS.sub, fontSize: 12, marginTop: 8, fontStyle: 'italic' }}>
+              📝 参考所見（売買指示ではありません）
+            </p>
+          )}
         </div>
       )}
 

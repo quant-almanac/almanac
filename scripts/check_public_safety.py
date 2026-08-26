@@ -110,56 +110,57 @@ def _scan_text(label: str, text: str, failures: list[str]) -> None:
 IDENTITY_BASELINE_PATH = ROOT / "scripts" / "public_identity_baseline.txt"
 
 
-def _identity_baseline() -> dict[tuple[str, str], int]:
-    """``{(path, pattern_name): allowed_count}``。
+def _identity_baseline() -> set[tuple[str, str, str]]:
+    """``{(path, pattern_name, normalized_value)}``。
 
-    ⚠️ 以前はファイル単位の許可リストで、baseline に載ったファイルは
-    **内容を一切検査せず** 丸ごと exempt していた。同じ事故 (既存ファイルへ
-    識別子を追記) を再現できてしまう検査だった (レビューで実測:
-    baseline 済みファイルへ新規に "husband" を足しても素通り)。
+    ⚠️ 出現「回数」だけの baseline は、同数の別の新しい秘密情報への置換を
+    見逃す —— 既存9件の wallet 名を9件の新しい wallet 名へ丸ごと置き換えても
+    カウントが変わらないので通ってしまっていた (レビューで実測:
+    api/routes/cash.py の許容9件を新規9件へ置換して failures=[])。
 
-    ここでは baseline を「ファイル × パターン ごとの出現回数の上限」として
-    持つ。既存の出現数までは許すが、**それを超えたら失敗**にする —— 同じ
-    ファイルへの新規追記も、超過分として検出できる。
+    ここでは baseline を「ファイル × パターン × 実際にマッチした値」の
+    集合として持つ。同じ値の再出現は何度あっても許すが、baseline に無い
+    新しい値が1つでも現れたら失敗する。broker 名や household role のような
+    固定的な語は値が語そのものなので実質パターン単位のままだが、
+    wallet route のようにワイルドカードで内容が変わりうるパターンは、
+    値ごとに個別追跡される。
     """
-    counts: dict[tuple[str, str], int] = {}
+    entries: set[tuple[str, str, str]] = set()
     try:
         lines = IDENTITY_BASELINE_PATH.read_text(encoding="utf-8").splitlines()
     except OSError:
-        return counts
+        return entries
     for line in lines:
         line = line.strip()
         if not line or line.startswith("#"):
             continue
         try:
-            path, pattern_name, count = line.split("	")
-            counts[(path, pattern_name)] = int(count)
+            path, pattern_name, value = line.split("\t")
         except ValueError:
             continue
-    return counts
+        entries.add((path, pattern_name, value))
+    return entries
 
 
 def _scan_identities(label: str, text: str, failures: list[str],
-                     baseline: dict[tuple[str, str], int]) -> None:
-    """保有者を特定できる情報を **作業ツリーに対して**、出現回数で検査する。
+                     baseline: set[tuple[str, str, str]]) -> None:
+    """保有者を特定できる情報を作業ツリーに対して、値単位で検査する。
 
-    ファイルが baseline に載っていても、パターンごとの出現数が記録値を
-    超えたら失敗させる —— 既存ファイルへの新規追記を捕まえるため。
-    履歴は対象外 (別途 _scan_history_identities が info として報告する):
+    ファイルが baseline に載っていても、baseline に無い新しい値が
+    パターンにマッチしたら失敗させる —— 既存ファイルへの新規追記も、
+    既存識別子の新しい値への置換も、どちらも捕まえる。
+    履歴は対象外 (別途 _report_history_identity_hits が info として報告する):
     履歴には初回スナップショット由来の出現が多数あり、そこまで失敗にすると
     検査が恒久的に赤くなって役に立たなくなる。
     """
     for name, pattern in IDENTITY_PATTERNS.items():
-        actual = len(pattern.findall(text))
-        if actual == 0:
-            continue
-        allowed = baseline.get((label, name), 0)
-        if actual > allowed:
-            failures.append(
-                f"{label}: contains {name} ({actual} occurrences, "
-                f"{allowed} allowed by {IDENTITY_BASELINE_PATH.name}; "
-                f"owner-identifying)")
-
+        for value in set(pattern.findall(text)):
+            normalized = value if isinstance(value, str) else "".join(value)
+            if (label, name, normalized) not in baseline:
+                failures.append(
+                    f"{label}: contains {name} (new value not in "
+                    f"{IDENTITY_BASELINE_PATH.name}; owner-identifying): "
+                    f"{normalized!r}")
 
 def _history_objects(ref: str) -> list[tuple[str, str]]:
     """Return unique ``(blob_sha, path)`` relations reachable from ``ref``."""
@@ -310,7 +311,11 @@ def main() -> int:
             failures.append(rel + f" (cannot read tracked file: {exc})")
             continue
         _scan_text(rel, text, failures)
-        _scan_identities(rel, text, failures, identity_baseline)
+        # baseline ファイル自身は識別子の一覧というデータファイルであり、
+        # そこに実際の値が並ぶのは仕様。自己参照の鶏卵問題になるため
+        # identity 検査からは除外する (secret/forbidden-text 検査は受ける)。
+        if rel != str(IDENTITY_BASELINE_PATH.relative_to(ROOT)):
+            _scan_identities(rel, text, failures, identity_baseline)
     if args.history:
         _scan_history(args.history, failures, skipped)
         _scan_history_identities(args.history, failures)

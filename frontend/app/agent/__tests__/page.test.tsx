@@ -50,3 +50,27 @@ describe('AgentPage', () => {
     expect(enabledModesCall).not.toBe('/api/agent/enabled-modes')
   })
 })
+
+describe('AgentPage — non-actionable commentary', () => {
+  afterEach(() => vi.restoreAllMocks())
+
+  it('shows the non-actionable notice on the headline even when risk_warnings is empty', async () => {
+    const fetchMock = mockFetch({
+      '/api/agent/enabled-modes': { enabled_modes: ['default'], all_modes: ['default'] },
+      '/api/agent/result': {
+        headline: '売買っぽいことを言うかもしれない自由文',
+        overall_stance: 'neutral',
+        risk_warnings: [],
+        commentary_is_non_actionable: true,
+        actions: [],
+      },
+    })
+    vi.stubGlobal('fetch', fetchMock)
+
+    const { findByText } = render(<AgentPage />)
+
+    // 以前は risk_warnings のブロック内にしか注記が無く、
+    // risk_warnings=[] のときは一度も表示されなかった。
+    await findByText('📝 参考所見（売買指示ではありません）')
+  })
+})

@@ -90,3 +90,50 @@ def test_a_query_exception_still_logs_a_row(monkeypatch, sandbox):
     assert code == 1
     assert rows, "query() の例外が会計ログに1行も残らなかった"
     assert rows[-1]["status"] == "error"
+
+
+def test_a_persistence_failure_after_a_known_cost_still_logs_a_row(monkeypatch, sandbox):
+    """保存失敗後も既知のコストが会計ログに残る (API と同じ理由)。"""
+    rows: list[dict] = []
+
+    class ResultMessage:
+        subtype = "success"
+        total_cost_usd = 0.0789
+
+    class AssistantMessage:
+        def __init__(self):
+            self.content = [_TextBlock("x")]
+
+    async def fake_query(prompt, options):
+        yield AssistantMessage()
+        yield ResultMessage()
+
+    fake_sdk = types.SimpleNamespace(
+        query=fake_query, ClaudeAgentOptions=lambda **kw: types.SimpleNamespace(**kw),
+        ResultMessage=ResultMessage, AssistantMessage=AssistantMessage)
+    monkeypatch.setitem(sys.modules, "claude_agent_sdk", fake_sdk)
+    monkeypatch.setitem(sys.modules, "claude_agent_sdk.types",
+                        types.SimpleNamespace(TextBlock=_TextBlock, ToolUseBlock=_ToolUseBlock))
+
+    import agent_projection as ap
+    projection = ap.build_agent_projection("default", base_dir=sandbox)
+    scope = projection["action_scope"][0]
+    ResultMessage.result = json.dumps({
+        "headline": "h", "overall_stance": "neutral", "risk_warnings": [],
+        "actions": [{"rank": 1, "candidate_id": scope["candidate_id"],
+                     "action_type": scope["allowed_actions"][0],
+                     "actionability": "watch_only", "reason": "ok"}]})
+    ResultMessage.structured_output = json.loads(ResultMessage.result)
+
+    monkeypatch.setattr(cli, "_log_agent_result", lambda **kw: rows.append(kw))
+    monkeypatch.setattr(
+        cli, "save_verified_result",
+        lambda *a, **k: (_ for _ in ()).throw(OSError("disk full")))
+
+    code = asyncio.run(cli._run_locked("default"))
+
+    assert code == 1
+    assert rows, "保存失敗が会計ログに1行も残らなかった"
+    row = rows[-1]
+    assert row["status"] == "persistence_error"
+    assert row["cost_usd"] == 0.0789

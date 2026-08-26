@@ -165,7 +165,15 @@ async def _run_locked(mode: str) -> int:
         return 2
 
     path = BASE_DIR / OUTPUT_FILES[mode]
-    saved = save_verified_result(path, verified, as_of=now.isoformat())
+    # ⚠️ 検証を通った後の保存失敗も、既知のコストを持つ run として
+    # 記録する (API と同じ理由 —— レビューで再現)。
+    try:
+        saved = save_verified_result(path, verified, as_of=now.isoformat())
+    except OSError as exc:
+        _log_agent_result(mode=mode, prompt=prompt, started=started,
+                          status="persistence_error", cost_usd=cost_usd, error=exc)
+        print(f"\n❌ 保存に失敗しました: {exc}")
+        return 1
     _log_agent_result(mode=mode, prompt=prompt, started=started,
                       status="success" if saved else "skipped_stale_write",
                       cost_usd=cost_usd)

@@ -203,8 +203,18 @@ async def _run_agent_locked(mode: str) -> AsyncIterator[str]:
         yield _sse("error", {"message": f"出力の検証に失敗、保存しません: {e}"})
         return
 
-    saved = save_verified_result(BASE_DIR / OUTPUT_FILES[mode], verified,
-                                 as_of=now.isoformat())
+    # ⚠️ 検証を通った後、保存そのものが失敗しうる (ディスク満杯等)。
+    # 課金は ResultMessage の時点で確定しているので、ここで例外を外へ
+    # 投げっぱなしにすると、既知のコストを持つ run が会計ログに一行も
+    # 残らず消える (レビューで再現: OSError 注入 → 例外伝播・ログ0行)。
+    try:
+        saved = save_verified_result(BASE_DIR / OUTPUT_FILES[mode], verified,
+                                     as_of=now.isoformat())
+    except OSError as e:
+        _log_agent_result(mode=mode, prompt=prompt, started=started,
+                          status="persistence_error", cost_usd=cost, error=e)
+        yield _sse("error", {"message": f"保存に失敗しました: {e}"})
+        return
     # 検証を通ってから、最終 status と実コストを1行だけ記録する。
     _log_agent_result(mode=mode, prompt=prompt, started=started,
                       status="success" if saved else "skipped_stale_write",
