@@ -71,8 +71,7 @@ jobs:
           FRED_API_KEY:      "dummy"
         run: |
           pytest tests/ -v --tb=short -x \
-            --ignore=tests/test_integration.py \
-            2>/dev/null || echo "テストなし or スキップ"
+            --ignore=tests/test_integration.py
 
   # ── フロントエンドリント ──────────────────────────────
   frontend-lint:

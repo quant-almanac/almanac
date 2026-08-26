@@ -52,14 +52,27 @@ from utils import LockBusy, process_lock
 BASE_DIR = Path(__file__).parent
 
 
-def _log_agent_result(**kwargs) -> None:
+def _log_agent_result(**kwargs) -> dict:
     """API 経路と同じ会計ログへ書く。CLI だけ記録が抜けると、
-    費用の全体像が追えない (Codex レビュー round 14)。"""
+    費用の全体像が追えない (Codex レビュー round 14)。
+
+    委譲先 (api.routes.agent._log_agent_result) は書き込み失敗時に
+    自分で stderr フォールバックを行い、常に row を返す。ここでの
+    try/except は「委譲そのもの」(import 失敗等) に対する保険で、
+    その場合も cost_usd だけは stderr へ残す —— 真のディスク障害では
+    委譲先の JSONL 書き込みと CLI 側の記録が同時に失われうる
+    (レビューで指摘)。
+    """
     try:
         from api.routes.agent import _log_agent_result as _log
-        _log(**kwargs)
+        return _log(**kwargs)
     except Exception:
-        pass
+        import sys
+        fallback = {k: v for k, v in kwargs.items()
+                   if k in ("mode", "status", "cost_usd")}
+        print(f"⚠️ agent_sdk_run accounting delegation failed, "
+              f"row follows: {fallback}", file=sys.stderr)
+        return fallback
 
 # ホストが書く。Agent には触らせない。
 OUTPUT_FILES = {

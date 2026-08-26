@@ -294,3 +294,55 @@ def test_a_persistence_failure_after_a_known_cost_still_logs_a_row(monkeypatch, 
     row = rows[-1]
     assert row["status"] == "persistence_error"
     assert row["cost_usd"] == 0.0789, "確定済みのコストが保存失敗で失われた"
+
+
+def test_a_true_dual_write_failure_still_surfaces_cost_via_sse(monkeypatch, sandbox):
+    """真のディスク障害では、保存とログ書き込みが同時に失敗しうる。
+
+    以前は analyst.llm_client._append_llm_call_log が自分の例外を握り潰して
+    正常終了したように見せていたため、api/routes/agent.py 側の
+    try/except は常に「成功」と判定していた。結果、既に確定した cost_usd が
+    SSE にも監査ログにもどこにも残らなかった (レビューで実測)。
+
+    ここでは監査ログの書き込み先を存在しないパスへ差し替えて、両方の
+    書き込みが実際に失敗する状況を再現する。
+    """
+    import analyst.llm_client as llm_client
+
+    rows: list[dict] = []
+    _install_fake_sdk(monkeypatch, blocks=[_TextBlock("analysis")],
+                      result=_valid_agent_output(sandbox), cost=0.0789)
+    monkeypatch.setattr(agent, "save_verified_result",
+                        lambda *a, **k: (_ for _ in ()).throw(OSError("disk full")))
+    monkeypatch.setattr(llm_client, "_DEFAULT_LOG_PATH",
+                        Path("/nonexistent_root_disk_full/x.jsonl"))
+    # 会計ログの実体は書けないので rows は空のまま —— それでも SSE には
+    # cost_usd/model/status が残ることを検証する。
+    monkeypatch.setattr(agent, "_append_llm_call_log",
+                        lambda row: llm_client._append_llm_call_log(row))
+
+    chunks = asyncio.run(_collect_agent_chunks("default"))
+
+    error_chunks = [c for c in chunks if "event: error" in c]
+    assert error_chunks, "エラーイベントが1つも出なかった"
+    assert "0.0789" in error_chunks[-1], (
+        "監査ログが書けないとき、SSE にコストが残らなかった")
+    assert "persistence_error" in error_chunks[-1]
+    assert "claude-sonnet-5" in error_chunks[-1] or "sonnet" in error_chunks[-1]
+
+
+def test_the_underlying_logger_reports_write_failure_truthfully(tmp_path, monkeypatch):
+    """analyst.llm_client._append_llm_call_log が実際の書き込み成否を返す。
+
+    以前は例外を握り潰すだけで戻り値も無く (-> None)、呼び出し側は
+    「書けたかどうか」を一切判定できなかった。
+    """
+    import analyst.llm_client as llm_client
+
+    monkeypatch.setattr(llm_client, "_DEFAULT_LOG_PATH",
+                        tmp_path / "ok" / "log.jsonl")
+    assert llm_client._append_llm_call_log({"role": "test"}) is True
+
+    monkeypatch.setattr(llm_client, "_DEFAULT_LOG_PATH",
+                        Path("/nonexistent_root_disk_full/x.jsonl"))
+    assert llm_client._append_llm_call_log({"role": "test"}) is False

@@ -12,6 +12,7 @@ sanitized projection にし、ツール自体を外した。CLI (portfolio_agent
 
 import asyncio
 import json
+import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -49,12 +50,21 @@ OUTPUT_FILES = {
 }
 
 
-def _append_llm_call_log(row: dict) -> None:
+def _append_llm_call_log(row: dict) -> bool:
+    """会計ログへ1行追加する。書けたかどうかを返す。
+
+    ⚠️ 従来は例外を握り潰すだけで戻り値も無かった。真のディスク障害では
+    save_verified_result の失敗とこのログ書き込みの失敗が **同時に** 起き
+    うる —— その場合、既に確定した cost_usd がどこにも残らず消える
+    (レビューで実測: 出力先を存在しないパスへ差し替えて再現)。
+    呼び出し側 (_log_agent_result) が成否を見て stderr / SSE へ退避できる
+    よう、bool を返すようにする。
+    """
     try:
         from analyst.llm_client import _append_llm_call_log as _append
-        _append(row)
+        return bool(_append(row))
     except Exception:
-        pass
+        return False
 
 
 def _log_agent_result(
@@ -65,7 +75,10 @@ def _log_agent_result(
     status: str,
     cost_usd=None,
     error: Exception | None = None,
-) -> None:
+) -> dict:
+    """会計ログへ1行記録し、その行を返す (常に返す —— 書き込みの成否に
+    関わらず)。呼び出し側は返り値の cost_usd/model/status を SSE へ載せる
+    ことで、監査ログ自体が書けない状況でもクライアント側に情報を残せる。"""
     # ⚠️ model は実際の ID を記録する。"claude-agent-sdk" という総称だと
     # 「どのモデルにいくら使ったか」を後から検証できない
     # (Codex レビュー round 14)。
@@ -95,11 +108,31 @@ def _log_agent_result(
         # 未知なら 0 円と断定せず欠損のままにする。
         if cost_usd is None:
             row.setdefault("cost_status", "unknown")
-    _append_llm_call_log(row)
+    if not _append_llm_call_log(row):
+        # 監査ログへ書けなかった。同じディスク障害が原因なら、この行が
+        # 唯一の記録になりうる。stderr は systemd/launchd のログへ拾われる
+        # ので、少なくとも運用者が後から grep できる。
+        print(f"⚠️ agent_sdk_run accounting log write failed, row follows: "
+              f"{json.dumps(row, ensure_ascii=False)}", file=sys.stderr)
+    return row
 
 
 def _sse(event: str, data: dict) -> str:
     return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
+
+
+def _sse_error(message: str, row: dict) -> str:
+    """会計ログの行から cost/model/status を SSE 側にも複製する。
+
+    監査ログ (JSONL) 自体が書けない状況 (真のディスク障害) でも、
+    クライアントへ配信される SSE にだけは cost_usd/model/status が残る
+    ようにする —— これが唯一生き残る記録になりうる (レビューで指摘)。
+    """
+    payload = {"message": message}
+    for key in ("cost_usd", "model", "status"):
+        if key in row:
+            payload[key] = row[key]
+    return _sse("error", payload)
 
 
 async def _run_agent(mode: str) -> AsyncIterator[str]:
@@ -173,22 +206,22 @@ async def _run_agent_locked(mode: str) -> AsyncIterator[str]:
                 # (レビューで success → output_rejected の2行を再現)。
                 cost = getattr(message, "total_cost_usd", None)
                 if message.subtype != "success":
-                    _log_agent_result(mode=mode, prompt=prompt, started=started,
-                                      status=message.subtype, cost_usd=cost)
+                    row = _log_agent_result(mode=mode, prompt=prompt, started=started,
+                                            status=message.subtype, cost_usd=cost)
                     yield _sse("done", {"success": False, "error": message.subtype,
-                                        "cost_usd": cost})
+                                        "cost_usd": cost, "model": row.get("model")})
                     return
                 result_payload = message
             await asyncio.sleep(0)  # イベントループに制御を返す
     except AgentProtocolViolation as e:
-        _log_agent_result(mode=mode, prompt=prompt, started=started,
-                          status="protocol_violation", error=e)
-        yield _sse("error", {"message": f"プロトコル違反: {e}"})
+        row = _log_agent_result(mode=mode, prompt=prompt, started=started,
+                                status="protocol_violation", error=e)
+        yield _sse_error(f"プロトコル違反: {e}", row)
         return
     except Exception as e:
-        _log_agent_result(mode=mode, prompt=prompt, started=started,
-                          status="error", error=e)
-        yield _sse("error", {"message": str(e)})
+        row = _log_agent_result(mode=mode, prompt=prompt, started=started,
+                                status="error", error=e)
+        yield _sse_error(str(e), row)
         return
 
     # ── ホスト側の検証と保存 ──
@@ -198,9 +231,9 @@ async def _run_agent_locked(mode: str) -> AsyncIterator[str]:
         raw = parse_agent_result(result_payload)
         verified = validate_agent_output(raw, projection, base_dir=BASE_DIR)
     except AgentOutputError as e:
-        _log_agent_result(mode=mode, prompt=prompt, started=started,
-                          status="output_rejected", cost_usd=cost, error=e)
-        yield _sse("error", {"message": f"出力の検証に失敗、保存しません: {e}"})
+        row = _log_agent_result(mode=mode, prompt=prompt, started=started,
+                                status="output_rejected", cost_usd=cost, error=e)
+        yield _sse_error(f"出力の検証に失敗、保存しません: {e}", row)
         return
 
     # ⚠️ 検証を通った後、保存そのものが失敗しうる (ディスク満杯等)。
@@ -211,9 +244,9 @@ async def _run_agent_locked(mode: str) -> AsyncIterator[str]:
         saved = save_verified_result(BASE_DIR / OUTPUT_FILES[mode], verified,
                                      as_of=now.isoformat())
     except OSError as e:
-        _log_agent_result(mode=mode, prompt=prompt, started=started,
-                          status="persistence_error", cost_usd=cost, error=e)
-        yield _sse("error", {"message": f"保存に失敗しました: {e}"})
+        row = _log_agent_result(mode=mode, prompt=prompt, started=started,
+                                status="persistence_error", cost_usd=cost, error=e)
+        yield _sse_error(f"保存に失敗しました: {e}", row)
         return
     # 検証を通ってから、最終 status と実コストを1行だけ記録する。
     _log_agent_result(mode=mode, prompt=prompt, started=started,

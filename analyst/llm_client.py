@@ -133,8 +133,17 @@ def response_hit_max_tokens(response) -> bool:
     return getattr(response, "stop_reason", None) == "max_tokens"
 
 
-def _append_llm_call_log(row: dict) -> None:
-    """LLM timeout 調査用の軽量メタログ。プロンプト本文は保存しない。"""
+def _append_llm_call_log(row: dict) -> bool:
+    """LLM timeout 調査用の軽量メタログ。プロンプト本文は保存しない。
+
+    書き込みが実際に成功したかを返す。⚠️ 以前は -> None で、例外を
+    握り潰すだけだった。呼び出し側 (api/routes/agent.py 等) が
+    「書けたかどうか」で分岐しようとしても、ここが常に正常終了して見える
+    ため判定できなかった (レビューで実測: 出力先を存在しないパスへ差し替え
+    ても呼び出し側の try/except には何も伝わらなかった)。
+    既存の呼び出し元は全て戻り値を無視する fire-and-forget なので、
+    None -> bool は非破壊的な変更。
+    """
     try:
         from llm_cost_accounting import normalize_usage_row
         row = normalize_usage_row(row)
@@ -142,8 +151,9 @@ def _append_llm_call_log(row: dict) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("a", encoding="utf-8") as f:
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
+        return True
     except Exception:
-        pass
+        return False
 
 
 def _is_max_tokens_error_text(text: str) -> bool:
