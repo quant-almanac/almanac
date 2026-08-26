@@ -5,6 +5,11 @@ uvicorn[standard]>=0.30
 # ── AI / LLM ──────────────────────────────────────────────
 anthropic>=0.50
 openai>=1.50             # DeepSeek用（互換API）
+# portfolio_agent.py / api/routes/agent.py が実際に import する実行時
+# 依存。以前 requirements.txt に含まれておらず、CI では未インストール
+# だった (レビューで指摘: manylinux wheel が無いと誤認していたが、
+# 実際には manylinux_2_17_x86_64 / aarch64 とも PyPI に存在する)。
+claude-agent-sdk~=0.1.50
 
 # ── データ取得 ─────────────────────────────────────────────
 # P3-16: 再現性のためマイナーバージョンを固定（~=）。

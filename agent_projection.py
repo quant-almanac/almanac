@@ -1164,13 +1164,20 @@ def build_agent_options_kwargs() -> dict:
     検証するテストが、この dict を直接検査できるようにするために
     `ClaudeAgentOptions(...)` の呼び出しから分離してある。
 
-    claude-agent-sdk は 0.1.8 以降 macOS 専用のプラットフォーム別
-    wheel になり、CI (ubuntu-latest) にインストールできる Linux wheel が
-    存在しない。以前は4件の安全契約テストが `pytest.importorskip` で
-    SDK 未インストール環境ではまるごと skip されており、CI ではこの
-    契約が一度も検証されていなかった (レビューで指摘: Round 11-13 で
-    塞いだはずの核心的な安全契約が CI 上は無検証だった)。
-    ここを純粋な dict 構築にしておけば、SDK 無しでも contents を検証できる。
+    以前は4件の安全契約テストが `pytest.importorskip("claude_agent_sdk")`
+    で SDK 未インストール環境ではまるごと skip されており、claude-agent-sdk
+    が requirements.txt に含まれていなかったため CI ではこの契約が一度も
+    検証されていなかった (レビューで指摘: Round 11-13 で塞いだはずの
+    核心的な安全契約が CI 上は無検証だった)。
+    ⚠️ 「CI 向けの Linux wheel が無いから SDK を入れられない」という
+    のは誤りだった —— claude-agent-sdk 0.1.50 は PyPI に
+    manylinux_2_17_x86_64/aarch64 wheel を公開しており、CI へ普通に
+    インストールできる (レビューで指摘・PyPI のファイル一覧で確認)。
+    現在は requirements.txt に追加済みで CI でも実際にインストールされる。
+    この dict 分離自体は SDK オブジェクトの内部表現へ依存せず契約を検査
+    できるという設計上の利点が残るので維持している —— SDK の有無に
+    関わらず、SDK オブジェクトのプロパティ名や型に依存しない、より
+    直接的な検査になる。
     """
     return {
         "tools": [],

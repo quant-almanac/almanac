@@ -241,16 +241,17 @@ class TestAgentOptionsHaveNoTools:
 
     ⚠️ 以前はここが `claude_agent_sdk` のインストールに依存しており、
     CI の軽量依存セット (SDK 無し) では importorskip で丸ごと skip されて
-    いた。claude-agent-sdk は 0.1.8 以降 macOS 専用のプラットフォーム別
-    wheel になり、CI (ubuntu-latest) にインストールできる Linux wheel が
-    無い —— 古い互換バージョン (0.1.7 以下) を入れる手もあるが、本番が
-    実際に使う 0.1.50 と40件以上のパッチ差があり、そちらで契約テストを
-    通しても本番の挙動を保証したことにならない (レビューで指摘)。
+    いた。「CI 向けの Linux wheel が無いから入れられない」というのは
+    誤り —— claude-agent-sdk 0.1.50 は PyPI に manylinux_2_17_x86_64/
+    aarch64 wheel を公開しており普通にインストールできる (レビューで
+    指摘・PyPI のファイル一覧で確認)。原因は単に requirements.txt に
+    含まれていなかったことで、追加済み。
 
     Round 11-13 で塞いだはずのこの安全契約が CI 上は一度も検証されて
-    いなかった、という指摘に対する修正: `build_agent_options_kwargs()`
-    (SDK 非依存の純粋な dict 構築) を直接検査することで、SDK の有無に
-    関わらず常に実行されるようにする。
+    いなかった、という指摘に対する修正: SDK を requirements.txt へ追加した
+    上で、さらに `build_agent_options_kwargs()` (SDK 非依存の純粋な dict
+    構築) を直接検査する。SDK オブジェクトの内部プロパティ名や型に
+    依存しない、より直接的な契約検査になる。
     """
 
     def test_no_tools_are_granted(self):
@@ -823,16 +824,14 @@ def test_the_identity_baseline_is_occurrence_count_not_file_exemption():
 
 
 def test_build_agent_options_wraps_the_kwargs_unchanged():
-    """SDK ありの統合テスト (1件のみ)。
+    """`ClaudeAgentOptions(**kwargs)` が `build_agent_options_kwargs()` の
+    値をそのまま反映しているか、という配線を検証する。
 
-    安全契約そのものは TestAgentOptionsHaveNoTools が SDK 非依存で常に
-    検証する。ここでは「`ClaudeAgentOptions(**kwargs)` が
-    `build_agent_options_kwargs()` の値をそのまま反映しているか」という
-    配線だけを、SDK が実際にインストールされている環境で確認する
-    (ローカル開発機・本番では claude-agent-sdk 0.1.50 が入っている)。
-    SDK 未インストールの CI では skip されるが、安全契約自体は
-    TestAgentOptionsHaveNoTools が別途担保しているので、CI がこの契約を
-    無検証で通すことはない。
+    安全契約の中身そのものは TestAgentOptionsHaveNoTools が SDK 非依存で
+    直接検証する。claude-agent-sdk は requirements.txt に含まれており
+    CI にも実際にインストールされるので、この importorskip は通常
+    skip されない (SDK 未インストールという万一の環境でのみ発動する
+    防御的なガードであって、CI を通すための skip ではない)。
     """
     pytest.importorskip("claude_agent_sdk")
     kwargs = ap.build_agent_options_kwargs()
