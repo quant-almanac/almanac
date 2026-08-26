@@ -1,7 +1,7 @@
 import { cleanup, fireEvent, render, screen, within } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
-import AlmanacStrip from '../AlmanacStrip'
+import AlmanacStrip, { jstHHMM, jstMinutesOfDay } from '../AlmanacStrip'
 import type { AlmanacData, ExecutionPlan } from '../types'
 
 const plan: ExecutionPlan = {
@@ -136,5 +136,29 @@ describe('AlmanacStrip', () => {
 
     expect(screen.getByText('損益未集計')).toBeInTheDocument()
     expect(screen.queryByLabelText('週次損益 ¥0')).not.toBeInTheDocument()
+  })
+})
+
+describe('JST time helpers', () => {
+  // ⚠️ Date.getHours()/getMinutes() はブラウザ/実行ホストのローカル
+  // タイムゾーンを使う。この画面は「JST」と明示ラベルしているのに、
+  // 以前は host-local な getHours() で計算していたため、UTC 設定の
+  // CI ランナーでは「23:15 JST」が「14:15」と表示され、それに連動する
+  // セッション判定 (米国/東証どちらが取引中か) も丸ごとずれていた
+  // (レビューが導入した CI 分離で初めて UTC ホスト上で実行され、
+  // AlmanacStrip.test.tsx の cross-midnight セッションテストが失敗して発覚)。
+  // 日本は DST が無いので UTC+9 固定オフセットとして扱ってよい。
+  it('reads JST regardless of what host-local getHours() would return', () => {
+    // 23:15 JST = 14:15 UTC。host-local な実装ならホストのタイムゾーン
+    // 設定次第で結果が変わってしまう箇所。
+    const at2315JST = new Date('2026-07-15T23:15:00+09:00')
+    expect(jstHHMM(at2315JST)).toBe('23:15')
+    expect(jstMinutesOfDay(at2315JST)).toBe(23 * 60 + 15)
+  })
+
+  it('handles the JST midnight rollover correctly', () => {
+    const at0005JST = new Date('2026-07-16T00:05:00+09:00')
+    expect(jstHHMM(at0005JST)).toBe('00:05')
+    expect(jstMinutesOfDay(at0005JST)).toBe(5)
   })
 })

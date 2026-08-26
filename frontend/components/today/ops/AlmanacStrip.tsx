@@ -592,6 +592,20 @@ function durationLabel(totalMinutes: number): string {
   return hours > 0 ? `${hours}時間${minutes ? `${minutes}分` : ''}` : `${minutes}分`
 }
 
+// ⚠️ Date.getHours()/getMinutes() はブラウザのローカルタイムゾーンを使う。
+// この画面は「JST」と明示ラベルしているが、ホストのタイムゾーン設定が
+// JST でない環境 (UTC 設定の CI, 海外設定の端末) では表示も
+// セッション判定もずれる。日本は DST が無いので UTC+9 固定として扱える。
+export function jstMinutesOfDay(date: Date): number {
+  const jst = new Date(date.getTime() + 9 * 60 * 60 * 1000)
+  return jst.getUTCHours() * 60 + jst.getUTCMinutes()
+}
+
+export function jstHHMM(date: Date): string {
+  const jst = new Date(date.getTime() + 9 * 60 * 60 * 1000)
+  return `${String(jst.getUTCHours()).padStart(2, '0')}:${String(jst.getUTCMinutes()).padStart(2, '0')}`
+}
+
 function clockSegments(start: string, end: string): Array<{ start: number; end: number }> {
   const from = minutesOf(start)
   const to = minutesOf(end)
@@ -607,7 +621,7 @@ function MarketClock({ almanac }: { almanac: AlmanacData }) {
     return () => clearInterval(timer)
   }, [])
 
-  const nowMinutes = now ? now.getHours() * 60 + now.getMinutes() : 0
+  const nowMinutes = now ? jstMinutesOfDay(now) : 0
   const active = now
     ? [...almanac.sessions]
       .sort((a, b) => Number(b.phase === 'regular') - Number(a.phase === 'regular'))
@@ -631,7 +645,7 @@ function MarketClock({ almanac }: { almanac: AlmanacData }) {
     <div className="market-clock" aria-label="本日の市場タイムライン">
       <div className="market-clock-summary">
         <div className="market-clock-card" style={{ borderColor: active ? `${activeColor}66` : OPS.hairline }}>
-          <div style={eyebrow}>MARKET NOW · JST {now ? `${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}` : '—'}</div>
+          <div style={eyebrow}>MARKET NOW · JST {now ? jstHHMM(now) : '—'}</div>
           <div style={{ display: 'flex', alignItems: 'center', gap: 9, marginTop: 6 }}>
             <span aria-hidden style={{ width: 8, height: 8, borderRadius: '50%', background: active ? activeColor : OPS.dim, boxShadow: active ? `0 0 10px ${activeColor}` : undefined }} />
             <strong style={{ color: active ? OPS.text : OPS.sub, fontSize: 17 }}>

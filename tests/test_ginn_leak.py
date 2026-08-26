@@ -24,8 +24,17 @@ def test_X_does_not_include_future():
     assert X[0].shape == (seq_len, 4)
     # X[0] に含まれる最後の行は feat.iloc[seq_len - 1]（= i-1 の情報）
     # y[0] は r.iloc[seq_len + 1] の絶対値（= 翌日）
-    expected_y0 = abs(float(r.iloc[seq_len + 1]))
-    assert abs(y[0] - expected_y0) < 1e-12
+    #
+    # ⚠️ _build_sequences は y を float32 で返す (np.array(y, dtype=np.float32))
+    # が、ここでの期待値は Python の float (float64 相当) で計算していた。
+    # float64→float32 の丸めは値ごとに ~1e-7 相対の誤差を持ちうるため、
+    # 1e-12 という絶対許容誤差はそもそも数学的に成立しえない基準だった
+    # (レビューが導入した CI 分離で初めて別の numpy/BLAS ビルド上で実行され、
+    # 実測 diff=6.99e-11 で発覚。ローカルではたまたま丸め方向が一致し
+    # diff が表示上 0.0 になっていた)。期待値も float32 精度へ揃えてから
+    # 比較する。
+    expected_y0 = np.float32(abs(float(r.iloc[seq_len + 1])))
+    assert abs(y[0] - expected_y0) < 1e-9
 
 
 def test_fit_stats_applied_externally():
