@@ -12,8 +12,13 @@ type LogEntry =
   | { type: 'start'; message: string }
   | { type: 'text'; content: string }
   | { type: 'tool'; name: string; input: string }
-  | { type: 'done'; success: boolean; cost_usd?: number; result?: string; error?: string }
-  | { type: 'error'; message: string }
+  | { type: 'done'; success: boolean; cost_usd?: number; result?: string; error?: string
+      model?: string; status?: string }
+  // SSE/stderr は永続台帳ではない (接続切断・同一ディスク障害では
+  // 事後監査できない)。UI 側で見えた時点の cost_usd/model/status を
+  // コピーできるようにして、少なくともその場でユーザーが別媒体へ
+  // 残せるようにする (レビューで指摘)。
+  | { type: 'error'; message: string; cost_usd?: number; model?: string; status?: string }
 
 type AgentResult = {
   as_of?: string
@@ -126,7 +131,28 @@ function StreamLog({ logs, running }: { logs: LogEntry[]; running: boolean }) {
           {log.type === 'text'  && <p style={{ color: OPS.sub, fontSize: 14, whiteSpace: 'pre-wrap' }}>{log.content}</p>}
           {log.type === 'done' && log.success  && <p style={{ color: OPS.green, fontSize: 14 }}>✅ 完了{log.cost_usd ? ` ($${log.cost_usd.toFixed(4)})` : ''}</p>}
           {(log.type === 'error' || (log.type === 'done' && !log.success)) && (
-            <p style={{ color: OPS.vermilion, fontSize: 14 }}>❌ {log.type === 'error' ? log.message : log.error}</p>
+            <div>
+              <p style={{ color: OPS.vermilion, fontSize: 14 }}>
+                ❌ {log.type === 'error' ? log.message : log.error}
+              </p>
+              {(log.cost_usd != null || log.model || log.status) && (
+                <p style={{ color: OPS.sub, fontSize: 12, marginTop: 2, display: 'flex', gap: 8, alignItems: 'center' }}>
+                  {log.cost_usd != null && <span>💴 ${log.cost_usd.toFixed(4)}</span>}
+                  {log.model && <span>model={log.model}</span>}
+                  {log.status && <span>status={log.status}</span>}
+                  <button
+                    onClick={() => navigator.clipboard.writeText(JSON.stringify({
+                      message: log.type === 'error' ? log.message : log.error,
+                      cost_usd: log.cost_usd, model: log.model, status: log.status,
+                    }, null, 2))}
+                    style={{ background: 'none', border: `1px solid ${OPS.border}`, borderRadius: 4,
+                            color: OPS.sub, fontSize: 11, padding: '1px 6px', cursor: 'pointer' }}
+                  >
+                    コピー
+                  </button>
+                </p>
+              )}
+            </div>
           )}
         </div>
       ))}

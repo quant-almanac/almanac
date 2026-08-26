@@ -346,3 +346,21 @@ def test_the_underlying_logger_reports_write_failure_truthfully(tmp_path, monkey
     monkeypatch.setattr(llm_client, "_DEFAULT_LOG_PATH",
                         Path("/nonexistent_root_disk_full/x.jsonl"))
     assert llm_client._append_llm_call_log({"role": "test"}) is False
+
+
+def test_a_non_success_result_message_sse_carries_the_status_field(monkeypatch, sandbox):
+    """非success の ResultMessage も、他の失敗系 SSE と同じ "status" キーで
+    会計行の状態を運ぶ。error フィールド (message.subtype と同値) だけでは
+    キー名が他と揃わず、UI 側の統一的な扱いが崩れる (レビューで指摘)。
+    """
+    _install_fake_sdk(monkeypatch, blocks=[_TextBlock("analysis")],
+                      result=_valid_agent_output(sandbox), subtype="error_max_turns",
+                      cost=0.0234)
+    monkeypatch.setattr(agent, "_append_llm_call_log", lambda row: True, raising=False)
+
+    chunks = asyncio.run(_collect_agent_chunks("default"))
+
+    done_chunks = [c for c in chunks if "event: done" in c]
+    assert done_chunks
+    assert '"status": "error_max_turns"' in done_chunks[-1]
+    assert '"cost_usd": 0.0234' in done_chunks[-1]

@@ -74,3 +74,55 @@ describe('AgentPage — non-actionable commentary', () => {
     await findByText('📝 参考所見（売買指示ではありません）')
   })
 })
+
+describe('AgentPage — failure accounting in the run log', () => {
+  afterEach(() => vi.restoreAllMocks())
+
+  it('shows cost/model/status and offers a copy affordance when a run fails', async () => {
+    // jsdom は scrollIntoView を実装していない。ログ表示コンポーネントが
+    // 自動スクロールのため呼ぶので、テスト環境ではスタブする。
+    Element.prototype.scrollIntoView = vi.fn()
+    vi.spyOn(window, 'confirm').mockReturnValue(true)
+    const writeText = vi.fn()
+    Object.assign(navigator, { clipboard: { writeText } })
+
+    const sseBody =
+      'event: start\ndata: {"mode":"default","message":"start"}\n\n' +
+      'event: error\ndata: {"message":"保存に失敗しました: disk full",' +
+      '"cost_usd":0.0789,"model":"claude-sonnet-5","status":"persistence_error"}\n\n'
+    const encoder = new TextEncoder()
+    const stream = new ReadableStream({
+      start(controller) {
+        controller.enqueue(encoder.encode(sseBody))
+        controller.close()
+      },
+    })
+
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input)
+      if (init?.method === 'POST' && url.includes('/api/agent/run')) {
+        return { ok: true, status: 200, body: stream } as unknown as Response
+      }
+      if (url.includes('/api/agent/enabled-modes')) {
+        return { ok: true, json: async () => ({ enabled_modes: ['default'], all_modes: ['default'] }) } as Response
+      }
+      return { ok: true, json: async () => ({ headline: '', actions: [] }) } as Response
+    })
+    vi.stubGlobal('fetch', fetchMock)
+
+    const { getByText, findByText } = render(<AgentPage />)
+    await waitFor(() => getByText('↺ 再実行'))
+    getByText('↺ 再実行').click()
+
+    await findByText(/保存に失敗しました: disk full/)
+    // SSE/stderr は永続台帳ではないので、UI に見えた情報をその場でコピー
+    // できることを確認する (以前は message しか表示・保持していなかった)。
+    await findByText(/\$0\.0789/)
+    await findByText('model=claude-sonnet-5')
+    await findByText('status=persistence_error')
+
+    const copyButton = getByText('コピー')
+    copyButton.click()
+    expect(writeText).toHaveBeenCalledWith(expect.stringContaining('0.0789'))
+  })
+})

@@ -208,8 +208,14 @@ async def _run_agent_locked(mode: str) -> AsyncIterator[str]:
                 if message.subtype != "success":
                     row = _log_agent_result(mode=mode, prompt=prompt, started=started,
                                             status=message.subtype, cost_usd=cost)
+                    # ⚠️ status を明示的に含める。error フィールドは
+                    # message.subtype と同じ値だが、他の失敗系 SSE は
+                    # 全て "status" というキー名で会計行の状態を運ぶので、
+                    # ここだけキー名が違うと UI 側の統一的な扱いが崩れる
+                    # (レビューで指摘)。
                     yield _sse("done", {"success": False, "error": message.subtype,
-                                        "cost_usd": cost, "model": row.get("model")})
+                                        "cost_usd": cost, "model": row.get("model"),
+                                        "status": row.get("status")})
                     return
                 result_payload = message
             await asyncio.sleep(0)  # イベントループに制御を返す
