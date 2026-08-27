@@ -18,6 +18,7 @@ from __future__ import annotations
 import hashlib
 import json
 import sys
+import time
 from copy import deepcopy
 from datetime import datetime
 from enum import Enum
@@ -194,15 +195,26 @@ def _invalidate_portfolio_cache() -> None:
 
 
 def _event_fx_rate(req: CashRequest, account: dict) -> Optional[float]:
+    """USD 入出金の FX レートを**値として**取得する。
+
+    ⚠️ 以前は get_fx_rate_cached(persist_live_rate=True) を呼んで
+    account.json への書き込みを SDK 側に任せていたが、2つの経路で
+    その書き込みが成立しないことが分かった (レビューで実測・再現):
+      1. キャッシュヒット時: persist_live_rate=True を渡してもキャッシュ
+         ヒットの分岐は書き込みブロックより前で return するため、一切
+         書かれない。
+      2. キャッシュミス時: _prepare_cash_change() は先に account を
+         メモリへ複製しており、get_fx_rate_cached() がファイルへ直接
+         書いた直後に、呼び出し元がその古いメモリ上の account で
+         上書きコミットしてしまう。
+    そのため account への反映は呼び出し元 (_prepare_cash_change) が
+    トランザクションの一部として行う。この関数はレートの値だけを返す。
+    """
     if req.currency != CashCurrency.USD:
         return None
     try:
         from utils import get_fx_rate_cached
-        # このパスは deposit/withdraw の書き込み系エンドポイントからのみ
-        # 呼ばれる (_apply_cash_change 経由)。これから確定させる USD 現金
-        # 移動と同期させるため、明示的に account.json への保存を許可する。
-        # 読み取り専用の呼び出しは既定の persist_live_rate=False を使う。
-        fx_for_event, _ = get_fx_rate_cached(persist_live_rate=True)
+        fx_for_event, _ = get_fx_rate_cached()
         return float(fx_for_event)
     except Exception as e:
         stale = account.get("fx_rate_usdjpy")
@@ -246,6 +258,16 @@ def _prepare_cash_change(req: CashRequest, tx_type: TxType) -> tuple[dict, dict,
         )
         if duplicate is not None:
             raise HTTPException(status_code=409, detail="同じ証券会社取引IDは既に記録済みです")
+
+    # ── FX レートの取得と account への反映 ──
+    # ⚠️ _sync_account_cash_totals() や後段の new_tx (new_total_cash) が
+    # account["fx_rate_usdjpy"] を読む前に、USD 入出金なら最新レートを
+    # 反映しておく。取得だけ先にやって反映を後回しにすると、書き込みが
+    # 成立しない・totals が古いレートのままになる (レビューで指摘・再現)。
+    fx_for_event = _event_fx_rate(req, account)
+    if fx_for_event is not None:
+        account["fx_rate_usdjpy"] = fx_for_event
+        account["fx_rate_usdjpy_as_of"] = time.time()
 
     # ── account.json 更新内容の検証 ──
     if req.currency == CashCurrency.JPY and req.broker == CashBroker.rakuten and req.owner == CashOwner.husband:
@@ -341,7 +363,6 @@ def _prepare_cash_change(req: CashRequest, tx_type: TxType) -> tuple[dict, dict,
     }
     txs.append(new_tx)
     tx_log["transactions"] = txs
-    fx_for_event = _event_fx_rate(req, account)
 
     return original_account, original_holdings, original_tx_log, {
         "account": account,

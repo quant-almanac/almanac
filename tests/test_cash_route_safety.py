@@ -69,6 +69,33 @@ def test_cash_change_rolls_back_json_when_ledger_append_fails(isolated_cash, mon
     assert _read(isolated_cash["tx"]) == before_tx
 
 
+def test_usd_cash_change_rolls_back_the_fetched_fx_rate_when_ledger_append_fails(isolated_cash, monkeypatch):
+    """USD入出金がledger失敗で巻き戻る際、途中で取得・適用した新FXレートも
+    一緒に元へ戻ることを固定する。account["fx_rate_usdjpy"]は_prepare_cash_change
+    内でメモリ上のaccountへ直接書き込まれるため、_commit_cash_changeの
+    無条件restore (original_accountの書き戻し) から漏れていないかが論点。"""
+    before_account = _read(isolated_cash["account"])
+    assert before_account["fx_rate_usdjpy"] == 150.0
+    assert "fx_rate_usdjpy_as_of" not in before_account
+
+    monkeypatch.setattr(cash, "_event_fx_rate", lambda req, account: 152.5)
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("ledger down")
+
+    monkeypatch.setattr(cash, "_append_cash_flow_event", boom)
+
+    req = cash.CashRequest(currency=cash.CashCurrency.USD, amount=10, broker=cash.CashBroker.rakuten)
+    with pytest.raises(HTTPException) as exc:
+        cash._apply_cash_change(req, cash.TxType.deposit)
+
+    assert exc.value.status_code == 500
+    after_account = _read(isolated_cash["account"])
+    assert after_account == before_account
+    assert after_account["fx_rate_usdjpy"] == 150.0
+    assert "fx_rate_usdjpy_as_of" not in after_account
+
+
 def test_cash_change_records_cash_flow_event(isolated_cash):
     req = cash.CashRequest(
         currency=cash.CashCurrency.JPY,

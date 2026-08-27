@@ -405,3 +405,76 @@ def test_get_balances_recomputes_total_cash_when_stored_value_is_stale(isolated)
     result = asyncio.run(cash_module.get_balances())
 
     assert result["total_cash_jpy"] == 251_250
+
+
+# ---------------------------------------------------------------------------
+# USD 入出金: FX レートが account.json へ実際に反映されること
+# ---------------------------------------------------------------------------
+#
+# ⚠️ 以前は _event_fx_rate() が get_fx_rate_cached(persist_live_rate=True)
+# を呼び、その内部でファイルへ直接書いていた。2つの経路で成立しなかった
+# (レビューで実測・再現):
+#   1. キャッシュヒット時: persist_live_rate=True でもキャッシュヒットの
+#      分岐は書き込みより前で return するため一切書かれない。
+#   2. キャッシュミス時: _prepare_cash_change() が先に account を複製済み
+#      なので、直接書き込みの直後に古いメモリ上の account で上書き
+#      コミットしてしまう。
+# 修正: _event_fx_rate() は値だけを返し、_prepare_cash_change() がその値を
+# トランザクション内の account へ反映してから commit する。
+
+
+def _install_fake_fx(monkeypatch, rate: float, *, via_cache: bool = False) -> None:
+    """utils.get_fx_rate_cached を差し替え、cash モジュールの import 経路を通す。"""
+    import utils as utils_module
+
+    def _fake(*_a, **_kw):
+        return float(rate), ('cache' if via_cache else 'live')
+
+    monkeypatch.setattr(utils_module, "get_fx_rate_cached", _fake)
+
+
+def test_usd_deposit_persists_the_fetched_fx_rate_on_a_cache_miss(isolated, monkeypatch) -> None:
+    """キャッシュミス (source='live') でも FX レートが account.json へ残る。"""
+    _install_fake_fx(monkeypatch, 151.25, via_cache=False)
+
+    req = CashRequest(currency=CashCurrency.USD, amount=100.0, broker=CashBroker.rakuten)
+    result = _apply_cash_change(req, TxType.deposit)
+
+    assert result["ok"] is True
+    account = _read(isolated["account"])
+    assert account["fx_rate_usdjpy"] == 151.25, (
+        "USD 入出金なのに account.json の FX レートが更新されなかった")
+    assert "fx_rate_usdjpy_as_of" in account
+    # total_cash / jpy_equivalent_usd も新レートで再計算されていること。
+    assert account["total_cash"] == _recompute_total_cash(account)
+
+
+def test_usd_deposit_persists_the_fetched_fx_rate_on_a_cache_hit(isolated, monkeypatch) -> None:
+    """キャッシュヒット (source='cache') でも FX レートが account.json へ残る。
+
+    以前は get_fx_rate_cached(persist_live_rate=True) 自身がキャッシュ
+    ヒットの早期 return で書き込みブロックへ到達できず、この経路だけ
+    サイレントに何も保存されなかった。
+    """
+    _install_fake_fx(monkeypatch, 151.25, via_cache=True)
+
+    req = CashRequest(currency=CashCurrency.USD, amount=100.0, broker=CashBroker.rakuten)
+    result = _apply_cash_change(req, TxType.deposit)
+
+    assert result["ok"] is True
+    account = _read(isolated["account"])
+    assert account["fx_rate_usdjpy"] == 151.25, (
+        "キャッシュヒット経路で FX レートが account.json へ反映されなかった")
+
+
+def test_a_jpy_transaction_does_not_require_an_fx_fetch(isolated, monkeypatch) -> None:
+    """JPY 取引は FX を取りに行かない (既存スコープ通り)。呼ばれたら失敗させる。"""
+    def _must_not_be_called(*_a, **_kw):
+        raise AssertionError("JPY 取引で get_fx_rate_cached が呼ばれた")
+
+    import utils as utils_module
+    monkeypatch.setattr(utils_module, "get_fx_rate_cached", _must_not_be_called)
+
+    req = CashRequest(currency=CashCurrency.JPY, amount=100_000.0, broker=CashBroker.rakuten)
+    result = _apply_cash_change(req, TxType.deposit)
+    assert result["ok"] is True
