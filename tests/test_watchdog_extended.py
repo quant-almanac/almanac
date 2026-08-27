@@ -53,6 +53,55 @@ def test_fx_staleness_old_as_of_is_stale():
     assert age_hours == pytest.approx(96.0, abs=0.1)
 
 
+def test_fx_staleness_future_as_of_beyond_tolerance_is_stale():
+    """時計ずれ・書き込みバグで未来の as_of が書かれると、経過時間が負に
+    なり `fx_age_sec > FX_STALE_SEC` が常に False で fresh 扱いになって
+    いた (レビューで指摘・実測: 7日未来の as_of が (False, -168.0) を
+    返していた)。許容幅 (FX_FUTURE_TOLERANCE_HOURS) を超える未来値は
+    stale 側へ倒す。
+    """
+    now = time.time()
+    seven_days_future = now + 7 * 24 * 3600
+    stale, age_hours = wd._fx_staleness({"fx_rate_usdjpy_as_of": seven_days_future}, now=now)
+    assert stale is True
+    assert age_hours == -168.0
+
+
+def test_fx_staleness_future_as_of_within_tolerance_is_still_fresh():
+    """通常の時計ずれ (許容幅以内) までは fresh のまま — 誤検知しない。"""
+    now = time.time()
+    thirty_min_future = now + 1800
+    stale, age_hours = wd._fx_staleness({"fx_rate_usdjpy_as_of": thirty_min_future}, now=now)
+    assert stale is False
+    assert age_hours == -0.5
+
+
+def test_fx_staleness_non_numeric_as_of_does_not_crash():
+    """float() できない値で evaluate_health() ごとクラッシュしていた
+    (レビューで指摘・実測: ValueError が伝播し、heartbeat/schema/parquet
+    など他の全チェックまで巻き込んで止まっていた)。stale=True, age=None
+    へ fail-closed し、例外は投げない。
+    """
+    stale, age_hours = wd._fx_staleness({"fx_rate_usdjpy_as_of": "not_a_number"}, now=time.time())
+    assert stale is True
+    assert age_hours is None
+
+
+def test_fx_staleness_nan_as_of_is_treated_as_stale():
+    """NaN との比較は常に False になるため、素朴な比較では fresh 扱いに
+    なっていた (レビューで指摘・実測: (False, nan) を返していた)。
+    """
+    stale, age_hours = wd._fx_staleness({"fx_rate_usdjpy_as_of": float("nan")}, now=time.time())
+    assert stale is True
+    assert age_hours is None
+
+
+def test_fx_staleness_infinite_as_of_is_treated_as_stale():
+    stale, age_hours = wd._fx_staleness({"fx_rate_usdjpy_as_of": float("inf")}, now=time.time())
+    assert stale is True
+    assert age_hours is None
+
+
 # ────────────────────────────────────────────────────────
 # _check_critical_json
 # ────────────────────────────────────────────────────────

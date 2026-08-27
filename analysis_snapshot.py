@@ -212,10 +212,22 @@ def _parse_timestamp_value(value: object) -> Optional[datetime]:
     return None
 
 
+_FUTURE_TOLERANCE_HOURS = 1.0  # api/routes/dashboard.py・scenario.py と同じ許容幅
+
+
 def _freshness_status(as_of: Optional[datetime], *, now: datetime, max_age_hours: float) -> str:
     if as_of is None:
         return "unknown"
-    age_hours = max(0.0, (now - as_of).total_seconds() / 3600)
+    raw_age_hours = (now - as_of).total_seconds() / 3600
+    # ⚠️ 時計ずれ・壊れた state で未来のタイムスタンプが書き込まれると、
+    # raw_age_hours が負になり、それを 0.0 にクランプするだけでは常に
+    # fresh 判定になっていた (レビューで指摘・実測: 7日未来の as_of が
+    # "fresh" を返す)。許容幅を超える未来値は unknown へ fail-closed する
+    # — 欠落 (as_of is None) と同じ「信頼できない」の扱い。通常の時計ずれ
+    # (許容幅以内) はこれまで通り 0.0 にクランプして fresh 側へ倒す。
+    if raw_age_hours < -_FUTURE_TOLERANCE_HOURS:
+        return "unknown"
+    age_hours = max(0.0, raw_age_hours)
     if age_hours > max_age_hours:
         return "stale"
     if age_hours > max_age_hours / 2:

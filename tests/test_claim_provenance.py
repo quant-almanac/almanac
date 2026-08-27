@@ -193,7 +193,11 @@ def test_claims_from_bl_views_empty_root_returns_empty_list():
 def test_snapshot_claims_and_action_claim_preserve_parent_quality(tmp_path):
     import analysis_snapshot as snapshot
 
-    now = datetime(2026, 7, 28, 9, 0)
+    # holdings.json は ts_keys=("__mtime__",) で実ファイルの mtime を権威
+    # にするため、now が固定の過去日時だと mtime (実行時の実時刻) との差が
+    # 常に「未来」になり、_freshness_status の未来許容幅チェック (レビュー
+    # で追加) に引っかかって unknown 化する。now は実時刻を使う。
+    now = datetime.now()
     for name, payload in {
         # fx_rate_usdjpy_as_of が無いと fx の provenance が "unknown" になり
         # (レビューで指摘・修正済み: last_updated への fallback は fail-open

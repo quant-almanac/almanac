@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 from datetime import date
+import math
 import os
 import shutil
 import sys
@@ -124,6 +125,10 @@ EXPECTED_INTERVALS = {
 
 # FX as-of が古すぎる閾値
 FX_STALE_SEC = 3 * 24 * 3600  # 3 日
+# 時計ずれ許容幅。api/routes/dashboard.py・scenario.py の
+# _FUTURE_TOLERANCE_HOURS と同じ値 (1時間) — 未来のタイムスタンプを
+# 一律 stale にすると通常の時計ずれまで誤検知するため、この幅までは許容する。
+FX_FUTURE_TOLERANCE_HOURS = 1.0
 
 # Telegram は「今すぐ見に行くべき問題」だけに絞る。
 # parquet stale / screener 欠落などの保守メモは status 出力に残し、通知対象から外す。
@@ -715,12 +720,32 @@ def _fx_staleness(acc: dict, *, now: float) -> tuple[bool, Optional[float]]:
     フィールドを更新しないため、一度も live/cache 取得のない口座だと
     永久に欠落したままになり得る。欠落を fresh の既定値にすると、その
     間ずっとこの watchdog チェックが発火しない fail-open になる。
+
+    ⚠️ 値があっても、それが妥当とは限らない (レビューで指摘・実測):
+      - 数値に変換できない (str 等): float() が ValueError を投げ、
+        呼び出し元の evaluate_health() ごとクラッシュしていた ——
+        heartbeat/schema/parquet など他の全チェックまで巻き込んで
+        止まる、この関数単体の入力ミスにしては影響が大きすぎる欠陥。
+      - NaN: float(nan) 自体は例外を投げないが、NaN との比較は常に
+        False になるため `fx_age_sec > FX_STALE_SEC` が常に False ==
+        fresh 扱いになっていた。
+      - 未来の値 (時計ずれ・書き込みバグ): 経過時間が負になり、同じ理由で
+        常に fresh 扱いになっていた (7日未来で再現)。
+    いずれも「新鮮」ではなく「判定できない/疑わしい」に倒す。
     """
     fx_as_of = acc.get('fx_rate_usdjpy_as_of')
     if not fx_as_of:
         return True, None
-    fx_age_sec = now - float(fx_as_of)
+    try:
+        fx_as_of_epoch = float(fx_as_of)
+    except (TypeError, ValueError):
+        return True, None
+    if not math.isfinite(fx_as_of_epoch):
+        return True, None
+    fx_age_sec = now - fx_as_of_epoch
     fx_age_hours = round(fx_age_sec / 3600, 1)
+    if fx_age_hours < -FX_FUTURE_TOLERANCE_HOURS:
+        return True, fx_age_hours
     return fx_age_sec > FX_STALE_SEC, fx_age_hours
 
 
@@ -925,7 +950,9 @@ def _build_watchdog_message(report: dict) -> str:
     if report.get('fx_stale'):
         fx_age_hours = report.get('fx_age_hours')
         if fx_age_hours is None:
-            msg_lines.append("\n💱 FX レート鮮度不明: fx_rate_usdjpy_as_of が未記録")
+            msg_lines.append("\n💱 FX レート鮮度不明: fx_rate_usdjpy_as_of が未記録/不正")
+        elif fx_age_hours < 0:
+            msg_lines.append(f"\n💱 FX レート時刻が未来: {-fx_age_hours}h 先（時計ずれ疑い）")
         else:
             msg_lines.append(f"\n💱 FX レート古い: {fx_age_hours}h 前（3日超）")
     if report.get('schema_issues'):

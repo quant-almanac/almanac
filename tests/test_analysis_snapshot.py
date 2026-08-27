@@ -75,12 +75,45 @@ def test_extract_timestamp_rejects_small_numeric_counters(tmp_path):
     assert snap._extract_json_timestamp(tmp_path / "counter.json", ("scanned",)) is None
 
 
+def test_parse_timestamp_value_rejects_nan_and_infinity():
+    """NaN/Infinity は妥当な時刻ではないため None (unknown) へ倒す。
+
+    標準 JSON は NaN/Infinity を許さないが json.loads は既定でこれを
+    拡張として受理するため、ここで弾かないと不正な入力がそのまま日時
+    扱いされ得る (レビューで指摘・実測: 現状は既に None を返すことを
+    確認済みだが、回帰を防ぐため固定する)。
+    """
+    assert snap._parse_timestamp_value(float("nan")) is None
+    assert snap._parse_timestamp_value(float("inf")) is None
+    assert snap._parse_timestamp_value(float("-inf")) is None
+    assert snap._parse_timestamp_value("not_a_number") is None
+
+
 def test_freshness_status_thresholds():
     now = datetime(2026, 7, 27, 12, 0, 0)
     assert snap._freshness_status(None, now=now, max_age_hours=24) == "unknown"
     assert snap._freshness_status(now - timedelta(hours=1), now=now, max_age_hours=24) == "fresh"
     assert snap._freshness_status(now - timedelta(hours=20), now=now, max_age_hours=24) == "degraded"
     assert snap._freshness_status(now - timedelta(hours=30), now=now, max_age_hours=24) == "stale"
+
+
+def test_freshness_status_future_beyond_tolerance_is_unknown():
+    """時計ずれ・壊れた state で未来の as_of が書かれると、経過時間の負値を
+    0.0 にクランプするだけでは常に fresh 判定になっていた (レビューで
+    指摘・実測: 7日未来の as_of が "fresh" を返していた)。許容幅
+    (_FUTURE_TOLERANCE_HOURS) を超える未来値は unknown へ倒す —
+    欠落 (as_of is None) と同じ「信頼できない」の扱い。
+    """
+    now = datetime(2026, 7, 27, 12, 0, 0)
+    seven_days_future = now + timedelta(days=7)
+    assert snap._freshness_status(seven_days_future, now=now, max_age_hours=24) == "unknown"
+
+
+def test_freshness_status_future_within_tolerance_is_still_fresh():
+    """通常の時計ずれ (許容幅以内) までは fresh のまま — 誤検知しない。"""
+    now = datetime(2026, 7, 27, 12, 0, 0)
+    thirty_min_future = now + timedelta(minutes=30)
+    assert snap._freshness_status(thirty_min_future, now=now, max_age_hours=24) == "fresh"
 
 
 # ---------------------------------------------------------------------------
