@@ -39,6 +39,7 @@ from agent_projection import (
     AgentOutputError,
     AgentProtocolViolation,
     MODES,
+    assert_no_forbidden_tool_use,
     build_agent_options,
     build_agent_projection,
     build_agent_prompt,
@@ -126,9 +127,9 @@ async def _run_locked(mode: str) -> int:
             if isinstance(message, AssistantMessage):
                 for block in message.content:
                     if isinstance(block, ToolUseBlock):
-                        # ツールを与えていないので、使おうとした時点で契約違反。
-                        raise AgentProtocolViolation(
-                            f"agent attempted tool use: {block.name}")
+                        # 構造化出力の配信機構 (STRUCTURED_OUTPUT_TOOL_NAME)
+                        # だけは通す。それ以外は禁止ツールの使用として契約違反。
+                        assert_no_forbidden_tool_use(block)
                     # ⚠️ TextBlock は表示しない。scope 外の銘柄に触れる
                     # 自由文が検証前に人の目に入ると、構造化 action を
                     # 縛った意味が薄れる (Codex レビュー round 13)。

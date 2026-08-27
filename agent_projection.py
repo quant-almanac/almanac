@@ -1194,6 +1194,13 @@ def build_agent_options_kwargs() -> dict:
         # (Codex レビュー round 13: model=None / max_budget_usd=None だった)。
         "model": resolve_agent_model(),
         "max_budget_usd": AGENT_MAX_BUDGET_USD,
+        # ⚠️ 明示しないと、SDK 同梱の CLI が claude-sonnet-5 向けに
+        # レガシーな thinking.type=enabled をデフォルト注入し、API が
+        # 400 (invalid_request_error) で拒否する (レビューで指摘・実測:
+        # 隔離ライブの初回試行で再現)。同梱 CLI のバージョン (claude-agent-sdk
+        # のバージョンに紐づく) に関わらず、明示的に adaptive を要求する。
+        "thinking": {"type": "adaptive"},
+        "effort": "medium",
     }
 
 
@@ -1212,6 +1219,35 @@ def build_agent_options():
 
 class AgentProtocolViolation(AgentOutputError):
     """Agent がツールを使おうとした。ツールは与えていないので契約違反。"""
+
+
+# ⚠️ output_format={"type": "json_schema", ...} を要求すると、SDK 同梱の
+# CLI はこの名前の ToolUseBlock を使って構造化出力を配信する
+# (tools=[] で実ツールを一切与えなくても現れる)。SDK 0.1.50/0.2.145・
+# claude-haiku-4-5-20251001/claude-sonnet-5 のいずれの組み合わせでも
+# 再現・実測で確認済み — SDK のバージョンやモデルに依存しない、
+# 構造化出力の配信機構そのもの。
+# この名前を「禁止したツールの使用」と区別しないと、構造化出力を要求する
+# 限り**成功する run が存在し得ない** (毎回 AgentProtocolViolation として
+# 誤検知される)。実際に本番コードはこの区別を一度もしておらず、隔離ライブの
+# 検証で初めて発覚した (レビューで発見)。
+STRUCTURED_OUTPUT_TOOL_NAME = "StructuredOutput"
+
+
+def assert_no_forbidden_tool_use(block) -> None:
+    """block が禁止ツールの使用なら AgentProtocolViolation を送出する。
+
+    SDK 自身が構造化出力の配信に使う STRUCTURED_OUTPUT_TOOL_NAME だけは
+    実際のツール使用ではないため対象外にする。CLI (portfolio_agent.py) と
+    API (api/routes/agent.py) の両方がこの1関数だけを呼ぶことで、
+    どちらか片方だけこの区別を持って食い違う事態を避ける
+    (呼び出し側は `isinstance(block, ToolUseBlock)` を確認してから渡す —
+    この関数自体は claude_agent_sdk の型に依存しないよう `block.name` の
+    duck typing のみで判定する)。
+    """
+    if block.name == STRUCTURED_OUTPUT_TOOL_NAME:
+        return
+    raise AgentProtocolViolation(f"agent attempted tool use: {block.name}")
 
 
 def parse_agent_result(message: object) -> dict:

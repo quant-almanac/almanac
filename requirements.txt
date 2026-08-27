@@ -19,7 +19,19 @@ openai>=1.50             # DeepSeek用（互換API）
 # 上の P3-16 が前提とする requirements-lock.txt は未作成なので、`~=` だけ
 # では再現性が担保されない点も踏まえた判断。SDK を上げるときは本番と
 # 同時に、Agent 経路の契約テストを通してから上げること。
-claude-agent-sdk==0.1.50
+#
+# ⚠️ 0.1.50 → 0.2.145 (2026-08-28): 0.1.50 が同梱する CLI (2.1.81) は
+# claude-sonnet-5 に対してレガシーな thinking.type=enabled をデフォルト
+# 注入し、API に 400 (invalid_request_error) で拒否されていた
+# (レビューで指摘・隔離ライブの実行で再現)。SDK は cli_path 未指定時、
+# システム PATH の claude より**同梱 CLI を優先**するため、システム側の
+# claude を更新しても効果が無い (レビューで指摘・実測: shutil.which の
+# 前に _find_bundled_cli() が呼ばれることを SDK ソースで確認)。
+# 0.2.145 は PyPI 上の最新版で同梱 CLI 2.1.247・manylinux wheel あり
+# (PyPI JSON API で確認)。agent_projection.py 側で thinking={"type":
+# "adaptive"}, effort="medium" を明示することとセットで、実際に
+# claude-sonnet-5 への live 呼び出しが成功することを確認済み。
+claude-agent-sdk==0.2.145
 
 # ── データ取得 ─────────────────────────────────────────────
 # P3-16: 再現性のためマイナーバージョンを固定（~=）。

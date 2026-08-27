@@ -276,6 +276,18 @@ class TestAgentOptionsHaveNoTools:
         assert kwargs["output_format"]["type"] == "json_schema"
         assert kwargs["output_format"]["schema"]["additionalProperties"] is False
 
+    def test_thinking_is_adaptive(self):
+        """claude-sonnet-5 は thinking.type=enabled (レガシー) を拒否し、
+        adaptive を要求する。明示しないと SDK 同梱 CLI がレガシー値を
+        デフォルト注入し、API が 400 で拒否する (レビューで指摘・
+        隔離ライブで実測・再現)。"""
+        kwargs = ap.build_agent_options_kwargs()
+        assert kwargs["thinking"] == {"type": "adaptive"}
+
+    def test_effort_is_medium(self):
+        kwargs = ap.build_agent_options_kwargs()
+        assert kwargs["effort"] == "medium"
+
 
 class TestOutputValidation:
     @pytest.fixture
@@ -696,6 +708,64 @@ def test_the_api_does_not_block_the_event_loop_on_the_lock():
     assert "timeout=0" in src, "API がロック待ちで event loop を止めている"
 
 
+class TestStructuredOutputIsNotAToolUseViolation:
+    """output_format={"type": "json_schema", ...} を要求すると、SDK 同梱の
+    CLI はこの機構自体を STRUCTURED_OUTPUT_TOOL_NAME という名前の
+    ToolUseBlock で配信する (tools=[] で実ツールを一切与えなくても現れる)。
+    これを「禁止したツールの使用」と区別しないと、構造化出力を要求する限り
+    **成功する run が存在し得ない** (毎回 AgentProtocolViolation として
+    誤検知される)。隔離ライブの検証で実際に発生することを実測して発見した
+    —— SDK 0.1.50/0.2.145・claude-haiku-4-5-20251001/claude-sonnet-5 の
+    いずれの組み合わせでも再現した。
+    """
+
+    def test_the_structured_output_tool_name_is_allowed(self):
+        block = type("FakeBlock", (), {"name": ap.STRUCTURED_OUTPUT_TOOL_NAME})()
+        ap.assert_no_forbidden_tool_use(block)  # raise しないこと自体が確認
+
+    def test_a_genuinely_forbidden_tool_still_raises(self):
+        block = type("FakeBlock", (), {"name": "Bash"})()
+        with pytest.raises(ap.AgentProtocolViolation, match="Bash"):
+            ap.assert_no_forbidden_tool_use(block)
+
+    def test_both_entrypoints_call_the_shared_guard(self):
+        """CLI と API が別々に isinstance(ToolUseBlock) の後続処理を持つと、
+        どちらか片方だけ STRUCTURED_OUTPUT_TOOL_NAME の除外を実装し忘れて
+        再びこのクラスの最初の欠陥に戻り得る。両方が同じ関数を呼ぶことを
+        ソース検査で固定する。"""
+        import inspect
+
+        import api.routes.agent as api_agent
+        import portfolio_agent as cli_agent
+
+        api_src = inspect.getsource(api_agent._run_agent_locked)
+        cli_src = inspect.getsource(cli_agent._run_locked)
+        assert "assert_no_forbidden_tool_use(block)" in api_src
+        assert "assert_no_forbidden_tool_use(block)" in cli_src
+        # 生の isinstance(...) 直後に raise AgentProtocolViolation を書く
+        # 旧パターンへの回帰がないこと (呼び出しを経由せず直接 raise すると
+        # STRUCTURED_OUTPUT_TOOL_NAME の除外が効かない)。
+        assert "raise AgentProtocolViolation(\n" not in api_src
+        assert "raise AgentProtocolViolation(\n" not in cli_src
+
+    def test_both_entrypoints_build_options_via_the_shared_builder(self):
+        """CLI/API が別々に ClaudeAgentOptions(...) を組み立てると、
+        安全契約 (ツール禁止・thinking・budget 等) が片方だけ更新されて
+        食い違いうる。両方が build_agent_options() だけを呼ぶことを
+        ソース検査で固定する。"""
+        import inspect
+
+        import api.routes.agent as api_agent
+        import portfolio_agent as cli_agent
+
+        api_src = inspect.getsource(api_agent._run_agent_locked)
+        cli_src = inspect.getsource(cli_agent._run_locked)
+        assert "build_agent_options()" in api_src
+        assert "build_agent_options()" in cli_src
+        assert "ClaudeAgentOptions(" not in api_src
+        assert "ClaudeAgentOptions(" not in cli_src
+
+
 def test_both_entrypoints_record_the_resolved_model():
     """「どのモデルにいくら使ったか」を後から検証できること。"""
     import inspect
@@ -848,3 +918,51 @@ def test_build_agent_options_wraps_the_kwargs_unchanged():
     assert options.max_turns == kwargs["max_turns"]
     assert options.model == kwargs["model"]
     assert options.max_budget_usd == kwargs["max_budget_usd"]
+    assert options.thinking == kwargs["thinking"]
+    assert options.effort == kwargs["effort"]
+
+
+def test_claude_agent_sdk_version_is_pinned_exactly():
+    """requirements.txt と実際にインストールされている SDK のバージョンが
+    一致すること。SDK は cli_path 未指定時、システム PATH の claude より
+    同梱 CLI を優先するため (_find_bundled_cli() が shutil.which() より先)、
+    「どの SDK バージョンが入っているか」が「どの CLI バイナリが実際に
+    起動するか」をそのまま決める。ここがずれると、CI で検証した契約と
+    本番が使う CLI の実際の挙動が一致しなくなる (レビューで指摘:
+    0.1.50 が同梱していた CLI 2.1.81 は claude-sonnet-5 のリクエストを
+    400 で拒否していた)。
+    """
+    import re
+
+    import claude_agent_sdk
+
+    req_text = (Path(ap.__file__).parent / "requirements.txt").read_text(encoding="utf-8")
+    m = re.search(r"^claude-agent-sdk==([0-9.]+)\s*$", req_text, re.MULTILINE)
+    assert m is not None, "requirements.txt に claude-agent-sdk==X.Y.Z の完全固定が無い"
+    pinned = m.group(1)
+    assert claude_agent_sdk.__version__ == pinned, (
+        f"インストール済み SDK ({claude_agent_sdk.__version__}) が "
+        f"requirements.txt の固定値 ({pinned}) と食い違っている")
+
+
+def test_bundled_cli_reports_the_expected_version():
+    """SDK が実際に起動する同梱 CLI (システム PATH の claude ではない) の
+    バージョンを固定する。SDK バージョンを上げるたびに同梱 CLI も変わる
+    ため、意図した CLI が実際にインストールされたことをここで確認する。
+    """
+    import subprocess
+
+    from claude_agent_sdk._internal.transport.subprocess_cli import (
+        SubprocessCLITransport,
+    )
+    import claude_agent_sdk as _sdk
+
+    transport = SubprocessCLITransport(
+        prompt="unused", options=_sdk.ClaudeAgentOptions()
+    )
+    bundled = transport._find_bundled_cli()
+    assert bundled is not None, "同梱 CLI が見つからない（システム CLI へ fallback しうる）"
+    out = subprocess.run([bundled, "--version"], capture_output=True, text=True, timeout=10)
+    assert out.returncode == 0
+    assert out.stdout.strip().startswith("2.1.247"), (
+        f"同梱 CLI のバージョンが想定と異なる: {out.stdout.strip()!r}")
