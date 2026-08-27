@@ -23,6 +23,37 @@ def isolated_base(tmp_path, monkeypatch):
 
 
 # ────────────────────────────────────────────────────────
+# _fx_staleness
+# ────────────────────────────────────────────────────────
+
+def test_fx_staleness_absent_as_of_is_treated_as_stale():
+    """fx_rate_usdjpy_as_of が一度も記録されていない account は stale
+    (fresh ではない) 扱いにする。「確認できていない」のを「新鮮」と誤認
+    する fail-open を防ぐ (レビューで指摘): account_stale 経由の USD 入出金
+    は意図的にこのフィールドを更新しないため、一度も live/cache 取得の
+    ない口座だと永久に欠落したままになり得る。
+    """
+    stale, age_hours = wd._fx_staleness({}, now=time.time())
+    assert stale is True
+    assert age_hours is None
+
+
+def test_fx_staleness_recent_as_of_is_fresh():
+    now = time.time()
+    stale, age_hours = wd._fx_staleness({"fx_rate_usdjpy_as_of": now - 3600}, now=now)
+    assert stale is False
+    assert age_hours == 1.0
+
+
+def test_fx_staleness_old_as_of_is_stale():
+    now = time.time()
+    four_days_ago = now - 4 * 24 * 3600
+    stale, age_hours = wd._fx_staleness({"fx_rate_usdjpy_as_of": four_days_ago}, now=now)
+    assert stale is True
+    assert age_hours == pytest.approx(96.0, abs=0.1)
+
+
+# ────────────────────────────────────────────────────────
 # _check_critical_json
 # ────────────────────────────────────────────────────────
 

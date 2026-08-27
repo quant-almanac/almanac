@@ -195,7 +195,11 @@ def test_snapshot_claims_and_action_claim_preserve_parent_quality(tmp_path):
 
     now = datetime(2026, 7, 28, 9, 0)
     for name, payload in {
-        "account.json": {"last_updated": now.isoformat()},
+        # fx_rate_usdjpy_as_of が無いと fx の provenance が "unknown" になり
+        # (レビューで指摘・修正済み: last_updated への fallback は fail-open
+        # だったため撤去した)、このテストの「全カテゴリ fresh」という前提が
+        # 崩れる。last_updated だけでなく FX 固有の as_of も明示する。
+        "account.json": {"last_updated": now.isoformat(), "fx_rate_usdjpy_as_of": now.timestamp()},
         "technical_state.json": {"cached_at": now.isoformat()},
         "macro_event_state.json": {"refreshed_at": now.isoformat()},
         "news_signal_candidates.json": {"generated_at": now.isoformat()},

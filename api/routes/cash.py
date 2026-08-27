@@ -268,6 +268,14 @@ def _prepare_cash_change(req: CashRequest, tx_type: TxType) -> tuple[dict, dict,
         if duplicate is not None:
             raise HTTPException(status_code=409, detail="同じ証券会社取引IDは既に記録済みです")
 
+    # ── holdings.json のルート検証 ──
+    # ⚠️ owner×broker×currency の組み合わせが未定義かどうかは、残高検証や
+    # FX 取得より前に確定させる。後段 (holdings.json 同期内容の検証) まで
+    # 遅らせると、本来 409 になるはずの未定義ルートが、間に挟まる FX 取得の
+    # 一時的な障害によって先に 500 になってしまう (レビューで指摘)。
+    # 検証結果の key はこの後の holdings 更新でもそのまま再利用する。
+    key = _holdings_key(req.currency, req.broker, req.owner)
+
     # ── account.json 更新内容の検証 ──
     # ⚠️ ここでの残高不足チェックは FX 取得より前に置く。逆にすると、
     # 本来 400 (残高不足) になるはずのリクエストが、FX 取得の一時的な
@@ -294,6 +302,7 @@ def _prepare_cash_change(req: CashRequest, tx_type: TxType) -> tuple[dict, dict,
     # (usd_balance は USD 建てのまま比較する) ため、検証を先に済ませられる。
     fx_result = _event_fx_rate(req, account)
     fx_for_event: Optional[float] = None
+    fx_source: Optional[str] = None
     if fx_result is not None:
         fx_for_event, fx_source = fx_result
         if fx_source == "hardcoded":
@@ -326,7 +335,7 @@ def _prepare_cash_change(req: CashRequest, tx_type: TxType) -> tuple[dict, dict,
         account["reconciled_at"] = reconciled_at
 
     # ── holdings.json 同期内容の検証 ──
-    key = _holdings_key(req.currency, req.broker, req.owner)
+    # key は関数冒頭のルート検証で既に確定済み。
     h = holdings.get(key)
     if not isinstance(h, dict):
         raise HTTPException(status_code=500, detail=f"holdings.json に {key} がありません")
@@ -394,6 +403,10 @@ def _prepare_cash_change(req: CashRequest, tx_type: TxType) -> tuple[dict, dict,
         "new_balance_jpy": account.get("balance"),
         "new_balance_usd": account.get("usd_balance"),
         "new_total_cash":  account.get("total_cash"),
+        # USD 以外や FX 取得なしでは None。live/cache/account_stale のいずれで
+        # 換算されたかを取引ごとに残す — account.json は後から書き換わり
+        # 得るため、これが無いと当時の換算根拠を事後監査できない (レビューで指摘)。
+        "fx_rate_source": fx_source,
     }
     txs.append(new_tx)
     tx_log["transactions"] = txs
@@ -423,6 +436,7 @@ def _append_cash_flow_event(req: CashRequest, tx_type: TxType, tx: dict, fx_for_
             "owner": req.owner.value,
             "broker": req.broker.value,
             "cash_route": _holdings_key(req.currency, req.broker, req.owner),
+            "fx_rate_source": tx.get("fx_rate_source"),
         },
         event_id=tx["id"],  # cash tx id を event_id に流用（idempotency）
     )

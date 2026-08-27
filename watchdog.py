@@ -25,7 +25,7 @@ import sys
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Dict
+from typing import Dict, Optional
 
 import json as _json
 
@@ -706,6 +706,24 @@ def evaluate_heartbeats(heartbeats: dict | None = None) -> Dict:
     return {'stale': stale, 'errors': errors, 'ok': ok}
 
 
+def _fx_staleness(acc: dict, *, now: float) -> tuple[bool, Optional[float]]:
+    """account.json の fx_rate_usdjpy_as_of から FX の鮮度を判定する。
+
+    fx_rate_usdjpy_as_of が無い場合は fresh (fx_stale=False) ではなく
+    stale 扱いにする。「確認できていない」のであって「新鮮」ではない
+    (レビューで指摘): account_stale 経由の USD 入出金は意図的にこの
+    フィールドを更新しないため、一度も live/cache 取得のない口座だと
+    永久に欠落したままになり得る。欠落を fresh の既定値にすると、その
+    間ずっとこの watchdog チェックが発火しない fail-open になる。
+    """
+    fx_as_of = acc.get('fx_rate_usdjpy_as_of')
+    if not fx_as_of:
+        return True, None
+    fx_age_sec = now - float(fx_as_of)
+    fx_age_hours = round(fx_age_sec / 3600, 1)
+    return fx_age_sec > FX_STALE_SEC, fx_age_hours
+
+
 def evaluate_health() -> Dict:
     """
     heartbeats.json を評価して問題リストを返す。
@@ -728,13 +746,7 @@ def evaluate_health() -> Dict:
 
     # FX as-of チェック
     acc = load_json(ACCOUNT_JSON, default={})
-    fx_as_of = acc.get('fx_rate_usdjpy_as_of')
-    fx_stale = False
-    fx_age_hours = None
-    if fx_as_of:
-        fx_age_sec = now - float(fx_as_of)
-        fx_age_hours = round(fx_age_sec / 3600, 1)
-        fx_stale = fx_age_sec > FX_STALE_SEC
+    fx_stale, fx_age_hours = _fx_staleness(acc, now=now)
 
     # P2-25: silent failure 検知拡張
     schema_issues   = _check_critical_json()
@@ -911,7 +923,11 @@ def _build_watchdog_message(report: dict) -> str:
         if len(report['errors']) > 5:
             msg_lines.append(f"  ... 他 {len(report['errors']) - 5} 件")
     if report.get('fx_stale'):
-        msg_lines.append(f"\n💱 FX レート古い: {report.get('fx_age_hours')}h 前（3日超）")
+        fx_age_hours = report.get('fx_age_hours')
+        if fx_age_hours is None:
+            msg_lines.append("\n💱 FX レート鮮度不明: fx_rate_usdjpy_as_of が未記録")
+        else:
+            msg_lines.append(f"\n💱 FX レート古い: {fx_age_hours}h 前（3日超）")
     if report.get('schema_issues'):
         msg_lines.append('\n📁 重要JSON破損/schema異常:')
         for s in report['schema_issues'][:5]:

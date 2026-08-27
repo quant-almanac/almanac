@@ -130,6 +130,35 @@ def test_base_snapshot_fx_uses_rate_timestamp_before_account_date(tmp_path):
     assert base.fx.freshness_status == "fresh"
 
 
+def test_base_snapshot_fx_is_not_fresh_when_as_of_missing_but_last_updated_is_today(tmp_path):
+    """fx_rate_usdjpy_as_of が無いのに last_updated が今日だと、last_updated
+    へフォールバックして fresh と誤認しないこと (レビューで指摘)。
+
+    account_stale 経由の USD 入出金は fx_rate_usdjpy_as_of を意図的に
+    更新しない (レート自体は使うが「今確認した」わけではないため) が、
+    同じ取引が account["last_updated"] は今日の日付へ進める。以前は
+    ts_keys=("fx_rate_usdjpy_as_of", "last_updated") が last_updated へ
+    フォールバックしていたため、何日も未確認の FX レートが「今日確認した」
+    かのように fresh と判定されてしまっていた。
+    """
+    now = datetime(2026, 7, 29, 12, 0, 0)
+    _write(
+        tmp_path,
+        "account.json",
+        {
+            "last_updated": now.date().isoformat(),
+            "fx_rate_usdjpy": 149.0,
+            # fx_rate_usdjpy_as_of は意図的に無し (account_stale 経由を模する)
+        },
+    )
+
+    base = snap.build_base_snapshot(base_dir=tmp_path, now=now)
+
+    assert base.fx.freshness_status != "fresh", (
+        "fx_rate_usdjpy_as_of 欠落時に last_updated(今日) へフォールバックして fresh と誤認した")
+    assert base.fx.freshness_status == "unknown"
+
+
 def test_base_snapshot_missing_files_are_unknown_not_fresh(tmp_path):
     """存在しないファイルを暗黙に fresh 扱いしない (fail-closed)。"""
     now = datetime(2026, 7, 27, 12, 0, 0)

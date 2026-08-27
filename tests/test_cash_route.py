@@ -602,3 +602,60 @@ def test_a_jpy_transaction_does_not_require_an_fx_fetch(isolated, monkeypatch) -
     req = CashRequest(currency=CashCurrency.JPY, amount=100_000.0, broker=CashBroker.rakuten)
     result = _apply_cash_change(req, TxType.deposit)
     assert result["ok"] is True
+
+
+def test_undefined_route_is_rejected_before_any_fx_fetch(isolated, monkeypatch) -> None:
+    """owner×broker×currency が未定義なルート (例: USD+sbi+wife) は 409。
+
+    ルート検証を FX 取得より後に置くと、本来 409 になるはずの不正
+    リクエストが、間に挟まる FX 取得のネットワーク/yfinance 障害によって
+    先に 500 へ化けてしまう (レビューで指摘)。get_fx_rate_cached の
+    呼び出し回数を数え、実際に呼ばれていないことを確認する。
+    """
+    calls = {"n": 0}
+
+    def _counting_fake(*_a, **_kw):
+        calls["n"] += 1
+        return 999.0, "live"
+
+    import utils as utils_module
+    monkeypatch.setattr(utils_module, "get_fx_rate_cached", _counting_fake)
+
+    # CASH_USD は broker 間で共有され、USD+sbi+wife は _holdings_key で未定義。
+    req = CashRequest(currency=CashCurrency.USD, amount=10.0, broker=CashBroker.sbi, owner=CashOwner.wife)
+    with pytest.raises(HTTPException) as exc:
+        _apply_cash_change(req, TxType.deposit)
+
+    assert exc.value.status_code == 409
+    assert calls["n"] == 0, "未定義ルートの判定より前に get_fx_rate_cached が呼ばれた"
+
+
+def test_fx_rate_source_is_recorded_on_the_transaction_and_ledger_event(isolated, monkeypatch) -> None:
+    """account.json の fx_rate_usdjpy/fx_rate_source は後続の取引で上書き
+    され得るため、当該取引が live/cache/account_stale のどれで換算された
+    かを cash_transactions.json と event_ledger 側にも残す。account だけ
+    では、後から見て当時の換算根拠を監査できない (レビューで指摘)。
+    """
+    _install_fake_fx(monkeypatch, 151.25, source="cache")
+
+    req = CashRequest(currency=CashCurrency.USD, amount=100.0, broker=CashBroker.rakuten)
+    result = _apply_cash_change(req, TxType.deposit)
+    assert result["ok"] is True
+
+    tx_log = _read(isolated["tx_file"])
+    assert tx_log["transactions"][-1]["fx_rate_source"] == "cache"
+
+    events = event_ledger.query_events(types=["cash_flow"])
+    assert events, "cash_flow イベントが記録されていない"
+    payload = json.loads(events[-1]["raw_payload"])
+    assert payload["fx_rate_source"] == "cache"
+
+
+def test_fx_rate_source_is_none_for_a_jpy_transaction(isolated) -> None:
+    """JPY 取引には FX 取得自体が発生しないため fx_rate_source も None。"""
+    req = CashRequest(currency=CashCurrency.JPY, amount=10_000.0, broker=CashBroker.rakuten)
+    result = _apply_cash_change(req, TxType.deposit)
+    assert result["ok"] is True
+
+    tx_log = _read(isolated["tx_file"])
+    assert tx_log["transactions"][-1]["fx_rate_source"] is None

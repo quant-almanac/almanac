@@ -334,9 +334,17 @@ def build_base_snapshot(*, base_dir: Path = BASE_DIR, now: Optional[datetime] = 
     # Account balance の日付ではなく、レート固有の取得時刻を権威にする。
     # これを last_updated だけで判定すると、同日取得した最新レートでも
     # 日付の00:00を起点に24時間超と誤認しうる。
+    # ⚠️ last_updated を fallback に含めない。fx_rate_usdjpy_as_of が
+    # 無い(=account_stale 経由の USD 入出金でレート自体は使ったが「今
+    # 確認した」わけではない)場合に last_updated へフォールバックすると、
+    # 同じ入出金が account["last_updated"] を今日へ進めるため、確認して
+    # いないレートを「今日確認した」かのように fresh 扱いしてしまう
+    # (レビューで指摘・再現)。fx_rate_usdjpy_as_of が無ければ
+    # _freshness_status は "unknown" を返し、decision_freshness_issues()
+    # は stale と同様に issue として扱う — fresh より安全な既定。
     fx = _provenance_for_file(
         base_dir / "account.json",
-        ts_keys=("fx_rate_usdjpy_as_of", "last_updated"),
+        ts_keys=("fx_rate_usdjpy_as_of",),
         max_age_hours=stale_after_hours("fx"),
         now=now, source_label="account.json(fx_rate_usdjpy)",
     )
