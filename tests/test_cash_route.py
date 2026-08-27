@@ -419,23 +419,28 @@ def test_get_balances_recomputes_total_cash_when_stored_value_is_stale(isolated)
 #   2. キャッシュミス時: _prepare_cash_change() が先に account を複製済み
 #      なので、直接書き込みの直後に古いメモリ上の account で上書き
 #      コミットしてしまう。
-# 修正: _event_fx_rate() は値だけを返し、_prepare_cash_change() がその値を
-# トランザクション内の account へ反映してから commit する。
+# 修正: _event_fx_rate() は (値, source) を返し、_prepare_cash_change() が
+# その値をトランザクション内の account へ反映してから commit する。source
+# ('live' / 'cache' / 'account_stale' / 'hardcoded') は fx_rate_usdjpy_as_of
+# を「今」へ進めてよいかどうかの判断にも使う — stale な値やハードコード
+# 既定値を「たった今確認できた」かのように鮮度を偽装しないため
+# (レビューで指摘: watchdog.py / analysis_snapshot.py の鮮度チェックが
+# 誤認する)。
 
 
-def _install_fake_fx(monkeypatch, rate: float, *, via_cache: bool = False) -> None:
+def _install_fake_fx(monkeypatch, rate: float, source: str = "live") -> None:
     """utils.get_fx_rate_cached を差し替え、cash モジュールの import 経路を通す。"""
     import utils as utils_module
 
     def _fake(*_a, **_kw):
-        return float(rate), ('cache' if via_cache else 'live')
+        return float(rate), source
 
     monkeypatch.setattr(utils_module, "get_fx_rate_cached", _fake)
 
 
 def test_usd_deposit_persists_the_fetched_fx_rate_on_a_cache_miss(isolated, monkeypatch) -> None:
     """キャッシュミス (source='live') でも FX レートが account.json へ残る。"""
-    _install_fake_fx(monkeypatch, 151.25, via_cache=False)
+    _install_fake_fx(monkeypatch, 151.25, source="live")
 
     req = CashRequest(currency=CashCurrency.USD, amount=100.0, broker=CashBroker.rakuten)
     result = _apply_cash_change(req, TxType.deposit)
@@ -444,6 +449,7 @@ def test_usd_deposit_persists_the_fetched_fx_rate_on_a_cache_miss(isolated, monk
     account = _read(isolated["account"])
     assert account["fx_rate_usdjpy"] == 151.25, (
         "USD 入出金なのに account.json の FX レートが更新されなかった")
+    assert account["fx_rate_source"] == "live"
     assert "fx_rate_usdjpy_as_of" in account
     # total_cash / jpy_equivalent_usd も新レートで再計算されていること。
     assert account["total_cash"] == _recompute_total_cash(account)
@@ -456,7 +462,7 @@ def test_usd_deposit_persists_the_fetched_fx_rate_on_a_cache_hit(isolated, monke
     ヒットの早期 return で書き込みブロックへ到達できず、この経路だけ
     サイレントに何も保存されなかった。
     """
-    _install_fake_fx(monkeypatch, 151.25, via_cache=True)
+    _install_fake_fx(monkeypatch, 151.25, source="cache")
 
     req = CashRequest(currency=CashCurrency.USD, amount=100.0, broker=CashBroker.rakuten)
     result = _apply_cash_change(req, TxType.deposit)
@@ -465,6 +471,124 @@ def test_usd_deposit_persists_the_fetched_fx_rate_on_a_cache_hit(isolated, monke
     account = _read(isolated["account"])
     assert account["fx_rate_usdjpy"] == 151.25, (
         "キャッシュヒット経路で FX レートが account.json へ反映されなかった")
+    assert account["fx_rate_source"] == "cache"
+    # cache は TTL (10分) 内のライブ値の再利用なので、live と同じく
+    # as_of を「今」に進めてよい。
+    assert "fx_rate_usdjpy_as_of" in account
+
+
+def test_usd_deposit_does_not_advance_fx_as_of_on_an_account_stale_rate(isolated, monkeypatch) -> None:
+    """source='account_stale' はレートを使うが、確認時刻の偽装はしない。
+
+    yfinance 障害時に account.json の既存レートへ再度フォールバックした
+    だけであり、「たった今確認できた」わけではない。ここで as_of を
+    進めると、watchdog.py / analysis_snapshot.py の FX 鮮度チェックが
+    実際には古いレートを新鮮と誤認する (レビューで指摘)。
+    """
+    _install_fake_fx(monkeypatch, 149.0, source="account_stale")
+    account_before = _read(isolated["account"])
+    assert "fx_rate_usdjpy_as_of" not in account_before
+
+    req = CashRequest(currency=CashCurrency.USD, amount=100.0, broker=CashBroker.rakuten)
+    result = _apply_cash_change(req, TxType.deposit)
+
+    assert result["ok"] is True
+    account = _read(isolated["account"])
+    assert account["fx_rate_usdjpy"] == 149.0
+    assert account["fx_rate_source"] == "account_stale"
+    assert "fx_rate_usdjpy_as_of" not in account, (
+        "account_stale レートなのに fx_rate_usdjpy_as_of が新規追加/更新された")
+
+
+def test_usd_deposit_fails_closed_when_fx_is_only_the_hardcoded_fallback(isolated, monkeypatch) -> None:
+    """source='hardcoded' (yfinance も account.json の値も使えない) では
+    財務台帳を確定させず、fail-closed で見送る。実勢と無関係な定数を
+    現在の FX レートとして記録するより、失敗を明示する方が安全。
+    """
+    _install_fake_fx(monkeypatch, 150.0, source="hardcoded")
+    before_account = _read(isolated["account"])
+    before_holdings = _read(isolated["holdings"])
+    before_tx = _read(isolated["tx_file"])
+
+    req = CashRequest(currency=CashCurrency.USD, amount=100.0, broker=CashBroker.rakuten)
+    with pytest.raises(HTTPException) as exc:
+        _apply_cash_change(req, TxType.deposit)
+
+    assert exc.value.status_code == 500
+    assert _read(isolated["account"]) == before_account
+    assert _read(isolated["holdings"]) == before_holdings
+    assert _read(isolated["tx_file"]) == before_tx
+
+
+def test_usd_withdrawal_with_insufficient_balance_never_fetches_fx(isolated, monkeypatch) -> None:
+    """残高不足は FX 取得より先にローカルだけで判定され、400 を返す。
+
+    FX 取得を残高検証より前に置くと、本来 400 になるべきリクエストが
+    ネットワーク/yfinance 障害で先に 500 になり得る (レビューで指摘)。
+
+    ⚠️ get_fx_rate_cached を「呼ばれたら例外」にして検知する方式は使わない
+    — _event_fx_rate() 自身が except Exception でフォールバックするため、
+    その例外は account_stale 扱いに吸収されてしまい、呼ばれたことを
+    検知できない (実際にこの書き方で書いたところミューテーションを
+    検出できず、書き直した)。代わりに呼び出し回数を数える。
+    """
+    calls = {"n": 0}
+
+    def _counting_fake(*_a, **_kw):
+        calls["n"] += 1
+        return 999.0, "live"
+
+    import utils as utils_module
+    monkeypatch.setattr(utils_module, "get_fx_rate_cached", _counting_fake)
+
+    # isolated フィクスチャの usd_balance は 1,000.0
+    req = CashRequest(currency=CashCurrency.USD, amount=2_000.0, broker=CashBroker.rakuten)
+    with pytest.raises(HTTPException) as exc:
+        _apply_cash_change(req, TxType.withdraw)
+
+    assert exc.value.status_code == 400
+    assert calls["n"] == 0, "残高不足の判定より前に get_fx_rate_cached が呼ばれた"
+
+
+def test_usd_deposit_uses_a_genuinely_warmed_cache_from_a_prior_read(isolated, monkeypatch) -> None:
+    """utils.get_fx_rate_cached そのものは差し替えず、実際に GET 相当の
+    読み取り呼び出しで TTL キャッシュを温めてから USD POST を発行する。
+    source='cache' がモックなしで _prepare_cash_change() まで正しく
+    伝わることを確認する (以前の _install_fake_fx 経由の2テストは
+    source 文字列を直接指定するだけで、実際のキャッシュ分岐を踏んで
+    いなかった)。
+    """
+    import utils as utils_module
+    utils_module._fx_cache_clear()
+    calls = {"n": 0}
+
+    class _Fake:
+        @property
+        def fast_info(self):
+            calls["n"] += 1
+            return {"lastPrice": 153.4}
+
+    class _FakeMod:
+        def Ticker(self, _pair):
+            return _Fake()
+
+    monkeypatch.setitem(__import__("sys").modules, "yfinance", _FakeMod())
+
+    # dashboard/Today の GET 相当。read-only (persist_live_rate 既定 False)
+    # でも、yfinance のライブ取得自体はモジュール内 TTL キャッシュへ格納する。
+    warm_rate, warm_source = utils_module.get_fx_rate_cached()
+    assert warm_source == "live"
+    assert calls["n"] == 1
+
+    req = CashRequest(currency=CashCurrency.USD, amount=100.0, broker=CashBroker.rakuten)
+    result = _apply_cash_change(req, TxType.deposit)
+
+    assert result["ok"] is True
+    assert calls["n"] == 1, "2回目はキャッシュヒットのはずが yfinance を再度叩いた"
+    account = _read(isolated["account"])
+    assert account["fx_rate_usdjpy"] == warm_rate == 153.4
+    assert account["fx_rate_source"] == "cache"
+    assert "fx_rate_usdjpy_as_of" in account
 
 
 def test_a_jpy_transaction_does_not_require_an_fx_fetch(isolated, monkeypatch) -> None:

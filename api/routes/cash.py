@@ -194,8 +194,17 @@ def _invalidate_portfolio_cache() -> None:
         pass
 
 
-def _event_fx_rate(req: CashRequest, account: dict) -> Optional[float]:
-    """USD 入出金の FX レートを**値として**取得する。
+def _event_fx_rate(req: CashRequest, account: dict) -> Optional[tuple[float, str]]:
+    """USD 入出金の FX レートを **(値, source)** で取得する。
+
+    source は utils.get_fx_rate_cached() の 4 段階フォールバックをそのまま
+    呼び出し元へ伝える ('live' / 'cache' / 'account_stale' / 'hardcoded')。
+    _prepare_cash_change() はこの source を見て、fx_rate_usdjpy_as_of を
+    「今」へ進めてよいか判断する。stale な値やハードコード既定値を
+    「たった今確認できた最新レート」であるかのように鮮度を偽装すると、
+    watchdog.py と analysis_snapshot.py の FX 鮮度チェックが、実際には
+    古い/架空のレートを新鮮と誤認してしまう (レビューで指摘。両ファイルの
+    fx_rate_usdjpy_as_of 参照箇所で実際に鮮度判定に使われていることを確認済み)。
 
     ⚠️ 以前は get_fx_rate_cached(persist_live_rate=True) を呼んで
     account.json への書き込みを SDK 側に任せていたが、2つの経路で
@@ -208,18 +217,18 @@ def _event_fx_rate(req: CashRequest, account: dict) -> Optional[float]:
          書いた直後に、呼び出し元がその古いメモリ上の account で
          上書きコミットしてしまう。
     そのため account への反映は呼び出し元 (_prepare_cash_change) が
-    トランザクションの一部として行う。この関数はレートの値だけを返す。
+    トランザクションの一部として行う。この関数は値と source を返すだけ。
     """
     if req.currency != CashCurrency.USD:
         return None
     try:
         from utils import get_fx_rate_cached
-        fx_for_event, _ = get_fx_rate_cached()
-        return float(fx_for_event)
+        fx_for_event, source = get_fx_rate_cached()
+        return float(fx_for_event), source
     except Exception as e:
         stale = account.get("fx_rate_usdjpy")
         if stale and 50 < float(stale) < 500:
-            return float(stale)
+            return float(stale), "account_stale"
         raise HTTPException(status_code=500, detail=f"USD 入出金の FX レート取得に失敗: {e}") from e
 
 
@@ -259,17 +268,12 @@ def _prepare_cash_change(req: CashRequest, tx_type: TxType) -> tuple[dict, dict,
         if duplicate is not None:
             raise HTTPException(status_code=409, detail="同じ証券会社取引IDは既に記録済みです")
 
-    # ── FX レートの取得と account への反映 ──
-    # ⚠️ _sync_account_cash_totals() や後段の new_tx (new_total_cash) が
-    # account["fx_rate_usdjpy"] を読む前に、USD 入出金なら最新レートを
-    # 反映しておく。取得だけ先にやって反映を後回しにすると、書き込みが
-    # 成立しない・totals が古いレートのままになる (レビューで指摘・再現)。
-    fx_for_event = _event_fx_rate(req, account)
-    if fx_for_event is not None:
-        account["fx_rate_usdjpy"] = fx_for_event
-        account["fx_rate_usdjpy_as_of"] = time.time()
-
     # ── account.json 更新内容の検証 ──
+    # ⚠️ ここでの残高不足チェックは FX 取得より前に置く。逆にすると、
+    # 本来 400 (残高不足) になるはずのリクエストが、FX 取得の一時的な
+    # 障害 (ネットワーク断・yfinance 障害) によって先に 500 を返してしまい、
+    # 呼び出し元が「残高不足なのか FX 障害なのか」を区別できなくなる
+    # (レビューで指摘)。ローカルだけで判定できる検証を先に済ませる。
     if req.currency == CashCurrency.JPY and req.broker == CashBroker.rakuten and req.owner == CashOwner.husband:
         # 楽天 JPY のみ account.balance に直接反映（既存実装の慣習）
         new_jpy = float(account.get("balance", 0) or 0) + amount_signed
@@ -282,6 +286,36 @@ def _prepare_cash_change(req: CashRequest, tx_type: TxType) -> tuple[dict, dict,
             raise HTTPException(status_code=400, detail=f"USD 残高不足（現在: {account.get('usd_balance', 0)}, 要求: -{req.amount}）")
         account["usd_balance"] = round(new_usd, 2)
     # SBI JPY は account には載せず holdings 側だけで管理（既存設計通り）
+
+    # ── FX レートの取得と account への反映 ──
+    # 残高検証の「後」・_sync_account_cash_totals() の「前」に置く。
+    # totals は account["fx_rate_usdjpy"] を読むので、取得した値をそれより
+    # 前に反映する必要がある一方、残高不足の判定自体は FX に依存しない
+    # (usd_balance は USD 建てのまま比較する) ため、検証を先に済ませられる。
+    fx_result = _event_fx_rate(req, account)
+    fx_for_event: Optional[float] = None
+    if fx_result is not None:
+        fx_for_event, fx_source = fx_result
+        if fx_source == "hardcoded":
+            # yfinance もキャッシュも account.json の既存値も使えず、最終
+            # フォールバックの固定値しか得られなかった。実勢と無関係な
+            # 定数を「現在の FX レート」として財務台帳へ確定させるより、
+            # fail-closed で入出金そのものを見送る方が安全 (レビューで指摘)。
+            raise HTTPException(
+                status_code=500,
+                detail="USD 入出金: FX レートがハードコード既定値しか得られなかったため確定を見送りました",
+            )
+        account["fx_rate_usdjpy"] = fx_for_event
+        account["fx_rate_source"] = fx_source
+        if fx_source in ("live", "cache"):
+            # cache は TTL (10分, utils.FX_CACHE_TTL_SEC) 内のライブ値の
+            # 再利用であり、実際の取得時刻からのずれは高々 TTL 秒。
+            # fx_rate_usdjpy_as_of を「今」としても鮮度判定上は無視できる。
+            account["fx_rate_usdjpy_as_of"] = time.time()
+        # account_stale: レートは今回のイベント計算には使うが、
+        # 「いつ確認できた値か」は更新しない — 実際には確認できていない
+        # (更新すると watchdog.py / analysis_snapshot.py の鮮度チェックを
+        # 古いレートのまま新鮮と誤認させてしまう)。
 
     _sync_account_cash_totals(account)
     account["last_updated"] = datetime.now().date().isoformat()

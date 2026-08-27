@@ -78,7 +78,7 @@ def test_usd_cash_change_rolls_back_the_fetched_fx_rate_when_ledger_append_fails
     assert before_account["fx_rate_usdjpy"] == 150.0
     assert "fx_rate_usdjpy_as_of" not in before_account
 
-    monkeypatch.setattr(cash, "_event_fx_rate", lambda req, account: 152.5)
+    monkeypatch.setattr(cash, "_event_fx_rate", lambda req, account: (152.5, "live"))
 
     def boom(*args, **kwargs):
         raise RuntimeError("ledger down")
