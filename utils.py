@@ -245,13 +245,15 @@ def sync_account_cash_derived_totals(account_json_path: Optional[Path] = None) -
 def get_fx_rate_cached(pair: str = 'USDJPY=X',
                        ttl_sec: int = FX_CACHE_TTL_SEC,
                        account_json_path: Optional[Path] = None,
+                       persist_live_rate: bool = False,
                        ) -> Tuple[float, str]:
     """
     USD/JPY（またはその他通貨ペア）の FX レートを TTL キャッシュ付きで取得する。
 
     優先順位:
       1. TTL 内のメモリキャッシュ（source='cache'）
-      2. yfinance ライブ値（source='live'）→ キャッシュに格納、account.json にも保存
+      2. yfinance ライブ値（source='live'）→ キャッシュに格納
+         （persist_live_rate=True のときだけ account.json にも保存）
       3. account.json の fx_rate_usdjpy（source='account_stale'）→ warning ログ
       4. FX_HARDCODED_FALLBACK=150.0（source='hardcoded'）→ error ログ
 
@@ -259,6 +261,10 @@ def get_fx_rate_cached(pair: str = 'USDJPY=X',
         pair: 通貨ペア（デフォルト USDJPY=X）
         ttl_sec: キャッシュ TTL 秒数
         account_json_path: account.json のパス（テスト時に上書き可）
+        persist_live_rate: ``True`` を明示した書き込み系だけ account.json へ
+            最新レートを保存する。既定は ``False`` で、読み取り系リクエスト
+            (dashboard/portfolio/Today の GET 経路) が財務状態を変更しない
+            ようにする。
 
     Returns:
         (rate: float, source: str)
@@ -278,28 +284,33 @@ def get_fx_rate_cached(pair: str = 'USDJPY=X',
         rate = float(yf.Ticker(pair).fast_info['lastPrice'])
         if rate > 0 and rate < 1000:  # sanity: USDJPY は 50-500 の範囲を外れたら異常
             _fx_cache[pair] = (rate, now)
-            # account.json にも保存して stale fallback を鮮度高く保つ
-            try:
-                acc_path = account_json_path or (Path(__file__).parent / 'account.json')
-                if acc_path.exists():
-                    acc = load_json(acc_path, default={})
-                    if pair == 'USDJPY=X':
-                        acc['fx_rate_usdjpy'] = rate
-                        acc['fx_rate_usdjpy_as_of'] = now
-                        try:
-                            # ⚠️ 値そのものは使わない。「両方 float に
-                            # できるか」を確かめる parse 検証で、
-                            # 成功したときだけ else で正規化する。
-                            # 削除すると正規化が無条件になる。
-                            _jpy = float(acc.get('balance', 0) or 0)
-                            _usd = float(acc.get('usd_balance', 0) or 0)
-                        except (TypeError, ValueError):
-                            pass
-                        else:
-                            acc, _changed = normalize_account_cash_derived_totals(acc)
-                        atomic_write_json(acc_path, acc)
-            except Exception as e:
-                _logger.debug(f"[fx] account.json 更新失敗（無害）: {e}")
+            # ⚠️ ライブレートの取得自体は GET でも起きる (dashboard/portfolio/
+            # Today が呼ぶ)。ここで無条件に account.json を書くと、読み取り
+            # 専用のはずのリクエストが財務状態を変更してしまう。
+            # persist_live_rate=True を明示した書き込み系 (USD 入出金 POST 等)
+            # だけが account.json へ保存する。
+            if persist_live_rate:
+                try:
+                    acc_path = account_json_path or (Path(__file__).parent / 'account.json')
+                    if acc_path.exists():
+                        acc = load_json(acc_path, default={})
+                        if pair == 'USDJPY=X':
+                            acc['fx_rate_usdjpy'] = rate
+                            acc['fx_rate_usdjpy_as_of'] = now
+                            try:
+                                # ⚠️ 値そのものは使わない。「両方 float に
+                                # できるか」を確かめる parse 検証で、
+                                # 成功したときだけ else で正規化する。
+                                # 削除すると正規化が無条件になる。
+                                _jpy = float(acc.get('balance', 0) or 0)
+                                _usd = float(acc.get('usd_balance', 0) or 0)
+                            except (TypeError, ValueError):
+                                pass
+                            else:
+                                acc, _changed = normalize_account_cash_derived_totals(acc)
+                            atomic_write_json(acc_path, acc)
+                except Exception as e:
+                    _logger.debug(f"[fx] account.json 更新失敗（無害）: {e}")
             return rate, 'live'
     except Exception as e:
         _logger.warning(f"[fx] yfinance 取得失敗（stale fallback に切替）: {e}")

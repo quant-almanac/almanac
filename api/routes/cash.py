@@ -198,7 +198,11 @@ def _event_fx_rate(req: CashRequest, account: dict) -> Optional[float]:
         return None
     try:
         from utils import get_fx_rate_cached
-        fx_for_event, _ = get_fx_rate_cached()
+        # このパスは deposit/withdraw の書き込み系エンドポイントからのみ
+        # 呼ばれる (_apply_cash_change 経由)。これから確定させる USD 現金
+        # 移動と同期させるため、明示的に account.json への保存を許可する。
+        # 読み取り専用の呼び出しは既定の persist_live_rate=False を使う。
+        fx_for_event, _ = get_fx_rate_cached(persist_live_rate=True)
         return float(fx_for_event)
     except Exception as e:
         stale = account.get("fx_rate_usdjpy")

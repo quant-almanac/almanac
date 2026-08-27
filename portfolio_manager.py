@@ -179,10 +179,15 @@ def get_current_price(ticker: str, currency: str, current_nav: Optional[float] =
         return None
 
 
-def get_fx_rate(pair: str = 'USDJPY=X') -> float:
-    """USD/JPYレートを取得（P0-1 後: utils.get_fx_rate_cached() に委譲、TTL キャッシュ + stale fallback）。"""
+def get_fx_rate(pair: str = 'USDJPY=X', *, persist_live_rate: bool = False) -> float:
+    """USD/JPYレートを取得（P0-1 後: utils.get_fx_rate_cached() に委譲、TTL キャッシュ + stale fallback）。
+
+    persist_live_rate は utils.get_fx_rate_cached() へそのまま渡す。既定は
+    False — この関数は portfolio の読み取りパス (dashboard/Today 等) から
+    呼ばれるので、呼び出し元が明示しない限り account.json を書き換えない。
+    """
     from utils import get_fx_rate_cached
-    rate, _source = get_fx_rate_cached(pair)
+    rate, _source = get_fx_rate_cached(pair, persist_live_rate=persist_live_rate)
     return float(rate)
 
 
