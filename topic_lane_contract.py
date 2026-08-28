@@ -246,6 +246,7 @@ def build_run_record(
     skipped_count: int = 0,
     output_tokens: int = 0,
     budget_stop: Optional[str] = None,
+    selected_tickers: Optional[list] = None,
 ) -> dict:
     """両レーン共通の実行状態。監視・監査はこの形だけを見ればよい。"""
     now = time.time()
@@ -279,6 +280,9 @@ def build_run_record(
         "fallback_status": fallback_status,
         "error_code": error_code,
         "batches": batches,
+        # consumer 側 (injection_gate) が、保存後に ticker がすり替わって
+        # いないかを突き合わせるための選抜時点の集合。
+        "selected_tickers": list(selected_tickers) if selected_tickers else None,
     }
 
 
@@ -402,13 +406,53 @@ def injection_gate(
         )
         if not schema.ok:
             return False, f"stored rows fail schema: {schema.reason}"
-        selected = data.get("selected_count")
-        if isinstance(selected, int) and selected >= 0 and len(schema.rows) != selected:
-            return False, (f"row count {len(schema.rows)} != selected_count {selected}")
 
-    # 会計が取れていない run は費用の裏付けが無い。注入しない。
-    if data.get("accounting_incomplete"):
-        return False, "accounting log incomplete for this run"
+        # ⚠️ 監査メタデータは「あれば検証する」ではなく「無ければ拒否する」。
+        # 以前は各フィールドを個別に optional 扱いしており、レビューで
+        # source_as_of 欠損・started_at 欠損・selected_count 欠損・会計3項目
+        # 全欠損・call_count と accounting_logged_count の不一致・ticker の
+        # すり替え、のいずれも injection_gate=True で通ることが実測された。
+        # producer が正しく保存しても、保存後の欠損・部分書換えを検出できて
+        # いなかった。ここでは全項目の「存在」まで含めて必須にする。
+        if data.get("schema_version") != SCHEMA_VERSION:
+            return False, f"schema_version mismatch: {data.get('schema_version')!r}"
+        if not data.get("source_as_of"):
+            return False, "missing source_as_of"
+        if not data.get("started_at"):
+            return False, "missing started_at"
+
+        selected = data.get("selected_count")
+        if isinstance(selected, bool) or not isinstance(selected, int) or selected < 0:
+            return False, f"selected_count missing or invalid: {selected!r}"
+        if len(schema.rows) != selected:
+            return False, f"row count {len(schema.rows)} != selected_count {selected}"
+
+        call_count = data.get("call_count")
+        logged_count = data.get("accounting_logged_count")
+        if call_count is None or logged_count is None:
+            return False, "missing call_count/accounting_logged_count"
+        if call_count != logged_count:
+            return False, (f"call_count {call_count} != "
+                           f"accounting_logged_count {logged_count}")
+        # ⚠️ 「truthy でなければ拒否」ではなく「明示的に False でなければ拒否」。
+        # フィールド自体が欠損している run (accounting_incomplete が無い) も
+        # False と区別がつかず fail-open していた。
+        if data.get("accounting_incomplete") is not False:
+            return False, (f"accounting_incomplete is not False: "
+                           f"{data.get('accounting_incomplete')!r}")
+
+        # ⚠️ スキーマが正しくても、行の ticker が producer の選抜した集合と
+        # 一致するとは限らない (レビューで実測: 正しい形式のまま ticker だけ
+        # 別銘柄へ差し替えた成果物が通過した)。選抜時点の ticker 集合を
+        # producer 側で保存させ、ここで突き合わせる。
+        expected_tickers = data.get("selected_tickers")
+        if not isinstance(expected_tickers, list) or not expected_tickers:
+            return False, "missing selected_tickers"
+        got = {str(r.get("ticker", "")).upper() for r in schema.rows}
+        want = {str(t).upper() for t in expected_tickers}
+        if got != want:
+            return False, f"analysed tickers {sorted(got)} != selected_tickers {sorted(want)}"
+
     return True, ""
 
 

@@ -814,11 +814,13 @@ def test_consumer_revalidates_stored_rows(tmp_path, monkeypatch):
     now = datetime.now()
     good = {"ticker": "A", "catalyst_type": "macro", "durability": "short",
             "impact_magnitude": 50, "hold_horizon_days": 30, "one_liner": "x"}
-    art = {"run_status": "success",
+    art = {"run_status": "success", "schema_version": tlc.SCHEMA_VERSION,
            "generated_at": now.strftime("%Y-%m-%d %H:%M:%S"),
            "started_at": now.strftime("%Y-%m-%dT%H:%M:%S"),
            "source_as_of": now.strftime("%Y-%m-%d %H:%M:%S"),
-           "selected_count": 1, "analyses": [good]}
+           "selected_count": 1, "analyses": [good], "selected_tickers": ["A"],
+           "call_count": 1, "accounting_logged_count": 1,
+           "accounting_incomplete": False}
     f = tmp_path / "o.json"
     monkeypatch.setattr(nt, "OUTPUT_FILE", f)
 
@@ -832,6 +834,10 @@ def test_consumer_revalidates_stored_rows(tmp_path, monkeypatch):
     miscount = dict(art, selected_count=5)
     f.write_text(json.dumps(miscount), encoding="utf-8")
     assert nt.format_for_prompt() == "", "件数不一致が注入された"
+
+    # ticker だけを selected_tickers と独立に差し替えるケースは
+    # TestConsumerGateRejectsMissingAuditMetadata.test_ticker_swap_is_rejected
+    # で検証済み。
 
 
 def test_budget_is_rechecked_before_the_fallback_call(monkeypatch):
@@ -906,11 +912,13 @@ def test_long_one_liner_is_shortened_for_display_not_dropped(tmp_path, monkeypat
 
     now = datetime.now()
     long_liner = "あ" * 120
-    art = {"run_status": "success",
+    art = {"run_status": "success", "schema_version": tlc.SCHEMA_VERSION,
            "generated_at": now.strftime("%Y-%m-%d %H:%M:%S"),
            "started_at": now.strftime("%Y-%m-%dT%H:%M:%S"),
            "source_as_of": now.strftime("%Y-%m-%d %H:%M:%S"),
-           "selected_count": 1,
+           "selected_count": 1, "selected_tickers": ["A"],
+           "call_count": 1, "accounting_logged_count": 1,
+           "accounting_incomplete": False,
            "analyses": [{"ticker": "A", "catalyst_type": "macro",
                          "durability": "short", "impact_magnitude": 50,
                          "hold_horizon_days": 30, "one_liner": long_liner}]}
@@ -981,3 +989,170 @@ def test_shadow_completion_marker_is_written_last(tmp_path, monkeypatch):
                                "stocktwits": {"AAPL": {}, "MSFT": {}}})
     kinds = [json.loads(x)["kind"] for x in hist.read_text(encoding="utf-8").splitlines()]
     assert kinds[-1] == "collection_summary", f"marker が最後にない: {kinds}"
+
+
+# ---------------------------------------------------------------------------
+# Round 37: consumer gate の fail-open、heartbeat 前クラッシュ、shadow 重複
+# ---------------------------------------------------------------------------
+
+class TestConsumerGateRejectsMissingAuditMetadata:
+    """producer が正しく保存しても、保存後の欠損・部分書換えを検出できていなかった。"""
+
+    @staticmethod
+    def _base():
+        now = datetime.now()
+        return {
+            "run_status": "success", "schema_version": tlc.SCHEMA_VERSION,
+            "generated_at": now.strftime("%Y-%m-%d %H:%M:%S"),
+            "started_at": now.strftime("%Y-%m-%dT%H:%M:%S"),
+            "source_as_of": now.strftime("%Y-%m-%d %H:%M:%S"),
+            "selected_count": 1,
+            "analyses": [{"ticker": "A", "catalyst_type": "macro", "durability": "short",
+                         "impact_magnitude": 50, "hold_horizon_days": 30, "one_liner": "x"}],
+            "selected_tickers": ["A"],
+            "call_count": 1, "accounting_logged_count": 1, "accounting_incomplete": False,
+        }
+
+    def _gate(self, data):
+        import news_topic_analyzer as nt
+        return tlc.injection_gate(data, source="news_topic", upstream_source="news",
+                                  row_key="analyses", required_fields=nt.REQUIRED_FIELDS,
+                                  field_specs=nt.FIELD_SPECS)
+
+    def test_the_happy_path_still_passes(self):
+        ok, reason = self._gate(self._base())
+        assert ok is True, reason
+
+    @pytest.mark.parametrize("key", ["source_as_of", "started_at", "selected_count",
+                                     "schema_version", "selected_tickers",
+                                     "call_count", "accounting_logged_count",
+                                     "accounting_incomplete"])
+    def test_missing_audit_field_is_rejected(self, key):
+        data = self._base()
+        del data[key]
+        ok, reason = self._gate(data)
+        assert ok is False, f"{key} 欠損が通ってしまった"
+
+    def test_call_count_mismatch_is_rejected(self):
+        data = self._base()
+        data["call_count"] = 2   # accounting_logged_count は 1 のまま
+        ok, _ = self._gate(data)
+        assert ok is False
+
+    def test_accounting_incomplete_must_be_exactly_false(self):
+        """truthy でなければ通す、ではなく False であることを要求する。"""
+        data = self._base()
+        data["accounting_incomplete"] = None
+        ok, _ = self._gate(data)
+        assert ok is False
+
+    def test_ticker_swap_is_rejected(self):
+        """正しい形式のまま ticker だけ別銘柄へ差し替えても通さない。"""
+        data = self._base()
+        data["analyses"] = [dict(data["analyses"][0], ticker="ZZZZ")]
+        ok, reason = self._gate(data)
+        assert ok is False
+        assert "ZZZZ" in reason
+
+
+def test_build_run_record_saves_selected_tickers():
+    record = tlc.build_run_record(
+        lane="news_topic", run_id="r1", run_status=tlc.RUN_STATUS_SUCCESS,
+        started_at=0.0, input_count=2, selected_count=2, success_count=2,
+        batches=[], selected_tickers=["AAPL", "MSFT"])
+    assert record["selected_tickers"] == ["AAPL", "MSFT"]
+
+
+class TestPromptBuildingSurvivesLoaderEdgeCases:
+    """入力検証を通った値が heartbeat 前にクラッシュしていた。"""
+
+    def test_float_sentiment_score_does_not_crash_the_format_spec(self):
+        """_load_candidates は float も通すが、以前は "{:+d}" が ValueError だった。"""
+        import news_topic_analyzer as nt
+        prompt = nt._build_user_prompt(
+            [{"ticker": "A", "sentiment_score": 50.0, "top_headlines": ["x"]}])
+        assert "A" in prompt
+
+    def test_none_top_headlines_does_not_crash(self):
+        """.get の既定値はキー欠損時のみ効き、値が None だと素通りして
+        None[:N] が TypeError になっていた。"""
+        import news_topic_analyzer as nt
+        prompt = nt._build_user_prompt(
+            [{"ticker": "A", "sentiment_score": 50, "top_headlines": None}])
+        assert "A" in prompt
+
+    def test_future_generated_at_is_rejected_before_any_llm_call(self, tmp_path, monkeypatch):
+        """30日後の generated_at が input_state=ok を通り、実際に LLM を
+        呼び出していた (レビューで実測)。呼出し前に拒否する。"""
+        import news_topic_analyzer as nt
+
+        future = (datetime.now() + timedelta(days=30)).strftime("%Y-%m-%d %H:%M:%S")
+        f = tmp_path / "c.json"
+        f.write_text(json.dumps({"generated_at": future,
+                                 "candidates": [{"ticker": "AAPL", "sentiment_score": 90}]}),
+                     encoding="utf-8")
+        monkeypatch.setattr(nt, "CANDIDATES_FILE", f)
+        _, _, _, state = nt._load_candidates()
+        assert state == tlc.INPUT_STALE
+
+    def test_slightly_future_within_tolerance_is_not_rejected(self, tmp_path, monkeypatch):
+        """clock skew 1h 以内は許容する (他の鮮度チェックと同じ許容幅)。"""
+        import news_topic_analyzer as nt
+
+        near_future = (datetime.now() + timedelta(minutes=10)).strftime("%Y-%m-%d %H:%M:%S")
+        f = tmp_path / "c.json"
+        f.write_text(json.dumps({"generated_at": near_future,
+                                 "candidates": [{"ticker": "AAPL", "sentiment_score": 90}]}),
+                     encoding="utf-8")
+        monkeypatch.setattr(nt, "CANDIDATES_FILE", f)
+        _, _, _, state = nt._load_candidates()
+        assert state != tlc.INPUT_STALE
+
+
+def test_shadow_rerun_of_an_interrupted_run_purges_orphaned_rows_not_duplicates(
+        tmp_path, monkeypatch):
+    """中断 run の再実行は補完であって重複であってはならない。
+
+    完了マーカーを最後に置く判断自体は正しいが、以前は再実行前に未完了行を
+    除去しておらず、同じ (run_id, ticker) が 2 行になっていた (レビューで実測)。
+    """
+    import social_screener as ss
+
+    hist = tmp_path / "shadow.jsonl"
+    monkeypatch.setattr(ss, "SHADOW_HISTORY_FILE", hist)
+    hist.write_text(json.dumps({"kind": "ticker",
+                                "collection_run_id": "2026-08-28 18:47::cron",
+                                "ticker": "AAPL"}) + "\n", encoding="utf-8")
+
+    ok = ss._append_shadow_history({
+        "generated_at": "2026-08-28 18:47", "stocktwits_requested": 2,
+        "stocktwits": {"AAPL": {"sample_message_count": 30},
+                       "MSFT": {"sample_message_count": 28}}})
+
+    assert ok is True
+    rows = [json.loads(x) for x in hist.read_text(encoding="utf-8").splitlines()]
+    aapl_rows = [r for r in rows if r.get("ticker") == "AAPL"]
+    assert len(aapl_rows) == 1, f"AAPL が重複している: {len(aapl_rows)} 行"
+    assert rows[-1]["kind"] == "collection_summary", "marker が最後にない"
+
+
+def test_shadow_write_failure_is_visible_via_return_value(monkeypatch):
+    """握り潰さず、呼び出し元が失敗を知って heartbeat に反映できること。"""
+    import social_screener as ss
+
+    monkeypatch.setattr(ss, "SHADOW_HISTORY_FILE",
+                        ss.Path("/nonexistent_dir_xyz/nope/s.jsonl"))
+    ok = ss._append_shadow_history({
+        "generated_at": "2026-08-28 18:47", "stocktwits_requested": 1,
+        "stocktwits": {"AAPL": {"sample_message_count": 30}}})
+    assert ok is False
+
+
+def test_shadow_write_success_returns_true(tmp_path, monkeypatch):
+    import social_screener as ss
+
+    monkeypatch.setattr(ss, "SHADOW_HISTORY_FILE", tmp_path / "shadow.jsonl")
+    ok = ss._append_shadow_history({
+        "generated_at": "2026-08-28 18:47", "stocktwits_requested": 1,
+        "stocktwits": {"AAPL": {"sample_message_count": 30}}})
+    assert ok is True

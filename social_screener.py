@@ -61,7 +61,7 @@ SHADOW_HISTORY_FILE = BASE_DIR / 'data' / 'social_sentiment_shadow.jsonl'
 SHADOW_SCHEMA_VERSION = 'social_shadow_v1'
 
 
-def _append_shadow_history(result: dict) -> None:
+def _append_shadow_history(result: dict) -> bool:
     """日次の集計値を append-only の shadow 履歴へ残す。
 
     ⚠️ social_sentiment.json は毎日上書きされるため、そのままでは
@@ -93,7 +93,7 @@ def _append_shadow_history(result: dict) -> None:
         if collection_run_id in existing:
             print(f"[social_screener] shadow 履歴: {collection_run_id} は記録済み。"
                   f"重複追記をスキップ")
-            return
+            return True
 
         header = {
             'schema_version': SHADOW_SCHEMA_VERSION,
@@ -138,18 +138,77 @@ def _append_shadow_history(result: dict) -> None:
         # stocktwits が空だと 1 行も書かず、「未実行」と「60件試して全失敗」を
         # 区別できなかった (レビューで指摘)。
         rows.append(header)          # 完了マーカーを最後に
+
+        # ⚠️ 完了マーカーの無い run を再実行すると、前回中断で残った ticker
+        # 行が孤立したまま残り、新しい完全な行と重複する (レビューで実測:
+        # AAPL が 2 行になった)。この run_id に属す孤立行があれば除去してから
+        # 書く。無ければ従来通りの単純追記 (速い経路)。
         SHADOW_HISTORY_FILE.parent.mkdir(parents=True, exist_ok=True)
-        with open(SHADOW_HISTORY_FILE, 'a', encoding='utf-8') as f:
-            for row in rows:
-                f.write(json.dumps(row, ensure_ascii=False) + '\n')
-            f.flush()
-            os.fsync(f.fileno())
+        survivors = _orphaned_run_purged(collection_run_id)
+        if survivors is None:
+            with open(SHADOW_HISTORY_FILE, 'a', encoding='utf-8') as f:
+                for row in rows:
+                    f.write(json.dumps(row, ensure_ascii=False) + '\n')
+                f.flush()
+                os.fsync(f.fileno())
+        else:
+            print(f"[social_screener] shadow 履歴: {collection_run_id} の"
+                  f"孤立行を除去して書き直します")
+            tmp_fd, tmp_path = tempfile.mkstemp(
+                dir=SHADOW_HISTORY_FILE.parent, suffix='.tmp')
+            try:
+                with os.fdopen(tmp_fd, 'w', encoding='utf-8') as f:
+                    for line in survivors:
+                        f.write(line + '\n')
+                    for row in rows:
+                        f.write(json.dumps(row, ensure_ascii=False) + '\n')
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.replace(tmp_path, SHADOW_HISTORY_FILE)
+            except Exception:
+                os.unlink(tmp_path)
+                raise
         print(f"[social_screener] shadow 履歴へ {len(rows)} 行追記 "
               f"(summary 1 + ticker {len(rows) - 1}, "
               f"requested={requested} succeeded={succeeded} failed={failed})")
+        return True
     except Exception as exc:
         print(f"[social_screener] shadow 履歴の追記に失敗 (本処理は継続): {exc}",
               file=_sys.stderr)
+        return False
+
+
+def _orphaned_run_purged(run_id: str) -> list | None:
+    """指定 run_id に属す行を除いた既存行 (生の JSON 文字列) を返す。
+
+    _completed_collection_run_ids() で「完了マーカーが無い」と分かった run に
+    ついて、ファイルに既にその run_id の行が残っているか (=前回中断の孤立行)
+    を調べる。無ければ None (呼び出し側は単純追記でよい)。あれば、それらを
+    取り除いた残り全行を返す (呼び出し側が新しい完全な行と合わせて
+    アトミックに書き直す)。
+    """
+    if not SHADOW_HISTORY_FILE.exists():
+        return None
+    survivors: list[str] = []
+    found = False
+    try:
+        with open(SHADOW_HISTORY_FILE, encoding='utf-8') as f:
+            for raw in f:
+                line = raw.rstrip('\n')
+                if not line.strip():
+                    continue
+                try:
+                    row = json.loads(line)
+                except Exception:
+                    survivors.append(line)   # 壊れた行は推測で捨てず保持
+                    continue
+                if row.get('collection_run_id') == run_id:
+                    found = True
+                    continue
+                survivors.append(line)
+    except OSError:
+        return None
+    return survivors if found else None
 
 
 def _completed_collection_run_ids() -> set:
@@ -493,20 +552,31 @@ def run_social_screen(
         raise
 
     print(f"[{datetime.now().strftime('%H:%M:%S')}] 完了: social_sentiment.json 保存")
-    _append_shadow_history(result)
+    shadow_ok = _append_shadow_history(result)
 
     # ⚠️ social_screener 自身の heartbeat。下流の social_topic は上流欠損でも
     # no_candidates/ok になれるため、収集が止まったことを下流からは検知できない
     # (レビューで指摘)。収集側で直接生存シグナルを出す。
+    #
+    # ⚠️ shadow 書込み失敗を heartbeat に反映する。以前は stocktwits が
+    # 1件でも取れれば ok で、shadow への書込みが (握り潰されて) 失敗していても
+    # 監視は緑のままだった (レビューで指摘)。校正用データが欠測しているのに
+    # 気づけない状態を watchdog の warn_is_error (Round 36 で設定済み) に
+    # 拾わせる。
     try:
         from utils import heartbeat
         succeeded = len(result.get('stocktwits') or {})
         requested = result.get('stocktwits_requested') or 0
-        heartbeat('social_screener',
-                  status='ok' if succeeded else 'error',
-                  error=None if succeeded else 'all stocktwits fetches failed',
+        if not succeeded:
+            status, error = 'error', 'all stocktwits fetches failed'
+        elif not shadow_ok:
+            status, error = 'warn', 'shadow history write failed'
+        else:
+            status, error = 'ok', None
+        heartbeat('social_screener', status=status, error=error,
                   extra={'requested': requested, 'succeeded': succeeded,
-                         'failure_breakdown': result.get('stocktwits_failure_breakdown')})
+                         'failure_breakdown': result.get('stocktwits_failure_breakdown'),
+                         'shadow_write_ok': shadow_ok})
     except Exception as exc:
         print(f"[social_screener] heartbeat 失敗 (本処理は継続): {exc}", file=__import__('sys').stderr)
 

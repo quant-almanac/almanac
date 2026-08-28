@@ -291,6 +291,14 @@ def _load_candidates() -> tuple[list[dict[str, Any]], int, str | None, str]:
               file=sys.stderr)
         return [], len(cands), source_as_of, INPUT_UNREADABLE
     age_h = (time.time() - parsed) / 3600.0
+    # ⚠️ 老朽化だけでなく未来時刻も拒否する。以前は age_h < 0 (未来) が
+    # upstream_limit との比較を素通りし、30日後の generated_at でも
+    # input_state=ok のまま実際に LLM を呼び出していた (レビューで実測)。
+    # injection_gate / analysis_snapshot.py と同じ 1 時間の許容幅を使う。
+    if age_h < -1.0:
+        print(f"[news_topic] upstream generated_at is in the future: "
+              f"{age_h:.1f}h", file=sys.stderr)
+        return [], len(cands), source_as_of, INPUT_STALE
     if age_h > upstream_limit:
         print(f"[news_topic] upstream is stale: {age_h:.1f}h > {upstream_limit}h",
               file=sys.stderr)
@@ -329,8 +337,14 @@ def _build_user_prompt(batch: list[dict[str, Any]]) -> str:
         name = c.get("name", "")
         score = c.get("sentiment_score", 0)
         signal = c.get("signal", "")
-        heads = c.get("top_headlines", [])[:ARTICLES_PER_TK]
-        lines.append(f"## {t} ({name}) — score {score:+d}  signal {signal}")
+        # ⚠️ ここが会計/heartbeat より前のクラッシュ地点だった (レビューで実測)。
+        # _load_candidates は sentiment_score を int/float どちらも通すが、
+        # "{:+d}" は float を受け付けず ValueError。表示用に丸めて int 化する。
+        score_i = int(round(score)) if isinstance(score, (int, float)) else 0
+        # top_headlines は「キー自体が無い」場合だけ .get の既定値 [] が効く。
+        # 値が明示的に None のときは None が返り、None[:N] で TypeError になる。
+        heads = (c.get("top_headlines") or [])[:ARTICLES_PER_TK]
+        lines.append(f"## {t} ({name}) — score {score_i:+d}  signal {signal}")
         for h in heads:
             lines.append(f"  - {h}")
         lines.append("")
@@ -632,6 +646,7 @@ def analyze(dry_run: bool = False) -> dict:
         fallback_status=fallback_status, call_count=call_count,
         retry_count=retry_count, skipped_count=skipped_count,
         output_tokens=output_tokens, budget_stop=budget_stop,
+        selected_tickers=[c.get("ticker") for c in selected],
     )
     record["accounting_logged_count"] = accounting_logged_count
     record["accounting_incomplete"] = accounting_incomplete
