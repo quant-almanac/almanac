@@ -57,6 +57,101 @@ def _send_telegram(msg: str) -> None:
         pass
 
 
+SHADOW_HISTORY_FILE = BASE_DIR / 'data' / 'social_sentiment_shadow.jsonl'
+
+
+def _append_shadow_history(result: dict) -> None:
+    """日次の集計値を append-only の shadow 履歴へ残す。
+
+    ⚠️ social_sentiment.json は毎日上書きされるため、そのままでは
+    20-40 営業日の分布を後から見られない。閾値を実データから校正するには
+    履歴が要るので、選抜条件を変える「前」から貯め始める。
+
+    保存するのは銘柄ごとの集計値だけで、投稿本文・ユーザー名は含まない
+    (unique_author_count は件数のみ)。書き込み失敗で本処理は落とさないが、
+    握り潰さず stderr へ残す —— 静かに欠測すると校正時に気づけない。
+    """
+    import sys as _sys
+    try:
+        rows = []
+        as_of = result.get('generated_at') or datetime.now().strftime('%Y-%m-%d %H:%M')
+        for ticker, info in (result.get('stocktwits') or {}).items():
+            if not isinstance(info, dict):
+                continue
+            rows.append({
+                'as_of': as_of,
+                'ticker': ticker,
+                'sample_message_count': info.get('sample_message_count', info.get('message_count')),
+                'labeled_message_count': info.get('labeled_message_count'),
+                'bullish_count': info.get('bullish_count'),
+                'bearish_count': info.get('bearish_count'),
+                'bullish_pct': info.get('bullish_pct'),
+                'unique_author_count': info.get('unique_author_count'),
+                'oldest_message_at': info.get('oldest_message_at'),
+                'newest_message_at': info.get('newest_message_at'),
+                'watchlist_count': info.get('watchlist_count'),
+                'is_trending': info.get('is_trending'),
+                'source_window': info.get('source_window'),
+            })
+        if not rows:
+            return
+        SHADOW_HISTORY_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with open(SHADOW_HISTORY_FILE, 'a', encoding='utf-8') as f:
+            for row in rows:
+                f.write(json.dumps(row, ensure_ascii=False) + '\n')
+        print(f"[social_screener] shadow 履歴へ {len(rows)} 行追記: "
+              f"{SHADOW_HISTORY_FILE.name}")
+    except Exception as exc:
+        print(f"[social_screener] shadow 履歴の追記に失敗 (本処理は継続): {exc}",
+              file=_sys.stderr)
+
+
+def _sample_quality(messages: list, bullish_count: int, bearish_count: int) -> dict:
+    """将来の閾値校正に必要な「標本の素性」を記録する。
+
+    ⚠️ 現状の ``message_count`` は StockTwits API が 1 回のリクエストで返す
+    1 ページ分の長さ (実測 27-30) であって、24時間の投稿量ではない。それを
+    volume と誤解した下流 (social_topic_analyzer) が ``message_count > 200``
+    を要求していたため、選抜が 4 ヶ月間ずっと 0 件だった。
+
+    ここでは判定条件を一切変えず、校正に必要な集計値だけを増やす:
+      - sample_message_count : 1 ページ標本のサイズ (message_count と同値。
+                               名前で「これは総量ではない」と明示する)
+      - labeled_message_count: 感情ラベルが付いた投稿数 = bullish_pct の分母。
+                               これが無いと「100% Bullish」が 2/2 なのか
+                               20/20 なのか区別できない
+      - unique_author_count  : 同一人物の連投で盛り上がって見える分を割る
+      - oldest/newest_message_at : 標本が何時間分に相当するか (投稿速度)
+
+    ⚠️ 投稿本文・ユーザー名などの個人情報は保存しない。集計値のみ。
+    """
+    labeled = int(bullish_count) + int(bearish_count)
+    authors: set = set()
+    stamps: list[str] = []
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+        user = msg.get('user') or {}
+        # 識別子のみ (表示名・本文は保存しない)
+        uid = user.get('id') if isinstance(user, dict) else None
+        if uid is not None:
+            authors.add(uid)
+        created = msg.get('created_at')
+        if created:
+            stamps.append(str(created))
+    stamps.sort()
+    return {
+        'sample_message_count': len(messages),
+        'labeled_message_count': labeled,
+        'bullish_count': int(bullish_count),
+        'bearish_count': int(bearish_count),
+        'unique_author_count': len(authors) or None,
+        'oldest_message_at': stamps[0] if stamps else None,
+        'newest_message_at': stamps[-1] if stamps else None,
+        'source_window': 'api_page',   # 24h集計ではない。ページング/公式24h指標は未使用
+    }
+
+
 def fetch_stocktwits_sentiment(ticker: str, timeout: int = 8) -> dict | None:
     """
     StockTwits API から感情データ取得（無料、認証不要）
@@ -102,14 +197,19 @@ def fetch_stocktwits_sentiment(ticker: str, timeout: int = 8) -> dict | None:
                     bearish_count += 1
 
         total = bullish_count + bearish_count
+        watchlist_count = data.get('symbol', {}).get('watchlist_count', 0)
+        quality = _sample_quality(messages, bullish_count, bearish_count)
+
         if total == 0:
             # 感情ラベルなしでもメッセージ数は有用
             return {
                 'bullish_pct': 50.0,
                 'bearish_pct': 50.0,
                 'message_count': len(messages),
-                'is_trending': data.get('symbol', {}).get('watchlist_count', 0) > 10000,
+                'is_trending': watchlist_count > 10000,
+                'watchlist_count': watchlist_count,
                 'sentiment': 'NEUTRAL',
+                **quality,
             }
 
         bullish_pct = bullish_count / total * 100
@@ -121,8 +221,6 @@ def fetch_stocktwits_sentiment(ticker: str, timeout: int = 8) -> dict | None:
         elif bearish_pct >= 65:
             sentiment = 'BEARISH'
 
-        watchlist_count = data.get('symbol', {}).get('watchlist_count', 0)
-
         return {
             'bullish_pct': round(bullish_pct, 1),
             'bearish_pct': round(bearish_pct, 1),
@@ -130,6 +228,7 @@ def fetch_stocktwits_sentiment(ticker: str, timeout: int = 8) -> dict | None:
             'is_trending': watchlist_count > 10000,
             'watchlist_count': watchlist_count,
             'sentiment': sentiment,
+            **quality,
         }
 
     except requests.exceptions.Timeout:
@@ -303,6 +402,7 @@ def run_social_screen(
         raise
 
     print(f"[{datetime.now().strftime('%H:%M:%S')}] 完了: social_sentiment.json 保存")
+    _append_shadow_history(result)
 
     # SNSセンチメントの Telegram 通知は廃止。詳細は social_sentiment.json / Web UI を参照。
     if len(top_bullish) >= 3:
