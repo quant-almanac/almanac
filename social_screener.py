@@ -86,7 +86,10 @@ def _append_shadow_history(result: dict) -> None:
         # 無条件 append だと同一 run を 2 回流したときに完全に同じ行が重複し、
         # 校正時に日次分布が歪む (レビューで実測: 2行重複)。
         collection_run_id = f"{as_of}::{result.get('run_id') or 'cron'}"
-        existing = _existing_collection_run_ids()
+        # ⚠️ 完了マーカーを持つ run だけを「記録済み」とみなす。header だけ書いて
+        # 中断した場合、以前は再実行が「記録済み」と判断して欠けた ticker 行を
+        # 永久に補完しなかった (レビューで指摘)。
+        existing = _completed_collection_run_ids()
         if collection_run_id in existing:
             print(f"[social_screener] shadow 履歴: {collection_run_id} は記録済み。"
                   f"重複追記をスキップ")
@@ -105,7 +108,9 @@ def _append_shadow_history(result: dict) -> None:
             'http_error_count': result.get('stocktwits_http_errors'),
         }
 
-        rows = [header]
+        # header は最後に書く (complete marker)。途中で落ちれば marker が無く、
+        # 次回の再実行が同じ run を書き直せる。
+        rows = []
         for ticker, info in stocktwits.items():
             if not isinstance(info, dict):
                 continue
@@ -132,10 +137,13 @@ def _append_shadow_history(result: dict) -> None:
         # ⚠️ 全銘柄の取得が失敗した日でも header だけは残す。以前は
         # stocktwits が空だと 1 行も書かず、「未実行」と「60件試して全失敗」を
         # 区別できなかった (レビューで指摘)。
+        rows.append(header)          # 完了マーカーを最後に
         SHADOW_HISTORY_FILE.parent.mkdir(parents=True, exist_ok=True)
         with open(SHADOW_HISTORY_FILE, 'a', encoding='utf-8') as f:
             for row in rows:
                 f.write(json.dumps(row, ensure_ascii=False) + '\n')
+            f.flush()
+            os.fsync(f.fileno())
         print(f"[social_screener] shadow 履歴へ {len(rows)} 行追記 "
               f"(summary 1 + ticker {len(rows) - 1}, "
               f"requested={requested} succeeded={succeeded} failed={failed})")
@@ -144,8 +152,12 @@ def _append_shadow_history(result: dict) -> None:
               file=_sys.stderr)
 
 
-def _existing_collection_run_ids() -> set:
-    """既存 shadow 履歴の collection_run_id 集合 (重複追記の防止用)。"""
+def _completed_collection_run_ids() -> set:
+    """完了マーカー (collection_summary 行) を持つ run の集合。
+
+    ⚠️ 「その run の行が 1 つでもある」ではなく「完了マーカーがある」で判定する。
+    header だけ書いて中断したケースを記録済みとみなすと、欠けた ticker 行が
+    永久に補完されない (レビューで指摘)。"""
     if not SHADOW_HISTORY_FILE.exists():
         return set()
     out = set()
@@ -156,11 +168,11 @@ def _existing_collection_run_ids() -> set:
                 if not line:
                     continue
                 try:
-                    rid = json.loads(line).get('collection_run_id')
+                    row = json.loads(line)
                 except Exception:
                     continue
-                if rid:
-                    out.add(rid)
+                if row.get('kind') == 'collection_summary' and row.get('collection_run_id'):
+                    out.add(row['collection_run_id'])
     except OSError:
         return set()
     return out
@@ -212,14 +224,25 @@ def _sample_quality(messages: list, bullish_count: int, bearish_count: int) -> d
     }
 
 
-def fetch_stocktwits_sentiment(ticker: str, timeout: int = 8) -> dict | None:
+def fetch_stocktwits_sentiment(ticker: str, timeout: int = 8,
+                               stats: dict | None = None) -> dict | None:
     """
     StockTwits API から感情データ取得（無料、認証不要）
     https://api.stocktwits.com/api/2/streams/symbol/{ticker}.json
     """
+    # ⚠️ 失敗理由を記録用の辞書へ集計する。以前は全ての失敗を None へ潰して
+    # いたため、shadow 履歴の timeout / rate_limited / http_error が常に None
+    # になり、「取れなかった日に何が起きたか」が残らなかった (レビューで指摘)。
+    if stats is None:
+        stats = {}
+
+    def _fail(kind: str):
+        stats[kind] = stats.get(kind, 0) + 1
+        return None
+
     # StockTwits はドット記号を対応: 6762.T → 使えないので日本株はスキップ
     if '.' in ticker:
-        return None
+        return _fail('skipped_symbol')
 
     url = f"https://api.stocktwits.com/api/2/streams/symbol/{ticker}.json"
     headers = {
@@ -232,15 +255,15 @@ def fetch_stocktwits_sentiment(ticker: str, timeout: int = 8) -> dict | None:
         if response.status_code == 429:
             print(f"    StockTwits レートリミット - スキップ: {ticker}")
             time.sleep(5)
-            return None
+            return _fail('rate_limited')
         if response.status_code != 200:
-            return None
+            return _fail('http_error')
 
         data = response.json()
         messages = data.get('messages', [])
 
         if not messages:
-            return None
+            return _fail('empty_page')
 
         # 感情集計
         bullish_count = 0
@@ -292,9 +315,9 @@ def fetch_stocktwits_sentiment(ticker: str, timeout: int = 8) -> dict | None:
         }
 
     except requests.exceptions.Timeout:
-        return None
+        return _fail('timeout')
     except Exception:
-        return None
+        return _fail('exception')
 
 
 def fetch_options_unusual(ticker: str) -> dict | None:
@@ -383,13 +406,14 @@ def run_social_screen(
     # --- StockTwits 感情収集 ---
     print(f"  StockTwits: {len(st_scan)}銘柄スキャン中...")
     stocktwits_data = {}
+    st_stats: dict = {}          # 失敗理由の内訳 (timeout/429/http/…)
     top_bullish = []
     top_bearish = []
     trending_tickers = []
 
     for i, ticker in enumerate(st_scan):
         print(f"  StockTwits [{i+1}/{len(st_scan)}] {ticker}...", end='\r')
-        data = fetch_stocktwits_sentiment(ticker)
+        data = fetch_stocktwits_sentiment(ticker, stats=st_stats)
         if data:
             stocktwits_data[ticker] = data
             if data['sentiment'] == 'BULLISH':
@@ -427,6 +451,10 @@ def run_social_screen(
         # ⚠️ 「何銘柄試して何銘柄取れたか」を残す。取れた分だけ保存していると、
         # 全滅した日が「未実行」と区別できない (レビューで指摘)。
         'stocktwits_requested': len(st_scan),
+        'stocktwits_timeouts': st_stats.get('timeout', 0),
+        'stocktwits_rate_limited': st_stats.get('rate_limited', 0),
+        'stocktwits_http_errors': st_stats.get('http_error', 0),
+        'stocktwits_failure_breakdown': dict(st_stats),
         'options_unusual': options_unusual[:20],  # 上位20件
         'top_bullish': [t for t, _ in top_bullish[:10]],
         'top_bearish': [t for t, _ in top_bearish[:10]],
@@ -466,6 +494,21 @@ def run_social_screen(
 
     print(f"[{datetime.now().strftime('%H:%M:%S')}] 完了: social_sentiment.json 保存")
     _append_shadow_history(result)
+
+    # ⚠️ social_screener 自身の heartbeat。下流の social_topic は上流欠損でも
+    # no_candidates/ok になれるため、収集が止まったことを下流からは検知できない
+    # (レビューで指摘)。収集側で直接生存シグナルを出す。
+    try:
+        from utils import heartbeat
+        succeeded = len(result.get('stocktwits') or {})
+        requested = result.get('stocktwits_requested') or 0
+        heartbeat('social_screener',
+                  status='ok' if succeeded else 'error',
+                  error=None if succeeded else 'all stocktwits fetches failed',
+                  extra={'requested': requested, 'succeeded': succeeded,
+                         'failure_breakdown': result.get('stocktwits_failure_breakdown')})
+    except Exception as exc:
+        print(f"[social_screener] heartbeat 失敗 (本処理は継続): {exc}", file=__import__('sys').stderr)
 
     # SNSセンチメントの Telegram 通知は廃止。詳細は social_sentiment.json / Web UI を参照。
     if len(top_bullish) >= 3:

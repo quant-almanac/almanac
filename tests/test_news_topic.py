@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime
 import importlib
 
 
@@ -30,6 +31,11 @@ def test_analyze_logs_llm_usage_for_deepdive(tmp_path, monkeypatch):
     candidates_path.write_text(
         json.dumps(
             {
+                # ⚠️ generated_at は上流 (news_screener.py) が必ず書くフィールド。
+                # 以前この fixture には無く、鮮度を検証できない入力を
+                # 「新鮮」とみなす契約でしか通らない形になっていた。
+                # 上流が実際に出す形に合わせる。
+                "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M"),
                 "candidates": [
                     {
                         "ticker": "AAPL",

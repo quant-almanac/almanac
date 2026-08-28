@@ -226,12 +226,14 @@ def test_truncated_batch_is_split_and_retried(monkeypatch):
             return {"batch_id": batch_id, "role": role, "tickers": tickers,
                     "status": "error", "failure_kind": tlc.ERROR_TRUNCATION,
                     "rows": [], "usage": {"completion_tokens": 4000},
-                    "error": None, "raw_response": None, "adapter": "x", "model": "m"}
+                    "error": None, "raw_response": None, "adapter": "x", "model": "m",
+                    "accounting_logged": True}
         return {"batch_id": batch_id, "role": role, "tickers": tickers,
                 "status": "ok", "failure_kind": None,
                 "rows": [{"ticker": t, "catalyst_type": "macro"} for t in tickers],
                 "usage": {"completion_tokens": 900},
-                "error": None, "raw_response": None, "adapter": "x", "model": "m"}
+                "error": None, "raw_response": None, "adapter": "x", "model": "m",
+                    "accounting_logged": True}
 
     monkeypatch.setattr(nt, "_run_one_batch", _fake_run)
     monkeypatch.setattr(nt, "BATCH_SIZE", 3)
@@ -261,7 +263,8 @@ def test_split_retry_terminates_on_a_single_pathological_ticker(monkeypatch):
                 "tickers": [c["ticker"] for c in batch],
                 "status": "error", "failure_kind": tlc.ERROR_TRUNCATION,
                 "rows": [], "usage": {"completion_tokens": 4000},
-                "error": None, "raw_response": None, "adapter": "x", "model": "m"}
+                "error": None, "raw_response": None, "adapter": "x", "model": "m",
+                    "accounting_logged": True}
 
     monkeypatch.setattr(nt, "_run_one_batch", _always_truncate)
     monkeypatch.setattr(nt, "BATCH_SIZE", 2)
@@ -462,7 +465,8 @@ class TestRunBudget:
                     "tickers": [c["ticker"] for c in batch],
                     "status": "error", "failure_kind": tlc.ERROR_TRUNCATION,
                     "rows": [], "usage": {"completion_tokens": 4000},
-                    "error": None, "raw_response": None, "adapter": "x", "model": "m"}
+                    "error": None, "raw_response": None, "adapter": "x", "model": "m",
+                    "accounting_logged": True}
 
         monkeypatch.setattr(nt, "_run_one_batch", _always_truncate)
         monkeypatch.setattr(nt, "BATCH_SIZE", 3)
@@ -493,7 +497,8 @@ class TestRunBudget:
                     "rows": [{"ticker": c["ticker"], "catalyst_type": "macro"}
                              for c in batch],
                     "usage": {"completion_tokens": 4000},
-                    "error": None, "raw_response": None, "adapter": "x", "model": "m"}
+                    "error": None, "raw_response": None, "adapter": "x", "model": "m",
+                    "accounting_logged": True}
 
         monkeypatch.setattr(nt, "_run_one_batch", _big)
         monkeypatch.setattr(nt, "BATCH_SIZE", 1)
@@ -526,12 +531,14 @@ def test_call_count_matches_actual_api_calls_across_retries(monkeypatch):
             return {"batch_id": batch_id, "role": role, "tickers": tk,
                     "status": "error", "failure_kind": tlc.ERROR_TRUNCATION,
                     "rows": [], "usage": {"completion_tokens": 4000},
-                    "error": None, "raw_response": None, "adapter": "x", "model": "m"}
+                    "error": None, "raw_response": None, "adapter": "x", "model": "m",
+                    "accounting_logged": True}
         return {"batch_id": batch_id, "role": role, "tickers": tk,
                 "status": "ok", "failure_kind": None,
                 "rows": [{"ticker": t, "catalyst_type": "macro"} for t in tk],
                 "usage": {"completion_tokens": 900},
-                "error": None, "raw_response": None, "adapter": "x", "model": "m"}
+                "error": None, "raw_response": None, "adapter": "x", "model": "m",
+                    "accounting_logged": True}
 
     monkeypatch.setattr(nt, "_run_one_batch", _fake)
     monkeypatch.setattr(nt, "BATCH_SIZE", 2)
@@ -691,3 +698,286 @@ def test_social_shadow_history_stores_no_message_bodies_or_usernames():
     assert "Real Name" not in serialized
     assert "本文テキスト" not in serialized
     assert q["unique_author_count"] == 1        # 件数だけは残る
+
+
+# ---------------------------------------------------------------------------
+# Round 36: 自動運用前の P1 と、構造上残っていた P2
+# ---------------------------------------------------------------------------
+
+class TestUpstreamUsesItsOwnFreshnessContract:
+    """上流と成果物で別々の鮮度契約を使う。"""
+
+    def test_upstream_uses_news_not_news_topic(self, tmp_path, monkeypatch):
+        """24h 古いニュース入力は stale。
+
+        以前は成果物側の 72h (news_topic) を流用しており、24 時間古い入力が
+        ok で通っていた。analysis_snapshot.py は同じファイルを news=12h で
+        失効させているので、そこに合わせる。
+        """
+        import news_topic_analyzer as nt
+        from freshness_policy import stale_after_hours
+
+        assert stale_after_hours("news") == 12.0
+        assert stale_after_hours("news_topic") == 72.0
+
+        old = (datetime.now() - timedelta(hours=24)).strftime("%Y-%m-%d %H:%M:%S")
+        f = tmp_path / "c.json"
+        f.write_text(json.dumps({"generated_at": old,
+                                 "candidates": [{"ticker": "AAPL", "sentiment_score": 90}]}),
+                     encoding="utf-8")
+        monkeypatch.setattr(nt, "CANDIDATES_FILE", f)
+        assert nt._load_candidates()[3] == tlc.INPUT_STALE
+
+    def test_upstream_without_a_timestamp_is_not_assumed_fresh(self, tmp_path, monkeypatch):
+        import news_topic_analyzer as nt
+
+        f = tmp_path / "c.json"
+        f.write_text(json.dumps({"candidates": [{"ticker": "AAPL", "sentiment_score": 90}]}),
+                     encoding="utf-8")
+        monkeypatch.setattr(nt, "CANDIDATES_FILE", f)
+        assert nt._load_candidates()[3] == tlc.INPUT_UNREADABLE
+
+    def test_injection_gate_uses_the_upstream_contract(self):
+        """gate 側も上流には news=12h を使う。"""
+        now = datetime.now()
+        art = _artifact(
+            generated_at=now.strftime("%Y-%m-%d %H:%M:%S"),
+            started_at=now.strftime("%Y-%m-%dT%H:%M:%S"),
+            source_as_of=(now - timedelta(hours=24)).strftime("%Y-%m-%d %H:%M:%S"),
+        )
+        ok, reason = tlc.injection_gate(art, source="news_topic",
+                                        upstream_source="news")
+        assert ok is False
+        assert "upstream stale" in reason
+
+
+class TestMalformedInputDoesNotCrash:
+    """構造不正な入力で heartbeat 前にクラッシュしていた。"""
+
+    @pytest.mark.parametrize("payload", [
+        {"generated_at": "2026-08-28 18:18", "candidates": {"a": 1}},
+        {"generated_at": "2026-08-28 18:18", "candidates": ["AAPL"]},
+        # ⚠️ 非反復オブジェクト。dict/str は後段の行検証が拾うので、
+        # 冒頭の isinstance(list) チェックが実際に守っているのはここ
+        # (これが無いと for ループが TypeError で落ちる)。
+        {"generated_at": "2026-08-28 18:18", "candidates": 5},
+        {"generated_at": "2026-08-28 18:18", "candidates": None},
+        {"generated_at": "2026-08-28 18:18", "candidates": [{"ticker": 123, "sentiment_score": 5}]},
+        {"generated_at": "2026-08-28 18:18", "candidates": [{"ticker": "A", "sentiment_score": "x"}]},
+        {"generated_at": "2026-08-28 18:18", "candidates": [{"ticker": "A", "sentiment_score": True}]},
+    ])
+    def test_structural_problems_become_unreadable_not_a_crash(self, payload, tmp_path, monkeypatch):
+        import news_topic_analyzer as nt
+
+        f = tmp_path / "c.json"
+        f.write_text(json.dumps(payload), encoding="utf-8")
+        monkeypatch.setattr(nt, "CANDIDATES_FILE", f)
+        # 例外を投げず、状態として返すこと
+        assert nt._load_candidates()[3] == tlc.INPUT_UNREADABLE
+
+
+def test_partial_runs_alert_via_watchdog():
+    """partial (=注入ゼロ) を ok 扱いで素通りさせない。"""
+    import watchdog as wd
+
+    for lane in ("news_topic", "social_topic", "social_screener"):
+        assert wd.EXPECTED_INTERVALS[lane].get("warn_is_error") is True, (
+            f"{lane}: warn が ok 扱いになり partial が通知されない")
+
+
+def test_accounting_failure_makes_the_run_uninjectable(monkeypatch):
+    """会計ログが書けなかった run は費用の裏付けが無いので注入しない。"""
+    import news_topic_analyzer as nt
+
+    monkeypatch.setattr(nt, "_append_llm_call_log", lambda row: False)
+    payload = ('{"analyses":[{"ticker":"A","catalyst_type":"macro",'
+               '"durability":"short","impact_magnitude":50,'
+               '"hold_horizon_days":30,"one_liner":"x"}]}')
+    monkeypatch.setattr(nt, "call_by_role", lambda *a, **k: {
+        "content": payload, "error": None,
+        "usage": {"completion_tokens": 500}, "adapter": "x", "model": "m"})
+    monkeypatch.setattr(nt, "_load_candidates", lambda: (
+        [{"ticker": "A", "sentiment_score": 50, "top_headlines": []}],
+        1, "2026-08-28 18:18", tlc.INPUT_OK))
+
+    out = nt.analyze(dry_run=True)
+    assert out["accounting_incomplete"] is True
+    assert out["run_status"] != tlc.RUN_STATUS_SUCCESS
+    ok, _ = tlc.injection_gate(out, source="news_topic")
+    assert ok is False
+
+
+def test_consumer_revalidates_stored_rows(tmp_path, monkeypatch):
+    """保存後に書き換えられた成果物を gate が弾く。"""
+    import news_topic_analyzer as nt
+
+    now = datetime.now()
+    good = {"ticker": "A", "catalyst_type": "macro", "durability": "short",
+            "impact_magnitude": 50, "hold_horizon_days": 30, "one_liner": "x"}
+    art = {"run_status": "success",
+           "generated_at": now.strftime("%Y-%m-%d %H:%M:%S"),
+           "started_at": now.strftime("%Y-%m-%dT%H:%M:%S"),
+           "source_as_of": now.strftime("%Y-%m-%d %H:%M:%S"),
+           "selected_count": 1, "analyses": [good]}
+    f = tmp_path / "o.json"
+    monkeypatch.setattr(nt, "OUTPUT_FILE", f)
+
+    f.write_text(json.dumps(art), encoding="utf-8")
+    assert nt.format_for_prompt(), "正常な成果物が通らない"
+
+    tampered = dict(art, analyses=[dict(good, catalyst_type="BOGUS")])
+    f.write_text(json.dumps(tampered), encoding="utf-8")
+    assert nt.format_for_prompt() == "", "改竄された行が注入された"
+
+    miscount = dict(art, selected_count=5)
+    f.write_text(json.dumps(miscount), encoding="utf-8")
+    assert nt.format_for_prompt() == "", "件数不一致が注入された"
+
+
+def test_budget_is_rechecked_before_the_fallback_call(monkeypatch):
+    """max_calls=1 で fallback を含めても 1 回しか叩かない。"""
+    import news_topic_analyzer as nt
+
+    calls: list[str] = []
+
+    def _fail(batch, *, role, run_id, batch_id):
+        calls.append(role)
+        return {"batch_id": batch_id, "role": role,
+                "tickers": [c["ticker"] for c in batch],
+                "status": "error", "failure_kind": tlc.ERROR_PARSE, "rows": [],
+                "usage": {"completion_tokens": 4000}, "error": None,
+                "raw_response": None, "adapter": "x", "model": "m",
+                "accounting_logged": True}
+
+    monkeypatch.setattr(nt, "_run_one_batch", _fail)
+    monkeypatch.setattr(nt, "FALLBACK_ENABLED", True)
+    monkeypatch.setattr(nt, "BATCH_SIZE", 1)
+    monkeypatch.setattr(nt, "call_by_role", lambda *a, **k: None)
+    monkeypatch.setattr(nt, "RUN_BUDGET", tlc.RunBudget(
+        max_calls=1, max_output_tokens=5000, max_elapsed_sec=10**6))
+    monkeypatch.setattr(nt, "_load_candidates", lambda: (
+        [{"ticker": "A", "sentiment_score": 50, "top_headlines": []}],
+        1, None, tlc.INPUT_OK))
+
+    nt.analyze(dry_run=True)
+    assert len(calls) == 1, f"予算上限を超えて fallback まで叩いている: {calls}"
+
+
+def test_ripple_tickers_is_optional_but_validated_when_present():
+    """任意項目。無くても通るが、あれば型を検証する。"""
+    import news_topic_analyzer as nt
+
+    assert "ripple_tickers" not in nt.REQUIRED_FIELDS
+    base = {"ticker": "A", "catalyst_type": "macro", "durability": "short",
+            "impact_magnitude": 50, "hold_horizon_days": 30, "one_liner": "x"}
+
+    def _v(row):
+        return tlc.validate_rows({"analyses": [row]}, list_key="analyses",
+                                 required_fields=nt.REQUIRED_FIELDS,
+                                 expected_tickers=["A"],
+                                 field_specs=nt.FIELD_SPECS).ok
+
+    assert _v(base) is True                                   # 無くてよい
+    assert _v(dict(base, ripple_tickers=["B", "C"])) is True   # 正しい形は通る
+    assert _v(dict(base, ripple_tickers="BC")) is False        # 型が違えば落ちる
+
+
+def test_hold_horizon_days_rejects_bool_and_non_integers():
+    import news_topic_analyzer as nt
+
+    base = {"ticker": "A", "catalyst_type": "macro", "durability": "short",
+            "impact_magnitude": 50, "one_liner": "x"}
+
+    def _v(v):
+        return tlc.validate_rows(
+            {"analyses": [dict(base, hold_horizon_days=v)]}, list_key="analyses",
+            required_fields=nt.REQUIRED_FIELDS, expected_tickers=["A"],
+            field_specs=nt.FIELD_SPECS).ok
+
+    assert _v(30) is True
+    assert _v(True) is False      # bool は int のサブクラスだが日数ではない
+    assert _v(30.5) is False
+    assert _v(0) is False
+
+
+def test_long_one_liner_is_shortened_for_display_not_dropped(tmp_path, monkeypatch):
+    """50文字超はバッチを落とさず表示側で短縮する (200 は hard cap)。"""
+    import news_topic_analyzer as nt
+
+    now = datetime.now()
+    long_liner = "あ" * 120
+    art = {"run_status": "success",
+           "generated_at": now.strftime("%Y-%m-%d %H:%M:%S"),
+           "started_at": now.strftime("%Y-%m-%dT%H:%M:%S"),
+           "source_as_of": now.strftime("%Y-%m-%d %H:%M:%S"),
+           "selected_count": 1,
+           "analyses": [{"ticker": "A", "catalyst_type": "macro",
+                         "durability": "short", "impact_magnitude": 50,
+                         "hold_horizon_days": 30, "one_liner": long_liner}]}
+    f = tmp_path / "o.json"
+    monkeypatch.setattr(nt, "OUTPUT_FILE", f)
+    f.write_text(json.dumps(art), encoding="utf-8")
+
+    out = nt.format_for_prompt()
+    assert out, "120文字の one_liner でバッチごと落ちている"
+    assert long_liner not in out, "短縮されていない"
+    assert "…" in out
+
+
+def test_social_shadow_records_failure_breakdown(tmp_path, monkeypatch):
+    """timeout / 429 / http error が None へ潰れない。"""
+    import social_screener as ss
+
+    hist = tmp_path / "shadow.jsonl"
+    monkeypatch.setattr(ss, "SHADOW_HISTORY_FILE", hist)
+    ss._append_shadow_history({
+        "generated_at": "2026-08-28 18:47", "stocktwits_requested": 60,
+        "stocktwits_timeouts": 3, "stocktwits_rate_limited": 2,
+        "stocktwits_http_errors": 1,
+        "stocktwits": {"AAPL": {"sample_message_count": 30}}})
+
+    rows = [json.loads(x) for x in hist.read_text(encoding="utf-8").splitlines()]
+    summary = [r for r in rows if r["kind"] == "collection_summary"][0]
+    assert (summary["timeout_count"], summary["rate_limited_count"],
+            summary["http_error_count"]) == (3, 2, 1)
+
+
+def test_fetch_records_why_it_failed_instead_of_returning_bare_none():
+    import social_screener as ss
+
+    stats: dict = {}
+    assert ss.fetch_stocktwits_sentiment("6762.T", stats=stats) is None
+    assert stats.get("skipped_symbol") == 1, "失敗理由が記録されていない"
+
+
+def test_interrupted_shadow_write_is_redone_on_the_next_run(tmp_path, monkeypatch):
+    """完了マーカーの無い run は「記録済み」とみなさない。"""
+    import social_screener as ss
+
+    hist = tmp_path / "shadow.jsonl"
+    monkeypatch.setattr(ss, "SHADOW_HISTORY_FILE", hist)
+    # ticker 行だけ書いて中断した状態
+    hist.write_text(json.dumps({"kind": "ticker",
+                                "collection_run_id": "2026-08-28 18:47::cron",
+                                "ticker": "AAPL"}) + "\n", encoding="utf-8")
+
+    ss._append_shadow_history({"generated_at": "2026-08-28 18:47",
+                               "stocktwits_requested": 60,
+                               "stocktwits": {"AAPL": {"sample_message_count": 30}}})
+
+    rows = [json.loads(x) for x in hist.read_text(encoding="utf-8").splitlines()]
+    assert any(r["kind"] == "collection_summary" for r in rows), (
+        "中断した run が補完されていない")
+
+
+def test_shadow_completion_marker_is_written_last(tmp_path, monkeypatch):
+    """marker を最後に書くので、途中で落ちれば marker が残らない。"""
+    import social_screener as ss
+
+    hist = tmp_path / "shadow.jsonl"
+    monkeypatch.setattr(ss, "SHADOW_HISTORY_FILE", hist)
+    ss._append_shadow_history({"generated_at": "2026-08-28 18:47",
+                               "stocktwits_requested": 2,
+                               "stocktwits": {"AAPL": {}, "MSFT": {}}})
+    kinds = [json.loads(x)["kind"] for x in hist.read_text(encoding="utf-8").splitlines()]
+    assert kinds[-1] == "collection_summary", f"marker が最後にない: {kinds}"

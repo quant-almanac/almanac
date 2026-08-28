@@ -102,8 +102,17 @@ EXPECTED_INTERVALS = {
     # silent failure のままだった (レビューで指摘)。social_topic は実際に
     # 4 ヶ月間 0 件を書き続けても誰も気づかなかった。
     # 平日 18:25 / 18:55 生成で、金曜分は月曜まで空くので 72h + weekday_only。
-    'news_topic':        {'max_stale_sec': 72 * 3600, 'weekday_only': True},
-    'social_topic':      {'max_stale_sec': 72 * 3600, 'weekday_only': True},
+    # ⚠️ warn_is_error が無いと partial (=注入ゼロ) が ok 扱いで素通りし、
+    # 「毎日課金するが何も生まない」が再発する (レビューで指摘・実測:
+    # schema 失敗の warn が ok=['news_topic'] に入っていた)。
+    # 収集側 (18:45) も監視する。下流 social_topic は上流欠損でも
+    # no_candidates/ok になれるので、収集停止は下流からは見えない。
+    'social_screener':   {'max_stale_sec': 72 * 3600, 'weekday_only': True,
+                          'warn_is_error': True},
+    'news_topic':        {'max_stale_sec': 72 * 3600, 'weekday_only': True,
+                          'warn_is_error': True},
+    'social_topic':      {'max_stale_sec': 72 * 3600, 'weekday_only': True,
+                          'warn_is_error': True},
     'behavioral_guard_snapshot': {'max_stale_sec': 26 * 3600, 'weekday_only': True},
     # Written from the immutable decision snapshot. A primary-source fallback
     # must be visible rather than silently remaining degraded.
@@ -150,6 +159,7 @@ NOTIFY_STALE_SCRIPTS = {
     # 検知だけでなく通知まで届かせる。
     'news_topic',
     'social_topic',
+    'social_screener',
 }
 RECENT_EXECUTION_ISSUE_HOURS = 48
 

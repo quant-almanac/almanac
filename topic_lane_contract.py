@@ -319,6 +319,10 @@ def injection_gate(
     data: Optional[dict],
     *,
     source: str,
+    upstream_source: Optional[str] = None,
+    row_key: str = "analyses",
+    required_fields: Optional[Iterable[str]] = None,
+    field_specs: Optional[dict] = None,
     now: Optional[datetime] = None,
 ) -> tuple[bool, str]:
     """最終分析へ注入してよいかを判定する。
@@ -368,6 +372,9 @@ def injection_gate(
     # 上流の鮮度は consumer の現在時刻ではなく、その run が走った時刻
     # (started_at) との差で測る —— 実行後に時間が経ったことと、実行時点で
     # 既に古い入力を読んでいたことは別の問題。
+    # ⚠️ 上流には上流自身の契約を使う。成果物側の限界 (72h) を流用すると、
+    # 24時間古いニュース入力が通ってしまう (レビューで指摘・実測)。
+    upstream_limit = stale_after_hours(upstream_source) if upstream_source else limit
     source_as_of = data.get("source_as_of")
     if source_as_of:
         source_dt = _parse_ts(source_as_of)
@@ -377,9 +384,31 @@ def injection_gate(
         source_age_h = (run_started - source_dt).total_seconds() / 3600.0
         if source_age_h < -1.0:
             return False, f"source_as_of is in the future ({source_age_h:.1f}h)"
-        if source_age_h > limit:
+        if source_age_h > upstream_limit:
             return False, (f"upstream stale at run time: "
-                           f"source_as_of was {source_age_h:.1f}h old > {limit}h")
+                           f"source_as_of was {source_age_h:.1f}h old > {upstream_limit}h")
+
+    # ⚠️ run_status を信用するだけでは足りない。保存後にファイルが書き換わって
+    # いても gate は通ってしまう (レビューで実測: catalyst_type="BOGUS" へ
+    # 書き換えた成果物が通過した)。consumer 側でも行スキーマを再検証する。
+    if required_fields:
+        rows = data.get(row_key)
+        schema = validate_rows(
+            {row_key: rows} if rows is not None else None,
+            list_key=row_key,
+            required_fields=required_fields,
+            field_specs=field_specs,
+            require_full_coverage=False,   # 期待 ticker 集合は producer 側の契約
+        )
+        if not schema.ok:
+            return False, f"stored rows fail schema: {schema.reason}"
+        selected = data.get("selected_count")
+        if isinstance(selected, int) and selected >= 0 and len(schema.rows) != selected:
+            return False, (f"row count {len(schema.rows)} != selected_count {selected}")
+
+    # 会計が取れていない run は費用の裏付けが無い。注入しない。
+    if data.get("accounting_incomplete"):
+        return False, "accounting log incomplete for this run"
     return True, ""
 
 
@@ -400,7 +429,8 @@ def _parse_ts(value: object) -> Optional[datetime]:
     return None
 
 
-def load_and_gate(path: Path, *, source: str, now: Optional[datetime] = None) -> tuple[Optional[dict], str]:
+def load_and_gate(path: Path, *, source: str, now: Optional[datetime] = None,
+                  **gate_kwargs) -> tuple[Optional[dict], str]:
     """成果物を読み、注入可否まで判定して返す。"""
     if not Path(path).exists():
         return None, "file not found"
@@ -408,7 +438,7 @@ def load_and_gate(path: Path, *, source: str, now: Optional[datetime] = None) ->
         data = json.loads(Path(path).read_text(encoding="utf-8"))
     except Exception as exc:
         return None, f"unreadable: {exc}"
-    ok, reason = injection_gate(data, source=source, now=now)
+    ok, reason = injection_gate(data, source=source, now=now, **gate_kwargs)
     return (data if ok else None), reason
 
 

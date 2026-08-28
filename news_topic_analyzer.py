@@ -71,7 +71,11 @@ from topic_lane_contract import (  # noqa: E402
 )
 
 LANE = "news_topic"
+# 成果物 (news_topic_analysis.json) の鮮度契約: 週末越しの再利用を許す 72h。
 FRESHNESS_SOURCE = "news_topic"
+# 上流 (news_signal_candidates.json) の鮮度契約: analysis_snapshot.py が
+# 同じファイルへ課しているのと同じ 12h。両者は別の契約なので混同しない。
+UPSTREAM_FRESHNESS_SOURCE = "news"
 
 # 入出力
 CANDIDATES_FILE = BASE_DIR / "news_signal_candidates.json"
@@ -107,7 +111,10 @@ MAX_TOKENS_PER_BATCH = int(os.environ.get("NEWS_TOPIC_MAX_TOKENS", "4000") or 40
 # それ自体が無駄なので行わない)。
 FALLBACK_ENABLED = (os.environ.get("NEWS_TOPIC_FALLBACK", "0") or "0").lower() in ("1", "true", "yes")
 
-# スキーマ検証で必須にする項目
+# スキーマ検証で必須にする項目 (6件)。
+# ⚠️ ripple_tickers は **任意** — 波及先が思い当たらない材料では空が自然で、
+# 必須にすると正当な分析まで落ちる。ただし返ってきた場合は FIELD_SPECS で
+# 型と要素数を検証する (「7フィールドを検証」という以前の説明は不正確だった)。
 REQUIRED_FIELDS = ("ticker", "catalyst_type", "durability", "impact_magnitude",
                    "hold_horizon_days", "one_liner")
 
@@ -124,8 +131,12 @@ FIELD_SPECS = {
     "ticker": (str, lambda v: bool(str(v).strip())),
     "catalyst_type": (str, lambda v: str(v).lower() in _CATALYST_TYPES),
     "durability": (str, lambda v: str(v).lower() in _DURABILITIES),
-    "impact_magnitude": ((int, float), lambda v: 0 <= float(v) <= 100),
-    "hold_horizon_days": ((int, float), lambda v: 0 < float(v) <= 400),
+    "impact_magnitude": ((int, float), lambda v: not isinstance(v, bool)
+                         and 0 <= float(v) <= 100),
+    # 日数は整数のみ。bool は int のサブクラスなので明示的に除外する。
+    "hold_horizon_days": (int, lambda v: not isinstance(v, bool) and 0 < v <= 400),
+    # 200 は hard safety cap。プロンプトの「50文字以内」は soft target で、
+    # 超過だけでバッチ全体を落とさない (表示側で短縮する)。
     "one_liner": (str, lambda v: 0 < len(str(v)) <= 200),
     "ripple_tickers": (list, lambda v: len(v) <= 10
                        and all(isinstance(x, str) for x in v)),
@@ -160,8 +171,8 @@ def _log_adapter_usage(
     failure_kind: str | None,
     run_id: str,
     batch_id: str,
-) -> None:
-    """会計ログへ 1 行記録する。
+) -> bool:
+    """会計ログへ 1 行記録し、書けたかどうかを返す。
 
     ⚠️ status は「API が 200 を返したか」ではなく「使える結果になったか」。
     parse/schema まで通ったときだけ ok。以前は API 成功だけを見ており、
@@ -190,7 +201,14 @@ def _log_adapter_usage(
         row["error"] = str(result.get("error"))[:500]
         if not usage:
             row["cost_usd"] = 0.0
-    _append_llm_call_log(row)
+    # ⚠️ 戻り値を捨てない。以前は書き込み失敗が完全に不可視で、
+    # バッチは status=ok のまま stderr も空だった (レビューで実測)。
+    # 「call_count == 会計行数」は通常時の観測結果であって不変条件ではない。
+    written = _append_llm_call_log(row)
+    if not written:
+        print(f"[news_topic] accounting row lost, dumping to stderr: "
+              f"{json.dumps(row, ensure_ascii=False)}", file=sys.stderr)
+    return written
 
 
 SYSTEM_PROMPT = (
@@ -228,23 +246,55 @@ def _load_candidates() -> tuple[list[dict[str, Any]], int, str | None, str]:
         print("[news_topic] candidates JSON is not an object", file=sys.stderr)
         return [], 0, None, INPUT_UNREADABLE
 
-    cands: list[dict[str, Any]] = data.get("candidates", [])
+    cands = data.get("candidates", [])
     source_as_of = data.get("generated_at") or data.get("as_of")
 
-    # 上流が古すぎるなら、そこから作った分析も古い。実行前に弾く。
-    if source_as_of:
-        from freshness_policy import stale_after_hours
-        parsed = _parse_source_ts(source_as_of)
-        if parsed is None:
-            print(f"[news_topic] unparseable upstream as_of: {source_as_of!r}",
+    # ⚠️ 構造検証を選別より前に置く。JSON として読めても中身が想定外だと
+    # 選別中に AttributeError で落ち、heartbeat も run 記録も残らないまま
+    # プロセスごと終わる (レビューで実測: candidates が dict、要素が str の
+    # どちらでも 'str' object has no attribute 'get' でクラッシュした)。
+    if not isinstance(cands, list):
+        print(f"[news_topic] 'candidates' is {type(cands).__name__}, not a list",
+              file=sys.stderr)
+        return [], 0, source_as_of, INPUT_UNREADABLE
+    for row in cands:
+        if not isinstance(row, dict):
+            print(f"[news_topic] a candidate is {type(row).__name__}, not an object",
                   file=sys.stderr)
             return [], len(cands), source_as_of, INPUT_UNREADABLE
-        age_h = (time.time() - parsed) / 3600.0
-        limit = stale_after_hours(FRESHNESS_SOURCE)
-        if age_h > limit:
-            print(f"[news_topic] upstream is stale: {age_h:.1f}h > {limit}h",
-                  file=sys.stderr)
-            return [], len(cands), source_as_of, INPUT_STALE
+        if not isinstance(row.get("ticker"), str) or not row.get("ticker").strip():
+            print("[news_topic] a candidate has no usable ticker", file=sys.stderr)
+            return [], len(cands), source_as_of, INPUT_UNREADABLE
+        score = row.get("sentiment_score")
+        # bool は int のサブクラスなので明示的に除外する。
+        if isinstance(score, bool) or not isinstance(score, (int, float)):
+            print(f"[news_topic] {row.get('ticker')}: sentiment_score is "
+                  f"{type(score).__name__}", file=sys.stderr)
+            return [], len(cands), source_as_of, INPUT_UNREADABLE
+
+    # ⚠️ 上流の鮮度は「上流自身の契約」で測る。以前は成果物側の 72h
+    # (news_topic) を流用しており、24時間古いニュース入力が ok で通っていた
+    # (レビューで指摘・実測)。analysis_snapshot.py は同じ入力を news=12h で
+    # 失効させているので、そこに合わせる。
+    #   news        (12h): news_signal_candidates.json 自体の鮮度
+    #   news_topic  (72h): 生成済み topic 出力を週末越しに再利用する期限
+    from freshness_policy import stale_after_hours
+    upstream_limit = stale_after_hours(UPSTREAM_FRESHNESS_SOURCE)
+    if not source_as_of:
+        # 鮮度を確認できない入力を「新鮮」とはみなさない。
+        print("[news_topic] upstream has no generated_at; cannot verify freshness",
+              file=sys.stderr)
+        return [], len(cands), None, INPUT_UNREADABLE
+    parsed = _parse_source_ts(source_as_of)
+    if parsed is None:
+        print(f"[news_topic] unparseable upstream as_of: {source_as_of!r}",
+              file=sys.stderr)
+        return [], len(cands), source_as_of, INPUT_UNREADABLE
+    age_h = (time.time() - parsed) / 3600.0
+    if age_h > upstream_limit:
+        print(f"[news_topic] upstream is stale: {age_h:.1f}h > {upstream_limit}h",
+              file=sys.stderr)
+        return [], len(cands), source_as_of, INPUT_STALE
 
     filtered = [c for c in cands if abs(c.get("sentiment_score", 0)) >= SCORE_THRESHOLD]
     filtered.sort(key=lambda c: abs(c.get("sentiment_score", 0)), reverse=True)
@@ -345,7 +395,7 @@ def _run_one_batch(
                 rows = schema.rows
 
     status = "ok" if failure_kind is None else "error"
-    _log_adapter_usage(
+    accounting_logged = _log_adapter_usage(
         role=role,
         result=res,
         started=started,
@@ -363,6 +413,7 @@ def _run_one_batch(
         "role": role,
         "tickers": tickers,
         "status": status,
+        "accounting_logged": accounting_logged,
         "failure_kind": failure_kind,
         "adapter": res.get("adapter"),
         "model": res.get("model"),
@@ -457,6 +508,7 @@ def analyze(dry_run: bool = False) -> dict:
     retry_count = 0
     skipped_count = 0
     output_tokens = 0
+    accounting_logged_count = 0
     budget_stop: str | None = None
 
     while pending:
@@ -491,6 +543,7 @@ def analyze(dry_run: bool = False) -> dict:
                              run_id=run_id, batch_id=batch_id)
         call_count += 1
         output_tokens += int((res.get("usage") or {}).get("completion_tokens") or 0)
+        accounting_logged_count += 1 if res.get("accounting_logged") else 0
 
         if res["failure_kind"] == ERROR_QUOTA:
             # 残高切れは待っても直らない。同じ run 内で叩き続けない。
@@ -508,11 +561,16 @@ def analyze(dry_run: bool = False) -> dict:
             pending.insert(0, (f"{batch_id}/s1", batch[:mid]))
             continue
 
-        if res["status"] != "ok" and FALLBACK_ENABLED and not circuit_open:
+        # ⚠️ fallback の前にも予算を確認する。しないと max_calls=1 でも
+        # 2 回叩けてしまい hard cap にならない (レビューで指摘)。
+        fb_budget = RUN_BUDGET.exceeded(calls=call_count, output_tokens=output_tokens,
+                                        started_at=started_at)
+        if res["status"] != "ok" and FALLBACK_ENABLED and not circuit_open and not fb_budget:
             fb = _run_one_batch(batch, role="news_topic_fallback",
                                 run_id=run_id, batch_id=f"{batch_id}/fb")
             call_count += 1
             output_tokens += int((fb.get("usage") or {}).get("completion_tokens") or 0)
+            accounting_logged_count += 1 if fb.get("accounting_logged") else 0
             fallback_status = "used"
             if fb["failure_kind"] == ERROR_QUOTA:
                 circuit_open = True
@@ -549,6 +607,18 @@ def analyze(dry_run: bool = False) -> dict:
         run_status = RUN_STATUS_PARTIAL
         error_code = error_code or "analysis_count_mismatch"
 
+    # ⚠️ 会計が取れていない run は、費用の裏付けが無いまま結論だけ残る。
+    # 「call_count == 会計行数」は通常時の観測結果であって不変条件ではないので、
+    # 実際に書けた本数を数えて突き合わせる (レビューで指摘・実測: 書き込みを
+    # False にしてもバッチは status=ok のまま stderr も空だった)。
+    accounting_incomplete = accounting_logged_count != call_count
+    if accounting_incomplete:
+        print(f"[news_topic] accounting incomplete: {accounting_logged_count}/"
+              f"{call_count} rows written; run is not injectable", file=sys.stderr)
+        if run_status == RUN_STATUS_SUCCESS:
+            run_status = RUN_STATUS_PARTIAL
+        error_code = error_code or "accounting_incomplete"
+
     if error_code is None and run_status != RUN_STATUS_SUCCESS:
         kinds = [r.get("failure_kind") for r in results if r.get("failure_kind")]
         error_code = kinds[0] if kinds else ERROR_TRANSPORT
@@ -563,6 +633,8 @@ def analyze(dry_run: bool = False) -> dict:
         retry_count=retry_count, skipped_count=skipped_count,
         output_tokens=output_tokens, budget_stop=budget_stop,
     )
+    record["accounting_logged_count"] = accounting_logged_count
+    record["accounting_incomplete"] = accounting_incomplete
     # ⚠️ 部分成功でも analyses は保存する (監査用)。ただし最終分析へ注入されるかは
     # format_for_prompt() の injection_gate が run_status を見て決める —— ここで
     # 「一部だけ分析できた結果」を全体の所見として通さない。
@@ -576,7 +648,11 @@ def format_for_prompt(max_entries: int = 10) -> str:
     (fail-closed)。以前は generated_at を一切見ておらず、何日前の出力でも、
     また 0 件でエラーだけが入ったファイルでも、そのまま注入され得た。
     """
-    data, reason = load_and_gate(OUTPUT_FILE, source=FRESHNESS_SOURCE)
+    data, reason = load_and_gate(
+        OUTPUT_FILE, source=FRESHNESS_SOURCE,
+        upstream_source=UPSTREAM_FRESHNESS_SOURCE,
+        row_key="analyses", required_fields=REQUIRED_FIELDS,
+        field_specs=FIELD_SPECS)
     if data is None:
         if reason not in ("file not found",):
             print(f"[news_topic] context suppressed ({reason})", file=sys.stderr)
@@ -591,7 +667,11 @@ def format_for_prompt(max_entries: int = 10) -> str:
         dur = a.get("durability", "?")
         imp = a.get("impact_magnitude", "?")
         hold = a.get("hold_horizon_days", "?")
-        one = a.get("one_liner", "")
+        # 50文字は soft target。超過はバッチを落とさず表示時に短縮する
+        # (hard cap 200 は FIELD_SPECS 側)。
+        one = str(a.get("one_liner", ""))
+        if len(one) > 50:
+            one = one[:50] + "…"
         ripple = ", ".join(a.get("ripple_tickers", [])[:5])
         lines.append(
             f"- **{t}** [{cat}/{dur}/impact {imp}/hold {hold}d] {one}"
