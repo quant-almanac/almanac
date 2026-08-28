@@ -31,6 +31,9 @@ SOCIAL_FILE = BASE_DIR / "social_sentiment.json"
 NEWS_FILE   = BASE_DIR / "news_signal_candidates.json"  # 補助: 同じ ticker の記事見出し参照
 OUTPUT_FILE = BASE_DIR / "social_topic_analysis.json"
 
+LANE = "social_topic"
+FRESHNESS_SOURCE = "social_topic"
+
 try:
     from llm_adapters import call_by_role       # type: ignore
 except Exception as e:                          # pragma: no cover
@@ -94,6 +97,25 @@ SYSTEM_PROMPT = (
     "出力は `{\"evaluations\": [ {ticker, category, confidence_pct, action_bias, "
     "one_liner}, ... ]}` の JSON のみ。Markdown / コメント禁止。"
 )
+
+
+def _source_meta() -> dict:
+    """上流 social_sentiment.json のメタ情報 (読めなければ空)。"""
+    if not SOCIAL_FILE.exists():
+        return {}
+    try:
+        return json.loads(SOCIAL_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def _source_as_of() -> str | None:
+    return _source_meta().get("generated_at")
+
+
+def _source_sample_size() -> int:
+    st = _source_meta().get("stocktwits") or {}
+    return len(st) if isinstance(st, dict) else 0
 
 
 def _load_heated() -> list[dict[str, Any]]:
@@ -184,25 +206,58 @@ def _extract_json(text: str) -> dict | None:
 
 
 def analyze(dry_run: bool = False) -> dict:
+    from topic_lane_contract import (
+        RUN_STATUS_NO_CANDIDATES,
+        RUN_STATUS_UNAVAILABLE,
+        build_run_record,
+        write_heartbeat,
+    )
+
+    _started_at = time.time()
+    _run_id = f"social-{time.strftime('%Y%m%d-%H%M%S')}"
     heated = _load_heated()
     if not heated:
+        # ⚠️ 以前はここで何も print せずに戻っていたため、cron ログが
+        # 0 バイトのままになり「動いていない」と「動いたが 0 件」を外から
+        # 区別できなかった。実際にはこの分岐を 4 ヶ月間毎日通っていた
+        # (選抜条件 message_count>200 が上流の 1 ページ標本 (最大30) に対して
+        # 到達不能だったため)。0 件でも必ず状態と heartbeat を残す。
+        record = build_run_record(
+            lane=LANE, run_id=_run_id, run_status=RUN_STATUS_NO_CANDIDATES,
+            started_at=_started_at, input_count=_source_sample_size(),
+            selected_count=0, success_count=0, batches=[],
+            source_as_of=_source_as_of(),
+        )
         out = {
             "generated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
             "evaluations": [],
             "note": f"no tickers matched (msg>{MSG_THRESHOLD} & bullish>{BULLISH_THRESHOLD}%)",
+            **record,
         }
         if not dry_run:
             OUTPUT_FILE.write_text(json.dumps(out, indent=2, ensure_ascii=False), encoding="utf-8")
+            print(f"[social_topic] run={_run_id} status={RUN_STATUS_NO_CANDIDATES} "
+                  f"selected=0 (threshold msg>{MSG_THRESHOLD} & bullish>{BULLISH_THRESHOLD}%)")
+            write_heartbeat(LANE, record)
         return out
 
     if call_by_role is None:
+        record = build_run_record(
+            lane=LANE, run_id=_run_id, run_status=RUN_STATUS_UNAVAILABLE,
+            started_at=_started_at, input_count=_source_sample_size(),
+            selected_count=len(heated), success_count=0, batches=[],
+            source_as_of=_source_as_of(), error_code="llm_adapters unavailable",
+        )
         out = {
             "generated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
             "evaluations": [],
             "error": "llm_adapters unavailable",
+            **record,
         }
         if not dry_run:
             OUTPUT_FILE.write_text(json.dumps(out, indent=2, ensure_ascii=False), encoding="utf-8")
+            print(f"[social_topic] run={_run_id} status={RUN_STATUS_UNAVAILABLE}")
+            write_heartbeat(LANE, record)
         return out
 
     news_map = _load_news_headlines()
@@ -273,14 +328,23 @@ def analyze(dry_run: bool = False) -> dict:
 
 
 def format_for_prompt(max_entries: int = 8) -> str:
-    """Opus 合成プロンプトに差し込むコンテキスト文字列を返す。"""
-    if not OUTPUT_FILE.exists():
+    """Opus 合成プロンプトに差し込むコンテキスト文字列を返す。
+
+    ⚠️ 成功・スキーマ有効・鮮度内の 3 条件を満たさなければ空へ倒す
+    (fail-closed)。以前は generated_at を一切見ておらず、合成した 2020 年の
+    日付を持つファイルでも非空のプロンプトを返した。このレーンは現在
+    候補 0 件で LLM を呼んでいない (選抜条件が到達不能だったため) が、
+    将来非空の結果を出し始めたあとに cron が止まると、古い SNS 判断が
+    期限なく再利用されるため、先に契約だけ入れておく。
+    """
+    from topic_lane_contract import load_and_gate
+
+    data, reason = load_and_gate(OUTPUT_FILE, source=FRESHNESS_SOURCE)
+    if data is None:
+        if reason not in ("file not found",):
+            print(f"[social_topic] context suppressed ({reason})", file=sys.stderr)
         return ""
-    try:
-        data = json.loads(OUTPUT_FILE.read_text(encoding="utf-8"))
-    except Exception:
-        return ""
-    evals = data.get("evaluations", [])[:max_entries]
+    evals = (data.get("evaluations") or [])[:max_entries]
     if not evals:
         return ""
     lines = ["## 🔥 Social Heat Classification (DeepSeek)", ""]

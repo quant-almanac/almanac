@@ -60,6 +60,17 @@ SOURCE_FRESHNESS_POLICIES: dict[str, FreshnessPolicy] = {
     # stale はそれを上回る値にして契約 refresh < stale を成立させる。
     "screening_long_term": FreshnessPolicy(refresh_after_hours=96.0, stale_after_hours=120.0),
     "options": FreshnessPolicy(refresh_after_hours=12.0, stale_after_hours=24.0),
+    # news_topic / social_topic は平日 18:25 / 18:55 に生成され、翌営業日の
+    # 朝 06:15 の統合分析 (com.almanac.ai-analysis) が消費する。
+    #   平日:   18:25 生成 → 翌 06:15 消費 = 約 12h
+    #   金曜分: 18:25 生成 → 月 06:15 消費 = 約 60h (週末を挟む)
+    # 単純な 12h 固定にすると金曜生成分が月曜朝に必ず失効し、週明けだけ
+    # 材料コンテキストが落ちる。週末を含む実スケジュールから 72h を採り、
+    # refresh は日次生産者の実周期 (平日毎日) に合わせて 30h とする。
+    # どちらも最終分析への補助コンテキストであり執行ゲートではないため、
+    # 週末をまたいだ再利用は許容し、鮮度は run_status とともに可視化する。
+    "news_topic": FreshnessPolicy(refresh_after_hours=30.0, stale_after_hours=72.0),
+    "social_topic": FreshnessPolicy(refresh_after_hours=30.0, stale_after_hours=72.0),
 }
 
 
