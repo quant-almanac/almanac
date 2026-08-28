@@ -40,6 +40,20 @@ RUN_STATUS_FAILED = "failed"
 RUN_STATUS_NO_CANDIDATES = "no_candidates"
 RUN_STATUS_UNAVAILABLE = "unavailable"
 
+# ── 上流入力の状態 ──────────────────────────────────────────────────
+# ⚠️ 「候補が 0 件だった」と「入力ファイルが無い / 壊れている / 古い」を
+# 同じ扱いにしてはいけない。以前は全部 ([], 0, None) に潰しており、
+# 入力ファイルが消えていても run_status=no_candidates / error_code=None /
+# heartbeat=ok となり、外から見て完全に正常だった (レビューで指摘・再現)。
+INPUT_OK = "ok"                 # 読めて候補もある
+INPUT_EMPTY = "empty"           # 読めたが閾値を通る候補が無い (正常)
+INPUT_MISSING = "missing"       # ファイルが無い (異常)
+INPUT_UNREADABLE = "unreadable"  # JSON が壊れている (異常)
+INPUT_STALE = "stale"           # 読めるが上流が古すぎる (異常)
+
+# missing / unreadable / stale は「候補が無い」ではなく失敗として扱う。
+FAILING_INPUT_STATES = frozenset({INPUT_MISSING, INPUT_UNREADABLE, INPUT_STALE})
+
 # 判断入力への注入を許すのは success だけ。partial を許すと
 # 「20銘柄中3銘柄だけ分析された結果」が全体の所見のように扱われる。
 INJECTABLE_RUN_STATUSES = frozenset({RUN_STATUS_SUCCESS})
@@ -135,11 +149,24 @@ def validate_rows(
     list_key: str,
     required_fields: Iterable[str],
     expected_tickers: Optional[Iterable[str]] = None,
+    field_specs: Optional[dict] = None,
+    require_full_coverage: bool = True,
 ) -> SchemaResult:
     """parse 済み JSON が期待する形をしているか検証する。
 
     「JSON として読めた」と「使える分析が入っている」は別物。ここを通って
     初めて status=ok を名乗れる。
+
+    ⚠️ 「1 行でも正しければ成功」にしない (レビューで指摘・実測: 期待 2 銘柄に
+    対し 1 銘柄だけ返した応答が ok=True で通り、バッチ成功として計上されて
+    いた)。その状態で「全バッチ schema 成功」と言っても、実際には
+    「各バッチに最低 1 件の最低限の行があった」でしかない。
+    require_full_coverage=True なら、期待した銘柄集合と返却された銘柄集合が
+    完全一致することを求める。
+
+    field_specs は {field: (type_or_types, validator_or_None)} で、型と
+    enum・数値範囲まで検証する。必須項目を「存在するか」だけで見ていると、
+    catalyst_type="BOGUS" や impact_magnitude=9999 が素通りする (これも実測)。
     """
     if not isinstance(parsed, dict):
         return SchemaResult(False, [], "not a JSON object")
@@ -151,19 +178,47 @@ def validate_rows(
 
     required = list(required_fields)
     allowed = {str(t).upper() for t in expected_tickers} if expected_tickers else None
+    specs = field_specs or {}
+
     good: list[dict] = []
+    seen: set[str] = set()
     for row in rows:
         if not isinstance(row, dict):
-            continue
-        if any(row.get(f) in (None, "") for f in required):
-            continue
-        if allowed is not None:
-            ticker = str(row.get("ticker", "")).upper()
+            return SchemaResult(False, [], "a row is not an object")
+        missing = [f for f in required if row.get(f) in (None, "")]
+        if missing:
+            return SchemaResult(False, [], f"row missing {missing}")
+
+        ticker = str(row.get("ticker", "")).upper()
+        if allowed is not None and ticker not in allowed:
             # プロンプトに無い銘柄を LLM が創作していないか。scope 外の
             # 銘柄が最終分析へ混ざるのを防ぐ。
-            if ticker not in allowed:
+            return SchemaResult(False, [], f"ticker outside the prompt: {ticker}")
+        if ticker in seen:
+            # 同じ銘柄を 2 行返されると、後段の件数一致チェックが
+            # 「全銘柄そろった」と誤認しうる。
+            return SchemaResult(False, [], f"duplicate ticker: {ticker}")
+        seen.add(ticker)
+
+        for field_name, spec in specs.items():
+            value = row.get(field_name)
+            if value is None:
+                if field_name in required:
+                    return SchemaResult(False, [], f"{ticker}: {field_name} is null")
                 continue
+            expected_type, validator = spec
+            if expected_type is not None and not isinstance(value, expected_type):
+                return SchemaResult(
+                    False, [],
+                    f"{ticker}: {field_name} has type {type(value).__name__}")
+            if validator is not None and not validator(value):
+                return SchemaResult(
+                    False, [], f"{ticker}: {field_name}={value!r} is out of contract")
         good.append(row)
+
+    if allowed is not None and require_full_coverage and seen != allowed:
+        missing = sorted(allowed - seen)
+        return SchemaResult(False, [], f"missing tickers: {missing}")
 
     if not good:
         return SchemaResult(False, [], "no row satisfied the required fields")
@@ -183,8 +238,14 @@ def build_run_record(
     batches: list[dict],
     batch_count: Optional[int] = None,
     source_as_of: Optional[str] = None,
+    input_state: str = INPUT_OK,
     error_code: Optional[str] = None,
     fallback_status: str = "not_attempted",
+    call_count: int = 0,
+    retry_count: int = 0,
+    skipped_count: int = 0,
+    output_tokens: int = 0,
+    budget_stop: Optional[str] = None,
 ) -> dict:
     """両レーン共通の実行状態。監視・監査はこの形だけを見ればよい。"""
     now = time.time()
@@ -198,11 +259,23 @@ def build_run_record(
         "completed_at": _iso(now),
         "elapsed_sec": round(now - started_at, 2),
         "input_count": input_count,
+        "input_state": input_state,
         "selected_count": selected_count,
         "success_count": success_count,
         # ⚠️ batches は fallback が失敗すると 1 バッチにつき 2 エントリ持つので、
         # 「成功/全体」の分母には使えない。実際に投げたバッチ数を別に持つ。
         "batch_count": len(batches) if batch_count is None else int(batch_count),
+        # ⚠️ 指標を分離する (レビューで指摘・実測: 実 API 呼出し 3 / batch_count 2 /
+        # batches 配列 3 と三者三様だった)。会計ログの行数と一致すべきなのは
+        # call_count —— 分割 retry で切れた親バッチも会計には残るが、
+        # leaf の成功数には入らない。
+        "call_count": int(call_count),
+        "leaf_batch_count": len(batches) if batch_count is None else int(batch_count),
+        "successful_leaf_count": int(success_count),
+        "retry_count": int(retry_count),
+        "skipped_count": int(skipped_count),
+        "output_tokens": int(output_tokens),
+        "budget_stop": budget_stop,
         "fallback_status": fallback_status,
         "error_code": error_code,
         "batches": batches,
@@ -211,6 +284,34 @@ def build_run_record(
 
 def _iso(epoch: float) -> str:
     return datetime.fromtimestamp(epoch).isoformat(timespec="seconds")
+
+
+# ── run 全体の費用上限 ───────────────────────────────────────────────
+@dataclass
+class RunBudget:
+    """run 単位の呼び出し・トークン・時間の上限。
+
+    ⚠️ 分割 retry は必ず停止するが、「停止すること」と「費用が安全なこと」は
+    別 (レビューで指摘)。20 銘柄・3 件バッチで全経路が 1 件まで割れる最悪
+    ケースは呼び出し 33 回・要求トークン上限 132,000 になる。実際にそこまで
+    行くことは稀でも、上限が無いままにはしない。超過したら fail-closed で
+    partial/failed に倒す。
+    """
+    max_calls: int = 20
+    max_output_tokens: int = 60_000
+    max_elapsed_sec: float = 600.0
+
+    def exceeded(self, *, calls: int, output_tokens: int,
+                 started_at: float) -> Optional[str]:
+        if calls >= self.max_calls:
+            return f"call budget exhausted ({calls} >= {self.max_calls})"
+        if output_tokens >= self.max_output_tokens:
+            return (f"output-token budget exhausted "
+                    f"({output_tokens} >= {self.max_output_tokens})")
+        elapsed = time.time() - started_at
+        if elapsed >= self.max_elapsed_sec:
+            return f"time budget exhausted ({elapsed:.0f}s >= {self.max_elapsed_sec}s)"
+        return None
 
 
 # ── 注入可否 (fail-closed) ───────────────────────────────────────────
@@ -259,6 +360,26 @@ def injection_gate(
         return False, f"generated_at is in the future ({age_h:.1f}h)"
     if age_h > limit:
         return False, f"stale: {age_h:.1f}h > {limit}h"
+
+    # ⚠️ 自分の generated_at が新しいだけでは足りない。分析した「元データ」が
+    # 古ければ、古いニュースを今日読み直しただけの結果を fresh として
+    # 注入することになる (レビューで実測: source_as_of=30日前 / generated_at=現在
+    # の成果物が injection_gate=True で通っていた)。
+    # 上流の鮮度は consumer の現在時刻ではなく、その run が走った時刻
+    # (started_at) との差で測る —— 実行後に時間が経ったことと、実行時点で
+    # 既に古い入力を読んでいたことは別の問題。
+    source_as_of = data.get("source_as_of")
+    if source_as_of:
+        source_dt = _parse_ts(source_as_of)
+        if source_dt is None:
+            return False, f"unparseable source_as_of: {source_as_of!r}"
+        run_started = _parse_ts(data.get("started_at")) or parsed_at
+        source_age_h = (run_started - source_dt).total_seconds() / 3600.0
+        if source_age_h < -1.0:
+            return False, f"source_as_of is in the future ({source_age_h:.1f}h)"
+        if source_age_h > limit:
+            return False, (f"upstream stale at run time: "
+                           f"source_as_of was {source_age_h:.1f}h old > {limit}h")
     return True, ""
 
 

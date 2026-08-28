@@ -48,11 +48,18 @@ from topic_lane_contract import (  # noqa: E402
     ERROR_SCHEMA,
     ERROR_TRANSPORT,
     ERROR_TRUNCATION,
+    FAILING_INPUT_STATES,
+    INPUT_EMPTY,
+    INPUT_MISSING,
+    INPUT_OK,
+    INPUT_STALE,
+    INPUT_UNREADABLE,
     RUN_STATUS_FAILED,
     RUN_STATUS_NO_CANDIDATES,
     RUN_STATUS_PARTIAL,
     RUN_STATUS_SUCCESS,
     RUN_STATUS_UNAVAILABLE,
+    RunBudget,
     build_run_record,
     classify_error,
     extract_json,
@@ -101,7 +108,35 @@ MAX_TOKENS_PER_BATCH = int(os.environ.get("NEWS_TOPIC_MAX_TOKENS", "4000") or 40
 FALLBACK_ENABLED = (os.environ.get("NEWS_TOPIC_FALLBACK", "0") or "0").lower() in ("1", "true", "yes")
 
 # スキーマ検証で必須にする項目
-REQUIRED_FIELDS = ("ticker", "catalyst_type", "durability", "impact_magnitude")
+REQUIRED_FIELDS = ("ticker", "catalyst_type", "durability", "impact_magnitude",
+                   "hold_horizon_days", "one_liner")
+
+_CATALYST_TYPES = frozenset({
+    "earnings", "guidance", "product", "macro", "regulatory",
+    "m_and_a", "people", "litigation", "tech", "unknown",
+})
+_DURABILITIES = frozenset({"short", "medium", "long"})
+
+# ⚠️ 「項目が存在するか」だけでは足りない。実測で catalyst_type="BOGUS"・
+# impact_magnitude=9999 が素通りしていた (レビューで指摘)。型・enum・
+# 数値範囲まで検証する。
+FIELD_SPECS = {
+    "ticker": (str, lambda v: bool(str(v).strip())),
+    "catalyst_type": (str, lambda v: str(v).lower() in _CATALYST_TYPES),
+    "durability": (str, lambda v: str(v).lower() in _DURABILITIES),
+    "impact_magnitude": ((int, float), lambda v: 0 <= float(v) <= 100),
+    "hold_horizon_days": ((int, float), lambda v: 0 < float(v) <= 400),
+    "one_liner": (str, lambda v: 0 < len(str(v)) <= 200),
+    "ripple_tickers": (list, lambda v: len(v) <= 10
+                       and all(isinstance(x, str) for x in v)),
+}
+
+# run 全体の費用上限 (分割 retry があるので停止するだけでは足りない)
+RUN_BUDGET = RunBudget(
+    max_calls=int(os.environ.get("NEWS_TOPIC_MAX_CALLS", "20") or 20),
+    max_output_tokens=int(os.environ.get("NEWS_TOPIC_MAX_TOTAL_TOKENS", "60000") or 60000),
+    max_elapsed_sec=float(os.environ.get("NEWS_TOPIC_MAX_SEC", "600") or 600),
+)
 
 
 def _append_llm_call_log(row: dict) -> bool:
@@ -173,21 +208,64 @@ SYSTEM_PROMPT = (
 )
 
 
-def _load_candidates() -> tuple[list[dict[str, Any]], int, str | None]:
-    """(選別済み候補, 入力総数, 入力の as_of) を返す。"""
+def _load_candidates() -> tuple[list[dict[str, Any]], int, str | None, str]:
+    """(選別済み候補, 入力総数, 入力の as_of, 入力状態) を返す。
+
+    ⚠️ 「候補 0 件」と「ファイルが無い / 壊れている / 古い」を区別する。
+    以前は全部 ([], 0, None) に潰しており、入力ファイルが消えていても
+    run_status=no_candidates / error_code=None / heartbeat=ok となって、
+    外から見て完全に正常だった (レビューで指摘・実測)。
+    """
     if not CANDIDATES_FILE.exists():
-        print(f"[news_topic] {CANDIDATES_FILE.name} not found; nothing to analyze")
-        return [], 0, None
+        print(f"[news_topic] {CANDIDATES_FILE.name} not found", file=sys.stderr)
+        return [], 0, None, INPUT_MISSING
     try:
         data = json.loads(CANDIDATES_FILE.read_text(encoding="utf-8"))
     except Exception as e:
         print(f"[news_topic] failed to parse candidates JSON: {e}", file=sys.stderr)
-        return [], 0, None
+        return [], 0, None, INPUT_UNREADABLE
+    if not isinstance(data, dict):
+        print("[news_topic] candidates JSON is not an object", file=sys.stderr)
+        return [], 0, None, INPUT_UNREADABLE
+
     cands: list[dict[str, Any]] = data.get("candidates", [])
     source_as_of = data.get("generated_at") or data.get("as_of")
+
+    # 上流が古すぎるなら、そこから作った分析も古い。実行前に弾く。
+    if source_as_of:
+        from freshness_policy import stale_after_hours
+        parsed = _parse_source_ts(source_as_of)
+        if parsed is None:
+            print(f"[news_topic] unparseable upstream as_of: {source_as_of!r}",
+                  file=sys.stderr)
+            return [], len(cands), source_as_of, INPUT_UNREADABLE
+        age_h = (time.time() - parsed) / 3600.0
+        limit = stale_after_hours(FRESHNESS_SOURCE)
+        if age_h > limit:
+            print(f"[news_topic] upstream is stale: {age_h:.1f}h > {limit}h",
+                  file=sys.stderr)
+            return [], len(cands), source_as_of, INPUT_STALE
+
     filtered = [c for c in cands if abs(c.get("sentiment_score", 0)) >= SCORE_THRESHOLD]
     filtered.sort(key=lambda c: abs(c.get("sentiment_score", 0)), reverse=True)
-    return filtered[:MAX_TICKERS], len(cands), source_as_of
+    selected = filtered[:MAX_TICKERS]
+    return selected, len(cands), source_as_of, (INPUT_OK if selected else INPUT_EMPTY)
+
+
+def _parse_source_ts(value: object) -> float | None:
+    """上流 as_of を epoch 秒へ。読めなければ None。"""
+    from datetime import datetime as _dt
+    text = str(value or "").strip()
+    for parser in (
+        _dt.fromisoformat,
+        lambda s: _dt.strptime(s[:19], "%Y-%m-%d %H:%M:%S"),
+        lambda s: _dt.strptime(s[:16], "%Y-%m-%d %H:%M"),
+    ):
+        try:
+            return parser(text).timestamp()
+        except (ValueError, TypeError):
+            continue
+    return None
 
 
 def _build_user_prompt(batch: list[dict[str, Any]]) -> str:
@@ -259,6 +337,7 @@ def _run_one_batch(
                 list_key="analyses",
                 required_fields=REQUIRED_FIELDS,
                 expected_tickers=tickers,
+                field_specs=FIELD_SPECS,
             )
             if not schema.ok:
                 failure_kind = ERROR_SCHEMA
@@ -297,7 +376,7 @@ def _run_one_batch(
 def analyze(dry_run: bool = False) -> dict:
     run_id = f"news-{time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6]}"
     started_at = time.time()
-    selected, input_count, source_as_of = _load_candidates()
+    selected, input_count, source_as_of, input_state = _load_candidates()
 
     def _finish(record: dict, analyses: list[dict]) -> dict:
         out = {
@@ -311,17 +390,29 @@ def analyze(dry_run: bool = False) -> dict:
             # ⚠️ 分母はバッチ数。selected_count (銘柄数) を使うと
             # 「2/20 batches ok」のように実際の 4 バッチと食い違う。
             print(f"[news_topic] run={run_id} status={record['run_status']} "
-                  f"analyses={len(analyses)} "
-                  f"({record['success_count']}/{record['batch_count']} batches ok)")
+                  f"input={record['input_state']} analyses={len(analyses)} "
+                  f"({record['successful_leaf_count']}/{record['leaf_batch_count']} "
+                  f"leaves ok, {record['call_count']} calls)")
             write_heartbeat(LANE, record)
         return out
+
+    # ⚠️ 入力の異常 (欠損・破損・上流stale) は「候補0件」ではなく失敗。
+    # 以前は同じ扱いで、入力ファイルが消えていても heartbeat=ok だった。
+    if input_state in FAILING_INPUT_STATES:
+        return _finish(build_run_record(
+            lane=LANE, run_id=run_id, run_status=RUN_STATUS_FAILED,
+            started_at=started_at, input_count=input_count,
+            selected_count=0, success_count=0, batches=[],
+            source_as_of=source_as_of, input_state=input_state,
+            error_code=f"input_{input_state}",
+        ), [])
 
     if not selected:
         return _finish(build_run_record(
             lane=LANE, run_id=run_id, run_status=RUN_STATUS_NO_CANDIDATES,
             started_at=started_at, input_count=input_count,
             selected_count=0, success_count=0, batches=[],
-            source_as_of=source_as_of,
+            source_as_of=source_as_of, input_state=input_state,
         ), [])
 
     if call_by_role is None:
@@ -329,7 +420,8 @@ def analyze(dry_run: bool = False) -> dict:
             lane=LANE, run_id=run_id, run_status=RUN_STATUS_UNAVAILABLE,
             started_at=started_at, input_count=input_count,
             selected_count=len(selected), success_count=0, batches=[],
-            source_as_of=source_as_of, error_code="llm_adapters unavailable",
+            source_as_of=source_as_of, input_state=input_state,
+            error_code="llm_adapters unavailable",
         ), [])
 
     batches = _chunk(selected, BATCH_SIZE)
@@ -352,23 +444,53 @@ def analyze(dry_run: bool = False) -> dict:
     pending: list[tuple[str, list]] = [
         (f"{run_id}#b{i}", b) for i, b in enumerate(batches, start=1)
     ]
-    attempted_units = 0        # 実際に投げた最小単位の数 (成功率の分母)
+    # ⚠️ 指標を分離する (レビューで指摘・実測: 実API呼出し3 / batch_count 2 /
+    # batches配列 3 と三者三様だった)。
+    #   call_count           : 実際に API を叩いた回数 = 会計ログの行数
+    #   leaf_units           : 最終的に「これ以上割らない」と確定した単位の数
+    #   ok_units             : そのうち成功した数
+    #   retry_count          : 分割によって追加投入された単位の数
+    #   skipped_count        : circuit/budget で API を叩かずに諦めた数
+    leaf_units = 0
     ok_units = 0
+    call_count = 0
+    retry_count = 0
+    skipped_count = 0
+    output_tokens = 0
+    budget_stop: str | None = None
 
     while pending:
         batch_id, batch = pending.pop(0)
-        if circuit_open:
-            attempted_units += 1
+
+        # ⚠️ 分割 retry は必ず停止するが、停止することと費用が安全なことは別。
+        # 20銘柄・3件バッチで全経路が1件まで割れる最悪ケースは呼び出し33回・
+        # 要求トークン132,000 になる (レビューで指摘)。run 全体に上限を置き、
+        # 超えたら残りを叩かずに fail-closed で partial/failed へ倒す。
+        if budget_stop is None and not circuit_open:
+            budget_stop = RUN_BUDGET.exceeded(
+                calls=call_count, output_tokens=output_tokens,
+                started_at=started_at)
+            if budget_stop:
+                print(f"[news_topic] budget stop: {budget_stop}", file=sys.stderr)
+
+        if circuit_open or budget_stop:
+            skipped_count += 1
+            leaf_units += 1
+            reason = ("quota circuit breaker open" if circuit_open
+                      else f"run budget: {budget_stop}")
             results.append({
                 "batch_id": batch_id, "role": "news_topic_deepdive",
                 "tickers": [c.get("ticker") for c in batch],
-                "status": "skipped", "failure_kind": ERROR_QUOTA,
-                "rows": [], "error": "skipped: quota circuit breaker open",
+                "status": "skipped",
+                "failure_kind": ERROR_QUOTA if circuit_open else "budget_exhausted",
+                "rows": [], "error": f"skipped: {reason}",
             })
             continue
 
         res = _run_one_batch(batch, role="news_topic_deepdive",
                              run_id=run_id, batch_id=batch_id)
+        call_count += 1
+        output_tokens += int((res.get("usage") or {}).get("completion_tokens") or 0)
 
         if res["failure_kind"] == ERROR_QUOTA:
             # 残高切れは待っても直らない。同じ run 内で叩き続けない。
@@ -380,7 +502,8 @@ def analyze(dry_run: bool = False) -> dict:
         if (res["failure_kind"] == ERROR_TRUNCATION and len(batch) > 1
                 and not circuit_open):
             mid = len(batch) // 2
-            results.append(res)          # 監査のため失敗も残す
+            results.append(res)          # 監査のため失敗も残す (leaf には数えない)
+            retry_count += 2
             pending.insert(0, (f"{batch_id}/s2", batch[mid:]))
             pending.insert(0, (f"{batch_id}/s1", batch[:mid]))
             continue
@@ -388,6 +511,8 @@ def analyze(dry_run: bool = False) -> dict:
         if res["status"] != "ok" and FALLBACK_ENABLED and not circuit_open:
             fb = _run_one_batch(batch, role="news_topic_fallback",
                                 run_id=run_id, batch_id=f"{batch_id}/fb")
+            call_count += 1
+            output_tokens += int((fb.get("usage") or {}).get("completion_tokens") or 0)
             fallback_status = "used"
             if fb["failure_kind"] == ERROR_QUOTA:
                 circuit_open = True
@@ -397,20 +522,32 @@ def analyze(dry_run: bool = False) -> dict:
             else:
                 results.append(fb)
 
-        attempted_units += 1
+        leaf_units += 1
         results.append(res)
         if res["status"] == "ok":
             ok_units += 1
             analyses.extend(res["rows"])
 
     ok_batches = ok_units
-    total_batches = attempted_units
+    total_batches = leaf_units
     if ok_batches == total_batches:
         run_status = RUN_STATUS_SUCCESS
     elif ok_batches > 0:
         run_status = RUN_STATUS_PARTIAL
     else:
         run_status = RUN_STATUS_FAILED
+
+    # ⚠️ 最後に件数の総和で突き合わせる。バッチ単位で全部 ok でも、
+    # 選抜した銘柄数と分析件数が一致しないなら「全銘柄を分析できた」とは
+    # 言えない (レビューで指摘: 現在の「全バッチ schema 成功」は正確には
+    # 「各バッチに最低 1 件の行があった」でしかなかった)。
+    # validate_rows 側で全数一致を要求済みだが、分割や重複排除を経ても
+    # 崩れないことを run 全体でもう一度確かめる二重の担保。
+    if run_status == RUN_STATUS_SUCCESS and len(analyses) != len(selected):
+        print(f"[news_topic] count mismatch: {len(analyses)} analyses "
+              f"!= {len(selected)} selected", file=sys.stderr)
+        run_status = RUN_STATUS_PARTIAL
+        error_code = error_code or "analysis_count_mismatch"
 
     if error_code is None and run_status != RUN_STATUS_SUCCESS:
         kinds = [r.get("failure_kind") for r in results if r.get("failure_kind")]
@@ -421,7 +558,10 @@ def analyze(dry_run: bool = False) -> dict:
         started_at=started_at, input_count=input_count,
         selected_count=len(selected), success_count=ok_batches,
         batches=results, batch_count=total_batches, source_as_of=source_as_of,
-        error_code=error_code, fallback_status=fallback_status,
+        input_state=input_state, error_code=error_code,
+        fallback_status=fallback_status, call_count=call_count,
+        retry_count=retry_count, skipped_count=skipped_count,
+        output_tokens=output_tokens, budget_stop=budget_stop,
     )
     # ⚠️ 部分成功でも analyses は保存する (監査用)。ただし最終分析へ注入されるかは
     # format_for_prompt() の injection_gate が run_status を見て決める —— ここで

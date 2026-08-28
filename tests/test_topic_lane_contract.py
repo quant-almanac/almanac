@@ -127,9 +127,11 @@ def test_schema_validation_accepts_a_well_formed_row():
 # ---------------------------------------------------------------------------
 
 def _artifact(**over) -> dict:
+    now = datetime.now()
     base = {
         "run_status": tlc.RUN_STATUS_SUCCESS,
-        "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "generated_at": now.strftime("%Y-%m-%d %H:%M:%S"),
+        "started_at": now.strftime("%Y-%m-%dT%H:%M:%S"),
         "analyses": [{"ticker": "AAPL"}],
     }
     base.update(over)
@@ -236,7 +238,7 @@ def test_truncated_batch_is_split_and_retried(monkeypatch):
     monkeypatch.setattr(nt, "call_by_role", lambda *a, **k: None)
     monkeypatch.setattr(nt, "_load_candidates", lambda: (
         [{"ticker": t, "sentiment_score": 50, "top_headlines": []}
-         for t in ("A", "B", "C")], 3, "2026-08-28 18:18"))
+         for t in ("A", "B", "C")], 3, "2026-08-28 18:18", tlc.INPUT_OK))
 
     out = nt.analyze(dry_run=True)
 
@@ -266,7 +268,7 @@ def test_split_retry_terminates_on_a_single_pathological_ticker(monkeypatch):
     monkeypatch.setattr(nt, "call_by_role", lambda *a, **k: None)
     monkeypatch.setattr(nt, "_load_candidates", lambda: (
         [{"ticker": t, "sentiment_score": 50, "top_headlines": []}
-         for t in ("A", "B")], 2, None))
+         for t in ("A", "B")], 2, None, tlc.INPUT_OK))
 
     out = nt.analyze(dry_run=True)
 
@@ -296,13 +298,254 @@ def test_quota_error_opens_a_circuit_breaker(monkeypatch):
     monkeypatch.setattr(nt, "call_by_role", lambda *a, **k: None)
     monkeypatch.setattr(nt, "_load_candidates", lambda: (
         [{"ticker": t, "sentiment_score": 50, "top_headlines": []}
-         for t in ("A", "B", "C", "D")], 4, None))
+         for t in ("A", "B", "C", "D")], 4, None, tlc.INPUT_OK))
 
     out = nt.analyze(dry_run=True)
 
     assert len(calls) == 1, f"402 の後も呼び出しを続けている: {calls}"
     assert out["run_status"] == tlc.RUN_STATUS_FAILED
     assert out["error_code"] == tlc.ERROR_QUOTA
+
+
+class TestUpstreamFreshnessAndInputState:
+    """P1: 上流データの鮮度・欠損が正常扱いされていた。"""
+
+    def test_stale_upstream_is_not_injected_even_when_output_is_fresh(self):
+        """source_as_of が古ければ、出力が今日でも注入しない。
+
+        実測: source_as_of=30日前 / generated_at=現在 の成果物が
+        injection_gate=True で通っていた。古いニュースを今日再処理すれば
+        fresh な分析として注入できてしまう。
+        """
+        now = datetime.now()
+        art = _artifact(
+            generated_at=now.strftime("%Y-%m-%d %H:%M:%S"),
+            started_at=now.strftime("%Y-%m-%dT%H:%M:%S"),
+            source_as_of=(now - timedelta(days=30)).strftime("%Y-%m-%d %H:%M:%S"),
+        )
+        ok, reason = tlc.injection_gate(art, source="news_topic")
+        assert ok is False
+        assert "upstream stale" in reason
+
+    def test_upstream_freshness_is_measured_at_run_time_not_read_time(self):
+        """上流鮮度は started_at との差で測る。
+
+        実行後に時間が経ったことと、実行時点で既に古い入力を読んでいたことは
+        別の問題。実行時に新鮮だったなら、その run の出力は上流由来では失効しない
+        (出力自体の鮮度は generated_at 側で別途判定される)。
+        """
+        run_time = datetime.now() - timedelta(hours=10)
+        art = _artifact(
+            generated_at=run_time.strftime("%Y-%m-%d %H:%M:%S"),
+            started_at=run_time.strftime("%Y-%m-%dT%H:%M:%S"),
+            # run 時点では 2h 前 = 新鮮だった
+            source_as_of=(run_time - timedelta(hours=2)).strftime("%Y-%m-%d %H:%M:%S"),
+        )
+        ok, reason = tlc.injection_gate(art, source="news_topic")
+        assert ok is True, reason
+
+    def test_missing_input_file_is_a_failure_not_no_candidates(self, monkeypatch):
+        """入力ファイル欠損を「候補0件」と同じ扱いにしない。
+
+        実測: 欠損時に run_status=no_candidates / error_code=None /
+        heartbeat=ok となり、外から見て完全に正常だった。
+        """
+        import news_topic_analyzer as nt
+
+        monkeypatch.setattr(nt, "CANDIDATES_FILE", Path("/nonexistent/nope.json"))
+        selected, total, as_of, state = nt._load_candidates()
+        assert state == tlc.INPUT_MISSING
+        assert state in tlc.FAILING_INPUT_STATES
+
+    def test_corrupt_input_file_is_a_failure(self, tmp_path, monkeypatch):
+        import news_topic_analyzer as nt
+
+        bad = tmp_path / "candidates.json"
+        bad.write_text("{ this is not json", encoding="utf-8")
+        monkeypatch.setattr(nt, "CANDIDATES_FILE", bad)
+        _, _, _, state = nt._load_candidates()
+        assert state == tlc.INPUT_UNREADABLE
+
+    def test_stale_upstream_is_rejected_before_spending_anything(self, tmp_path, monkeypatch):
+        """上流が古いと分かった時点で、LLM を呼ばずに failed にする。"""
+        import news_topic_analyzer as nt
+
+        old = tmp_path / "candidates.json"
+        old.write_text(json.dumps({
+            "generated_at": (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d %H:%M:%S"),
+            "candidates": [{"ticker": "AAPL", "sentiment_score": 90}],
+        }), encoding="utf-8")
+        monkeypatch.setattr(nt, "CANDIDATES_FILE", old)
+
+        selected, _, _, state = nt._load_candidates()
+        assert state == tlc.INPUT_STALE
+        assert selected == [], "古い上流から候補を選抜してしまっている"
+
+    def test_empty_candidates_stays_a_normal_outcome(self, tmp_path, monkeypatch):
+        """閾値を通る候補が無いだけなら異常ではない (empty であって missing ではない)。"""
+        import news_topic_analyzer as nt
+
+        f = tmp_path / "candidates.json"
+        f.write_text(json.dumps({
+            "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "candidates": [{"ticker": "AAPL", "sentiment_score": 1}],   # 閾値未満
+        }), encoding="utf-8")
+        monkeypatch.setattr(nt, "CANDIDATES_FILE", f)
+        _, _, _, state = nt._load_candidates()
+        assert state == tlc.INPUT_EMPTY
+        assert state not in tlc.FAILING_INPUT_STATES
+
+
+class TestSchemaCoverage:
+    """P1: 「1行でも正しければバッチ成功」だった。"""
+
+    def _validate(self, rows, expected):
+        import news_topic_analyzer as nt
+        return tlc.validate_rows(
+            {"analyses": rows}, list_key="analyses",
+            required_fields=nt.REQUIRED_FIELDS,
+            expected_tickers=expected, field_specs=nt.FIELD_SPECS)
+
+    @staticmethod
+    def _row(ticker, **over):
+        row = {"ticker": ticker, "catalyst_type": "macro", "durability": "short",
+               "impact_magnitude": 50, "hold_horizon_days": 30, "one_liner": "x"}
+        row.update(over)
+        return row
+
+    def test_partial_ticker_coverage_fails_the_batch(self):
+        """3銘柄中1銘柄しか返らないバッチを成功にしない。"""
+        res = self._validate([self._row("A")], ["A", "B"])
+        assert res.ok is False
+        assert "missing tickers" in res.reason
+
+    def test_duplicate_tickers_fail_the_batch(self):
+        """重複があると件数一致チェックを誤魔化せてしまう。"""
+        res = self._validate([self._row("A"), self._row("A")], ["A"])
+        assert res.ok is False
+        assert "duplicate" in res.reason
+
+    def test_invalid_enum_fails_the_batch(self):
+        res = self._validate([self._row("A", catalyst_type="BOGUS")], ["A"])
+        assert res.ok is False
+
+    def test_out_of_range_impact_fails_the_batch(self):
+        res = self._validate([self._row("A", impact_magnitude=9999)], ["A"])
+        assert res.ok is False
+
+    def test_wrong_type_fails_the_batch(self):
+        res = self._validate([self._row("A", hold_horizon_days="thirty")], ["A"])
+        assert res.ok is False
+
+    def test_full_valid_coverage_passes(self):
+        res = self._validate([self._row("A"), self._row("B")], ["A", "B"])
+        assert res.ok is True
+        assert len(res.rows) == 2
+
+
+class TestRunBudget:
+    """P1: 分割 retry に run 全体のコスト上限が無かった。"""
+
+    def test_call_budget_stops_a_runaway_split(self, monkeypatch):
+        """全経路が 1 件まで割れる最悪ケースでも呼び出し上限で止まる。
+
+        20銘柄・3件バッチの最悪ケースは呼び出し 33 回・要求トークン 132,000。
+        停止することと費用が安全なことは別なので、run 全体に上限を置く。
+        """
+        import news_topic_analyzer as nt
+
+        calls: list[str] = []
+
+        def _always_truncate(batch, *, role, run_id, batch_id):
+            calls.append(batch_id)
+            return {"batch_id": batch_id, "role": role,
+                    "tickers": [c["ticker"] for c in batch],
+                    "status": "error", "failure_kind": tlc.ERROR_TRUNCATION,
+                    "rows": [], "usage": {"completion_tokens": 4000},
+                    "error": None, "raw_response": None, "adapter": "x", "model": "m"}
+
+        monkeypatch.setattr(nt, "_run_one_batch", _always_truncate)
+        monkeypatch.setattr(nt, "BATCH_SIZE", 3)
+        monkeypatch.setattr(nt, "call_by_role", lambda *a, **k: None)
+        monkeypatch.setattr(nt, "RUN_BUDGET", tlc.RunBudget(
+            max_calls=5, max_output_tokens=10**9, max_elapsed_sec=10**6))
+        monkeypatch.setattr(nt, "_load_candidates", lambda: (
+            [{"ticker": f"T{i}", "sentiment_score": 50, "top_headlines": []}
+             for i in range(20)], 20, None, tlc.INPUT_OK))
+
+        out = nt.analyze(dry_run=True)
+
+        assert len(calls) <= 5, f"呼び出し上限を超えている: {len(calls)}"
+        assert out["budget_stop"], "budget_stop が記録されていない"
+        assert out["skipped_count"] > 0
+        assert out["run_status"] == tlc.RUN_STATUS_FAILED
+
+    def test_output_token_budget_stops_the_run(self, monkeypatch):
+        import news_topic_analyzer as nt
+
+        calls: list[str] = []
+
+        def _big(batch, *, role, run_id, batch_id):
+            calls.append(batch_id)
+            return {"batch_id": batch_id, "role": role,
+                    "tickers": [c["ticker"] for c in batch],
+                    "status": "ok", "failure_kind": None,
+                    "rows": [{"ticker": c["ticker"], "catalyst_type": "macro"}
+                             for c in batch],
+                    "usage": {"completion_tokens": 4000},
+                    "error": None, "raw_response": None, "adapter": "x", "model": "m"}
+
+        monkeypatch.setattr(nt, "_run_one_batch", _big)
+        monkeypatch.setattr(nt, "BATCH_SIZE", 1)
+        monkeypatch.setattr(nt, "call_by_role", lambda *a, **k: None)
+        monkeypatch.setattr(nt, "RUN_BUDGET", tlc.RunBudget(
+            max_calls=10**6, max_output_tokens=9000, max_elapsed_sec=10**6))
+        monkeypatch.setattr(nt, "_load_candidates", lambda: (
+            [{"ticker": f"T{i}", "sentiment_score": 50, "top_headlines": []}
+             for i in range(10)], 10, None, tlc.INPUT_OK))
+
+        out = nt.analyze(dry_run=True)
+        assert "output-token budget" in (out["budget_stop"] or "")
+        assert len(calls) <= 3
+
+
+def test_call_count_matches_actual_api_calls_across_retries(monkeypatch):
+    """P2: retry 時に会計行数と batch_count がズレていた。
+
+    実測: 実API呼出し 3 / batch_count 2 / batches配列 3 と三者三様だった。
+    会計ログ行数と一致すべきなのは call_count。
+    """
+    import news_topic_analyzer as nt
+
+    calls: list[str] = []
+
+    def _fake(batch, *, role, run_id, batch_id):
+        calls.append(batch_id)
+        tk = [c["ticker"] for c in batch]
+        if len(batch) >= 2:
+            return {"batch_id": batch_id, "role": role, "tickers": tk,
+                    "status": "error", "failure_kind": tlc.ERROR_TRUNCATION,
+                    "rows": [], "usage": {"completion_tokens": 4000},
+                    "error": None, "raw_response": None, "adapter": "x", "model": "m"}
+        return {"batch_id": batch_id, "role": role, "tickers": tk,
+                "status": "ok", "failure_kind": None,
+                "rows": [{"ticker": t, "catalyst_type": "macro"} for t in tk],
+                "usage": {"completion_tokens": 900},
+                "error": None, "raw_response": None, "adapter": "x", "model": "m"}
+
+    monkeypatch.setattr(nt, "_run_one_batch", _fake)
+    monkeypatch.setattr(nt, "BATCH_SIZE", 2)
+    monkeypatch.setattr(nt, "call_by_role", lambda *a, **k: None)
+    monkeypatch.setattr(nt, "_load_candidates", lambda: (
+        [{"ticker": t, "sentiment_score": 50, "top_headlines": []}
+         for t in ("A", "B")], 2, None, tlc.INPUT_OK))
+
+    out = nt.analyze(dry_run=True)
+
+    assert out["call_count"] == len(calls), "call_count が実呼び出し数と一致しない"
+    assert out["leaf_batch_count"] == 2
+    assert out["retry_count"] == 2
+    assert out["skipped_count"] == 0
 
 
 def test_social_screener_message_count_is_a_page_sample_not_a_daily_volume():
