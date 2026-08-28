@@ -58,6 +58,7 @@ def _send_telegram(msg: str) -> None:
 
 
 SHADOW_HISTORY_FILE = BASE_DIR / 'data' / 'social_sentiment_shadow.jsonl'
+SHADOW_SCHEMA_VERSION = 'social_shadow_v1'
 
 
 def _append_shadow_history(result: dict) -> None:
@@ -73,14 +74,48 @@ def _append_shadow_history(result: dict) -> None:
     """
     import sys as _sys
     try:
-        rows = []
         as_of = result.get('generated_at') or datetime.now().strftime('%Y-%m-%d %H:%M')
-        for ticker, info in (result.get('stocktwits') or {}).items():
+        stocktwits = result.get('stocktwits') or {}
+        requested = result.get('stocktwits_requested')
+        if requested is None:
+            requested = len(stocktwits)
+        succeeded = len(stocktwits)
+        failed = max(0, int(requested) - succeeded)
+
+        # ⚠️ collection_run_id で「同じ run の再実行」を識別できるようにする。
+        # 無条件 append だと同一 run を 2 回流したときに完全に同じ行が重複し、
+        # 校正時に日次分布が歪む (レビューで実測: 2行重複)。
+        collection_run_id = f"{as_of}::{result.get('run_id') or 'cron'}"
+        existing = _existing_collection_run_ids()
+        if collection_run_id in existing:
+            print(f"[social_screener] shadow 履歴: {collection_run_id} は記録済み。"
+                  f"重複追記をスキップ")
+            return
+
+        header = {
+            'schema_version': SHADOW_SCHEMA_VERSION,
+            'collection_run_id': collection_run_id,
+            'as_of': as_of,
+            'kind': 'collection_summary',
+            'requested_count': int(requested),
+            'succeeded_count': succeeded,
+            'failed_count': failed,
+            'timeout_count': result.get('stocktwits_timeouts'),
+            'rate_limited_count': result.get('stocktwits_rate_limited'),
+            'http_error_count': result.get('stocktwits_http_errors'),
+        }
+
+        rows = [header]
+        for ticker, info in stocktwits.items():
             if not isinstance(info, dict):
                 continue
             rows.append({
+                'schema_version': SHADOW_SCHEMA_VERSION,
+                'collection_run_id': collection_run_id,
                 'as_of': as_of,
+                'kind': 'ticker',
                 'ticker': ticker,
+                'fetch_status': info.get('fetch_status', 'ok'),
                 'sample_message_count': info.get('sample_message_count', info.get('message_count')),
                 'labeled_message_count': info.get('labeled_message_count'),
                 'bullish_count': info.get('bullish_count'),
@@ -93,17 +128,42 @@ def _append_shadow_history(result: dict) -> None:
                 'is_trending': info.get('is_trending'),
                 'source_window': info.get('source_window'),
             })
-        if not rows:
-            return
+
+        # ⚠️ 全銘柄の取得が失敗した日でも header だけは残す。以前は
+        # stocktwits が空だと 1 行も書かず、「未実行」と「60件試して全失敗」を
+        # 区別できなかった (レビューで指摘)。
         SHADOW_HISTORY_FILE.parent.mkdir(parents=True, exist_ok=True)
         with open(SHADOW_HISTORY_FILE, 'a', encoding='utf-8') as f:
             for row in rows:
                 f.write(json.dumps(row, ensure_ascii=False) + '\n')
-        print(f"[social_screener] shadow 履歴へ {len(rows)} 行追記: "
-              f"{SHADOW_HISTORY_FILE.name}")
+        print(f"[social_screener] shadow 履歴へ {len(rows)} 行追記 "
+              f"(summary 1 + ticker {len(rows) - 1}, "
+              f"requested={requested} succeeded={succeeded} failed={failed})")
     except Exception as exc:
         print(f"[social_screener] shadow 履歴の追記に失敗 (本処理は継続): {exc}",
               file=_sys.stderr)
+
+
+def _existing_collection_run_ids() -> set:
+    """既存 shadow 履歴の collection_run_id 集合 (重複追記の防止用)。"""
+    if not SHADOW_HISTORY_FILE.exists():
+        return set()
+    out = set()
+    try:
+        with open(SHADOW_HISTORY_FILE, encoding='utf-8') as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rid = json.loads(line).get('collection_run_id')
+                except Exception:
+                    continue
+                if rid:
+                    out.add(rid)
+    except OSError:
+        return set()
+    return out
 
 
 def _sample_quality(messages: list, bullish_count: int, bearish_count: int) -> dict:
@@ -364,6 +424,9 @@ def run_social_screen(
     result = {
         'generated_at': datetime.now().strftime('%Y-%m-%d %H:%M'),
         'stocktwits': stocktwits_data,
+        # ⚠️ 「何銘柄試して何銘柄取れたか」を残す。取れた分だけ保存していると、
+        # 全滅した日が「未実行」と区別できない (レビューで指摘)。
+        'stocktwits_requested': len(st_scan),
         'options_unusual': options_unusual[:20],  # 上位20件
         'top_bullish': [t for t, _ in top_bullish[:10]],
         'top_bearish': [t for t, _ in top_bearish[:10]],

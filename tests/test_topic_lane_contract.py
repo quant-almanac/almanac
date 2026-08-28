@@ -600,16 +600,82 @@ def test_social_shadow_history_is_append_only(tmp_path, monkeypatch):
     hist = tmp_path / "shadow.jsonl"
     monkeypatch.setattr(ss, "SHADOW_HISTORY_FILE", hist)
 
-    day1 = {"generated_at": "2026-08-27 18:47",
+    day1 = {"generated_at": "2026-08-27 18:47", "stocktwits_requested": 1,
             "stocktwits": {"AAPL": {"sample_message_count": 30, "bullish_pct": 80.0}}}
-    day2 = {"generated_at": "2026-08-28 18:47",
+    day2 = {"generated_at": "2026-08-28 18:47", "stocktwits_requested": 1,
             "stocktwits": {"AAPL": {"sample_message_count": 28, "bullish_pct": 75.0}}}
     ss._append_shadow_history(day1)
     ss._append_shadow_history(day2)
 
     rows = [json.loads(line) for line in hist.read_text(encoding="utf-8").splitlines()]
-    assert len(rows) == 2, "2 日目の追記が 1 日目を上書きしている"
-    assert [r["as_of"] for r in rows] == ["2026-08-27 18:47", "2026-08-28 18:47"]
+    tickers = [r for r in rows if r.get("kind") == "ticker"]
+    assert len(tickers) == 2, "2 日目の追記が 1 日目を上書きしている"
+    assert [r["as_of"] for r in tickers] == ["2026-08-27 18:47", "2026-08-28 18:47"]
+
+
+def test_social_shadow_history_does_not_duplicate_the_same_run(tmp_path, monkeypatch):
+    """同じ run を再実行しても行が重複しない。
+
+    実測: 無条件 append だったため、同一 run を 2 回流すと完全に同じ行が
+    2 行残り、校正時の日次分布が歪んだ。
+    """
+    import social_screener as ss
+
+    hist = tmp_path / "shadow.jsonl"
+    monkeypatch.setattr(ss, "SHADOW_HISTORY_FILE", hist)
+    same = {"generated_at": "2026-08-28 18:47", "stocktwits_requested": 1,
+            "stocktwits": {"AAPL": {"sample_message_count": 30}}}
+    ss._append_shadow_history(same)
+    ss._append_shadow_history(same)
+
+    rows = [json.loads(line) for line in hist.read_text(encoding="utf-8").splitlines()]
+    ids = {r["collection_run_id"] for r in rows}
+    assert len(ids) == 1
+    assert len(rows) == 2, f"同一 run が重複している: {len(rows)} 行"
+
+
+def test_social_shadow_distinguishes_total_failure_from_not_running(tmp_path, monkeypatch):
+    """全銘柄の取得に失敗した日でも記録を残す。
+
+    実測: stocktwits が空だと 1 行も書かず、「未実行」と「60件試して全失敗」を
+    外から区別できなかった。
+    """
+    import social_screener as ss
+
+    hist = tmp_path / "shadow.jsonl"
+    monkeypatch.setattr(ss, "SHADOW_HISTORY_FILE", hist)
+    ss._append_shadow_history({"generated_at": "2026-08-29 18:47",
+                               "stocktwits_requested": 60, "stocktwits": {}})
+
+    rows = [json.loads(line) for line in hist.read_text(encoding="utf-8").splitlines()]
+    assert len(rows) == 1, "全失敗した日の記録が残っていない"
+    summary = rows[0]
+    assert summary["kind"] == "collection_summary"
+    assert summary["requested_count"] == 60
+    assert summary["succeeded_count"] == 0
+    assert summary["failed_count"] == 60
+    assert summary["schema_version"] == ss.SHADOW_SCHEMA_VERSION
+
+
+def test_topic_lanes_are_monitored_by_watchdog():
+    """cron 自体が止まったときに通知が届くこと。
+
+    実測: 両レーンとも heartbeats.json へは書いていたが、watchdog の
+    EXPECTED_INTERVALS にも NOTIFY_STALE_SCRIPTS にも無く、止まっても
+    silent failure のままだった。social_topic は実際に 4 ヶ月間
+    0 件を書き続けても誰も気づかなかった。
+    """
+    import watchdog as wd
+
+    for lane in ("news_topic", "social_topic"):
+        assert lane in wd.EXPECTED_INTERVALS, f"{lane} が監視対象に無い"
+        spec = wd.EXPECTED_INTERVALS[lane]
+        # 平日 18:25/18:55 生成。金曜分は月曜まで空くので週末を吸収できること。
+        assert spec["weekday_only"] is True
+        assert spec["max_stale_sec"] >= 72 * 3600, (
+            f"{lane}: 週末 (金→月) を跨げず毎週末 false positive になる")
+        assert lane in wd.NOTIFY_STALE_SCRIPTS, (
+            f"{lane}: 検知しても通知対象でなければ気づけない")
 
 
 def test_social_shadow_history_stores_no_message_bodies_or_usernames():

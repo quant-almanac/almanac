@@ -97,6 +97,13 @@ EXPECTED_INTERVALS = {
     'data_fetcher':      {'max_stale_sec': 26 * 3600, 'weekday_only': True},
     'margin_manager':    {'max_stale_sec': 26 * 3600, 'weekday_only': True},
     'long_term_screener':{'max_stale_sec': 8 * 24 * 3600, 'weekday_only': False},
+    # ⚠️ topic レーンは heartbeats.json へ書いていたが、この表にも
+    # NOTIFY_STALE_SCRIPTS にも無かったため、cron 自体が止まっても
+    # silent failure のままだった (レビューで指摘)。social_topic は実際に
+    # 4 ヶ月間 0 件を書き続けても誰も気づかなかった。
+    # 平日 18:25 / 18:55 生成で、金曜分は月曜まで空くので 72h + weekday_only。
+    'news_topic':        {'max_stale_sec': 72 * 3600, 'weekday_only': True},
+    'social_topic':      {'max_stale_sec': 72 * 3600, 'weekday_only': True},
     'behavioral_guard_snapshot': {'max_stale_sec': 26 * 3600, 'weekday_only': True},
     # Written from the immutable decision snapshot. A primary-source fallback
     # must be visible rather than silently remaining degraded.
@@ -138,6 +145,11 @@ NOTIFY_STALE_SCRIPTS = {
     'data_fetcher',
     'margin_manager',
     'monthly_governance_report',
+    # EXPECTED_INTERVALS に載せるだけでは通知されない (通知対象はこの集合)。
+    # 両レーンとも「止まっても誰も気づかない」状態を実際に長期間続けたので、
+    # 検知だけでなく通知まで届かせる。
+    'news_topic',
+    'social_topic',
 }
 RECENT_EXECUTION_ISSUE_HOURS = 48
 
