@@ -102,7 +102,7 @@
 | Lifecycle | Modules | 境界 |
 |---|---|---|
 | live/advisory | `scenario_engine.py`, `scenario_strategy.py`, `scenario_invariants.py` | scenario state、playbook、invariant |
-| observe | `catalyst_outcome_catchup.py`, `news_topic_analyzer.py`, `social_topic_analyzer.py` | catalyst/topic outcome・分類 |
+| observe | `catalyst_outcome_catchup.py`, `news_topic_analyzer.py`, `social_topic_analyzer.py`, `topic_lane_contract.py` | catalyst/topic outcome・分類 |
 | observe | `ipo_watch.py`, `insider_cluster.py`, `insider_tracker.py`, `insider_restrictions.py` | IPO/insider signal・制限 |
 
 ## 10. 税務

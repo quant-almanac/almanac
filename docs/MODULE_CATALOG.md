@@ -102,7 +102,7 @@ The large orchestration implementation lives in the `analyst/` package; see §15
 | Lifecycle | Modules | Boundary |
 |---|---|---|
 | live/advisory | `scenario_engine.py`, `scenario_strategy.py`, `scenario_invariants.py` | Scenario state, playbooks and invariant checks |
-| observe | `catalyst_outcome_catchup.py`, `news_topic_analyzer.py`, `social_topic_analyzer.py` | Catalyst/topic outcome and classification |
+| observe | `catalyst_outcome_catchup.py`, `news_topic_analyzer.py`, `social_topic_analyzer.py`, `topic_lane_contract.py` | Catalyst/topic outcome and classification |
 | observe | `ipo_watch.py`, `insider_cluster.py`, `insider_tracker.py`, `insider_restrictions.py` | IPO and insider signals/restrictions |
 
 ## 10. Tax
