@@ -200,6 +200,111 @@ def test_future_timestamp_is_not_injected():
 # producer/consumer 契約: 上流が実際に出す値で下流が動くか
 # ---------------------------------------------------------------------------
 
+def test_truncated_batch_is_split_and_retried(monkeypatch):
+    """truncation したバッチは分割して retry する。
+
+    このレーンは「全バッチ成功時のみ注入」なので、retry が無いと病的な
+    1 バッチのせいで run 全体が永久に partial になり、結局一度も注入
+    されない —— 元の「毎日走るが何も生まない」状態を別の形で再現する。
+
+    隔離ライブの実測では 1 バッチあたりの出力が 591〜4000+ トークンと
+    ばらつき、同じ 3 銘柄が試行によって切れたり切れなかったりした
+    (V/MSFT/LRCX が 4000 で切れた次の試行では 2335 で成功)。
+    固定サイズだけでは吸収できない性質なので分割 retry で収束させる。
+    """
+    import news_topic_analyzer as nt
+
+    calls: list[list[str]] = []
+
+    def _fake_run(batch, *, role, run_id, batch_id):
+        tickers = [c["ticker"] for c in batch]
+        calls.append(tickers)
+        # 3 銘柄だと必ず切れ、2 銘柄以下なら通る、という状況を作る
+        if len(batch) >= 3:
+            return {"batch_id": batch_id, "role": role, "tickers": tickers,
+                    "status": "error", "failure_kind": tlc.ERROR_TRUNCATION,
+                    "rows": [], "usage": {"completion_tokens": 4000},
+                    "error": None, "raw_response": None, "adapter": "x", "model": "m"}
+        return {"batch_id": batch_id, "role": role, "tickers": tickers,
+                "status": "ok", "failure_kind": None,
+                "rows": [{"ticker": t, "catalyst_type": "macro"} for t in tickers],
+                "usage": {"completion_tokens": 900},
+                "error": None, "raw_response": None, "adapter": "x", "model": "m"}
+
+    monkeypatch.setattr(nt, "_run_one_batch", _fake_run)
+    monkeypatch.setattr(nt, "BATCH_SIZE", 3)
+    monkeypatch.setattr(nt, "call_by_role", lambda *a, **k: None)
+    monkeypatch.setattr(nt, "_load_candidates", lambda: (
+        [{"ticker": t, "sentiment_score": 50, "top_headlines": []}
+         for t in ("A", "B", "C")], 3, "2026-08-28 18:18"))
+
+    out = nt.analyze(dry_run=True)
+
+    assert calls[0] == ["A", "B", "C"], "最初は 3 銘柄でまとめて投げる"
+    assert len(calls) > 1, "truncation したのに分割 retry していない"
+    assert out["run_status"] == tlc.RUN_STATUS_SUCCESS, (
+        f"分割 retry 後も success になっていない: {out['run_status']}")
+    assert {a["ticker"] for a in out["analyses"]} == {"A", "B", "C"}
+
+
+def test_split_retry_terminates_on_a_single_pathological_ticker(monkeypatch):
+    """サイズ 1 でなお切れる銘柄では分割を止める (無限ループにしない)。"""
+    import news_topic_analyzer as nt
+
+    calls: list[list[str]] = []
+
+    def _always_truncate(batch, *, role, run_id, batch_id):
+        calls.append([c["ticker"] for c in batch])
+        return {"batch_id": batch_id, "role": role,
+                "tickers": [c["ticker"] for c in batch],
+                "status": "error", "failure_kind": tlc.ERROR_TRUNCATION,
+                "rows": [], "usage": {"completion_tokens": 4000},
+                "error": None, "raw_response": None, "adapter": "x", "model": "m"}
+
+    monkeypatch.setattr(nt, "_run_one_batch", _always_truncate)
+    monkeypatch.setattr(nt, "BATCH_SIZE", 2)
+    monkeypatch.setattr(nt, "call_by_role", lambda *a, **k: None)
+    monkeypatch.setattr(nt, "_load_candidates", lambda: (
+        [{"ticker": t, "sentiment_score": 50, "top_headlines": []}
+         for t in ("A", "B")], 2, None))
+
+    out = nt.analyze(dry_run=True)
+
+    assert out["run_status"] == tlc.RUN_STATUS_FAILED
+    assert out["error_code"] == tlc.ERROR_TRUNCATION
+    # 2 銘柄 → 分割して 1 銘柄 ×2。サイズ 1 ではもう割らないので計 3 回で止まる。
+    assert len(calls) == 3, f"分割が収束していない: {calls}"
+
+
+def test_quota_error_opens_a_circuit_breaker(monkeypatch):
+    """402 を掴んだら残りのバッチを叩かない (待っても直らないため)。"""
+    import news_topic_analyzer as nt
+
+    calls: list[str] = []
+
+    def _quota(batch, *, role, run_id, batch_id):
+        calls.append(batch_id)
+        return {"batch_id": batch_id, "role": role,
+                "tickers": [c["ticker"] for c in batch],
+                "status": "error", "failure_kind": tlc.ERROR_QUOTA,
+                "rows": [], "usage": None,
+                "error": "Error code: 402", "raw_response": None,
+                "adapter": "x", "model": "m"}
+
+    monkeypatch.setattr(nt, "_run_one_batch", _quota)
+    monkeypatch.setattr(nt, "BATCH_SIZE", 1)
+    monkeypatch.setattr(nt, "call_by_role", lambda *a, **k: None)
+    monkeypatch.setattr(nt, "_load_candidates", lambda: (
+        [{"ticker": t, "sentiment_score": 50, "top_headlines": []}
+         for t in ("A", "B", "C", "D")], 4, None))
+
+    out = nt.analyze(dry_run=True)
+
+    assert len(calls) == 1, f"402 の後も呼び出しを続けている: {calls}"
+    assert out["run_status"] == tlc.RUN_STATUS_FAILED
+    assert out["error_code"] == tlc.ERROR_QUOTA
+
+
 def test_social_screener_message_count_is_a_page_sample_not_a_daily_volume():
     """上流の message_count は API 1 ページ分の長さであることを固定する。
 

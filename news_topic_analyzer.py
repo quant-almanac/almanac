@@ -22,7 +22,8 @@ Opus 合成 (analyst/__init__.py _synthesize) に news_topic_context として�
   正常に見えていた。
 
   対策:
-    - 小バッチ (既定 5 銘柄) へ分割し、1 バッチあたりの出力量を抑える
+    - 小バッチ (既定 3 銘柄 / 4000 トークン) へ分割し、出力量を上限内に収める
+      (5 銘柄 / 3000 トークンでも 4 バッチ中 2 バッチが切れることを実測)
     - parse だけでなくスキーマ検証まで通って初めて status=ok を名乗る
     - truncation / parse / schema / transport / quota を区別して記録
     - 402 を掴んだら同一 run 内で以降の呼び出しを止める (circuit breaker)
@@ -83,10 +84,15 @@ SCORE_THRESHOLD = 30     # |score| >= 30 のみ対象（弱シグナルを切り
 MAX_TICKERS     = 20     # 1 run で扱う銘柄数の上限
 ARTICLES_PER_TK = 3      # 1 銘柄につき top_headlines 3 本までプロンプトに投入
 
-# ⚠️ バッチサイズ。20 銘柄一括は出力が max_tokens に張り付いて必ず切れていた。
-# 5 銘柄なら 1 銘柄あたり ~600 トークン使えるので、6 項目の構造化出力には十分。
-BATCH_SIZE = int(os.environ.get("NEWS_TOPIC_BATCH_SIZE", "5") or 5)
-MAX_TOKENS_PER_BATCH = int(os.environ.get("NEWS_TOPIC_MAX_TOKENS", "3000") or 3000)
+# ⚠️ バッチサイズと上限トークン。20 銘柄一括は必ず切れていたが、
+# 5 銘柄 / 3000 トークンでも足りないことが隔離ライブの実測で判明した:
+#   b1 2773 / b2 3000(切れ) / b3 3000(切れ) / b4 1861
+# 1 銘柄あたりの出力量は理由文の長さでかなりばらつく (370〜600+)。
+# 実測の最悪値に対して倍の余裕を取り、3 銘柄 / 4000 トークンにする。
+# max_tokens は「上限」であって課金対象は実出力なので、広く取っても
+# コストは増えない一方、切れると 1 バッチ丸ごと無駄になる。
+BATCH_SIZE = int(os.environ.get("NEWS_TOPIC_BATCH_SIZE", "3") or 3)
+MAX_TOKENS_PER_BATCH = int(os.environ.get("NEWS_TOPIC_MAX_TOKENS", "4000") or 4000)
 
 # ⚠️ Qwen fallback は既定で無効。OpenRouter の残高切れ (402) が続いており、
 # 有効にすると毎バッチで確実に失敗する呼び出しを 1 回ずつ足すだけになる。
@@ -302,9 +308,11 @@ def analyze(dry_run: bool = False) -> dict:
         if not dry_run:
             OUTPUT_FILE.write_text(
                 json.dumps(out, indent=2, ensure_ascii=False), encoding="utf-8")
+            # ⚠️ 分母はバッチ数。selected_count (銘柄数) を使うと
+            # 「2/20 batches ok」のように実際の 4 バッチと食い違う。
             print(f"[news_topic] run={run_id} status={record['run_status']} "
                   f"analyses={len(analyses)} "
-                  f"({record['success_count']}/{record['selected_count']} batches ok)")
+                  f"({record['success_count']}/{record['batch_count']} batches ok)")
             write_heartbeat(LANE, record)
         return out
 
@@ -334,9 +342,23 @@ def analyze(dry_run: bool = False) -> dict:
     error_code: str | None = None
     fallback_status = "disabled" if not FALLBACK_ENABLED else "not_attempted"
 
-    for i, batch in enumerate(batches, start=1):
-        batch_id = f"{run_id}#b{i}"
+    # ⚠️ truncation は分割して retry する。
+    # 出力量は 1 バッチあたり 591〜4000+ トークンとばらつきが大きく (実測)、
+    # 固定サイズだけでは時々どうしても上限へ張り付く。一方でこのレーンは
+    # 「全バッチ成功時のみ注入」という契約なので、retry が無いと病的な
+    # 1 バッチのせいで run 全体が永久に partial になり、結局一度も注入
+    # されない —— 元の「毎日走るが何も生まない」状態を別の形で再現して
+    # しまう。retry は失敗時にしか走らず、サイズ 1 まで割れば必ず止まる。
+    pending: list[tuple[str, list]] = [
+        (f"{run_id}#b{i}", b) for i, b in enumerate(batches, start=1)
+    ]
+    attempted_units = 0        # 実際に投げた最小単位の数 (成功率の分母)
+    ok_units = 0
+
+    while pending:
+        batch_id, batch = pending.pop(0)
         if circuit_open:
+            attempted_units += 1
             results.append({
                 "batch_id": batch_id, "role": "news_topic_deepdive",
                 "tickers": [c.get("ticker") for c in batch],
@@ -353,6 +375,16 @@ def analyze(dry_run: bool = False) -> dict:
             circuit_open = True
             error_code = ERROR_QUOTA
 
+        # truncation かつ 2 銘柄以上なら、半分に割って入れ直す。
+        # サイズ 1 でなお切れるなら、その銘柄自体が病的なので通常の失敗として扱う。
+        if (res["failure_kind"] == ERROR_TRUNCATION and len(batch) > 1
+                and not circuit_open):
+            mid = len(batch) // 2
+            results.append(res)          # 監査のため失敗も残す
+            pending.insert(0, (f"{batch_id}/s2", batch[mid:]))
+            pending.insert(0, (f"{batch_id}/s1", batch[:mid]))
+            continue
+
         if res["status"] != "ok" and FALLBACK_ENABLED and not circuit_open:
             fb = _run_one_batch(batch, role="news_topic_fallback",
                                 run_id=run_id, batch_id=f"{batch_id}/fb")
@@ -365,12 +397,14 @@ def analyze(dry_run: bool = False) -> dict:
             else:
                 results.append(fb)
 
+        attempted_units += 1
         results.append(res)
         if res["status"] == "ok":
+            ok_units += 1
             analyses.extend(res["rows"])
 
-    ok_batches = sum(1 for r in results if r["status"] == "ok")
-    total_batches = len(batches)
+    ok_batches = ok_units
+    total_batches = attempted_units
     if ok_batches == total_batches:
         run_status = RUN_STATUS_SUCCESS
     elif ok_batches > 0:
@@ -386,7 +420,7 @@ def analyze(dry_run: bool = False) -> dict:
         lane=LANE, run_id=run_id, run_status=run_status,
         started_at=started_at, input_count=input_count,
         selected_count=len(selected), success_count=ok_batches,
-        batches=results, source_as_of=source_as_of,
+        batches=results, batch_count=total_batches, source_as_of=source_as_of,
         error_code=error_code, fallback_status=fallback_status,
     )
     # ⚠️ 部分成功でも analyses は保存する (監査用)。ただし最終分析へ注入されるかは

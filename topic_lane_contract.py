@@ -181,6 +181,7 @@ def build_run_record(
     selected_count: int,
     success_count: int,
     batches: list[dict],
+    batch_count: Optional[int] = None,
     source_as_of: Optional[str] = None,
     error_code: Optional[str] = None,
     fallback_status: str = "not_attempted",
@@ -199,6 +200,9 @@ def build_run_record(
         "input_count": input_count,
         "selected_count": selected_count,
         "success_count": success_count,
+        # ⚠️ batches は fallback が失敗すると 1 バッチにつき 2 エントリ持つので、
+        # 「成功/全体」の分母には使えない。実際に投げたバッチ数を別に持つ。
+        "batch_count": len(batches) if batch_count is None else int(batch_count),
         "fallback_status": fallback_status,
         "error_code": error_code,
         "batches": batches,
