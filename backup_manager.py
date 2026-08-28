@@ -111,6 +111,16 @@ TARGETS = [
     'data/kabu_mini_verification_needed.json',
 ]
 
+# ⚠️ TARGETS はファイルの明示リストであって、snapshot() のコピーは
+# shutil.copy2(src, dst) を直に呼ぶ。ここへディレクトリを1行足すと
+# IsADirectoryError で日次バックアップ全体が失敗する。ディレクトリ単位で
+# 増えていく証跡 (隔離ライブ検証のハッシュマニフェストなど) は別リストで
+# 扱い、配下の通常ファイルを個別に再帰コピーする (2026-08-29、
+# logs/verification_manifests/ 追加時)。
+EVIDENCE_DIRECTORIES = [
+    'logs/verification_manifests',
+]
+
 SQLITE_TARGETS = [
     'almanac.db',
     'nexustrader.db',
@@ -302,6 +312,26 @@ def snapshot(
             results['copied'].append(rel)
             results['sqlite_backups'].append(rel)
             results['hashes'][rel] = _sha256(dst)
+
+    # ⚠️ portfolio lock の外。財務state と違って書込み一貫性を要らず、
+    # ディレクトリが育つほど時間もかかる — repo_bundle 等と同じ理由
+    # (上のコメント参照)。ディレクトリ不在は「証跡がまだ無いだけ」であり
+    # 日次バックアップ自体を失敗させない (optional 扱い)。
+    for rel_dir in EVIDENCE_DIRECTORIES:
+        src_dir = BASE_DIR / rel_dir
+        if not src_dir.is_dir():
+            results['missing'].append(rel_dir)
+            continue
+        for src in sorted(p for p in src_dir.rglob('*') if p.is_file()):
+            rel = str(src.relative_to(BASE_DIR))
+            dst = target_dir / rel
+            dst.parent.mkdir(exist_ok=True, parents=True)
+            shutil.copy2(src, dst)
+            results['copied'].append(rel)
+            try:
+                results['hashes'][rel] = _sha256(dst)
+            except Exception:
+                results['hashes'][rel] = None
 
     results['repo_bundle'] = _create_repo_bundle(
         target_dir,

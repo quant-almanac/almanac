@@ -113,6 +113,77 @@ def test_backup_is_restorable_and_bundle_cloneable(tmp_path, monkeypatch):
     assert "frontend/node_modules/ignored.js" not in archive_names
 
 
+def test_backup_snapshot_includes_evidence_directory_files(tmp_path, monkeypatch):
+    """logs/verification_manifests/ の証跡が日次バックアップに含まれること。
+
+    ⚠️ EVIDENCE_DIRECTORIES はディレクトリ単位で扱う。TARGETS と同じ扱いで
+    shutil.copy2(src, dst) に直接渡すと IsADirectoryError で日次バックアップ
+    全体が失敗する (レビューで指摘・実測)。配下のファイルを個別に再帰コピー
+    し、copied/hashes へそれぞれ記録する実装を検証する。
+    """
+    root = tmp_path / "repo"
+    root.mkdir()
+    backup_dir = root / "backups"
+    backup_dir.mkdir()
+    monkeypatch.setattr(bm, "BASE_DIR", root)
+    monkeypatch.setattr(bm, "BACKUP_DIR", backup_dir)
+
+    evidence_dir = root / "logs" / "verification_manifests"
+    evidence_dir.mkdir(parents=True)
+    manifest_36 = {"verification": "news_topic isolated live run (round 36)",
+                   "run_status": "success"}
+    manifest_37 = {"verification": "news_topic isolated live run (round 37)",
+                   "run_status": "success"}
+    (evidence_dir / "round36_manifest.json").write_text(
+        json.dumps(manifest_36), encoding="utf-8")
+    (evidence_dir / "round37_manifest.json").write_text(
+        json.dumps(manifest_37), encoding="utf-8")
+
+    result = bm.snapshot(date(2026, 8, 29))
+    restored = backup_dir / "20260829"
+
+    expected = {
+        "logs/verification_manifests/round36_manifest.json",
+        "logs/verification_manifests/round37_manifest.json",
+    }
+    assert expected.issubset(set(result["copied"]))
+    assert all(result["hashes"].get(rel) for rel in expected), (
+        "証跡ファイルの hash が manifest.json 用に記録されていない")
+
+    assert json.loads(
+        (restored / "logs" / "verification_manifests" / "round36_manifest.json")
+        .read_text(encoding="utf-8")
+    ) == manifest_36
+    assert json.loads(
+        (restored / "logs" / "verification_manifests" / "round37_manifest.json")
+        .read_text(encoding="utf-8")
+    ) == manifest_37
+
+    # 改竄検知用 manifest.json にも同じ2ファイルが載ること。
+    top_manifest = json.loads((restored / "manifest.json").read_text(encoding="utf-8"))
+    assert expected.issubset(set(top_manifest["files"]))
+    assert expected.issubset(set(top_manifest["hashes"]))
+
+
+def test_backup_snapshot_survives_a_missing_evidence_directory(tmp_path, monkeypatch):
+    """証跡ディレクトリが無い日でも日次バックアップ自体は失敗しない。"""
+    root = tmp_path / "repo"
+    root.mkdir()
+    backup_dir = root / "backups"
+    backup_dir.mkdir()
+    monkeypatch.setattr(bm, "BASE_DIR", root)
+    monkeypatch.setattr(bm, "BACKUP_DIR", backup_dir)
+    # logs/verification_manifests/ を意図的に作らない。
+
+    result = bm.snapshot(date(2026, 8, 30))
+
+    assert "logs/verification_manifests" in result["missing"]
+    assert result["portfolio_lock_acquired"] is True
+    assert not any(
+        rel.startswith("logs/verification_manifests") for rel in result["copied"]
+    )
+
+
 def test_offsite_skips_when_rclone_is_not_installed(tmp_path, monkeypatch):
     monkeypatch.setattr(bm, "BACKUP_DIR", tmp_path)
     (tmp_path / "20260612").mkdir()
