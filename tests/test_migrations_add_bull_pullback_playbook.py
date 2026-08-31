@@ -216,8 +216,10 @@ def test_validation_failure_leaves_no_backup(tmp_path: Path) -> None:
 
 def test_playbook_carries_round11_feature_flags() -> None:
     """Round 7 C7-3 / Round 11 #C — 2-axis enable/observe."""
-    assert BULL_PULLBACK_PLAYBOOK["enabled_for_decision"] is True
-    assert BULL_PULLBACK_PLAYBOOK["observe_only"] is False
+    assert BULL_PULLBACK_PLAYBOOK["enabled_for_decision"] is False
+    assert BULL_PULLBACK_PLAYBOOK["observe_only"] is True
+    assert BULL_PULLBACK_PLAYBOOK["decision_hard_disabled"] is True
+    assert BULL_PULLBACK_PLAYBOOK["decision_disabled_reason"]
 
 
 def test_playbook_has_three_phase_actions() -> None:

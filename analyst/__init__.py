@@ -10688,6 +10688,62 @@ _PLAYBOOK_REPROPOSE_DAYS = 7          # 同一 ticker×buy の再提案間隔
 _PLAYBOOK_INJECT_TOTAL_CAP_PCT = 0.05
 
 
+def _playbook_phase_entries(playbook: dict, phase_prefix: str) -> list[dict]:
+    """Return all buy rows from canonical and suffixed phase names."""
+    actions = playbook.get("actions") if isinstance(playbook, dict) else {}
+    if not isinstance(actions, dict):
+        return []
+    rows: list[dict] = []
+    for phase_name, phase in actions.items():
+        if not str(phase_name).startswith(phase_prefix) or not isinstance(phase, dict):
+            continue
+        rows.extend(row for row in (phase.get("buy") or []) if isinstance(row, dict))
+    return rows
+
+
+def _playbook_allocation_jpy(entry: dict, *, fx_rate: float, scale: float) -> tuple[float | None, str | None]:
+    """Normalize the legacy and R12 playbook allocation contracts.
+
+    The new contract is ``allocation_amount`` plus an explicit ``currency``.
+    Legacy ``allocation_jpy`` / ``allocation_usd`` remains readable while old
+    playbooks are migrated.  Ambiguous, boolean, non-finite, or non-positive
+    values fail closed instead of manufacturing an order size.
+    """
+    has_amount = entry.get("allocation_amount") is not None
+    legacy_keys = [key for key in ("allocation_jpy", "allocation_usd") if entry.get(key) is not None]
+    if has_amount and legacy_keys:
+        return None, "allocation contract ambiguous"
+    if len(legacy_keys) > 1:
+        return None, "allocation contract ambiguous"
+
+    raw: object
+    multiplier: float
+    if has_amount:
+        raw = entry.get("allocation_amount")
+        currency = str(entry.get("currency") or "").strip().upper()
+        if currency == "JPY":
+            multiplier = 1.0
+        elif currency == "USD":
+            multiplier = fx_rate
+        else:
+            return None, "allocation currency invalid"
+    elif legacy_keys == ["allocation_jpy"]:
+        raw = entry.get("allocation_jpy")
+        multiplier = 1.0
+    elif legacy_keys == ["allocation_usd"]:
+        raw = entry.get("allocation_usd")
+        multiplier = fx_rate
+    else:
+        return None, "allocation 未定義"
+
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+        return None, "allocation numeric invalid"
+    amount = float(raw)
+    if not math.isfinite(amount) or amount <= 0:
+        return None, "allocation 0 以下または非有限"
+    return amount * multiplier * scale, None
+
+
 def _inject_playbook_actions(synthesis: dict, data: dict) -> dict:
     """active/partial シナリオの phase_1 buy を priority_actions へ決定論注入する。
 
@@ -10782,9 +10838,9 @@ def _inject_playbook_actions(synthesis: dict, data: dict) -> dict:
             1.0 if sc.get("status") == "active" else 0.5
         )
         pb = playbook_by_id.get(sid) or {}
-        phase1 = ((pb.get("actions") or {}).get("phase_1") or {})
+        phase1_entries = _playbook_phase_entries(pb, "phase_1")
         if scale <= 0:
-            for entry in phase1.get("buy") or []:
+            for entry in phase1_entries:
                 if isinstance(entry, dict) and entry.get("ticker"):
                     skipped.append({
                         "scenario_id": sid,
@@ -10792,9 +10848,7 @@ def _inject_playbook_actions(synthesis: dict, data: dict) -> dict:
                         "reason": "allocation_scale_zero",
                     })
             continue
-        for entry in phase1.get("buy") or []:
-            if not isinstance(entry, dict):
-                continue
+        for entry in phase1_entries:
             ticker = str(entry.get("ticker") or "")
             if not ticker:
                 continue
@@ -10819,15 +10873,11 @@ def _inject_playbook_actions(synthesis: dict, data: dict) -> dict:
                     _skip(f"jp_equity_ex_employer {jp_pct:.1f}% >= 目標 {jp_target:.0f}%")
                     continue
 
-            if entry.get("allocation_jpy") is not None:
-                amt_jpy = float(entry.get("allocation_jpy") or 0) * scale
-            elif entry.get("allocation_usd") is not None:
-                amt_jpy = float(entry.get("allocation_usd") or 0) * fx_rate * scale
-            else:
-                _skip("allocation 未定義")
-                continue
-            if amt_jpy <= 0:
-                _skip("allocation 0 以下")
+            amt_jpy, allocation_error = _playbook_allocation_jpy(
+                entry, fx_rate=fx_rate, scale=scale
+            )
+            if allocation_error is not None or amt_jpy is None:
+                _skip(allocation_error or "allocation invalid")
                 continue
             if used_jpy + amt_jpy > total_cap_jpy:
                 _skip(f"注入合計上限 {_PLAYBOOK_INJECT_TOTAL_CAP_PCT*100:.0f}% 超過")

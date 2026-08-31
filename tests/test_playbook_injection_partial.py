@@ -527,3 +527,58 @@ def test_inject_converts_usd_allocation(monkeypatch):
     assert [a["ticker"] for a in result["injected"]] == ["TQQQ"]
     # $5000 × 150 × 0.5 = ¥375,000
     assert synthesis["priority_actions"][0]["amount_hint"] == "¥375,000"
+
+
+def test_inject_reads_suffixed_phase_and_explicit_currency_contract(monkeypatch):
+    playbook = {
+        "scenarios": [
+            {
+                "id": "contract_v2",
+                "name": "contract v2",
+                "actions": {
+                    "phase_1_conservative": {
+                        "buy": [
+                            {
+                                "ticker": "SPY",
+                                "allocation_amount": 2_000,
+                                "currency": "USD",
+                            }
+                        ]
+                    }
+                },
+            }
+        ]
+    }
+    monkeypatch.setattr(analyst, "load_json", _fake_load_json_factory(playbook=playbook))
+    data = _base_data()
+    data["scenario_monitoring"]["active_scenarios"] = [
+        {
+            "id": "contract_v2",
+            "name": "contract v2",
+            "status": "active",
+            "allocation_scale": 1.0,
+            "readiness_pct": 80,
+            "priority": "medium",
+        }
+    ]
+    synthesis = {"priority_actions": []}
+
+    result = analyst._inject_playbook_actions(synthesis, data)
+
+    assert [row["ticker"] for row in result["injected"]] == ["SPY"]
+    assert synthesis["priority_actions"][0]["amount_hint"] == "¥300,000"
+
+
+@pytest.mark.parametrize(
+    ("entry", "reason"),
+    [
+        ({"allocation_amount": 1_000}, "currency"),
+        ({"allocation_amount": True, "currency": "USD"}, "numeric"),
+        ({"allocation_amount": float("nan"), "currency": "JPY"}, "非有限"),
+        ({"allocation_jpy": 1_000, "allocation_usd": 1_000}, "ambiguous"),
+    ],
+)
+def test_playbook_allocation_contract_rejects_ambiguous_or_invalid_values(entry, reason):
+    amount, error = analyst._playbook_allocation_jpy(entry, fx_rate=150.0, scale=1.0)
+    assert amount is None
+    assert reason in str(error)

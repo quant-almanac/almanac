@@ -120,6 +120,25 @@ def test_evaluate_scenarios_uses_market_snapshot_and_regime_state(tmp_path, monk
     assert bull["recommended_actions"]["phase_3"] == [{"ticker": "TQQQ"}]
 
 
+def test_ma50_pullback_and_above_ma50_contract_cannot_match_together():
+    scenario = _bull_pullback_scenario()
+    for diff in (-5.0, 5.0):
+        indicator = scenario_engine._eval_indicators(
+            scenario,
+            vix_state={},
+            macro_state={},
+            market_state={"SPY": {"ma50_diff": diff}},
+        )[0]
+        technical = scenario_engine._eval_technical(
+            scenario,
+            tech_state={},
+            market_state={"SPY": {"ma50_diff": diff}},
+            regime_state={"regime": "A_強気"},
+        )
+        above = {row["key"]: row for row in technical}["SPY_above_MA50"]
+        assert not (indicator["matched"] and above["matched"])
+
+
 def test_an_unresolved_technical_row_cannot_satisfy_a_condition():
     """引き継がれた行 (rebuild_unresolved) の指標値は現在値ではない。
 

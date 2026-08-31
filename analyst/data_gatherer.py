@@ -437,16 +437,28 @@ def scenario_context_decision_flags(
         and promotion_info.get("promotion_ready") is True
     )
 
-    if observe_only and not promotion_ready:
+    hard_disabled = bool(
+        sc_data.get(
+            "decision_hard_disabled",
+            playbook_entry.get("decision_hard_disabled", False),
+        )
+    )
+    if hard_disabled:
+        # Promotion may lift an observe-only rollout, but it must never
+        # override an explicit hard disable used for a contradictory or
+        # otherwise unsafe playbook contract.
+        enabled_for_decision = False
+    elif observe_only and not promotion_ready:
         enabled_for_decision = False
     elif observe_only and promotion_ready:
         enabled_for_decision = True
 
     return {
         "enabled_for_decision": enabled_for_decision is not False,
-        "observe_only": bool(observe_only and not promotion_ready),
+        "observe_only": bool(observe_only and (hard_disabled or not promotion_ready)),
         "original_observe_only": bool(observe_only),
         "promotion_ready": promotion_ready,
+        "decision_hard_disabled": hard_disabled,
         "promotion": promotion_info if isinstance(promotion_info, dict) else {},
     }
 
@@ -1919,6 +1931,11 @@ def gather_data() -> dict:
                     "observe_only": flags["observe_only"],
                     "original_observe_only": flags["original_observe_only"],
                     "enabled_for_decision": enabled_for_decision,
+                    "decision_hard_disabled": flags["decision_hard_disabled"],
+                    "decision_disabled_reason": sc_data.get(
+                        "decision_disabled_reason",
+                        pb.get("decision_disabled_reason"),
+                    ),
                     "promotion_ready": flags["promotion_ready"],
                     "promotion": flags["promotion"],
                 }

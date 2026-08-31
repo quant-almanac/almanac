@@ -132,6 +132,10 @@ def response_hit_max_tokens(response) -> bool:
     return getattr(response, "stop_reason", None) == "max_tokens"
 
 
+class _MaxTokensResponse(RuntimeError):
+    """A response already accounted as truncated and unsafe to consume."""
+
+
 def _append_llm_call_log(row: dict) -> bool:
     """LLM timeout 調査用の軽量メタログ。プロンプト本文は保存しない。
 
@@ -480,6 +484,7 @@ def call_claude(system: str, user: str, model: str = "claude-sonnet-5",
             _stop_reason = getattr(msg, "stop_reason", None)
             _content_types = [b.type for b in msg.content]
             _usage = getattr(msg, "usage", None)
+            _is_maxtok = response_hit_max_tokens(msg)
             _append_llm_call_log({
                 "ts": time.strftime("%Y-%m-%dT%H:%M:%S"),
                 "role": role,
@@ -491,12 +496,20 @@ def call_claude(system: str, user: str, model: str = "claude-sonnet-5",
                 "elapsed_sec": round(time.monotonic() - started, 2),
                 "prompt_chars": prompt_chars,
                 "cached_prefix_chars": prefix_chars,
-                "status": "ok",
+                # A non-empty tool payload can still be structurally truncated.
+                # Record and reject the transport outcome before inspecting any
+                # content so no caller can mistake a partial result for success.
+                "status": "max_tokens" if _is_maxtok else "ok",
                 **usage_fields(
                     msg,
                     effort=(anthropic_compat_kwargs(model).get("output_config") or {}).get("effort"),
                 ),
             })
+            if _is_maxtok:
+                raise _MaxTokensResponse(
+                    f"Claude response: stop_reason=max_tokens — max_tokens={max_tokens} が不足。"
+                    "出力は非空でも不完全なため受理しません。"
+                )
             if use_tool:
                 tool_result = None
                 _raw_input = None
@@ -509,7 +522,6 @@ def call_claude(system: str, user: str, model: str = "claude-sonnet-5",
                     return tool_result
                 # max_tokens truncation: JSON が途中で切れると block.input = {} になる。
                 # temperature=0 の決定論的呼び出しでは何度リトライしても同結果なので即raise。
-                _is_maxtok = (_stop_reason == "max_tokens")
                 _append_llm_call_log({
                     "ts": time.strftime("%Y-%m-%dT%H:%M:%S"),
                     "role": role,
@@ -527,11 +539,6 @@ def call_claude(system: str, user: str, model: str = "claude-sonnet-5",
                     "raw_input_keys": list(_raw_input.keys()) if isinstance(_raw_input, dict) else repr(type(_raw_input)),
                     "raw_input_len": len(str(_raw_input)) if _raw_input is not None else 0,
                 })
-                if _is_maxtok:
-                    raise RuntimeError(
-                        f"Claude tool_use: stop_reason=max_tokens — max_tokens={max_tokens} が不足。"
-                        "増やすか出力スキーマを縮小してください。"
-                    )
                 if attempt < 2:
                     time.sleep(5)
                     continue
@@ -540,6 +547,10 @@ def call_claude(system: str, user: str, model: str = "claude-sonnet-5",
                 if _block.type == "text":
                     return _block.text
             return ""
+        except _MaxTokensResponse:
+            # The response row above already records this billable transport
+            # attempt as max_tokens.  Do not append a second generic error row.
+            raise
         except anthropic.APIStatusError as e:
             if e.status_code == 529 and attempt < 3:
                 wait = 5 * (2 ** attempt)

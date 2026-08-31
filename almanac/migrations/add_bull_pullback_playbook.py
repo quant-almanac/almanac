@@ -12,9 +12,9 @@ level pullback playbook. The trigger is the textbook setup:
 Per Round 7 C7-3 / Round 11 #C the scenario carries two new feature-flag
 fields:
 
-- ``enabled_for_decision`` (default ``true``) — whether the playbook may
+- ``enabled_for_decision`` — whether the playbook may
   drive any priority action.
-- ``observe_only`` (default ``false``) — when ``true``, the catalyst layer
+- ``observe_only`` — when ``true``, the catalyst layer
   still logs candidates the playbook fires, but they cannot become
   ``adopted``. Used in Week 3-6 shadow validation before we let it drive
   real money.
@@ -83,9 +83,16 @@ BULL_PULLBACK_PLAYBOOK: dict[str, Any] = {
         " ではない、を全て満たすときに ACTIVE。Conservative (大型ETF) /"
         " Aggressive (個別グロース) / Tactical (レバETF) の 3 階層で実行。"
     ),
-    # Round 7 C7-3 / Round 11 #C feature-flag axes.
-    "enabled_for_decision": True,
-    "observe_only": False,
+    # The deployed metric currently reuses MA50 distance for both "3-8% below"
+    # and "above MA50", which cannot be true simultaneously.  Keep collection
+    # visible but hard-disable decisions until a separate recent-high pullback
+    # metric is wired end to end.
+    "enabled_for_decision": False,
+    "observe_only": True,
+    "decision_hard_disabled": True,
+    "decision_disabled_reason": (
+        "MA50距離への矛盾した正負条件をrecent-high基準へ移行するまで観測専用"
+    ),
     "detect": {
         "news_keywords": [],
         "indicators": {

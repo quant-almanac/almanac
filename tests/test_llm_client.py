@@ -6,6 +6,43 @@ import pytest
 from analyst import llm_client
 
 
+def test_call_claude_rejects_nonempty_tool_result_cut_off_by_max_tokens(monkeypatch):
+    rows = []
+
+    class FakeMessages:
+        def create(self, **kwargs):
+            return types.SimpleNamespace(
+                stop_reason="max_tokens",
+                content=[types.SimpleNamespace(
+                    type="tool_use",
+                    input={"result": {"priority_actions": [{"ticker": "AAPL"}]}},
+                )],
+                usage=types.SimpleNamespace(
+                    input_tokens=10,
+                    output_tokens=20,
+                    output_tokens_details=None,
+                ),
+            )
+
+    class FakeAnthropicClient:
+        def __init__(self, **kwargs):
+            self.messages = FakeMessages()
+
+    fake_anthropic = types.SimpleNamespace(
+        Anthropic=FakeAnthropicClient,
+        APIStatusError=type("APIStatusError", (Exception,), {}),
+        APITimeoutError=type("APITimeoutError", (Exception,), {}),
+        APIConnectionError=type("APIConnectionError", (Exception,), {}),
+    )
+    monkeypatch.setitem(sys.modules, "anthropic", fake_anthropic)
+    monkeypatch.setattr(llm_client, "_append_llm_call_log", lambda row: rows.append(row))
+
+    with pytest.raises(RuntimeError, match="stop_reason=max_tokens"):
+        llm_client.call_claude("system", "user", use_tool=True, request_timeout=1)
+
+    assert [row["status"] for row in rows] == ["max_tokens"]
+
+
 def test_call_claude_retries_empty_tool_result(monkeypatch):
     calls = {"n": 0}
 

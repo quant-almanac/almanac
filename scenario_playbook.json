@@ -1481,8 +1481,10 @@
       "color": "#1976D2",
       "priority": "medium",
       "description": "強気レジーム継続中に指数が 3-8% 押した場面で段階的に買い増す playbook。 VIX 25 未満 / SPY が MA50 より上 / 押し幅 3-8% / Fear&Greed が極端な Greed ではない、を全て満たすときに ACTIVE。Conservative (大型ETF) / Aggressive (個別グロース) / Tactical (レバETF) の 3 階層で実行。",
-      "enabled_for_decision": true,
-      "observe_only": false,
+      "enabled_for_decision": false,
+      "observe_only": true,
+      "decision_hard_disabled": true,
+      "decision_disabled_reason": "現行の spy_dist_from_ma50_pct と SPY_above_MA50 は同じ MA50 差分に負値と正値を同時要求するため、recent-high 基準の独立pullback指標へ移行するまで観測専用",
       "detect": {
         "news_keywords": [],
         "indicators": {

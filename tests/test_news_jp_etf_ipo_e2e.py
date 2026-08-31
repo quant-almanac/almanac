@@ -274,6 +274,24 @@ def test_japan_standalone_bull_stays_observe_only_until_promotion_ready():
     assert ready["promotion_ready"] is True
 
 
+def test_hard_disabled_scenario_cannot_be_promoted_into_decision_context():
+    result = data_gatherer.scenario_context_decision_flags(
+        "bull_pullback",
+        {
+            "observe_only": True,
+            "enabled_for_decision": False,
+            "decision_hard_disabled": True,
+        },
+        {},
+        {"bull_pullback": {"promotion_ready": True, "hit_rate": 1.0}},
+    )
+
+    assert result["promotion_ready"] is True
+    assert result["decision_hard_disabled"] is True
+    assert result["enabled_for_decision"] is False
+    assert result["observe_only"] is True
+
+
 def test_ipo_new_listings_reach_news_scan_and_decision_context(tmp_path):
     (tmp_path / "download_tickers.py").write_text(
         "NEW_LISTINGS = [\n    'SPCX',\n    'NVRB',\n]\n",

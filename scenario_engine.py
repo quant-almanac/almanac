@@ -1241,6 +1241,8 @@ def evaluate_scenarios() -> dict:
             "allocation_scale": allocation_scale,
             "enabled_for_decision": enabled_for_decision,
             "observe_only": observe_only,
+            "decision_hard_disabled": bool(sc.get("decision_hard_disabled", False)),
+            "decision_disabled_reason": sc.get("decision_disabled_reason"),
             "recommended_actions": _build_recommended_actions(sc),
             "first_detected": first_detected,
             "last_evaluated": now_iso,
