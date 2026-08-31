@@ -284,6 +284,7 @@ _JP_PLAYBOOK = {
             "id": "japan_standalone_bull",
             "name": "日本株単独強気",
             "priority": "medium",
+            "enabled_for_decision": True,
             "actions": {
                 "phase_1": {
                     "buy": [
@@ -441,6 +442,7 @@ def test_inject_skips_insider_restricted(monkeypatch):
     playbook = {
         "scenarios": [
             {"id": "japan_standalone_bull", "name": "日本株単独強気",
+             "enabled_for_decision": True,
              "actions": {"phase_1": {"buy": [{"ticker": "9999.T", "allocation_jpy": 500000}]}}}
         ]
     }
@@ -510,6 +512,7 @@ def test_inject_converts_usd_allocation(monkeypatch):
     playbook = {
         "scenarios": [
             {"id": "war_end", "name": "戦争終結ラリー",
+             "enabled_for_decision": True,
              "actions": {"phase_1": {"buy": [{"ticker": "TQQQ", "allocation_usd": 5000}]}}}
         ]
     }
@@ -535,6 +538,7 @@ def test_inject_reads_suffixed_phase_and_explicit_currency_contract(monkeypatch)
             {
                 "id": "contract_v2",
                 "name": "contract v2",
+                "enabled_for_decision": True,
                 "actions": {
                     "phase_1_conservative": {
                         "buy": [
@@ -567,6 +571,59 @@ def test_inject_reads_suffixed_phase_and_explicit_currency_contract(monkeypatch)
 
     assert [row["ticker"] for row in result["injected"]] == ["SPY"]
     assert synthesis["priority_actions"][0]["amount_hint"] == "¥300,000"
+
+
+def test_injector_does_not_treat_phase_10_as_phase_1(monkeypatch):
+    playbook = {
+        "scenarios": [{
+            "id": "contract_v2",
+            "enabled_for_decision": True,
+            "actions": {
+                "phase_10": {"buy": [{"ticker": "BAD", "allocation_jpy": 100_000}]},
+                "phase_1": {"buy": [{"ticker": "GOOD", "allocation_jpy": 100_000}]},
+            },
+        }]
+    }
+    monkeypatch.setattr(analyst, "load_json", _fake_load_json_factory(playbook=playbook))
+    data = _base_data()
+    data["scenario_monitoring"]["active_scenarios"] = [{
+        "id": "contract_v2", "status": "active", "allocation_scale": 1.0,
+        "readiness_pct": 80, "priority": "medium",
+    }]
+    synthesis = {"priority_actions": []}
+
+    result = analyst._inject_playbook_actions(synthesis, data)
+
+    assert [row["ticker"] for row in result["injected"]] == ["GOOD"]
+
+
+@pytest.mark.parametrize(
+    "disabled_fields",
+    [
+        {"enabled_for_decision": False},
+        {"enabled_for_decision": True, "observe_only": True},
+        {"enabled_for_decision": True, "decision_hard_disabled": True},
+    ],
+)
+def test_injector_rechecks_authoritative_decision_flags(monkeypatch, disabled_fields):
+    playbook = {
+        "scenarios": [{
+            "id": "disabled",
+            **disabled_fields,
+            "actions": {"phase_1": {"buy": [{"ticker": "BAD", "allocation_jpy": 100_000}]}},
+        }]
+    }
+    monkeypatch.setattr(analyst, "load_json", _fake_load_json_factory(playbook=playbook))
+    data = _base_data()
+    data["scenario_monitoring"]["active_scenarios"] = [{
+        "id": "disabled", "status": "active", "allocation_scale": 1.0,
+        "readiness_pct": 99, "priority": "high",
+    }]
+
+    result = analyst._inject_playbook_actions({"priority_actions": []}, data)
+
+    assert result["injected"] == []
+    assert result["skipped"][0]["reason"] == "scenario_not_enabled_for_decision"
 
 
 @pytest.mark.parametrize(

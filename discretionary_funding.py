@@ -194,6 +194,7 @@ def evaluate_discretionary_funding(
     *,
     plan_state: dict[str, Any] | None,
     now: datetime | None = None,
+    requested_notional_jpy: object = None,
 ) -> dict[str, Any]:
     """Return a fail-closed funding decision for a recommendation/order.
 
@@ -239,10 +240,35 @@ def evaluate_discretionary_funding(
             "approved_contribution_available_jpy": contribution_available,
         }
 
+    if (
+        isinstance(requested_notional_jpy, bool)
+        or not isinstance(requested_notional_jpy, Real)
+        or not math.isfinite(float(requested_notional_jpy))
+        or float(requested_notional_jpy) <= 0
+    ):
+        return {
+            "required": True,
+            "allowed": False,
+            "reason_code": "discretionary_funding_notional_unresolved",
+            "message": "注文予定額を確認できないため、新規買い注文を許可しません",
+            "available_jpy": available,
+        }
+    requested = int(math.ceil(float(requested_notional_jpy)))
+    if requested > available:
+        return {
+            "required": True,
+            "allowed": False,
+            "reason_code": "approved_discretionary_funding_exceeded",
+            "message": "注文予定額が承認済み裁量投資枠を超えています",
+            "requested_notional_jpy": requested,
+            "available_jpy": available,
+        }
+
     return {
         "required": True,
         "allowed": True,
         "reason_code": None,
+        "requested_notional_jpy": requested,
         "available_jpy": available,
         "normal_pool_available_jpy": normal_available,
         "opportunity_pool_available_jpy": opportunity_available,

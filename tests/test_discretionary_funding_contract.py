@@ -7,6 +7,7 @@ from pydantic import ValidationError
 
 from api.routes.actions import (
     BrokerConfirmationEvidence,
+    ExecutionPatchRequest,
     ExecutionRequest,
     PreflightRequest,
 )
@@ -37,11 +38,30 @@ def _active_plan(*, as_of: datetime = NOW - timedelta(hours=1)) -> dict:
 
 def test_current_plan_is_valid_order_authority() -> None:
     decision = evaluate_discretionary_funding(
-        "buy", plan_state=_active_plan(), now=NOW
+        "buy", plan_state=_active_plan(), now=NOW, requested_notional_jpy=99_999
     )
 
     assert decision["allowed"] is True
     assert decision["available_jpy"] == 100_000
+
+
+def test_order_larger_than_available_budget_is_rejected() -> None:
+    decision = evaluate_discretionary_funding(
+        "buy", plan_state=_active_plan(), now=NOW, requested_notional_jpy=100_001
+    )
+
+    assert decision["allowed"] is False
+    assert decision["reason_code"] == "approved_discretionary_funding_exceeded"
+
+
+@pytest.mark.parametrize("bad", [None, True, math.nan, math.inf, "100"])
+def test_order_without_strict_finite_notional_is_rejected(bad) -> None:
+    decision = evaluate_discretionary_funding(
+        "buy", plan_state=_active_plan(), now=NOW, requested_notional_jpy=bad
+    )
+
+    assert decision["allowed"] is False
+    assert decision["reason_code"] == "discretionary_funding_notional_unresolved"
 
 
 @pytest.mark.parametrize(
@@ -130,3 +150,10 @@ def test_order_models_reject_nonfinite_bool_and_string_numbers(model, payload, b
     payload = {**payload, "quantity": bad}
     with pytest.raises(ValidationError):
         model(**payload)
+
+
+@pytest.mark.parametrize("field", ["price", "quantity", "filled_price", "filled_quantity"])
+@pytest.mark.parametrize("bad", [True, False, math.nan, math.inf, -math.inf, "10"])
+def test_execution_patch_rejects_nonfinite_bool_and_string_numbers(field, bad) -> None:
+    with pytest.raises(ValidationError):
+        ExecutionPatchRequest(**{field: bad})

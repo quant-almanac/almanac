@@ -1150,10 +1150,20 @@ def _enforce_discretionary_order_funding(req: ExecutionRequest) -> None:
         return
     from discretionary_funding import evaluate_discretionary_funding, load_execution_plan_state
 
+    linked_payload = _execution_preflight_payload(req)
+    requested_notional_jpy = linked_payload.get("estimated_notional_jpy")
+    if requested_notional_jpy is None:
+        unit_price = req.limit_price or req.price or req.decision_price
+        if req.quantity is not None and unit_price is not None:
+            requested_notional_jpy = float(req.quantity) * float(unit_price)
+            currency = req.currency.value if req.currency else linked_payload.get("currency")
+            if str(currency or "JPY").upper() == "USD":
+                requested_notional_jpy *= float(_get_fx_rate())
     decision = evaluate_discretionary_funding(
         req.direction.value,
         plan_state=load_execution_plan_state(BASE_DIR),
         now=datetime.now().astimezone(),
+        requested_notional_jpy=requested_notional_jpy,
     )
     if decision.get("required") and not decision.get("allowed"):
         raise HTTPException(
@@ -3022,7 +3032,20 @@ class ExecutionPatchRequest(BaseModel):
     reconciled_at: Optional[str] = None
     reconciliation_snapshot_hash: Optional[str] = None
 
-    @field_validator("price", "quantity")
+    @field_validator(
+        "price", "quantity", "filled_quantity", "filled_price", mode="before"
+    )
+    @classmethod
+    def _finite_number(cls, v):
+        if v is None:
+            return None
+        if isinstance(v, bool) or not isinstance(v, Real):
+            raise ValueError("price/quantity は有限の数値で指定してください")
+        if not math.isfinite(float(v)):
+            raise ValueError("price/quantity は有限の数値で指定してください")
+        return v
+
+    @field_validator("price", "quantity", "filled_quantity", "filled_price")
     @classmethod
     def _non_negative(cls, v):
         if v is not None and v < 0:

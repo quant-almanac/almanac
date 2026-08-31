@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import importlib
+from datetime import datetime
 
 
 def test_module_imports():
@@ -28,6 +29,7 @@ def test_analyze_logs_llm_usage_for_deepdive(tmp_path, monkeypatch):
     social_path.write_text(
         json.dumps(
             {
+                "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                 "stocktwits": {
                     "TSLA": {
                         "message_count": 280,
@@ -76,7 +78,10 @@ def test_analyze_logs_llm_usage_for_deepdive(tmp_path, monkeypatch):
     monkeypatch.setattr(sta, "NEWS_FILE", news_path)
     monkeypatch.setattr(sta, "OUTPUT_FILE", tmp_path / "social_topic_analysis.json")
     monkeypatch.setattr(sta, "call_by_role", fake_call_by_role)
-    monkeypatch.setattr(sta, "_append_llm_call_log", lambda row: rows.append(row), raising=False)
+    def _append(row):
+        rows.append(row)
+        return True
+    monkeypatch.setattr(sta, "_append_llm_call_log", _append, raising=False)
 
     out = sta.analyze(dry_run=True)
 
@@ -90,3 +95,38 @@ def test_analyze_logs_llm_usage_for_deepdive(tmp_path, monkeypatch):
     assert row["candidate_count"] == 1
     assert row["input_tokens"] == 88
     assert row["output_tokens"] == 21
+    assert out["run_status"] == "success"
+    assert out["call_count"] == out["accounting_logged_count"] == 1
+    assert out["accounting_incomplete"] is False
+    assert out["selected_tickers"] == ["TSLA"]
+
+
+def test_empty_or_unparseable_social_responses_are_never_logged_as_ok(tmp_path, monkeypatch):
+    import social_topic_analyzer as sta
+
+    social_path = tmp_path / "social_sentiment.json"
+    social_path.write_text(json.dumps({
+        "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "stocktwits": {
+            "TEST": {"message_count": 280, "bullish_pct": 82.5},
+        },
+    }), encoding="utf-8")
+    rows = []
+    monkeypatch.setattr(sta, "SOCIAL_FILE", social_path)
+    monkeypatch.setattr(sta, "NEWS_FILE", tmp_path / "missing-news.json")
+    monkeypatch.setattr(sta, "OUTPUT_FILE", tmp_path / "social_topic_analysis.json")
+    monkeypatch.setattr(sta, "call_by_role", lambda *_a, **_k: {
+        "content": "", "adapter": "fixture", "model": "fixture", "usage": {},
+    })
+    def _append(row):
+        rows.append(row)
+        return True
+    monkeypatch.setattr(sta, "_append_llm_call_log", _append)
+
+    out = sta.analyze(dry_run=True)
+
+    assert out["run_status"] == "failed"
+    assert out["evaluations"] == []
+    assert out["call_count"] == out["accounting_logged_count"] == 2
+    assert rows and all(row["status"] == "error" for row in rows)
+    assert {row["failure_kind"] for row in rows} == {"parse_error"}

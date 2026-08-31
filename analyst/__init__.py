@@ -10695,7 +10695,11 @@ def _playbook_phase_entries(playbook: dict, phase_prefix: str) -> list[dict]:
         return []
     rows: list[dict] = []
     for phase_name, phase in actions.items():
-        if not str(phase_name).startswith(phase_prefix) or not isinstance(phase, dict):
+        phase_text = str(phase_name)
+        if (
+            not re.fullmatch(rf"{re.escape(phase_prefix)}(?:_[a-z][a-z0-9_]*)?", phase_text)
+            or not isinstance(phase, dict)
+        ):
             continue
         rows.extend(row for row in (phase.get("buy") or []) if isinstance(row, dict))
     return rows
@@ -10839,6 +10843,22 @@ def _inject_playbook_actions(synthesis: dict, data: dict) -> dict:
         )
         pb = playbook_by_id.get(sid) or {}
         phase1_entries = _playbook_phase_entries(pb, "phase_1")
+        if (
+            pb.get("enabled_for_decision") is not True
+            or pb.get("observe_only") is True
+            or pb.get("decision_hard_disabled") is True
+            or sc.get("enabled_for_decision") is False
+            or sc.get("observe_only") is True
+            or sc.get("decision_hard_disabled") is True
+        ):
+            for entry in phase1_entries:
+                if entry.get("ticker"):
+                    skipped.append({
+                        "scenario_id": sid,
+                        "ticker": str(entry.get("ticker")),
+                        "reason": "scenario_not_enabled_for_decision",
+                    })
+            continue
         if scale <= 0:
             for entry in phase1_entries:
                 if isinstance(entry, dict) and entry.get("ticker"):

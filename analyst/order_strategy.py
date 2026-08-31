@@ -14,7 +14,9 @@ from __future__ import annotations
 
 import json
 import hashlib
-from datetime import datetime, timezone
+import math
+from datetime import datetime, timedelta, timezone
+from numbers import Real
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 
@@ -25,6 +27,8 @@ CACHE_PATH = BASE_DIR / "ai_portfolio_analysis.json"
 
 _running = False
 ORDER_STRATEGY_LOCK_NAME = "order_strategy"
+MAX_FORMAL_ANALYSIS_AGE = timedelta(hours=36)
+MAX_FUTURE_CLOCK_SKEW = timedelta(minutes=5)
 
 
 def is_running() -> bool:
@@ -72,10 +76,71 @@ def _validate_order_response(
         expected_ticker = str(expected[action_id].get("ticker") or "")
         if str(order.get("ticker") or "") != expected_ticker:
             raise ValueError("ticker does not match action_id")
+        order_type = order.get("order_type")
+        if not isinstance(order_type, str) or order_type not in {"market", "limit"}:
+            raise ValueError("order_type must be market or limit")
+
+        def _positive_number(key: str, *, required: bool) -> float | None:
+            value = order.get(key)
+            if value is None and not required:
+                return None
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, Real)
+                or not math.isfinite(float(value))
+                or float(value) <= 0
+            ):
+                raise ValueError(f"{key} must be a positive finite number")
+            return float(value)
+
+        limit_price = _positive_number("limit_price", required=order_type == "limit")
+        if order_type == "market" and limit_price is not None:
+            raise ValueError("market order must not include limit_price")
+        _positive_number("decision_price", required=False)
+        expiry = order.get("expiry_minutes")
+        if expiry is not None and (
+            isinstance(expiry, bool)
+            or not isinstance(expiry, int)
+            or expiry <= 0
+            or expiry > 24 * 60
+        ):
+            raise ValueError("expiry_minutes must be an integer from 1 to 1440")
+        reason = order.get("execution_reason")
+        if reason is not None and (
+            not isinstance(reason, str) or not reason.strip() or len(reason) > 1000
+        ):
+            raise ValueError("execution_reason must be a non-empty bounded string")
         validated[action_id] = order
     if set(validated) != set(expected):
         raise ValueError("orders do not cover the requested action set")
     return [validated[_order_action_id(action)] for action in actions]
+
+
+def _validate_formal_analysis(data: object, *, now: datetime | None = None) -> tuple[dict, str]:
+    if not isinstance(data, dict):
+        raise ValueError("formal analysis is not an object")
+    synthesis = data.get("synthesis")
+    if not isinstance(synthesis, dict):
+        raise ValueError("formal analysis synthesis is missing")
+    analysis_id = synthesis.get("analysis_id") or data.get("analysis_id")
+    if not isinstance(analysis_id, str) or not analysis_id.strip():
+        raise ValueError("formal analysis_id is missing")
+    raw_as_of = data.get("as_of")
+    if not isinstance(raw_as_of, str) or not raw_as_of.strip():
+        raise ValueError("formal analysis as_of is missing")
+    try:
+        as_of = datetime.fromisoformat(raw_as_of.strip().replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ValueError("formal analysis as_of is invalid") from exc
+    current = now or datetime.now().astimezone()
+    if as_of.tzinfo is None:
+        as_of = as_of.replace(tzinfo=current.tzinfo)
+    age = current.astimezone(timezone.utc) - as_of.astimezone(timezone.utc)
+    if age < -MAX_FUTURE_CLOCK_SKEW:
+        raise ValueError("formal analysis is future-dated")
+    if age > MAX_FORMAL_ANALYSIS_AGE:
+        raise ValueError("formal analysis is stale")
+    return synthesis, analysis_id.strip()
 
 
 def _get_current_price_atr(ticker: str) -> dict:
@@ -211,7 +276,14 @@ def _re_evaluate_locked(send_telegram: bool = False) -> dict:
         initial_bytes = CACHE_PATH.read_bytes()
         initial_hash = hashlib.sha256(initial_bytes).hexdigest()
         data = json.loads(initial_bytes.decode("utf-8"))
-        syn = data.get("synthesis") or {}
+        try:
+            syn, formal_analysis_id = _validate_formal_analysis(data)
+        except ValueError as exc:
+            return {
+                "status": "stale_or_invalid_analysis",
+                "error": str(exc),
+                "updated": 0,
+            }
         actions: list = syn.get("priority_actions") or []
         if not actions:
             # filtered_actions に何件あるかも教える（post-filter で除去された場合）
@@ -261,13 +333,23 @@ def _re_evaluate_locked(send_telegram: bool = False) -> dict:
 
         if llm_actions:
             try:
-                from analyst.llm_client import call_claude
+                from analyst.llm_client import _MaxTokensResponse, call_claude
                 system, user = _build_prompt(llm_actions, price_map, mm)
-                resp = call_claude(
-                    system=system, user=user,
-                    model="claude-sonnet-5",
-                    max_tokens=3000, temperature=0.2, use_tool=False,
-                )
+                try:
+                    resp = call_claude(
+                        system=system, user=user,
+                        model="claude-sonnet-5",
+                        max_tokens=3000, temperature=0.2, use_tool=False,
+                    )
+                except _MaxTokensResponse:
+                    resp = call_claude(
+                        system=system,
+                        user=user + "\n\n説明を短くし、全action_idを完全なJSONで返してください。",
+                        model="claude-sonnet-5",
+                        max_tokens=6000,
+                        temperature=0.2,
+                        use_tool=False,
+                    )
                 raw = resp if isinstance(resp, str) else json.dumps(resp, ensure_ascii=False)
                 import re
                 m = re.search(r"\{[\s\S]*\}", raw)
@@ -285,29 +367,17 @@ def _re_evaluate_locked(send_telegram: bool = False) -> dict:
                     idx = index_by_id[str(order["action_id"])]
                     a = actions[idx]
                     # 上書き対象フィールド
-                    if order.get("order_type") in ("market", "limit"):
-                        a["order_type"] = order["order_type"]
-                    if "limit_price" in order:
-                        lp = order["limit_price"]
-                        if lp is None or a.get("order_type") == "market":
-                            a.pop("limit_price", None)
-                        else:
-                            try:
-                                a["limit_price"] = float(lp)
-                            except Exception:
-                                pass
-                    if "decision_price" in order:
-                        try:
-                            a["decision_price"] = float(order["decision_price"])
-                        except Exception:
-                            pass
-                    if "expiry_minutes" in order:
-                        try:
-                            a["expiry_minutes"] = int(order["expiry_minutes"])
-                        except Exception:
-                            pass
-                    if order.get("execution_reason"):
-                        a["execution_reason"] = order["execution_reason"]
+                    a["order_type"] = order["order_type"]
+                    if a["order_type"] == "market":
+                        a.pop("limit_price", None)
+                    else:
+                        a["limit_price"] = float(order["limit_price"])
+                    if order.get("decision_price") is not None:
+                        a["decision_price"] = float(order["decision_price"])
+                    if order.get("expiry_minutes") is not None:
+                        a["expiry_minutes"] = int(order["expiry_minutes"])
+                    if order.get("execution_reason") is not None:
+                        a["execution_reason"] = order["execution_reason"].strip()
             except Exception as e:
                 return {
                     "error": f"LLM 呼び出し失敗: {type(e).__name__}: {e}",
@@ -396,6 +466,23 @@ def _re_evaluate_locked(send_telegram: bool = False) -> dict:
                 return {
                     "status": "stale_analysis_conflict",
                     "message": "正式分析が更新されたため、古い注文方法の再評価結果を破棄しました",
+                    "updated": 0,
+                    "skipped": skipped,
+                }
+            current_data = json.loads(current_bytes.decode("utf-8"))
+            try:
+                _current_syn, current_analysis_id = _validate_formal_analysis(current_data)
+            except ValueError:
+                return {
+                    "status": "stale_analysis_conflict",
+                    "message": "正式分析の有効性を再確認できないため結果を破棄しました",
+                    "updated": 0,
+                    "skipped": skipped,
+                }
+            if current_analysis_id != formal_analysis_id:
+                return {
+                    "status": "stale_analysis_conflict",
+                    "message": "正式分析IDが更新されたため結果を破棄しました",
                     "updated": 0,
                     "skipped": skipped,
                 }

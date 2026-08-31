@@ -1334,6 +1334,7 @@ def classify_execution_readiness(
         action_type,
         plan_state=load_execution_plan_state(base_dir),
         now=now,
+        requested_notional_jpy=action.get("estimated_notional_jpy"),
     )
     if funding.get("required") and not funding.get("allowed"):
         add(

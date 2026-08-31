@@ -18,9 +18,9 @@ Plan Part C 参照。
 from __future__ import annotations
 
 import json
-import re
 import sys
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -45,13 +45,27 @@ MSG_THRESHOLD      = 200       # plan: message_count > 200
 BULLISH_THRESHOLD  = 70.0      # plan: bullish_pct > 70
 MAX_TICKERS        = 15
 
+REQUIRED_FIELDS = (
+    "ticker", "category", "confidence_pct", "action_bias", "one_liner",
+)
+_CATEGORIES = {"pump_meme", "earnings_driven", "product_catalyst", "macro_rotation", "mixed"}
+_ACTION_BIASES = {"buy", "hold", "avoid", "short"}
+FIELD_SPECS = {
+    "ticker": (str, lambda v: bool(str(v).strip())),
+    "category": (str, lambda v: str(v).lower() in _CATEGORIES),
+    "confidence_pct": ((int, float), lambda v: not isinstance(v, bool) and 0 <= float(v) <= 100),
+    "action_bias": (str, lambda v: str(v).lower() in _ACTION_BIASES),
+    "one_liner": (str, lambda v: 0 < len(str(v)) <= 200),
+}
 
-def _append_llm_call_log(row: dict) -> None:
+
+def _append_llm_call_log(row: dict) -> bool:
     try:
         from analyst.llm_client import _append_llm_call_log as _append
-        _append(row)
-    except Exception:
-        pass
+        return bool(_append(row))
+    except Exception as exc:
+        print(f"[social_topic] accounting log write failed: {exc}", file=sys.stderr)
+        return False
 
 
 def _log_adapter_usage(
@@ -62,7 +76,11 @@ def _log_adapter_usage(
     prompt_chars: int,
     max_tokens: int,
     candidate_count: int,
-) -> None:
+    status: str,
+    failure_kind: str | None,
+    run_id: str,
+    batch_id: str,
+) -> bool:
     usage = result.get("usage") or {}
     row = {
         "ts": time.strftime("%Y-%m-%dT%H:%M:%S"),
@@ -73,16 +91,26 @@ def _log_adapter_usage(
         "max_tokens": max_tokens,
         "elapsed_sec": round(time.monotonic() - started, 2),
         "prompt_chars": prompt_chars,
-        "status": "error" if result.get("error") else "ok",
+        "status": status,
         "candidate_count": candidate_count,
         "input_tokens": usage.get("prompt_tokens"),
         "output_tokens": usage.get("completion_tokens"),
+        "run_id": run_id,
+        "batch_id": batch_id,
     }
+    if failure_kind:
+        row["failure_kind"] = failure_kind
     if result.get("error"):
         row["error"] = str(result.get("error"))[:500]
         if not usage:
             row["cost_usd"] = 0.0
-    _append_llm_call_log(row)
+    written = _append_llm_call_log(row)
+    if not written:
+        print(
+            f"[social_topic] accounting row lost: {json.dumps(row, ensure_ascii=False)}",
+            file=sys.stderr,
+        )
+    return written
 
 SYSTEM_PROMPT = (
     "あなたは機関投資家向けセンチメント分析官です。"
@@ -118,20 +146,31 @@ def _source_sample_size() -> int:
     return len(st) if isinstance(st, dict) else 0
 
 
-def _load_heated() -> list[dict[str, Any]]:
+def _load_heated_input() -> tuple[list[dict[str, Any]], int, str | None, str]:
+    from topic_lane_contract import INPUT_EMPTY, INPUT_MISSING, INPUT_OK, INPUT_UNREADABLE
+
     if not SOCIAL_FILE.exists():
         print(f"[social_topic] {SOCIAL_FILE.name} not found; nothing to analyze")
-        return []
+        return [], 0, None, INPUT_MISSING
     try:
         data = json.loads(SOCIAL_FILE.read_text(encoding="utf-8"))
     except Exception as e:
         print(f"[social_topic] parse error: {e}", file=sys.stderr)
-        return []
-    stocktwits: dict[str, dict] = data.get("stocktwits", {})
+        return [], 0, None, INPUT_UNREADABLE
+    if not isinstance(data, dict) or not isinstance(data.get("stocktwits"), dict):
+        print("[social_topic] stocktwits input is not an object", file=sys.stderr)
+        return [], 0, (data.get("generated_at") if isinstance(data, dict) else None), INPUT_UNREADABLE
+    stocktwits: dict[str, dict] = data["stocktwits"]
     heated: list[dict[str, Any]] = []
     for tk, info in stocktwits.items():
+        if not isinstance(tk, str) or not tk.strip() or not isinstance(info, dict):
+            return [], len(stocktwits), data.get("generated_at"), INPUT_UNREADABLE
         mc = info.get("message_count", 0) or 0
         bp = info.get("bullish_pct", 0.0) or 0.0
+        if isinstance(mc, bool) or not isinstance(mc, (int, float)):
+            return [], len(stocktwits), data.get("generated_at"), INPUT_UNREADABLE
+        if isinstance(bp, bool) or not isinstance(bp, (int, float)):
+            return [], len(stocktwits), data.get("generated_at"), INPUT_UNREADABLE
         if mc > MSG_THRESHOLD and bp > BULLISH_THRESHOLD:
             heated.append({
                 "ticker":         tk,
@@ -143,7 +182,18 @@ def _load_heated() -> list[dict[str, Any]]:
             })
     # ソート: trending > message_count 降順
     heated.sort(key=lambda x: (x["is_trending"], x["message_count"]), reverse=True)
-    return heated[:MAX_TICKERS]
+    selected = heated[:MAX_TICKERS]
+    return (
+        selected,
+        len(stocktwits),
+        data.get("generated_at"),
+        INPUT_OK if selected else INPUT_EMPTY,
+    )
+
+
+def _load_heated() -> list[dict[str, Any]]:
+    """Compatibility wrapper for callers/tests that only need selected rows."""
+    return _load_heated_input()[0]
 
 
 def _load_news_headlines() -> dict[str, list[str]]:
@@ -184,38 +234,57 @@ def _build_user_prompt(heated: list[dict], news_map: dict[str, list[str]]) -> st
     return "\n".join(lines)
 
 
-_JSON_BLOCK_RE = re.compile(r"\{[\s\S]*\}", re.MULTILINE)
-
-
-def _extract_json(text: str) -> dict | None:
-    if not text:
-        return None
-    s = text.strip()
-    if s.startswith("```"):
-        s = s.strip("`").lstrip("json").strip()
-    m = _JSON_BLOCK_RE.search(s)
-    if not m:
-        return None
-    try:
-        return json.loads(m.group(0))
-    except Exception:
-        try:
-            return json.loads(m.group(0).rstrip(",") + "}")
-        except Exception:
-            return None
-
-
 def analyze(dry_run: bool = False) -> dict:
     from topic_lane_contract import (
+        ERROR_PARSE,
+        ERROR_SCHEMA,
+        ERROR_TRUNCATION,
+        FAILING_INPUT_STATES,
+        INPUT_OK,
+        RUN_STATUS_FAILED,
         RUN_STATUS_NO_CANDIDATES,
+        RUN_STATUS_PARTIAL,
+        RUN_STATUS_SUCCESS,
         RUN_STATUS_UNAVAILABLE,
         build_run_record,
+        classify_error,
+        extract_json,
+        looks_truncated,
+        validate_rows,
         write_heartbeat,
     )
+    from utils import atomic_write_json
 
     _started_at = time.time()
     _run_id = f"social-{time.strftime('%Y%m%d-%H%M%S')}"
-    heated = _load_heated()
+    heated, input_count, source_as_of, input_state = _load_heated_input()
+
+    def _finish(record: dict, evaluations: list[dict], *, meta: dict | None = None) -> dict:
+        out = {
+            "generated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "evaluations": evaluations,
+            **(meta or {}),
+            **record,
+        }
+        if not dry_run:
+            atomic_write_json(OUTPUT_FILE, out)
+            print(
+                f"[social_topic] run={_run_id} status={record['run_status']} "
+                f"input={record['input_state']} evaluations={len(evaluations)} "
+                f"calls={record['call_count']}",
+            )
+            write_heartbeat(LANE, record)
+        return out
+
+    if input_state in FAILING_INPUT_STATES:
+        return _finish(build_run_record(
+            lane=LANE, run_id=_run_id, run_status=RUN_STATUS_FAILED,
+            started_at=_started_at, input_count=input_count,
+            selected_count=0, success_count=0, batches=[],
+            source_as_of=source_as_of, input_state=input_state,
+            error_code=f"input_{input_state}",
+        ), [])
+
     if not heated:
         # ⚠️ 以前はここで何も print せずに戻っていたため、cron ログが
         # 0 バイトのままになり「動いていない」と「動いたが 0 件」を外から
@@ -224,107 +293,117 @@ def analyze(dry_run: bool = False) -> dict:
         # 到達不能だったため)。0 件でも必ず状態と heartbeat を残す。
         record = build_run_record(
             lane=LANE, run_id=_run_id, run_status=RUN_STATUS_NO_CANDIDATES,
-            started_at=_started_at, input_count=_source_sample_size(),
+            started_at=_started_at, input_count=input_count,
             selected_count=0, success_count=0, batches=[],
-            source_as_of=_source_as_of(),
+            source_as_of=source_as_of, input_state=input_state,
         )
-        out = {
-            "generated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-            "evaluations": [],
+        return _finish(record, [], meta={
             "note": f"no tickers matched (msg>{MSG_THRESHOLD} & bullish>{BULLISH_THRESHOLD}%)",
-            **record,
-        }
-        if not dry_run:
-            OUTPUT_FILE.write_text(json.dumps(out, indent=2, ensure_ascii=False), encoding="utf-8")
-            print(f"[social_topic] run={_run_id} status={RUN_STATUS_NO_CANDIDATES} "
-                  f"selected=0 (threshold msg>{MSG_THRESHOLD} & bullish>{BULLISH_THRESHOLD}%)")
-            write_heartbeat(LANE, record)
-        return out
+        })
 
     if call_by_role is None:
         record = build_run_record(
             lane=LANE, run_id=_run_id, run_status=RUN_STATUS_UNAVAILABLE,
-            started_at=_started_at, input_count=_source_sample_size(),
+            started_at=_started_at, input_count=input_count,
             selected_count=len(heated), success_count=0, batches=[],
-            source_as_of=_source_as_of(), error_code="llm_adapters unavailable",
+            source_as_of=source_as_of, input_state=INPUT_OK,
+            error_code="llm_adapters unavailable",
         )
-        out = {
-            "generated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-            "evaluations": [],
-            "error": "llm_adapters unavailable",
-            **record,
-        }
-        if not dry_run:
-            OUTPUT_FILE.write_text(json.dumps(out, indent=2, ensure_ascii=False), encoding="utf-8")
-            print(f"[social_topic] run={_run_id} status={RUN_STATUS_UNAVAILABLE}")
-            write_heartbeat(LANE, record)
-        return out
+        return _finish(record, [], meta={"error": "llm_adapters unavailable"})
 
     news_map = _load_news_headlines()
     user_prompt = _build_user_prompt(heated, news_map)
     print(f"[social_topic] analyzing {len(heated)} heated tickers via DeepSeek V3…")
 
-    started = time.monotonic()
-    res = call_by_role(
-        "social_topic_deepdive",
-        SYSTEM_PROMPT,
-        user_prompt,
-        max_tokens=2500,
-        temperature=0.2,
-        json_mode=True,
-    )
-    _log_adapter_usage(
-        role="social_topic_deepdive",
-        result=res,
-        started=started,
-        prompt_chars=len(SYSTEM_PROMPT) + len(user_prompt),
-        max_tokens=2500,
-        candidate_count=len(heated),
-    )
-    content = res.get("content", "")
-    err     = res.get("error")
-    parsed  = _extract_json(content) if content else None
+    selected_tickers = [h["ticker"] for h in heated]
+    calls: list[dict] = []
+    accounting_logged_count = 0
 
-    if (err or not parsed):
-        print(f"[social_topic] DeepSeek failed ({err or 'parse error'}); fallback to Qwen")
+    def _run(role: str, batch_id: str) -> tuple[dict, list[dict]]:
+        nonlocal accounting_logged_count
         started = time.monotonic()
-        res = call_by_role(
-            "social_topic_fallback",
-            SYSTEM_PROMPT,
-            user_prompt,
-            max_tokens=2500,
-            temperature=0.2,
-            json_mode=True,
-        )
-        _log_adapter_usage(
-            role="social_topic_fallback",
-            result=res,
-            started=started,
+        try:
+            result = call_by_role(
+                role, SYSTEM_PROMPT, user_prompt,
+                max_tokens=2500, temperature=0.2, json_mode=True,
+            )
+        except Exception as exc:
+            result = {"content": "", "error": f"{type(exc).__name__}: {exc}"}
+        error = result.get("error")
+        usage = result.get("usage") or {}
+        parsed = extract_json(result.get("content") or "") if not error else None
+        rows: list[dict] = []
+        if error:
+            failure_kind = classify_error(error)
+        elif parsed is None:
+            failure_kind = ERROR_TRUNCATION if looks_truncated(usage, 2500) else ERROR_PARSE
+        else:
+            schema = validate_rows(
+                parsed,
+                list_key="evaluations",
+                required_fields=REQUIRED_FIELDS,
+                expected_tickers=selected_tickers,
+                field_specs=FIELD_SPECS,
+            )
+            failure_kind = None if schema.ok else ERROR_SCHEMA
+            rows = schema.rows if schema.ok else []
+        status = "ok" if failure_kind is None else "error"
+        logged = _log_adapter_usage(
+            role=role, result=result, started=started,
             prompt_chars=len(SYSTEM_PROMPT) + len(user_prompt),
-            max_tokens=2500,
-            candidate_count=len(heated),
+            max_tokens=2500, candidate_count=len(heated),
+            status=status, failure_kind=failure_kind,
+            run_id=_run_id, batch_id=batch_id,
         )
-        content = res.get("content", "")
-        err     = res.get("error")
-        parsed  = _extract_json(content) if content else None
+        accounting_logged_count += 1 if logged else 0
+        call = {
+            "batch_id": batch_id,
+            "role": role,
+            "tickers": selected_tickers,
+            "status": status,
+            "failure_kind": failure_kind,
+            "adapter": result.get("adapter"),
+            "model": result.get("model"),
+            "usage": usage or None,
+            "error": str(error)[:500] if error else None,
+        }
+        calls.append(call)
+        return result, rows
 
-    out = {
-        "generated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-        "tickers_evaluated": [h["ticker"] for h in heated],
-        "adapter":     res.get("adapter"),
-        "model":       res.get("model"),
-        "usage":       res.get("usage"),
-        "evaluations": (parsed.get("evaluations") if parsed and isinstance(parsed, dict) else []) or [],
-    }
-    if err:
-        out["error"] = err
-    if not parsed:
-        out["raw_response"] = content[:2000]
+    res, evaluations = _run("social_topic_deepdive", f"{_run_id}#b1")
+    fallback_status = "not_attempted"
+    if not evaluations:
+        first_failure = calls[-1].get("error") or calls[-1].get("failure_kind") or "parse error"
+        print(f"[social_topic] DeepSeek failed ({first_failure}); fallback to Qwen")
+        res, evaluations = _run("social_topic_fallback", f"{_run_id}#b1/fb")
+        fallback_status = "used"
 
-    if not dry_run:
-        OUTPUT_FILE.write_text(json.dumps(out, indent=2, ensure_ascii=False), encoding="utf-8")
-        print(f"[social_topic] wrote {OUTPUT_FILE.name}: {len(out['evaluations'])} evaluations")
-    return out
+    run_status = RUN_STATUS_SUCCESS if evaluations else RUN_STATUS_FAILED
+    accounting_incomplete = accounting_logged_count != len(calls)
+    if accounting_incomplete and run_status == RUN_STATUS_SUCCESS:
+        run_status = RUN_STATUS_PARTIAL
+    error_code = None if run_status == RUN_STATUS_SUCCESS else (
+        "accounting_incomplete" if accounting_incomplete
+        else next((c.get("failure_kind") for c in reversed(calls) if c.get("failure_kind")), "transport_error")
+    )
+    record = build_run_record(
+        lane=LANE, run_id=_run_id, run_status=run_status,
+        started_at=_started_at, input_count=input_count,
+        selected_count=len(heated), success_count=1 if evaluations else 0,
+        batches=calls, batch_count=1, source_as_of=source_as_of,
+        input_state=input_state, error_code=error_code,
+        fallback_status=fallback_status, call_count=len(calls),
+        output_tokens=sum(int((c.get("usage") or {}).get("completion_tokens") or 0) for c in calls),
+        selected_tickers=selected_tickers,
+    )
+    record["accounting_logged_count"] = accounting_logged_count
+    record["accounting_incomplete"] = accounting_incomplete
+    return _finish(record, evaluations, meta={
+        "tickers_evaluated": selected_tickers,
+        "adapter": res.get("adapter"),
+        "model": res.get("model"),
+        "usage": res.get("usage"),
+    })
 
 
 def format_for_prompt(max_entries: int = 8) -> str:
@@ -339,7 +418,13 @@ def format_for_prompt(max_entries: int = 8) -> str:
     """
     from topic_lane_contract import load_and_gate
 
-    data, reason = load_and_gate(OUTPUT_FILE, source=FRESHNESS_SOURCE)
+    data, reason = load_and_gate(
+        OUTPUT_FILE,
+        source=FRESHNESS_SOURCE,
+        row_key="evaluations",
+        required_fields=REQUIRED_FIELDS,
+        field_specs=FIELD_SPECS,
+    )
     if data is None:
         if reason not in ("file not found",):
             print(f"[social_topic] context suppressed ({reason})", file=sys.stderr)

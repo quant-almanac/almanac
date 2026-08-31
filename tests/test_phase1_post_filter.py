@@ -2363,6 +2363,7 @@ def test_playbook_injector_replaces_model_supplied_attestation(monkeypatch):
         "scenarios": [{
             "id": "test_scenario",
             "name": "Test scenario",
+            "enabled_for_decision": True,
             "actions": {"phase_1": {"buy": [{
                 "ticker": "META",
                 "allocation_jpy": 100_000,
@@ -2399,6 +2400,7 @@ def test_playbook_injector_replaces_model_supplied_attestation(monkeypatch):
             "scenario_monitoring": {"active_scenarios": [{
                 "id": "test_scenario",
                 "name": "Test scenario",
+                "enabled_for_decision": True,
                 "status": "active",
                 "allocation_scale": 1.0,
                 "readiness_pct": 90,

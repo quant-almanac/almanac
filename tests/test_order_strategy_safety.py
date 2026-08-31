@@ -1,4 +1,5 @@
 import json
+from datetime import datetime
 
 import pytest
 
@@ -33,7 +34,10 @@ def us_session_closed(monkeypatch):
 
 
 def _write_analysis(path, action):
-    path.write_text(json.dumps({"synthesis": {"priority_actions": [action]}}), encoding="utf-8")
+    path.write_text(json.dumps({
+        "as_of": datetime.now().astimezone().isoformat(),
+        "synthesis": {"analysis_id": "analysis-test", "priority_actions": [action]},
+    }), encoding="utf-8")
 
 
 def test_order_strategy_converts_unsafe_market_to_limit(monkeypatch, tmp_path, us_session_open):
@@ -140,7 +144,10 @@ def test_order_response_is_mapped_by_action_id_not_array_position(monkeypatch, t
         {"ticker": "MSFT", "type": "buy", "execution_account": "特定"},
     ]
     cache.write_text(
-        json.dumps({"synthesis": {"priority_actions": actions}}), encoding="utf-8"
+        json.dumps({
+            "as_of": datetime.now().astimezone().isoformat(),
+            "synthesis": {"analysis_id": "analysis-test", "priority_actions": actions},
+        }), encoding="utf-8"
     )
     monkeypatch.setattr(order_strategy, "CACHE_PATH", cache)
     monkeypatch.setattr(order_strategy, "_get_market_meta", lambda: {})
@@ -196,3 +203,78 @@ def test_order_strategy_cas_never_overwrites_new_formal_analysis(monkeypatch, tm
 
     assert result["status"] == "stale_analysis_conflict"
     assert json.loads(cache.read_text(encoding="utf-8"))["new_formal_analysis"] is True
+
+
+def test_order_strategy_rejects_stale_formal_analysis_before_quote_or_llm(monkeypatch, tmp_path):
+    cache = tmp_path / "ai_portfolio_analysis.json"
+    cache.write_text(json.dumps({
+        "as_of": "2020-01-01T00:00:00+09:00",
+        "synthesis": {
+            "analysis_id": "old-analysis",
+            "priority_actions": [{"ticker": "AAPL", "type": "buy"}],
+        },
+    }), encoding="utf-8")
+    monkeypatch.setattr(order_strategy, "CACHE_PATH", cache)
+    called = {"quote": 0}
+    monkeypatch.setattr(
+        order_strategy,
+        "_get_current_price_atr",
+        lambda _ticker: called.__setitem__("quote", called["quote"] + 1),
+    )
+
+    result = order_strategy.re_evaluate()
+
+    assert result["status"] == "stale_or_invalid_analysis"
+    assert called["quote"] == 0
+
+
+@pytest.mark.parametrize(
+    "bad_order",
+    [
+        {"order_type": "limit", "limit_price": -1.0},
+        {"order_type": "limit", "limit_price": True},
+        {"order_type": "limit", "limit_price": 95.0, "decision_price": True},
+        {"order_type": "limit", "limit_price": 95.0, "expiry_minutes": True},
+        {"order_type": "stop_limit", "limit_price": 95.0},
+    ],
+)
+def test_order_response_rejects_adversarial_order_fields(bad_order):
+    action = {"ticker": "AAPL", "type": "buy"}
+    order = {
+        "action_id": order_strategy._order_action_id(action),
+        "ticker": "AAPL",
+        **bad_order,
+    }
+
+    with pytest.raises(ValueError):
+        order_strategy._validate_order_response([order], [action])
+
+
+def test_order_strategy_retries_once_after_max_tokens(monkeypatch, tmp_path):
+    cache = tmp_path / "ai_portfolio_analysis.json"
+    action = {"ticker": "AAPL", "type": "buy"}
+    _write_analysis(cache, action)
+    monkeypatch.setattr(order_strategy, "CACHE_PATH", cache)
+    monkeypatch.setattr(order_strategy, "_get_market_meta", lambda: {})
+    monkeypatch.setattr(order_strategy, "_get_current_price_atr", lambda _ticker: {
+        "current_price": 100, "bid": 99, "ask": 101, "spread_bps": 10,
+    })
+    calls = []
+
+    def fake_call(**kwargs):
+        calls.append(kwargs["max_tokens"])
+        if len(calls) == 1:
+            raise llm_client._MaxTokensResponse("stop_reason=max_tokens")
+        return json.dumps({"orders": [{
+            "action_id": order_strategy._order_action_id(action),
+            "ticker": "AAPL",
+            "order_type": "limit",
+            "limit_price": 95.0,
+        }]})
+
+    monkeypatch.setattr(llm_client, "call_claude", fake_call)
+
+    result = order_strategy.re_evaluate()
+
+    assert result["status"] == "ok"
+    assert calls == [3000, 6000]

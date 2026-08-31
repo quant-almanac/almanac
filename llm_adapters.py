@@ -81,7 +81,8 @@ def _retry_openai_compat(base_url: str, api_key: str, model: str,
     for attempt in range(_MAX_RETRIES + 1):
         try:
             resp = client.chat.completions.create(**kwargs, timeout=req_timeout)
-            content = (resp.choices[0].message.content or "").strip()
+            choice = resp.choices[0]
+            content = (choice.message.content or "").strip()
             usage = getattr(resp, "usage", None)
             usage_dict: dict[str, int] = {}
             if usage:
@@ -89,6 +90,18 @@ def _retry_openai_compat(base_url: str, api_key: str, model: str,
                     "prompt_tokens":     getattr(usage, "prompt_tokens", 0) or 0,
                     "completion_tokens": getattr(usage, "completion_tokens", 0) or 0,
                     "total_tokens":      getattr(usage, "total_tokens", 0) or 0,
+                }
+            finish_reason = str(getattr(choice, "finish_reason", "") or "").lower()
+            if finish_reason in {"length", "max_tokens"}:
+                # OpenAI-compatible providers use ``length`` where Anthropic
+                # uses ``max_tokens``.  A partial JSON body is not a successful
+                # structured response even when it is non-empty.
+                return {
+                    "content": "",
+                    "usage": usage_dict,
+                    "model": getattr(resp, "model", model),
+                    "adapter": adapter_name,
+                    "error": f"stop_reason=max_tokens; finish_reason={finish_reason}",
                 }
             return {
                 "content": content,
