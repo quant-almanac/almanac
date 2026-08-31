@@ -14,33 +14,32 @@ sys.path.insert(0, str(BASE_DIR))
 
 # P1-15: モジュール内 bool 排他 → file lock に置換
 # 旧実装は _refresh_running = False/True で uvicorn --reload や複数プロセスで破綻していた。
-from utils import process_lock, is_locked, LockBusy, heartbeat  # noqa: E402
+from utils import is_locked, LockBusy, heartbeat  # noqa: E402
 
 LOCK_NAME = "ai_analysis"
 
 
 def _run_analysis_bg(send_telegram: bool = False):
     try:
-        with process_lock(LOCK_NAME):
-            from portfolio_analyst import run_analysis, send_to_telegram
-            result = run_analysis(force=True)
-            if send_telegram and result:
-                ok = send_to_telegram(result)
-                print(f"[ai_analysis] Telegram送信: {'✅ 完了' if ok else '❌ 失敗'}")
-                # portfolio_analyst.py / nightly_recheck.py と同じ配信結果
-                # 契約に揃える。以前はここも print だけで、配信失敗が
-                # durable な記録として残らなかった (2026-08-24 レビュー)。
-                # watchdog.EXPECTED_INTERVALS には未登録 (この経路は API から
-                # 都度起動されるオンデマンド実行で、定期実行の失効監視とは
-                # 性質が違う) — 能動的な監視は起動しないが、記録は残す。
-                try:
-                    heartbeat(
-                        "portfolio_analyst_api",
-                        "ok" if ok else "warn",
-                        None if ok else "Telegram送信に失敗（分析は正常終了）",
-                    )
-                except Exception:
-                    pass
+        from portfolio_analyst import run_analysis, send_to_telegram
+        result = run_analysis(force=True)
+        if send_telegram and result:
+            ok = send_to_telegram(result)
+            print(f"[ai_analysis] Telegram送信: {'✅ 完了' if ok else '❌ 失敗'}")
+            # portfolio_analyst.py / nightly_recheck.py と同じ配信結果
+            # 契約に揃える。以前はここも print だけで、配信失敗が
+            # durable な記録として残らなかった (2026-08-24 レビュー)。
+            # watchdog.EXPECTED_INTERVALS には未登録 (この経路は API から
+            # 都度起動されるオンデマンド実行で、定期実行の失効監視とは
+            # 性質が違う) — 能動的な監視は起動しないが、記録は残す。
+            try:
+                heartbeat(
+                    "portfolio_analyst_api",
+                    "ok" if ok else "warn",
+                    None if ok else "Telegram送信に失敗（分析は正常終了）",
+                )
+            except Exception:
+                pass
     except LockBusy:
         print(f"[ai_analysis] 別プロセスが分析中のため skip")
     except Exception as e:
@@ -127,7 +126,7 @@ async def refresh_order_strategy(background_tasks: BackgroundTasks, telegram: bo
     UI: 「📋 注文方法だけ再分析」ボタンから呼ばれる想定。
     """
     global _order_refresh_running
-    if _order_refresh_running:
+    if _order_refresh_running or is_locked("order_strategy"):
         return {"status": "already_running", "message": "注文方法の再分析は既に実行中です"}
     _order_refresh_running = True
     background_tasks.add_task(_run_order_strategy_bg, send_telegram=telegram)
@@ -151,7 +150,7 @@ async def get_order_strategy_status():
     except Exception:
         pass
     return {
-        "running":       _order_refresh_running,
+        "running":       _order_refresh_running or is_locked("order_strategy"),
         "refreshed_at":  refreshed_at,
         "last_result":   _order_last_result,
     }

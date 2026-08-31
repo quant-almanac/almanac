@@ -31,7 +31,7 @@ _HISTORY_TICKER_RE = re.compile(r"^[A-Z0-9][A-Z0-9._-]{0,19}$")
 
 # utils はルートに存在
 sys.path.insert(0, str(BASE_DIR))
-from utils import atomic_write_json
+from utils import atomic_write_json, process_lock
 
 
 def write_progress(step: int, total: int, label: str, detail: str = "") -> None:
@@ -60,35 +60,37 @@ def load_json(path: Path, default=None):
 
 def save_cache(data: dict) -> None:
     """分析結果をキャッシュに保存し、履歴サマリーを追記する"""
-    atomic_write_json(CACHE_PATH, data)
-
-    hist = load_json(HISTORY_PATH, {"history": []})
-    # 後方互換: 旧形式 (list) も dict も両方受け入れる。
-    if isinstance(hist, list):
-        records = hist
-        hist = {"history": records}
-    elif isinstance(hist, dict):
-        records = hist.get("history", [])
-    else:
-        records = []
-        hist = {"history": records}
-    s = data.get("synthesis", {})
-    records.append({
-        "as_of": data.get("as_of", ""),
-        "overall_stance": s.get("overall_stance", ""),
-        "stance_reason": s.get("stance_reason", ""),
-        "weekly_theme": s.get("weekly_theme", ""),
-        "priority_actions": [
-            {"ticker": a.get("ticker"), "type": a.get("type"), "action": a.get("action", "")[:80]}
-            for a in s.get("priority_actions", [])[:5]
-        ],
-        "risk_warnings": s.get("risk_warnings", [])[:3],
-        "geopolitical_note": s.get("geopolitical_note", ""),
-    })
-    if len(records) > HISTORY_MAX:
-        records = records[-HISTORY_MAX:]
-    hist["history"] = records
-    atomic_write_json(HISTORY_PATH, hist)
+    with process_lock("ai_analysis_cache", timeout=30.0):
+        hist = load_json(HISTORY_PATH, {"history": []})
+        # 後方互換: 旧形式 (list) も dict も両方受け入れる。
+        if isinstance(hist, list):
+            records = hist
+            hist = {"history": records}
+        elif isinstance(hist, dict):
+            records = hist.get("history", [])
+        else:
+            records = []
+            hist = {"history": records}
+        s = data.get("synthesis", {})
+        records.append({
+            "as_of": data.get("as_of", ""),
+            "overall_stance": s.get("overall_stance", ""),
+            "stance_reason": s.get("stance_reason", ""),
+            "weekly_theme": s.get("weekly_theme", ""),
+            "priority_actions": [
+                {"ticker": a.get("ticker"), "type": a.get("type"), "action": a.get("action", "")[:80]}
+                for a in s.get("priority_actions", [])[:5]
+            ],
+            "risk_warnings": s.get("risk_warnings", [])[:3],
+            "geopolitical_note": s.get("geopolitical_note", ""),
+        })
+        if len(records) > HISTORY_MAX:
+            records = records[-HISTORY_MAX:]
+        hist["history"] = records
+        # Cache is the public commit marker.  History is completed first while
+        # the same lock prevents another writer from losing this append.
+        atomic_write_json(HISTORY_PATH, hist)
+        atomic_write_json(CACHE_PATH, data)
 
 
 def load_history_context() -> str:

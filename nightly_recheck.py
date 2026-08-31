@@ -33,7 +33,7 @@ from pathlib import Path
 BASE = Path(__file__).parent
 sys.path.insert(0, str(BASE))
 
-from utils import load_json, heartbeat  # noqa: E402
+from utils import LockBusy, load_json, heartbeat  # noqa: E402
 
 CACHE_PATH = BASE / "ai_portfolio_analysis.json"
 
@@ -197,6 +197,10 @@ def main(force: bool = False) -> int:
             return 2
         else:
             raise RuntimeError("run_analysis returned no synthesis")
+    except LockBusy:
+        print("[nightly_recheck] 別の正式分析が実行中のためスキップ")
+        heartbeat("nightly_recheck", "warn", "別の正式分析が実行中")
+        return 0
     except Exception as e:
         print(f"[nightly_recheck] ❌ 再分析失敗: {e}")
         try:

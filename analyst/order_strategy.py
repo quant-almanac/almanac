@@ -13,6 +13,7 @@ analyst/order_strategy.py — 注文方法 (order_type / limit_price / expiry) �
 from __future__ import annotations
 
 import json
+import hashlib
 from datetime import datetime, timezone
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
@@ -23,10 +24,58 @@ BASE_DIR = Path(__file__).parent.parent
 CACHE_PATH = BASE_DIR / "ai_portfolio_analysis.json"
 
 _running = False
+ORDER_STRATEGY_LOCK_NAME = "order_strategy"
 
 
 def is_running() -> bool:
-    return _running
+    try:
+        from utils import is_locked
+        return _running or is_locked(ORDER_STRATEGY_LOCK_NAME)
+    except Exception:
+        return _running
+
+
+def _order_action_id(action: dict) -> str:
+    """Stable route-aware ID used only for this re-evaluation transaction."""
+    fields = (
+        action.get("ticker"),
+        action.get("type") or action.get("action_type"),
+        action.get("execution_owner"),
+        action.get("execution_broker"),
+        action.get("execution_account") or action.get("account"),
+        action.get("execution_investment_type") or action.get("investment_type") or action.get("tier"),
+        action.get("plan_item_id"),
+        action.get("recommendation_id") or action.get("action_state_id"),
+        action.get("amount_hint"),
+        action.get("action"),
+    )
+    encoded = json.dumps(fields, ensure_ascii=False, separators=(",", ":"))
+    return "order-action-" + hashlib.sha256(encoded.encode("utf-8")).hexdigest()[:20]
+
+
+def _validate_order_response(
+    orders: object,
+    actions: list[dict],
+) -> list[dict]:
+    if not isinstance(orders, list):
+        raise ValueError("orders must be a list")
+    expected = {_order_action_id(action): action for action in actions}
+    if len(expected) != len(actions):
+        raise ValueError("order action identity collision")
+    validated: dict[str, dict] = {}
+    for order in orders:
+        if not isinstance(order, dict):
+            raise ValueError("order row must be an object")
+        action_id = str(order.get("action_id") or "")
+        if action_id not in expected or action_id in validated:
+            raise ValueError("unknown or duplicate action_id")
+        expected_ticker = str(expected[action_id].get("ticker") or "")
+        if str(order.get("ticker") or "") != expected_ticker:
+            raise ValueError("ticker does not match action_id")
+        validated[action_id] = order
+    if set(validated) != set(expected):
+        raise ValueError("orders do not cover the requested action set")
+    return [validated[_order_action_id(action)] for action in actions]
 
 
 def _get_current_price_atr(ticker: str) -> dict:
@@ -106,11 +155,11 @@ def _build_prompt(actions: list[dict], price_map: dict[str, dict], mm: dict) -> 
         "出力は JSON 1 オブジェクト:\n"
         "{\n"
         '  "orders": [\n'
-        '    {"ticker": "META", "order_type": "limit", "limit_price": 605.0, "expiry_minutes": 240, "decision_price": 608.5, "execution_reason": "VIX18 強気でATR 1.4%、現値$608.5から-0.6%下の指値$605で攻める"},\n'
+        '    {"action_id": "order-action-...", "ticker": "META", "order_type": "limit", "limit_price": 605.0, "expiry_minutes": 240, "decision_price": 608.5, "execution_reason": "VIX18 強気でATR 1.4%、現値$608.5から-0.6%下の指値$605で攻める"},\n'
         "    ...\n"
         "  ]\n"
         "}\n"
-        "アクションリストの順番と同じ順で orders を返してください。"
+        "各行の action_id と ticker をそのまま返し、全 action_id を重複なく1回ずつ含めてください。"
     )
 
     lines = ["## 現在の市場環境"]
@@ -126,7 +175,7 @@ def _build_prompt(actions: list[dict], price_map: dict[str, dict], mm: dict) -> 
         tk = a.get("ticker", "?")
         info = price_map.get(tk, {})
         lines.append(
-            f"{i+1}. [{a.get('tier','?')}] {a.get('type','?')} {tk} "
+            f"{i+1}. action_id={_order_action_id(a)} [{a.get('tier','?')}] {a.get('type','?')} {tk} "
             f"urgency={a.get('urgency','?')} amount={a.get('amount_hint','?')}\n"
             f"   action: {(a.get('action') or '')[:100]}\n"
             f"   current_price={info.get('current_price','?')} ATR%={info.get('atr_pct','?')} "
@@ -137,6 +186,20 @@ def _build_prompt(actions: list[dict], price_map: dict[str, dict], mm: dict) -> 
 
 
 def re_evaluate(send_telegram: bool = False) -> dict:
+    from utils import LockBusy, process_lock
+
+    try:
+        with process_lock(ORDER_STRATEGY_LOCK_NAME):
+            return _re_evaluate_locked(send_telegram=send_telegram)
+    except LockBusy:
+        return {
+            "status": "already_running",
+            "message": "注文方法の再分析は既に実行中です",
+            "updated": 0,
+        }
+
+
+def _re_evaluate_locked(send_telegram: bool = False) -> dict:
     """既存 priority_actions の order_type/limit_price/expiry/decision_price/execution_reason を更新。
     Returns: {"updated": N, "skipped": [..], "as_of": "..."}
     """
@@ -145,7 +208,9 @@ def re_evaluate(send_telegram: bool = False) -> dict:
     try:
         if not CACHE_PATH.exists():
             return {"error": "ai_portfolio_analysis.json が存在しません。先に AI 総合分析を実行してください。"}
-        data = json.loads(CACHE_PATH.read_text(encoding="utf-8"))
+        initial_bytes = CACHE_PATH.read_bytes()
+        initial_hash = hashlib.sha256(initial_bytes).hexdigest()
+        data = json.loads(initial_bytes.decode("utf-8"))
         syn = data.get("synthesis") or {}
         actions: list = syn.get("priority_actions") or []
         if not actions:
@@ -206,38 +271,43 @@ def re_evaluate(send_telegram: bool = False) -> dict:
                 raw = resp if isinstance(resp, str) else json.dumps(resp, ensure_ascii=False)
                 import re
                 m = re.search(r"\{[\s\S]*\}", raw)
-                if m:
-                    parsed = json.loads(m.group(0))
-                    orders = parsed.get("orders", [])
-                    for j, order in enumerate(orders):
-                        if j >= len(llm_indices):
-                            break
-                        idx = llm_indices[j]
-                        a = actions[idx]
-                        # 上書き対象フィールド
-                        if order.get("order_type") in ("market", "limit"):
-                            a["order_type"] = order["order_type"]
-                        if "limit_price" in order:
-                            lp = order["limit_price"]
-                            if lp is None or a.get("order_type") == "market":
-                                a.pop("limit_price", None)
-                            else:
-                                try:
-                                    a["limit_price"] = float(lp)
-                                except Exception:
-                                    pass
-                        if "decision_price" in order:
+                if not m:
+                    raise ValueError("structured order response missing")
+                parsed = json.loads(m.group(0))
+                orders = _validate_order_response(
+                    parsed.get("orders"), llm_actions
+                )
+                index_by_id = {
+                    _order_action_id(action): idx
+                    for action, idx in zip(llm_actions, llm_indices)
+                }
+                for order in orders:
+                    idx = index_by_id[str(order["action_id"])]
+                    a = actions[idx]
+                    # 上書き対象フィールド
+                    if order.get("order_type") in ("market", "limit"):
+                        a["order_type"] = order["order_type"]
+                    if "limit_price" in order:
+                        lp = order["limit_price"]
+                        if lp is None or a.get("order_type") == "market":
+                            a.pop("limit_price", None)
+                        else:
                             try:
-                                a["decision_price"] = float(order["decision_price"])
+                                a["limit_price"] = float(lp)
                             except Exception:
                                 pass
-                        if "expiry_minutes" in order:
-                            try:
-                                a["expiry_minutes"] = int(order["expiry_minutes"])
-                            except Exception:
-                                pass
-                        if order.get("execution_reason"):
-                            a["execution_reason"] = order["execution_reason"]
+                    if "decision_price" in order:
+                        try:
+                            a["decision_price"] = float(order["decision_price"])
+                        except Exception:
+                            pass
+                    if "expiry_minutes" in order:
+                        try:
+                            a["expiry_minutes"] = int(order["expiry_minutes"])
+                        except Exception:
+                            pass
+                    if order.get("execution_reason"):
+                        a["execution_reason"] = order["execution_reason"]
             except Exception as e:
                 return {
                     "error": f"LLM 呼び出し失敗: {type(e).__name__}: {e}",
@@ -316,12 +386,20 @@ def re_evaluate(send_telegram: bool = False) -> dict:
         syn["priority_actions"] = actions
         data["synthesis"] = syn
 
-        # atomic write
-        try:
-            from utils import atomic_write_json
+        # Compare-and-swap under the same cache commit lock used by a full
+        # analysis.  Never overwrite a newer formal analysis with fields
+        # derived from the old snapshot read before the LLM call.
+        from utils import atomic_write_json, process_lock
+        with process_lock("ai_analysis_cache", timeout=30.0):
+            current_bytes = CACHE_PATH.read_bytes()
+            if hashlib.sha256(current_bytes).hexdigest() != initial_hash:
+                return {
+                    "status": "stale_analysis_conflict",
+                    "message": "正式分析が更新されたため、古い注文方法の再評価結果を破棄しました",
+                    "updated": 0,
+                    "skipped": skipped,
+                }
             atomic_write_json(CACHE_PATH, data)
-        except Exception:
-            CACHE_PATH.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
         # Telegram 通知 (任意)
         # ALMANAC: telegram disabled — ai_analysis only

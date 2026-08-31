@@ -20,7 +20,7 @@ from pathlib import Path
 
 # analyst パッケージから公開 API を再エクスポート
 from analyst import run_analysis, get_cached, send_to_telegram  # noqa: F401
-from utils import heartbeat
+from utils import LockBusy, heartbeat
 
 # 後方互換: 直接インポートされるケース用に定数・内部関数を公開
 from analyst.cache import (  # noqa: F401
@@ -49,6 +49,10 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         result = run_analysis(force=force)
+    except LockBusy:
+        heartbeat("portfolio_analyst", "warn", "別の正式分析が実行中のためスキップ")
+        print("⚠️ 別の正式分析が実行中のためスキップ", file=sys.stderr)
+        return 0
     except Exception as e:
         heartbeat("portfolio_analyst", "error", str(e)[:500])
         raise

@@ -11291,6 +11291,22 @@ def _apply_capital_allocator(
 
 # ── メインエントリー ─────────────────────────────────────
 
+ANALYSIS_LOCK_NAME = "ai_analysis"
+
+
+def _with_analysis_singleflight(function):
+    """Serialize every formal-analysis entrypoint, including CLI and cron."""
+    from functools import wraps
+
+    @wraps(function)
+    def wrapper(*args, **kwargs):
+        from utils import process_lock
+
+        with process_lock(ANALYSIS_LOCK_NAME):
+            return function(*args, **kwargs)
+
+    return wrapper
+
 def _with_analysis_run_context(function):
     """Issue one run ID and expose it to all nested LLM usage writers."""
     from functools import wraps
@@ -11309,6 +11325,7 @@ def _with_analysis_run_context(function):
     return wrapper
 
 
+@_with_analysis_singleflight
 @_with_analysis_run_context
 def run_analysis(force: bool = False) -> dict:
     """

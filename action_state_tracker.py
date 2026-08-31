@@ -9,8 +9,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+from functools import wraps
 from datetime import datetime, timedelta
 from pathlib import Path
+
+from utils import atomic_write_json, process_lock
 
 BASE_DIR   = Path(__file__).parent
 STATE_FILE = BASE_DIR / "action_state.json"
@@ -49,9 +52,17 @@ def _load() -> dict:
 
 def _save(state: dict) -> None:
     state["last_updated"] = datetime.now().isoformat()
-    tmp = STATE_FILE.with_suffix(".tmp")
-    tmp.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
-    tmp.replace(STATE_FILE)
+    atomic_write_json(STATE_FILE, state)
+
+
+def _state_mutation(function):
+    """Serialize every read-modify-write of action_state.json."""
+    @wraps(function)
+    def wrapper(*args, **kwargs):
+        with process_lock("action_state", timeout=30.0):
+            return function(*args, **kwargs)
+
+    return wrapper
 
 
 def _make_id(ticker: str, action_type: str, recommended_at: str,
@@ -358,6 +369,7 @@ def _format_order_for_alert(action: dict) -> str:
 # 公開API
 # ============================================================
 
+@_state_mutation
 def record_recommendations(actions: list[dict], source: str = "opus") -> int:
     """
     Opus priority_actions を state に記録する。
@@ -464,6 +476,7 @@ def record_recommendations(actions: list[dict], source: str = "opus") -> int:
     return added
 
 
+@_state_mutation
 def update_status(action_id: str, status: str, note: str = "") -> bool:
     """
     アクションのステータスを更新する。
@@ -528,6 +541,7 @@ def _entry_direction(entry: dict) -> str:
     return "hold"
 
 
+@_state_mutation
 def sync_execution_status(
     *,
     ticker: str,
@@ -758,6 +772,7 @@ def get_all_pending(days_threshold: int = 0) -> list[dict]:
     return sorted(results, key=lambda x: (-x["business_days_pending"], x["ticker"]))
 
 
+@_state_mutation
 def expire_old_actions(max_days: int = 30) -> int:
     """Expire pending actions by their own TTL, then the legacy fallback."""
     state = _load()
@@ -793,6 +808,7 @@ def expire_old_actions(max_days: int = 30) -> int:
     return expired
 
 
+@_state_mutation
 def expire_stale_placed_actions(max_days: int = 10) -> int:
     """N営業日超 placed のまま filled にならないアクションを自動 expired にする。
 
