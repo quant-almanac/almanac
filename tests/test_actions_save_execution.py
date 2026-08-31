@@ -18,7 +18,7 @@ import asyncio
 import json
 import uuid
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Iterator
 
@@ -105,6 +105,31 @@ def _read(path: Path) -> dict:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+def _active_execution_plan(
+    *,
+    normal_jpy: int = 500_000,
+    opportunity_jpy: int = 0,
+    contribution_jpy: int = 500_000,
+) -> dict:
+    now = datetime.now().astimezone()
+    week_start = now.date() - timedelta(days=now.date().weekday())
+    return {
+        "schema_version": 2,
+        "as_of": now.isoformat(),
+        "horizon": {
+            "month": f"{now.year:04d}-{now.month:02d}",
+            "week_start": week_start.isoformat(),
+            "week_end": (week_start + timedelta(days=6)).isoformat(),
+        },
+        "status": "active",
+        "budgets": {
+            "normal_pool_available_jpy": normal_jpy,
+            "opportunity_pool_available_jpy": opportunity_jpy,
+        },
+        "contribution_summary": {"available_jpy": contribution_jpy},
+    }
+
+
 @pytest.fixture
 def isolated(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     """Patch all file paths and the process_lock to use tmp_path."""
@@ -137,14 +162,7 @@ def isolated(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     history.write_text("", encoding="utf-8")
     _write_json(action_state, {"actions": {}})
     _write_json(analysis, {})
-    _write_json(execution_plan, {
-        "status": "active",
-        "budgets": {
-            "normal_pool_available_jpy": 500_000,
-            "opportunity_pool_available_jpy": 0,
-        },
-        "contribution_summary": {"available_jpy": 500_000},
-    })
+    _write_json(execution_plan, _active_execution_plan())
 
     monkeypatch.setattr(actions, "HOLDINGS_FILE", holdings)
     monkeypatch.setattr(actions, "ACCOUNT_FILE",  account)
@@ -850,14 +868,10 @@ def test_zero_funding_blocks_new_order_but_not_reported_fill(isolated, monkeypat
     # This test isolates funding precedence; the preflight contract itself is
     # exercised end-to-end above.
     monkeypatch.setattr(actions, "_enforce_execution_preflight", lambda req: None)
-    _write_json(files["execution_plan"], {
-        "status": "active",
-        "budgets": {
-            "normal_pool_available_jpy": 0,
-            "opportunity_pool_available_jpy": 0,
-        },
-        "contribution_summary": {"available_jpy": 0},
-    })
+    _write_json(files["execution_plan"], _active_execution_plan(
+        normal_jpy=0,
+        contribution_jpy=0,
+    ))
 
     ordered = ExecutionRequest(
         ticker="7203.T", direction="buy", quantity=1, price=1_000,

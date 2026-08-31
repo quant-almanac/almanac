@@ -561,6 +561,9 @@ def atomic_write_json(path, data: dict, **kwargs) -> None:
         **kwargs: json.dump に渡す追加引数
     """
     path = Path(path)
+    # NaN and Infinity are accepted by Python's encoder but are not valid JSON.
+    # Persisting either in financial state makes later comparisons fail open.
+    kwargs.setdefault("allow_nan", False)
     tmp_fd, tmp_path = tempfile.mkstemp(dir=path.parent, suffix='.tmp')
     try:
         with os.fdopen(tmp_fd, 'w', encoding='utf-8') as f:

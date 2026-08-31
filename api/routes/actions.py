@@ -10,11 +10,13 @@ import copy
 import csv
 import hashlib
 import json
+import math
 import re
 import sqlite3
 import sys
 from datetime import date, datetime, timedelta
 from enum import Enum
+from numbers import Real
 from pathlib import Path
 from typing import Literal, Optional
 
@@ -171,6 +173,21 @@ class ExecutionRequest(BaseModel):
     preflight_token:            Optional[str]   = None
     idempotency_key:           str
 
+    @field_validator(
+        "quantity", "price", "bid_at_order", "ask_at_order", "limit_price",
+        "decision_price", "ai_recommended_limit", "filled_quantity", "filled_price",
+        mode="before",
+    )
+    @classmethod
+    def finite_order_number(cls, v: object) -> object:
+        if v is None:
+            return None
+        if isinstance(v, bool) or not isinstance(v, Real):
+            raise ValueError("数量・価格には有限の数値を指定してください")
+        if not math.isfinite(float(v)):
+            raise ValueError("数量・価格には有限の数値を指定してください")
+        return v
+
     @field_validator("ticker")
     @classmethod
     def ticker_non_empty(cls, v: str) -> str:
@@ -275,6 +292,17 @@ class PreflightRequest(BaseModel):
     execution_broker: Optional[str] = None
     execution_position_keys: Optional[list[str]] = None
 
+    @field_validator("quantity", "price", "limit_price", mode="before")
+    @classmethod
+    def preflight_finite_number(cls, v: object) -> object:
+        if v is None:
+            return None
+        if isinstance(v, bool) or not isinstance(v, Real):
+            raise ValueError("数量・価格には有限の数値を指定してください")
+        if not math.isfinite(float(v)):
+            raise ValueError("数量・価格には有限の数値を指定してください")
+        return v
+
     @field_validator("ticker")
     @classmethod
     def preflight_ticker_non_empty(cls, v: str) -> str:
@@ -349,6 +377,19 @@ class BrokerConfirmationEvidence(BaseModel):
     filled_price: Optional[float] = None
     reconciled_at: Optional[str] = None
     reconciliation_snapshot_hash: Optional[str] = None
+
+    @field_validator(
+        "quantity", "price", "filled_quantity", "filled_price", mode="before"
+    )
+    @classmethod
+    def broker_evidence_finite_number(cls, v: object) -> object:
+        if v is None:
+            return None
+        if isinstance(v, bool) or not isinstance(v, Real):
+            raise ValueError("約定数量・価格には有限の数値を指定してください")
+        if not math.isfinite(float(v)):
+            raise ValueError("約定数量・価格には有限の数値を指定してください")
+        return v
 
 
 class StatusPatchRequest(BaseModel):
@@ -1112,6 +1153,7 @@ def _enforce_discretionary_order_funding(req: ExecutionRequest) -> None:
     decision = evaluate_discretionary_funding(
         req.direction.value,
         plan_state=load_execution_plan_state(BASE_DIR),
+        now=datetime.now().astimezone(),
     )
     if decision.get("required") and not decision.get("allowed"):
         raise HTTPException(

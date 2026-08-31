@@ -774,7 +774,20 @@ def evaluate_cash_buying_power(
             }],
         }
     resource_as_of = resource_as_of.astimezone(now.tzinfo)
-    age_hours = max(0.0, (now - resource_as_of).total_seconds() / 3600)
+    raw_age_hours = (now - resource_as_of).total_seconds() / 3600
+    if raw_age_hours < -1.0:
+        return {
+            "required": True,
+            "readiness": "blocked",
+            "reasons": [{
+                "code": "cash_resource_future_dated",
+                "message": f"{route} の残高基準時刻が未来のため、買付余力に使用しません",
+                "cash_resource_as_of": resource_as_of.isoformat(),
+                "cash_resource_age_hours": round(raw_age_hours, 1),
+                **details,
+            }],
+        }
+    age_hours = max(0.0, raw_age_hours)
     details.update({
         "cash_resource_as_of": resource_as_of.isoformat(),
         "cash_resource_age_hours": round(age_hours, 1),
@@ -790,10 +803,23 @@ def evaluate_cash_buying_power(
         snapshot_as_of=resource_as_of,
     )
     effective_resource_as_of = authority["authority_as_of"]
+    effective_age_hours = (now - effective_resource_as_of).total_seconds() / 3600
+    if effective_age_hours < -1.0:
+        return {
+            "required": True,
+            "readiness": "blocked",
+            "reasons": [{
+                "code": "cash_resource_future_dated",
+                "message": f"{route} の残高権威時刻が未来のため、買付余力に使用しません",
+                "cash_resource_as_of": effective_resource_as_of.isoformat(),
+                "cash_resource_age_hours": round(effective_age_hours, 1),
+                **details,
+            }],
+        }
     details.update({
         "cash_resource_as_of": effective_resource_as_of.isoformat(),
         "cash_resource_age_hours": round(
-            max(0.0, (now - effective_resource_as_of).total_seconds() / 3600),
+            max(0.0, effective_age_hours),
             1,
         ),
         "cash_resource_authority_source": authority["authority_source"],
@@ -1307,6 +1333,7 @@ def classify_execution_readiness(
     funding = evaluate_discretionary_funding(
         action_type,
         plan_state=load_execution_plan_state(base_dir),
+        now=now,
     )
     if funding.get("required") and not funding.get("allowed"):
         add(

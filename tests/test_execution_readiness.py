@@ -17,6 +17,31 @@ from execution_readiness import (
 JST = ZoneInfo("Asia/Tokyo")
 
 
+def _active_execution_plan(
+    now: datetime,
+    *,
+    normal_jpy: int = 100_000,
+    opportunity_jpy: int = 0,
+    contribution_jpy: int = 100_000,
+) -> dict:
+    week_start = now.date() - timedelta(days=now.date().weekday())
+    return {
+        "schema_version": 2,
+        "as_of": now.isoformat(),
+        "horizon": {
+            "month": f"{now.year:04d}-{now.month:02d}",
+            "week_start": week_start.isoformat(),
+            "week_end": (week_start + timedelta(days=6)).isoformat(),
+        },
+        "status": "active",
+        "budgets": {
+            "normal_pool_available_jpy": normal_jpy,
+            "opportunity_pool_available_jpy": opportunity_jpy,
+        },
+        "contribution_summary": {"available_jpy": contribution_jpy},
+    }
+
+
 def _write_base(tmp_path, now, *, snapshot_hours=1, ticker="XLF", tech_status="fresh"):
     stamp = (now - timedelta(hours=snapshot_hours)).isoformat()
     (tmp_path / "account.json").write_text(json.dumps({"last_updated": stamp}), encoding="utf-8")
@@ -39,27 +64,17 @@ def _write_base(tmp_path, now, *, snapshot_hours=1, ticker="XLF", tech_status="f
     (tmp_path / "macro_event_state.json").write_text(json.dumps({
         "status": "ok", "refreshed_at": now.isoformat(), "events": []
     }), encoding="utf-8")
-    (tmp_path / "execution_plan_state.json").write_text(json.dumps({
-        "status": "active",
-        "budgets": {
-            "normal_pool_available_jpy": 100_000,
-            "opportunity_pool_available_jpy": 0,
-        },
-        "contribution_summary": {"available_jpy": 100_000},
-    }), encoding="utf-8")
+    (tmp_path / "execution_plan_state.json").write_text(
+        json.dumps(_active_execution_plan(now)), encoding="utf-8"
+    )
 
 
 def test_zero_discretionary_funding_blocks_buy_independent_of_plan_gate(tmp_path):
     now = datetime(2026, 7, 14, 6, 0, tzinfo=JST)
     _write_base(tmp_path, now)
-    (tmp_path / "execution_plan_state.json").write_text(json.dumps({
-        "status": "active",
-        "budgets": {
-            "normal_pool_available_jpy": 0,
-            "opportunity_pool_available_jpy": 0,
-        },
-        "contribution_summary": {"available_jpy": 0},
-    }), encoding="utf-8")
+    (tmp_path / "execution_plan_state.json").write_text(json.dumps(
+        _active_execution_plan(now, normal_jpy=0, contribution_jpy=0)
+    ), encoding="utf-8")
 
     result = classify_execution_readiness({
         "ticker": "XLF",
@@ -93,11 +108,9 @@ def test_missing_discretionary_funding_state_fails_closed_for_buy(tmp_path):
 def test_zero_discretionary_funding_does_not_block_sell(tmp_path):
     now = datetime(2026, 7, 14, 6, 0, tzinfo=JST)
     _write_base(tmp_path, now)
-    (tmp_path / "execution_plan_state.json").write_text(json.dumps({
-        "status": "active",
-        "budgets": {"normal_pool_available_jpy": 0, "opportunity_pool_available_jpy": 0},
-        "contribution_summary": {"available_jpy": 0},
-    }), encoding="utf-8")
+    (tmp_path / "execution_plan_state.json").write_text(json.dumps(
+        _active_execution_plan(now, normal_jpy=0, contribution_jpy=0)
+    ), encoding="utf-8")
 
     result = classify_execution_readiness({
         "ticker": "XLF", "type": "sell", "order_type": "limit", "limit_price": 55,
@@ -298,6 +311,192 @@ def test_cash_buy_requires_confirmed_identity_scoped_balance_without_time_expiry
         == "wife|sbi|nisa_growth|JPY|cash"
     )
 
+
+def test_wife_sbi_effective_cash_reserves_weekly_outflow_after_snapshot(tmp_path):
+    now = datetime(2026, 8, 13, 6, 0, tzinfo=JST)
+    (tmp_path / "holdings.json").write_text(json.dumps({
+        "CASH_JPY_SBI_WIFE": {
+            "ticker": "CASH_JPY_SBI_WIFE",
+            "shares": 192_886,
+            "available_to_trade_jpy": 192_886,
+            "currency": "JPY",
+            "balance_status": "confirmed",
+            "reconciliation_required": False,
+            "source_as_of": "2026-08-07T11:55:00+09:00",
+            # An inferred label is deliberately not proof that the 8/10 debit
+            # is included in the broker snapshot.
+            "reserved_current": 23_076,
+            "reserved_current_status": "inferred",
+        },
+    }), encoding="utf-8")
+
+    result = evaluate_cash_buying_power({
+        "ticker": "1489.T", "type": "buy", "quantity": 52, "limit_price": 3_509,
+        "execution_owner": "wife", "execution_broker": "sbi",
+        "execution_account": "NISA成長投資枠",
+    }, base_dir=tmp_path, now=now)
+
+    assert result["readiness"] == "blocked"
+    reason = result["reasons"][0]
+    assert reason["code"] == "cash_balance_insufficient"
+    capacity = reason["cash_capacity_observation"]
+    assert capacity["scheduled_outflows"]["amount"] == 92_304
+    assert capacity["scheduled_outflows"]["unreflected_amount"] == 23_076
+    assert capacity["scheduled_outflows"]["future_amount"] == 69_228
+    assert capacity["effective_cash"] == 100_582
+    assert capacity["capacity_valid_until"].startswith("2026-08-13")
+
+
+def test_future_dated_cash_snapshot_never_authorizes_buy(tmp_path):
+    now = datetime(2026, 8, 13, 6, 0, tzinfo=JST)
+    (tmp_path / "holdings.json").write_text(json.dumps({
+        "CASH_JPY_SBI_WIFE": {
+            "ticker": "CASH_JPY_SBI_WIFE",
+            "shares": 200_000,
+            "available_to_trade_jpy": 200_000,
+            "currency": "JPY",
+            "balance_status": "confirmed",
+            "reconciliation_required": False,
+            "source_as_of": (now + timedelta(hours=2)).isoformat(),
+        },
+    }), encoding="utf-8")
+
+    result = evaluate_cash_buying_power({
+        "ticker": "1489.T", "type": "buy", "quantity": 1, "limit_price": 3_500,
+        "execution_owner": "wife", "execution_broker": "sbi",
+        "execution_account": "NISA成長投資枠",
+    }, base_dir=tmp_path, now=now)
+
+    assert result["readiness"] == "blocked"
+    assert result["reasons"][0]["code"] == "cash_resource_future_dated"
+
+
+def test_capacity_resolution_exposes_effective_wallet_without_bypassing_readiness(tmp_path):
+    now = datetime(2026, 8, 13, 6, 0, tzinfo=JST)
+    (tmp_path / "holdings.json").write_text(json.dumps({
+        "CASH_JPY_SBI_WIFE": {
+            "ticker": "CASH_JPY_SBI_WIFE",
+            "shares": 192_886,
+            "available_to_trade_jpy": 192_886,
+            "currency": "JPY",
+            "balance_status": "confirmed",
+            "reconciliation_required": False,
+            "source_as_of": "2026-08-07T11:55:00+09:00",
+        },
+    }), encoding="utf-8")
+    action = {
+        "ticker": "1489.T", "type": "buy", "quantity": 150, "limit_price": 3_509,
+        "execution_owner": "wife", "execution_broker": "sbi",
+        "execution_account": "NISA成長投資枠",
+    }
+    normal = evaluate_cash_buying_power(action, base_dir=tmp_path, now=now)
+    capacity = resolve_cash_buying_capacity(action, base_dir=tmp_path, now=now)
+
+    assert normal["readiness"] == "blocked"
+    assert normal["reasons"][0]["code"] == "cash_balance_insufficient"
+    assert capacity["readiness"] == "ready"
+    assert capacity["effective_cash"] == 100_582
+    assert capacity["cash_capacity_observation"]["scheduled_outflows"]["amount"] == 92_304
+
+
+def test_readiness_reasons_include_scoped_fingerprint(tmp_path):
+    now = datetime(2026, 8, 13, 6, 0, tzinfo=JST)
+    _write_base(tmp_path, now, ticker="1489.T")
+    (tmp_path / "holdings.json").write_text(json.dumps({
+        "CASH_JPY_SBI_WIFE": {
+            "ticker": "CASH_JPY_SBI_WIFE", "shares": 10_000,
+            "available_to_trade_jpy": 10_000, "currency": "JPY",
+            "balance_status": "confirmed", "reconciliation_required": False,
+            "source_as_of": now.isoformat(),
+        },
+    }), encoding="utf-8")
+    result = classify_execution_readiness({
+        "ticker": "1489.T", "type": "buy", "quantity": 20, "limit_price": 3_500,
+        "order_type": "limit", "execution_owner": "wife", "execution_broker": "sbi",
+        "execution_account": "NISA成長投資枠",
+    }, base_dir=tmp_path, now=now)
+    reason = next(row for row in result["execution_block_reasons"] if row["code"] == "cash_balance_insufficient")
+    assert reason["reason_scope"] == "wallet"
+    assert reason["scope_key"].startswith("wallet:wife|sbi|nisa_growth|JPY")
+
+
+def test_opposite_execution_reason_is_ticker_scoped():
+    rows = annotate_reason_scopes(
+        {"ticker": "XLF"},
+        [{"code": "same_session_opposite_execution", "message": "recent opposite fill"}],
+    )
+
+    assert rows[0]["reason_scope"] == "ticker"
+    assert rows[0]["scope_key"] == "ticker:XLF"
+
+
+def test_claim_provenance_reason_remains_analysis_scoped():
+    rows = annotate_reason_scopes(
+        {"ticker": "XLF"},
+        [{"code": "claim_provenance_unverified", "message": "stale parents"}],
+    )
+
+    assert rows[0]["reason_scope"] == "analysis"
+    assert rows[0]["scope_key"] == "analysis:global"
+
+
+def test_capacity_below_minimum_is_blocked_with_dedicated_reason(tmp_path):
+    now = datetime(2026, 8, 14, 6, 15, tzinfo=JST)
+    _write_base(tmp_path, now, ticker="1306.T")
+    result = classify_execution_readiness({
+        "ticker": "1306.T", "type": "buy", "order_type": "limit",
+        "limit_price": 3_500, "quantity": 150,
+        "max_executable_quantity_below_minimum": True,
+        "max_executable_quantity": 40,
+        "minimum_executable_quantity": 50,
+        "max_executable_notional_jpy": 140_000,
+        "minimum_executable_notional_jpy": 175_000,
+        "capacity_shortfall_jpy": 35_000,
+    }, base_dir=tmp_path, now=now)
+
+    assert result["execution_readiness"] == "blocked"
+    reason = next(
+        row for row in result["execution_block_reasons"]
+        if row["code"] == "max_executable_quantity_below_minimum"
+    )
+    assert reason["capacity_shortfall_jpy"] == 35_000
+    assert "必要余力差額" in reason["message"]
+
+
+def test_live_ordered_buy_reserves_same_wallet_without_auto_release(tmp_path):
+    now = datetime(2026, 8, 13, 6, 0, tzinfo=JST)
+    (tmp_path / "holdings.json").write_text(json.dumps({
+        "CASH_JPY_SBI_WIFE": {
+            "ticker": "CASH_JPY_SBI_WIFE",
+            "shares": 200_000,
+            "available_to_trade_jpy": 200_000,
+            "currency": "JPY",
+            "balance_status": "confirmed",
+            "reconciliation_required": False,
+            "source_as_of": "2026-08-13T05:00:00+09:00",
+        },
+    }), encoding="utf-8")
+    (tmp_path / "action_executions.json").write_text(json.dumps({
+        "executions": [{
+            "id": "live-buy", "status": "ordered", "ticker": "1489.T",
+            "direction": "buy", "quantity": 20, "limit_price": 3_000,
+            "execution_owner": "wife", "execution_broker": "sbi",
+            "execution_account": "NISA成長投資枠",
+            "ordered_at": "2026-07-29T09:00:00+09:00",
+        }],
+    }), encoding="utf-8")
+
+    result = evaluate_cash_buying_power({
+        "ticker": "1489.T", "type": "buy", "quantity": 50, "limit_price": 3_000,
+        "execution_owner": "wife", "execution_broker": "sbi",
+        "execution_account": "NISA成長投資枠",
+    }, base_dir=tmp_path, now=now)
+
+    assert result["readiness"] == "blocked"
+    capacity = result["reasons"][0]["cash_capacity_observation"]
+    assert capacity["active_order_reservations"]["reserved_cash"] == 60_000
+    assert capacity["active_order_reservations"]["stale_reservation_count"] == 1
+    assert capacity["effective_cash"] == 70_772
 
 def test_cash_snapshot_is_invalidated_by_later_fill(tmp_path):
     now = datetime(2026, 7, 28, 9, 0, tzinfo=JST)
@@ -897,11 +1096,9 @@ def test_date_only_snapshot_timestamp_uses_file_mtime(tmp_path):
     (tmp_path / "macro_event_state.json").write_text(json.dumps({
         "status": "ok", "refreshed_at": now.isoformat(), "events": []
     }), encoding="utf-8")
-    (tmp_path / "execution_plan_state.json").write_text(json.dumps({
-        "status": "active",
-        "budgets": {"normal_pool_available_jpy": 100_000, "opportunity_pool_available_jpy": 0},
-        "contribution_summary": {"available_jpy": 100_000},
-    }), encoding="utf-8")
+    (tmp_path / "execution_plan_state.json").write_text(
+        json.dumps(_active_execution_plan(now)), encoding="utf-8"
+    )
 
     result = classify_execution_readiness({
         "ticker": "XLF", "type": "buy", "order_type": "limit", "limit_price": 56,
