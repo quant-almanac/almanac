@@ -254,6 +254,36 @@ def test_reproposal_suppression_starts_only_after_versioned_prior_day(tmp_path):
     assert suppressed[0]["reproposal_recheck_after"] == "2026-08-19"
 
 
+def test_reproposal_suppression_never_hides_human_review_candidates(tmp_path):
+    (tmp_path / "ai_recommendation_log.json").write_text(json.dumps([{
+        "as_of": "2026-08-13T06:15:00+09:00",
+        "ticker": "V",
+        "type": "buy",
+        "execution_readiness": "review",
+        "reproposal_policy_version": "candidate_retry_v1",
+        "reproposal_reason_fingerprint": ["market_quote_session_closed", "ticker:V"],
+        "execution_scope_key": "owner|broker|account|long",
+    }]), encoding="utf-8")
+    review = {
+        "ticker": "V", "type": "buy", "execution_readiness": "review",
+        "execution_owner": "owner", "execution_broker": "broker",
+        "execution_account": "account", "execution_investment_type": "long",
+        "execution_block_reasons": [{
+            "code": "market_quote_session_closed",
+            "reason_scope": "ticker",
+            "scope_key": "ticker:V",
+        }],
+    }
+
+    kept, suppressed = analyst._suppress_repeated_candidate_failures(
+        [review], base_dir=tmp_path,
+        now=datetime(2026, 8, 14, 6, 15, tzinfo=ZoneInfo("Asia/Tokyo")),
+    )
+
+    assert kept == [review]
+    assert suppressed == []
+
+
 def test_reproposal_suppression_reopens_on_scheduled_session(tmp_path):
     (tmp_path / "ai_recommendation_log.json").write_text(json.dumps([{
         "as_of": "2026-08-18T06:15:00+09:00",

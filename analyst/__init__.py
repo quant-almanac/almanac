@@ -5604,7 +5604,10 @@ def _suppress_repeated_candidate_failures(
             kept.append(action)
             continue
         action["reproposal_policy_version"] = _REPROPOSAL_POLICY_VERSION
-        if action.get("execution_readiness") == "ready":
+        # Human-review candidates are themselves useful output and must stay
+        # visible.  Reproposal suppression is only for deterministically
+        # blocked buys that cannot be acted on until a scoped constraint moves.
+        if action.get("execution_readiness") != "blocked":
             kept.append(action)
             continue
         rows = [row for row in action.get("execution_block_reasons") or [] if isinstance(row, dict)]
@@ -10534,8 +10537,16 @@ def _log_recommendations(synthesis: dict, market_meta: dict) -> None:
         _n_tracked = _record_acts(actions, source="opus")
         if _n_tracked:
             print(f"  📌 発注追跡登録: {_n_tracked}件 → action_state.json")
-    except Exception:
-        pass
+    except Exception as exc:
+        synthesis["action_state_tracking"] = {
+            "status": "error",
+            "error": f"{type(exc).__name__}: {str(exc)[:240]}",
+            "retry_required": True,
+        }
+        print(
+            f"  ⚠️ 発注追跡登録に失敗: {type(exc).__name__}: {str(exc)[:160]}",
+            file=sys.stderr,
+        )
 
 
 def _ensure_scenario_state_fresh(base_dir: Path = BASE_DIR, evaluator=None, *, force: bool = False) -> bool:

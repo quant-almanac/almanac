@@ -89,6 +89,32 @@ def test_cache_history_read_modify_write_is_serialized(tmp_path, monkeypatch) ->
     }
 
 
+def test_cache_failure_never_publishes_a_new_history_generation(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(utils, "LOCKS_DIR", tmp_path / "locks")
+    monkeypatch.setattr(cache, "CACHE_PATH", tmp_path / "analysis.json")
+    monkeypatch.setattr(cache, "HISTORY_PATH", tmp_path / "history.json")
+    original_write = cache.atomic_write_json
+
+    def fail_cache(path, data):
+        if path == cache.CACHE_PATH:
+            raise OSError("disk full")
+        return original_write(path, data)
+
+    monkeypatch.setattr(cache, "atomic_write_json", fail_cache)
+
+    try:
+        cache.save_cache({
+            "as_of": "2026-08-31 06:00",
+            "synthesis": {"analysis_id": "new", "overall_stance": "neutral"},
+        })
+    except OSError:
+        pass
+    else:
+        raise AssertionError("cache write failure was swallowed")
+
+    assert not cache.HISTORY_PATH.exists()
+
+
 def test_action_state_mutations_share_one_lock(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr(utils, "LOCKS_DIR", tmp_path / "locks")
     state_path = tmp_path / "action_state.json"

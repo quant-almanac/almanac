@@ -796,6 +796,8 @@ def _response_for_execution_record(record: dict, *, idempotent_replay: bool) -> 
         "margin_closed_position_ids": record.get("margin_closed_position_ids"),
         "margin_side": record.get("margin_side"),
         "position_key": record.get("position_key"),
+        "action_state_sync_status": record.get("action_state_sync_status"),
+        "action_state_sync_error": record.get("action_state_sync_error"),
     }
     return {
         "ok": True,
@@ -825,24 +827,20 @@ def _sync_action_state_for_execution(
     execution_position_keys: Optional[list[str]] = None,
 ) -> Optional[str]:
     """execution log と action_state の未完了アクションを同期する。"""
-    try:
-        from action_state_tracker import sync_execution_status
+    from action_state_tracker import sync_execution_status
 
-        return sync_execution_status(
-            ticker=ticker,
-            direction=direction,
-            execution_status=execution_status,
-            note=note,
-            action_state_id=action_state_id,
-            execution_owner=execution_owner,
-            execution_broker=execution_broker,
-            execution_account=execution_account,
-            execution_investment_type=execution_investment_type,
-            execution_position_keys=execution_position_keys,
-        )
-    except Exception as e:
-        print(f"[action_state] sync skip: {e}")
-        return None
+    return sync_execution_status(
+        ticker=ticker,
+        direction=direction,
+        execution_status=execution_status,
+        note=note,
+        action_state_id=action_state_id,
+        execution_owner=execution_owner,
+        execution_broker=execution_broker,
+        execution_account=execution_account,
+        execution_investment_type=execution_investment_type,
+        execution_position_keys=execution_position_keys,
+    )
 
 
 def _validate_action_state_link(req: ExecutionRequest) -> None:
@@ -2742,18 +2740,28 @@ async def save_execution(req: ExecutionRequest):
                 record["executed_despite_readiness"] = True
                 record["readiness_at_execution"] = linked_readiness
                 record["execution_block_reasons_at_execution"] = linked_block_reasons
-            action_state_id = _sync_action_state_for_execution(
-                ticker=req.ticker,
-                direction=req.direction.value,
-                execution_status=req.status.value,
-                note=f"execution:{exec_id} status={req.status.value}",
-                action_state_id=req.action_state_id,
-                execution_owner=req.execution_owner,
-                execution_broker=req.execution_broker,
-                execution_account=(req.account.value if req.account else None),
-                execution_investment_type=req.investment_type.value,
-                execution_position_keys=req.execution_position_keys,
-            )
+            try:
+                action_state_id = _sync_action_state_for_execution(
+                    ticker=req.ticker,
+                    direction=req.direction.value,
+                    execution_status=req.status.value,
+                    note=f"execution:{exec_id} status={req.status.value}",
+                    action_state_id=req.action_state_id,
+                    execution_owner=req.execution_owner,
+                    execution_broker=req.execution_broker,
+                    execution_account=(req.account.value if req.account else None),
+                    execution_investment_type=req.investment_type.value,
+                    execution_position_keys=req.execution_position_keys,
+                )
+                record["action_state_sync_status"] = "synced"
+            except Exception as exc:
+                # A broker fill/ledger event is an immutable fact and must not
+                # be rolled back because the derived action board is busy.
+                # Preserve an explicit retry marker instead of silently
+                # leaving a pending recommendation behind.
+                action_state_id = None
+                record["action_state_sync_status"] = "pending"
+                record["action_state_sync_error"] = f"{type(exc).__name__}: {str(exc)[:240]}"
             if action_state_id:
                 record["action_state_id"] = action_state_id
             records.append(record)
@@ -2971,8 +2979,10 @@ async def update_action_status(action_id: str, req: StatusPatchRequest):
         from action_state_tracker import update_status
         ok = update_status(action_id, req.status, note=req.note)
         return {"ok": ok, "action_id": action_id, "status": req.status}
+    except LockBusy as e:
+        raise HTTPException(status_code=409, detail="action state is busy; retry") from e
     except Exception as e:
-        return {"ok": False, "error": str(e)}
+        raise HTTPException(status_code=500, detail=f"action state update failed: {e}") from e
 
 
 @router.delete("/api/actions/executions/{exec_id}")
@@ -3181,18 +3191,25 @@ async def patch_execution(exec_id: str, req: ExecutionPatchRequest):
                     rec["portfolio_application_reasons"] = []
 
             if "status" in patch:
-                action_state_id = _sync_action_state_for_execution(
-                    ticker=rec.get("ticker") or "",
-                    direction=rec.get("direction") or "",
-                    execution_status=rec.get("status") or "",
-                    note=f"execution:{exec_id} status={rec.get('status')}",
-                    action_state_id=rec.get("action_state_id"),
-                    execution_owner=rec.get("execution_owner"),
-                    execution_broker=rec.get("execution_broker"),
-                    execution_account=rec.get("account"),
-                    execution_investment_type=rec.get("investment_type"),
-                    execution_position_keys=rec.get("execution_position_keys"),
-                )
+                try:
+                    action_state_id = _sync_action_state_for_execution(
+                        ticker=rec.get("ticker") or "",
+                        direction=rec.get("direction") or "",
+                        execution_status=rec.get("status") or "",
+                        note=f"execution:{exec_id} status={rec.get('status')}",
+                        action_state_id=rec.get("action_state_id"),
+                        execution_owner=rec.get("execution_owner"),
+                        execution_broker=rec.get("execution_broker"),
+                        execution_account=rec.get("account"),
+                        execution_investment_type=rec.get("investment_type"),
+                        execution_position_keys=rec.get("execution_position_keys"),
+                    )
+                    rec["action_state_sync_status"] = "synced"
+                    rec.pop("action_state_sync_error", None)
+                except Exception as exc:
+                    action_state_id = None
+                    rec["action_state_sync_status"] = "pending"
+                    rec["action_state_sync_error"] = f"{type(exc).__name__}: {str(exc)[:240]}"
                 if action_state_id:
                     rec["action_state_id"] = action_state_id
 

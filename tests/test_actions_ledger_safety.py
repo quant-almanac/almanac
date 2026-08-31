@@ -251,6 +251,40 @@ def test_ordered_to_executed_applies_once_with_stable_event_id(isolated_actions)
     assert record["event_id"] == "exec_order_1"
 
 
+def test_fill_persists_explicit_retry_marker_when_action_state_is_busy(
+    isolated_actions, monkeypatch,
+):
+    files = isolated_actions
+    _write_json(files["executions"], {"executions": [{
+        "id": "order_busy",
+        "ticker": "7203.T",
+        "direction": "buy",
+        "status": "ordered",
+        "price": 100.0,
+        "quantity": 1.0,
+        "currency": "JPY",
+        "investment_type": "medium",
+        "execution_owner": "husband",
+        "execution_broker": "rakuten",
+        "execution_position_keys": ["7203.T"],
+    }]})
+    monkeypatch.setattr(
+        actions,
+        "_sync_action_state_for_execution",
+        lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("action state busy")),
+    )
+
+    asyncio.run(actions.patch_execution(
+        "order_busy",
+        actions.ExecutionPatchRequest(status=actions.Status.executed),
+    ))
+
+    record = _read(files["executions"])["executions"][0]
+    assert record["portfolio_applied"] is True
+    assert record["action_state_sync_status"] == "pending"
+    assert "action state busy" in record["action_state_sync_error"]
+
+
 def test_ordered_to_web_confirmed_fill_persists_complete_evidence(isolated_actions):
     files = isolated_actions
     _write_json(files["holdings"], {

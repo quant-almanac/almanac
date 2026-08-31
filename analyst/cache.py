@@ -87,10 +87,13 @@ def save_cache(data: dict) -> None:
         if len(records) > HISTORY_MAX:
             records = records[-HISTORY_MAX:]
         hist["history"] = records
-        # Cache is the public commit marker.  History is completed first while
-        # the same lock prevents another writer from losing this append.
-        atomic_write_json(HISTORY_PATH, hist)
+        # The formal cache is the investment authority.  Commit it before the
+        # derived history so a history write can never advertise a generation
+        # that the authoritative cache failed to publish.  If history fails it
+        # may lag conservatively; the reverse ordering exposed a new analysis
+        # through history while execution still used the old cache.
         atomic_write_json(CACHE_PATH, data)
+        atomic_write_json(HISTORY_PATH, hist)
 
 
 def load_history_context() -> str:
