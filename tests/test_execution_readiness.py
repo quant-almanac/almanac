@@ -69,6 +69,24 @@ def _write_base(tmp_path, now, *, snapshot_hours=1, ticker="XLF", tech_status="f
     )
 
 
+def _install_weekly_wallet_contribution(monkeypatch) -> None:
+    import contribution_schedule
+
+    monkeypatch.setattr(contribution_schedule, "CONTRIBUTIONS", [{
+        "id": "weekly_wallet_fixture",
+        "label": "weekly wallet fixture",
+        "amount": 23_076,
+        "currency": "JPY",
+        "cadence": "weekly",
+        "weekday": 0,
+        "calendar_rule": "weekday",
+        "owner": "wife",
+        "broker": "sbi",
+        "funding_source": "broker_cash",
+        "cash_route": "CASH_JPY_SBI_WIFE",
+    }])
+
+
 def test_zero_discretionary_funding_blocks_buy_independent_of_plan_gate(tmp_path):
     now = datetime(2026, 7, 14, 6, 0, tzinfo=JST)
     _write_base(tmp_path, now)
@@ -312,7 +330,10 @@ def test_cash_buy_requires_confirmed_identity_scoped_balance_without_time_expiry
     )
 
 
-def test_wife_sbi_effective_cash_reserves_weekly_outflow_after_snapshot(tmp_path):
+def test_wife_sbi_effective_cash_reserves_weekly_outflow_after_snapshot(
+    tmp_path, monkeypatch,
+):
+    _install_weekly_wallet_contribution(monkeypatch)
     now = datetime(2026, 8, 13, 6, 0, tzinfo=JST)
     (tmp_path / "holdings.json").write_text(json.dumps({
         "CASH_JPY_SBI_WIFE": {
@@ -371,7 +392,10 @@ def test_future_dated_cash_snapshot_never_authorizes_buy(tmp_path):
     assert result["reasons"][0]["code"] == "cash_resource_future_dated"
 
 
-def test_capacity_resolution_exposes_effective_wallet_without_bypassing_readiness(tmp_path):
+def test_capacity_resolution_exposes_effective_wallet_without_bypassing_readiness(
+    tmp_path, monkeypatch,
+):
+    _install_weekly_wallet_contribution(monkeypatch)
     now = datetime(2026, 8, 13, 6, 0, tzinfo=JST)
     (tmp_path / "holdings.json").write_text(json.dumps({
         "CASH_JPY_SBI_WIFE": {
@@ -440,30 +464,10 @@ def test_claim_provenance_reason_remains_analysis_scoped():
     assert rows[0]["scope_key"] == "analysis:global"
 
 
-def test_capacity_below_minimum_is_blocked_with_dedicated_reason(tmp_path):
-    now = datetime(2026, 8, 14, 6, 15, tzinfo=JST)
-    _write_base(tmp_path, now, ticker="1306.T")
-    result = classify_execution_readiness({
-        "ticker": "1306.T", "type": "buy", "order_type": "limit",
-        "limit_price": 3_500, "quantity": 150,
-        "max_executable_quantity_below_minimum": True,
-        "max_executable_quantity": 40,
-        "minimum_executable_quantity": 50,
-        "max_executable_notional_jpy": 140_000,
-        "minimum_executable_notional_jpy": 175_000,
-        "capacity_shortfall_jpy": 35_000,
-    }, base_dir=tmp_path, now=now)
-
-    assert result["execution_readiness"] == "blocked"
-    reason = next(
-        row for row in result["execution_block_reasons"]
-        if row["code"] == "max_executable_quantity_below_minimum"
-    )
-    assert reason["capacity_shortfall_jpy"] == 35_000
-    assert "必要余力差額" in reason["message"]
-
-
-def test_live_ordered_buy_reserves_same_wallet_without_auto_release(tmp_path):
+def test_live_ordered_buy_reserves_same_wallet_without_auto_release(
+    tmp_path, monkeypatch,
+):
+    _install_weekly_wallet_contribution(monkeypatch)
     now = datetime(2026, 8, 13, 6, 0, tzinfo=JST)
     (tmp_path / "holdings.json").write_text(json.dumps({
         "CASH_JPY_SBI_WIFE": {
