@@ -19,6 +19,7 @@ import requests
 import yfinance as yf
 from datetime import datetime
 from pathlib import Path
+from utils import LockBusy, process_lock
 
 BASE_DIR = Path(__file__).parent
 OUTPUT_FILE = BASE_DIR / 'social_sentiment.json'
@@ -61,7 +62,7 @@ SHADOW_HISTORY_FILE = BASE_DIR / 'data' / 'social_sentiment_shadow.jsonl'
 SHADOW_SCHEMA_VERSION = 'social_shadow_v1'
 
 
-def _append_shadow_history(result: dict) -> bool:
+def _append_shadow_history_unlocked(result: dict) -> bool:
     """日次の集計値を append-only の shadow 履歴へ残す。
 
     ⚠️ social_sentiment.json は毎日上書きされるため、そのままでは
@@ -175,6 +176,17 @@ def _append_shadow_history(result: dict) -> bool:
     except Exception as exc:
         print(f"[social_screener] shadow 履歴の追記に失敗 (本処理は継続): {exc}",
               file=_sys.stderr)
+        return False
+
+
+def _append_shadow_history(result: dict) -> bool:
+    """Atomically reconcile and append one collection run."""
+    import sys as _sys
+    try:
+        with process_lock("social_shadow_history", timeout=30):
+            return _append_shadow_history_unlocked(result)
+    except LockBusy as exc:
+        print(f"[social_screener] shadow 履歴 lock timeout: {exc}", file=_sys.stderr)
         return False
 
 

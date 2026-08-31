@@ -23,6 +23,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+from utils import LockBusy, process_lock
 
 BASE_DIR = Path(__file__).parent
 sys.path.insert(0, str(BASE_DIR))
@@ -234,7 +235,7 @@ def _build_user_prompt(heated: list[dict], news_map: dict[str, list[str]]) -> st
     return "\n".join(lines)
 
 
-def analyze(dry_run: bool = False) -> dict:
+def _analyze_unlocked(dry_run: bool = False) -> dict:
     from topic_lane_contract import (
         ERROR_PARSE,
         ERROR_SCHEMA,
@@ -404,6 +405,21 @@ def analyze(dry_run: bool = False) -> dict:
         "model": res.get("model"),
         "usage": res.get("usage"),
     })
+
+
+def analyze(dry_run: bool = False) -> dict:
+    """Serialize the cost-incurring lane across cron and manual callers."""
+    try:
+        with process_lock("social_topic_analysis", timeout=0):
+            return _analyze_unlocked(dry_run=dry_run)
+    except LockBusy:
+        return {
+            "schema_version": "topic_lane_v1",
+            "lane": LANE,
+            "run_status": "already_running",
+            "write_suppressed": True,
+            "evaluations": [],
+        }
 
 
 def format_for_prompt(max_entries: int = 8) -> str:

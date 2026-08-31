@@ -641,6 +641,80 @@ def test_social_shadow_history_does_not_duplicate_the_same_run(tmp_path, monkeyp
     assert len(rows) == 2, f"同一 run が重複している: {len(rows)} 行"
 
 
+def test_topic_analyzers_reject_overlapping_runs(monkeypatch):
+    import news_topic_analyzer as nt
+    import social_topic_analyzer as st
+    from utils import LockBusy
+
+    class Busy:
+        def __enter__(self):
+            raise LockBusy("busy")
+
+        def __exit__(self, *_args):
+            return False
+
+    monkeypatch.setattr(nt, "process_lock", lambda *_args, **_kwargs: Busy())
+    monkeypatch.setattr(st, "process_lock", lambda *_args, **_kwargs: Busy())
+    monkeypatch.setattr(nt, "_analyze_unlocked", lambda **_kwargs: (_ for _ in ()).throw(
+        AssertionError("overlapping news run reached LLM path")))
+    monkeypatch.setattr(st, "_analyze_unlocked", lambda **_kwargs: (_ for _ in ()).throw(
+        AssertionError("overlapping social run reached LLM path")))
+
+    news = nt.analyze()
+    social = st.analyze()
+    assert news["run_status"] == "already_running"
+    assert social["run_status"] == "already_running"
+    assert news["write_suppressed"] is True
+    assert social["write_suppressed"] is True
+
+
+def test_news_finish_uses_atomic_writer(tmp_path, monkeypatch):
+    import news_topic_analyzer as nt
+
+    calls = []
+    monkeypatch.setattr(nt, "OUTPUT_FILE", tmp_path / "out.json")
+    monkeypatch.setattr(nt, "atomic_write_json", lambda path, value: calls.append((path, value)))
+    monkeypatch.setattr(nt, "_load_candidates", lambda: ([], 0, "2026-08-31", "empty"))
+    monkeypatch.setattr(nt, "write_heartbeat", lambda *_args, **_kwargs: None)
+
+    out = nt._analyze_unlocked()
+    assert out["run_status"] == "no_candidates"
+    assert calls and calls[0][0] == nt.OUTPUT_FILE
+
+
+def test_social_shadow_wrapper_serializes_threads(tmp_path, monkeypatch):
+    import threading
+    import time
+
+    import social_screener as ss
+    import utils
+
+    monkeypatch.setattr(utils, "LOCKS_DIR", tmp_path / "locks")
+    active = 0
+    max_active = 0
+    guard = threading.Lock()
+
+    def slow_unlocked(_result):
+        nonlocal active, max_active
+        with guard:
+            active += 1
+            max_active = max(max_active, active)
+        time.sleep(0.08)
+        with guard:
+            active -= 1
+        return True
+
+    monkeypatch.setattr(ss, "_append_shadow_history_unlocked", slow_unlocked)
+    threads = [threading.Thread(target=ss._append_shadow_history, args=({},)) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=2)
+
+    assert all(not thread.is_alive() for thread in threads)
+    assert max_active == 1
+
+
 def test_social_shadow_distinguishes_total_failure_from_not_running(tmp_path, monkeypatch):
     """全銘柄の取得に失敗した日でも記録を残す。
 

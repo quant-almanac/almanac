@@ -69,6 +69,7 @@ from topic_lane_contract import (  # noqa: E402
     validate_rows,
     write_heartbeat,
 )
+from utils import LockBusy, atomic_write_json, process_lock  # noqa: E402
 
 LANE = "news_topic"
 # 成果物 (news_topic_analysis.json) の鮮度契約: 週末越しの再利用を許す 72h。
@@ -438,7 +439,7 @@ def _run_one_batch(
     }
 
 
-def analyze(dry_run: bool = False) -> dict:
+def _analyze_unlocked(dry_run: bool = False) -> dict:
     run_id = f"news-{time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6]}"
     started_at = time.time()
     selected, input_count, source_as_of, input_state = _load_candidates()
@@ -450,8 +451,7 @@ def analyze(dry_run: bool = False) -> dict:
             **record,
         }
         if not dry_run:
-            OUTPUT_FILE.write_text(
-                json.dumps(out, indent=2, ensure_ascii=False), encoding="utf-8")
+            atomic_write_json(OUTPUT_FILE, out)
             # ⚠️ 分母はバッチ数。selected_count (銘柄数) を使うと
             # 「2/20 batches ok」のように実際の 4 バッチと食い違う。
             print(f"[news_topic] run={run_id} status={record['run_status']} "
@@ -654,6 +654,23 @@ def analyze(dry_run: bool = False) -> dict:
     # format_for_prompt() の injection_gate が run_status を見て決める —— ここで
     # 「一部だけ分析できた結果」を全体の所見として通さない。
     return _finish(record, analyses)
+
+
+def analyze(dry_run: bool = False) -> dict:
+    """Run one cost-bounded analysis at a time across cron/API/manual callers."""
+    try:
+        with process_lock("news_topic_analysis", timeout=0):
+            return _analyze_unlocked(dry_run=dry_run)
+    except LockBusy:
+        # Do not overwrite the in-flight run's artifact or heartbeat.  The
+        # caller gets an explicit non-success result and may retry later.
+        return {
+            "schema_version": "topic_lane_v1",
+            "lane": LANE,
+            "run_status": "already_running",
+            "write_suppressed": True,
+            "analyses": [],
+        }
 
 
 def format_for_prompt(max_entries: int = 10) -> str:
