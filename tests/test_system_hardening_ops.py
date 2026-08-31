@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 from datetime import date, datetime
+from contextlib import contextmanager
 import json
 from pathlib import Path
 import sqlite3
 import subprocess
 import tarfile
+import threading
 
 import backup_manager as bm
 from catalyst_outcome_catchup import run_catchup
@@ -257,6 +259,33 @@ def test_offsite_never_reports_copied_when_remote_check_fails(tmp_path, monkeypa
     assert "remote_verification_failed" in result["reason"]
 
 
+def test_verify_offsite_checks_latest_generation_without_copying(tmp_path, monkeypatch):
+    source = tmp_path / "20260612"
+    source.mkdir()
+    monkeypatch.setattr(bm, "BACKUP_DIR", tmp_path)
+    monkeypatch.setattr(
+        bm,
+        "verify_snapshot",
+        lambda *_a, **_k: {"status": "ok", "date": "20260612"},
+    )
+    monkeypatch.setattr(bm, "_find_rclone", lambda: "/usr/bin/rclone")
+    commands = []
+
+    def fake_runner(cmd, **_kwargs):
+        commands.append(cmd)
+        if cmd[1] == "listremotes":
+            return subprocess.CompletedProcess(cmd, 0, stdout="crypt-gdrive:\n", stderr="")
+        if cmd[1] == "check":
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+        raise AssertionError(cmd)
+
+    result = bm.verify_offsite_snapshot("20260612", runner=fake_runner)
+
+    assert result["status"] == "ok"
+    assert result["verified"] is True
+    assert [cmd[1] for cmd in commands] == ["listremotes", "check"]
+
+
 def test_snapshot_rerun_replaces_generation_without_stale_files(tmp_path, monkeypatch):
     root = tmp_path / "repo"
     root.mkdir()
@@ -334,6 +363,114 @@ def test_verify_snapshot_detects_extra_and_modified_files(tmp_path, monkeypatch)
     result = bm.verify_snapshot("20260831")
     assert result["status"] == "error"
     assert any(row.get("reason") == "sha256_mismatch" for row in result["issues"])
+
+
+def test_verify_snapshot_treats_nested_manifest_as_an_unexpected_file(tmp_path, monkeypatch):
+    root = tmp_path / "repo"
+    root.mkdir()
+    backup_dir = root / "backups"
+    backup_dir.mkdir()
+    monkeypatch.setattr(bm, "BASE_DIR", root)
+    monkeypatch.setattr(bm, "BACKUP_DIR", backup_dir)
+    monkeypatch.setattr(bm, "TARGETS", ["account.json"])
+    monkeypatch.setattr(bm, "REQUIRED_TARGETS", ["account.json"])
+    monkeypatch.setattr(bm, "SQLITE_TARGETS", [])
+    monkeypatch.setattr(bm, "REQUIRED_SQLITE_TARGETS", [])
+    monkeypatch.setattr(bm, "EVIDENCE_DIRECTORIES", [])
+    (root / "account.json").write_text('{"cash": 1}', encoding="utf-8")
+    bm.snapshot(date(2026, 8, 31))
+    nested = backup_dir / "20260831" / "extra" / "manifest.json"
+    nested.parent.mkdir()
+    nested.write_text("{}", encoding="utf-8")
+
+    result = bm.verify_snapshot("20260831")
+
+    assert result["status"] == "error"
+    mismatch = next(row for row in result["issues"] if row.get("reason") == "file_set_mismatch")
+    assert "extra/manifest.json" in mismatch["unexpected"]
+
+
+def test_verify_snapshot_rejects_manifest_paths_outside_generation(tmp_path, monkeypatch):
+    backup_dir = tmp_path / "backups"
+    snapshot_dir = backup_dir / "20260831"
+    snapshot_dir.mkdir(parents=True)
+    outside = backup_dir / "outside.json"
+    outside.write_text("secret", encoding="utf-8")
+    (snapshot_dir / "manifest.json").write_text(json.dumps({
+        "schema_version": 2,
+        "status": "complete",
+        "expected_files": ["../../outside.json"],
+        "hashes": {"../../outside.json": bm._sha256(outside)},
+        "artifact_hashes": {},
+        "missing_required": [],
+    }), encoding="utf-8")
+    monkeypatch.setattr(bm, "BACKUP_DIR", backup_dir)
+
+    result = bm.verify_snapshot("20260831")
+
+    assert result["status"] == "error"
+    assert any(row.get("reason") == "invalid_manifest_path" for row in result["issues"])
+
+
+def test_offsite_and_rotation_share_generation_lock(tmp_path, monkeypatch):
+    backup_dir = tmp_path / "backups"
+    source = backup_dir / "20200101"
+    source.mkdir(parents=True)
+    monkeypatch.setattr(bm, "BACKUP_DIR", backup_dir)
+    monkeypatch.setattr(bm, "verify_snapshot", lambda *_a, **_k: {"status": "ok"})
+    monkeypatch.setattr(bm, "_find_rclone", lambda: "/usr/bin/rclone")
+    shared_lock = threading.Lock()
+    sync_started = threading.Event()
+    release_sync = threading.Event()
+
+    @contextmanager
+    def fake_process_lock(name, **_kwargs):
+        lock = shared_lock if name == "backup_snapshot" else threading.Lock()
+        with lock:
+            yield
+
+    def fake_runner(cmd, **_kwargs):
+        if cmd[1] == "listremotes":
+            return subprocess.CompletedProcess(cmd, 0, stdout="crypt-gdrive:\n", stderr="")
+        if cmd[1] == "sync":
+            sync_started.set()
+            assert release_sync.wait(2)
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+        if cmd[1] == "check":
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+        raise AssertionError(cmd)
+
+    monkeypatch.setattr(bm, "process_lock", fake_process_lock)
+    offsite = threading.Thread(
+        target=lambda: bm.offsite_copy(date(2020, 1, 1), runner=fake_runner)
+    )
+    rotate = threading.Thread(target=lambda: bm.rotate(date(2026, 8, 31)))
+    offsite.start()
+    assert sync_started.wait(2)
+    rotate.start()
+    assert source.exists()
+    release_sync.set()
+    offsite.join(2)
+    rotate.join(2)
+    assert not source.exists()
+
+
+def test_offsite_skip_is_failure_unless_explicitly_allowed():
+    skipped = {"status": "skipped", "reason": "remote_not_configured"}
+    assert bm._offsite_exit_code(skipped) == 1
+    assert bm._offsite_exit_code(skipped, allow_skip=True) == 0
+    assert bm._offsite_exit_code({"status": "copied", "verified": True}) == 0
+
+
+def test_backup_required_targets_are_real_targets_and_include_risk_authorities():
+    assert len(bm.TARGETS) == len(set(bm.TARGETS))
+    assert set(bm.REQUIRED_TARGETS).issubset(bm.TARGETS)
+    assert {
+        "guard_state.json",
+        "execution_invalidation_state.json",
+        "execution_reconciliation_state.json",
+        "drawdown_state.json",
+    }.issubset(bm.REQUIRED_TARGETS)
 
 
 def test_restore_rejects_traversal_and_dry_run_has_no_side_effect(tmp_path, monkeypatch):

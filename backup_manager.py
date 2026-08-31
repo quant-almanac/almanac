@@ -119,13 +119,22 @@ TARGETS = [
 REQUIRED_TARGETS = [
     'holdings.json',
     'account.json',
+    'guard_state.json',
     'action_state.json',
     'action_executions.json',
+    'execution_invalidation_state.json',
+    'execution_reconciliation_state.json',
+    'drawdown_state.json',
     'trade_history.csv',
     'nisa_portfolio.json',
     'cash_transactions.json',
 ]
 OPTIONAL_TARGETS = [rel for rel in TARGETS if rel not in REQUIRED_TARGETS]
+
+if len(TARGETS) != len(set(TARGETS)):
+    raise RuntimeError('backup TARGETS contains duplicate paths')
+if not set(REQUIRED_TARGETS).issubset(TARGETS):
+    raise RuntimeError('REQUIRED_TARGETS must be a subset of TARGETS')
 
 # ⚠️ TARGETS はファイルの明示リストであって、snapshot() のコピーは
 # shutil.copy2(src, dst) を直に呼ぶ。ここへディレクトリを1行足すと
@@ -422,22 +431,70 @@ def offsite_copy(
 ) -> dict:
     """Mirror one verified generation and verify the remote byte set."""
     today = today or date.today()
-    source = BACKUP_DIR / today.strftime('%Y%m%d')
-    if not source.exists():
-        return {'status': 'skipped', 'reason': 'backup_missing', 'source': str(source)}
-    local_verification = verify_snapshot(today.strftime('%Y%m%d'))
-    if local_verification.get('status') != 'ok':
+    with process_lock('backup_snapshot', timeout=30.0):
+        source = BACKUP_DIR / today.strftime('%Y%m%d')
+        if not source.exists():
+            return {'status': 'skipped', 'reason': 'backup_missing', 'source': str(source)}
+        local_verification = verify_snapshot(
+            today.strftime('%Y%m%d'),
+            runner=runner,
+            _already_locked=True,
+        )
+        if local_verification.get('status') != 'ok':
+            return {
+                'status': 'error',
+                'reason': 'local_backup_verification_failed',
+                'source': str(source),
+                'verification': local_verification,
+            }
+
+        resolved = _configured_offsite(remote=remote, runner=runner)
+        if resolved.get('status') != 'ok':
+            return resolved
+        rclone = str(resolved['rclone'])
+        destination_root = str(resolved['destination_root'])
+        destination = f"{destination_root}/{today.strftime('%Y%m%d')}"
+        copied = runner(
+            [rclone, 'sync', str(source), destination],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if copied.returncode != 0:
+            return {
+                'status': 'error',
+                'reason': (copied.stderr or copied.stdout).strip()[:500],
+                'destination': destination,
+            }
+        checked = runner(
+            [rclone, 'check', str(source), destination, '--download'],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if checked.returncode != 0:
+            return {
+                'status': 'error',
+                'reason': f"remote_verification_failed:{(checked.stderr or checked.stdout).strip()[:400]}",
+                'source': str(source),
+                'destination': destination,
+            }
         return {
-            'status': 'error',
-            'reason': 'local_backup_verification_failed',
+            'status': 'copied',
             'source': str(source),
-            'verification': local_verification,
+            'destination': destination,
+            'verified': True,
         }
 
+
+def _configured_offsite(
+    *,
+    remote: str | None,
+    runner: Callable[..., subprocess.CompletedProcess],
+) -> dict:
     rclone = _find_rclone()
     if not rclone:
         return {'status': 'skipped', 'reason': 'rclone_not_installed'}
-
     destination_root = (
         remote
         or get_env('ALMANAC_OFFSITE_REMOTE', DEFAULT_OFFSITE_REMOTE)
@@ -460,39 +517,57 @@ def offsite_copy(
     }
     if remotes.returncode != 0 or remote_name not in configured:
         return {'status': 'skipped', 'reason': f'remote_not_configured:{remote_name}'}
+    return {
+        'status': 'ok',
+        'rclone': rclone,
+        'destination_root': destination_root,
+    }
 
-    destination = f"{destination_root}/{today.strftime('%Y%m%d')}"
-    copied = runner(
-        [rclone, 'sync', str(source), destination],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    if copied.returncode != 0:
+
+def verify_offsite_snapshot(
+    backup_date: str | None = None,
+    *,
+    remote: str | None = None,
+    runner: Callable[..., subprocess.CompletedProcess] = subprocess.run,
+) -> dict:
+    """Verify a published local generation against its offsite mirror."""
+    with process_lock('backup_snapshot', timeout=30.0):
+        local = verify_snapshot(backup_date, runner=runner, _already_locked=True)
+        if local.get('status') != 'ok':
+            return {'status': 'error', 'reason': 'local_backup_verification_failed', 'local': local}
+        backup_date = str(local['date'])
+        source = BACKUP_DIR / backup_date
+        resolved = _configured_offsite(remote=remote, runner=runner)
+        if resolved.get('status') != 'ok':
+            return resolved
+        destination = f"{resolved['destination_root']}/{backup_date}"
+        checked = runner(
+            [str(resolved['rclone']), 'check', str(source), destination, '--download'],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if checked.returncode != 0:
+            return {
+                'status': 'error',
+                'reason': f"remote_verification_failed:{(checked.stderr or checked.stdout).strip()[:400]}",
+                'source': str(source),
+                'destination': destination,
+            }
         return {
-            'status': 'error',
-            'reason': (copied.stderr or copied.stdout).strip()[:500],
-            'destination': destination,
-        }
-    checked = runner(
-        [rclone, 'check', str(source), destination, '--download'],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    if checked.returncode != 0:
-        return {
-            'status': 'error',
-            'reason': f"remote_verification_failed:{(checked.stderr or checked.stdout).strip()[:400]}",
+            'status': 'ok',
             'source': str(source),
             'destination': destination,
+            'verified': True,
         }
-    return {
-        'status': 'copied',
-        'source': str(source),
-        'destination': destination,
-        'verified': True,
-    }
+
+
+def _offsite_exit_code(result: dict, *, allow_skip: bool = False) -> int:
+    if result.get('status') in {'copied', 'ok'} and result.get('verified') is True:
+        return 0
+    if allow_skip and result.get('status') == 'skipped':
+        return 0
+    return 1
 
 
 def _find_rclone() -> str | None:
@@ -513,7 +588,8 @@ def _parse_backup_date(dirname: str) -> date | None:
 
 
 def _manifest_artifact_hashes(manifest: dict) -> dict[str, str]:
-    hashes = dict(manifest.get('artifact_hashes') or {})
+    raw_hashes = manifest.get('artifact_hashes') or {}
+    hashes = dict(raw_hashes) if isinstance(raw_hashes, dict) else {}
     metas = [manifest.get('repo_bundle')]
     metas.extend((manifest.get('nested_repo_bundles') or {}).values())
     metas.extend((manifest.get('worktree_archives') or {}).values())
@@ -545,6 +621,23 @@ def _snapshot_manifest(snapshot_dir: Path) -> tuple[dict | None, list[dict]]:
     return manifest, issues
 
 
+def _validated_manifest_rel(snapshot_dir: Path, raw: object) -> tuple[str | None, str | None]:
+    """Return a contained POSIX relative path from an untrusted manifest value."""
+    if not isinstance(raw, str) or not raw or '\x00' in raw:
+        return None, 'invalid_manifest_path'
+    rel = Path(raw)
+    if rel.is_absolute() or '..' in rel.parts:
+        return None, 'invalid_manifest_path'
+    normalized = rel.as_posix()
+    if normalized in {'', '.', 'manifest.json'}:
+        return None, 'invalid_manifest_path'
+    try:
+        (snapshot_dir / rel).resolve(strict=False).relative_to(snapshot_dir.resolve())
+    except ValueError:
+        return None, 'manifest_path_outside_snapshot'
+    return normalized, None
+
+
 def _sqlite_integrity_without_sidecars(path: Path) -> str | None:
     """Check a backup copy without opening the published file in place."""
     with tempfile.TemporaryDirectory(prefix='almanac-backup-verify.') as tmp:
@@ -573,8 +666,16 @@ def verify_snapshot(
     backup_date: str | None = None,
     *,
     runner: Callable[..., subprocess.CompletedProcess] = subprocess.run,
+    _already_locked: bool = False,
 ) -> dict:
     """Verify exact contents, hashes, SQLite images, bundles, and archives."""
+    if not _already_locked:
+        with process_lock('backup_snapshot', timeout=30.0):
+            return verify_snapshot(
+                backup_date,
+                runner=runner,
+                _already_locked=True,
+            )
     if backup_date is None:
         dates = sorted(
             entry.name for entry in BACKUP_DIR.iterdir()
@@ -591,16 +692,54 @@ def verify_snapshot(
     if manifest is None:
         return {'status': 'error', 'date': str(backup_date), 'issues': issues}
 
-    file_hashes = {str(k): str(v) for k, v in (manifest.get('hashes') or {}).items() if v}
-    artifact_hashes = _manifest_artifact_hashes(manifest)
+    file_hashes: dict[str, str] = {}
+    artifact_hashes: dict[str, str] = {}
+    for bucket, raw_hashes in (
+        (file_hashes, manifest.get('hashes') or {}),
+        (artifact_hashes, _manifest_artifact_hashes(manifest)),
+    ):
+        if not isinstance(raw_hashes, dict):
+            issues.append({'file': 'manifest.json', 'reason': 'hashes_not_an_object'})
+            continue
+        for raw_rel, raw_hash in raw_hashes.items():
+            rel, reason = _validated_manifest_rel(snapshot_dir, raw_rel)
+            if reason:
+                issues.append({
+                    'file': 'manifest.json',
+                    'reason': reason,
+                    'path': str(raw_rel),
+                })
+                continue
+            if not isinstance(raw_hash, str) or not re.fullmatch(r'[0-9a-f]{64}', raw_hash):
+                issues.append({
+                    'file': 'manifest.json',
+                    'reason': 'invalid_sha256',
+                    'path': rel,
+                })
+                continue
+            bucket[rel] = raw_hash
     expected_hashes = {**file_hashes, **artifact_hashes}
-    expected = set(manifest.get('expected_files') or expected_hashes)
+    expected: set[str] = set()
+    raw_expected = manifest.get('expected_files') or expected_hashes
+    if not isinstance(raw_expected, (list, tuple, set, dict)):
+        issues.append({'file': 'manifest.json', 'reason': 'expected_files_not_a_collection'})
+        raw_expected = []
+    for raw_rel in raw_expected:
+        rel, reason = _validated_manifest_rel(snapshot_dir, raw_rel)
+        if reason:
+            issues.append({
+                'file': 'manifest.json',
+                'reason': reason,
+                'path': str(raw_rel),
+            })
+            continue
+        expected.add(rel)
     if manifest.get('schema_version') == 2 and expected != set(expected_hashes):
         issues.append({'file': 'manifest.json', 'reason': 'unhashed_expected_file'})
     actual = {
         str(path.relative_to(snapshot_dir))
         for path in snapshot_dir.rglob('*')
-        if path.is_file() and path.name != 'manifest.json'
+        if path.is_file() and path.relative_to(snapshot_dir).as_posix() != 'manifest.json'
     }
     for path in snapshot_dir.rglob('*'):
         if path.is_symlink():
@@ -669,36 +808,35 @@ def rotate(today: date = None) -> dict:
     kept = []
     removed = []
 
-    for entry in sorted(BACKUP_DIR.iterdir()):
-        if not entry.is_dir():
-            continue
-        bdate = _parse_backup_date(entry.name)
-        if bdate is None:
-            continue
-        age = (today - bdate).days
+    with process_lock('backup_snapshot', timeout=30.0):
+        for entry in sorted(BACKUP_DIR.iterdir()):
+            if not entry.is_dir():
+                continue
+            bdate = _parse_backup_date(entry.name)
+            if bdate is None:
+                continue
+            age = (today - bdate).days
 
-        keep = False
-        if age <= DAILY_RETENTION_DAYS:
-            keep = True
-        elif age <= WEEKLY_RETENTION_DAYS:
-            # 週次（月曜のみ）
-            keep = (bdate.weekday() == 0)
-        elif age <= MONTHLY_RETENTION_DAYS:
-            # 月次（1日のみ）
-            keep = (bdate.day == 1)
-        else:
             keep = False
+            if age <= DAILY_RETENTION_DAYS:
+                keep = True
+            elif age <= WEEKLY_RETENTION_DAYS:
+                # 週次（月曜のみ）
+                keep = (bdate.weekday() == 0)
+            elif age <= MONTHLY_RETENTION_DAYS:
+                # 月次（1日のみ）
+                keep = (bdate.day == 1)
 
-        if keep:
-            kept.append(entry.name)
-        else:
-            shutil.rmtree(entry)
-            removed.append(entry.name)
+            if keep:
+                kept.append(entry.name)
+            else:
+                shutil.rmtree(entry)
+                removed.append(entry.name)
 
     return {'kept': kept, 'removed': removed, 'rotated_at': today.isoformat()}
 
 
-def verify() -> dict:
+def verify(*, include_offsite: bool = False) -> dict:
     """
     重要 JSON ファイルの妥当性を検査し、破損検知時は最新バックアップを提案する。
     """
@@ -781,6 +919,17 @@ def verify() -> dict:
             'reason': 'latest_generation_verification_failed',
             'issues': backup_verification.get('issues'),
         })
+    offsite_verification = (
+        verify_offsite_snapshot(backup_verification.get('date'))
+        if include_offsite and backup_verification.get('status') == 'ok'
+        else {'status': 'not_requested'}
+    )
+    if include_offsite and offsite_verification.get('status') != 'ok':
+        broken.append({
+            'file': 'offsite_backup',
+            'reason': 'offsite_verification_failed',
+            'verification': offsite_verification,
+        })
 
     return {
         'verified_at': datetime.now().isoformat(),
@@ -789,6 +938,7 @@ def verify() -> dict:
         'missing_required': missing_required,
         'missing_optional': missing_optional,
         'backup_verification': backup_verification,
+        'offsite_verification': offsite_verification,
         'restore_suggestions': restore_suggestions,
     }
 
@@ -845,28 +995,39 @@ def restore(backup_date: str, file_rel: str, *, confirm: bool = False) -> bool:
     """
     指定日のバックアップから特定ファイルを復元する（現状ファイルは .bak に退避）。
     """
-    resolved = _validated_restore_paths(backup_date, file_rel)
-    if resolved is None:
-        return False
-    src, dst, _manifest = resolved
+    with process_lock('backup_snapshot', timeout=30.0):
+        verification = verify_snapshot(backup_date, _already_locked=True)
+        if verification.get('status') != 'ok':
+            print(f"[restore] バックアップ検証失敗: {verification.get('issues')}")
+            return False
+        resolved = _validated_restore_paths(backup_date, file_rel)
+        if resolved is None:
+            return False
+        src, dst, manifest = resolved
 
-    if not confirm:
-        print(f'[restore] 確認: {src} -> {dst} ? (--yes で実行)')
-        return False
+        if not confirm:
+            print(f'[restore] 確認: {src} -> {dst} ? (--yes で実行)')
+            return False
 
-    with process_lock('portfolio_ledger', timeout=30.0):
-        if dst.exists():
-            backup_current = dst.with_suffix(dst.suffix + '.bak')
-            shutil.copy2(dst, backup_current)
-            print(f'[restore] 現在ファイルを退避: {backup_current}')
-        dst.parent.mkdir(exist_ok=True, parents=True)
-        restore_tmp = dst.with_name(f'.{dst.name}.restore.{os.getpid()}')
-        try:
-            shutil.copy2(src, restore_tmp)
-            os.replace(restore_tmp, dst)
-        finally:
-            if restore_tmp.exists():
-                restore_tmp.unlink()
+        expected_hash = str((manifest.get('hashes') or {}).get(file_rel) or '')
+        with process_lock('portfolio_ledger', timeout=30.0):
+            # Recheck under both locks immediately before copying.  This closes
+            # the validation-to-copy replacement window.
+            if not expected_hash or _sha256(src) != expected_hash:
+                print(f'[restore] 復元直前のhash不一致: {src}')
+                return False
+            if dst.exists():
+                backup_current = dst.with_suffix(dst.suffix + '.bak')
+                shutil.copy2(dst, backup_current)
+                print(f'[restore] 現在ファイルを退避: {backup_current}')
+            dst.parent.mkdir(exist_ok=True, parents=True)
+            restore_tmp = dst.with_name(f'.{dst.name}.restore.{os.getpid()}')
+            try:
+                shutil.copy2(src, restore_tmp)
+                os.replace(restore_tmp, dst)
+            finally:
+                if restore_tmp.exists():
+                    restore_tmp.unlink()
     print(f'[restore] 復元完了: {dst} <- {src}')
     return True
 
@@ -876,9 +1037,21 @@ if __name__ == '__main__':
     sub = parser.add_subparsers(dest='cmd', required=True)
 
     sub.add_parser('snapshot', help='今日のバックアップを作成')
-    sub.add_parser('offsite', help='当日バックアップを rclone crypt remote へコピー')
+    offsite_parser = sub.add_parser(
+        'offsite', help='当日バックアップを rclone crypt remote へコピー'
+    )
+    offsite_parser.add_argument(
+        '--allow-skip',
+        action='store_true',
+        help='remote未設定等のskippedを明示的に成功扱いする',
+    )
     sub.add_parser('rotate',   help='古いバックアップを削除（7d/30d/365d ローテ）')
-    sub.add_parser('verify',   help='重要ファイルの妥当性検査')
+    verify_parser = sub.add_parser('verify', help='重要ファイルの妥当性検査')
+    verify_parser.add_argument(
+        '--offsite',
+        action='store_true',
+        help='最新世代をoffsite mirrorともbyte照合する',
+    )
 
     r = sub.add_parser('restore', help='特定日のバックアップから復元')
     r.add_argument('date',  help='YYYYMMDD')
@@ -897,7 +1070,7 @@ if __name__ == '__main__':
         r = rotate()
         print(json.dumps(r, indent=2, ensure_ascii=False))
     elif args.cmd == 'verify':
-        r = verify()
+        r = verify(include_offsite=args.offsite)
         print(json.dumps(r, indent=2, ensure_ascii=False))
         sys.exit(0 if not r['broken'] else 1)
     elif args.cmd == 'restore':
@@ -906,7 +1079,7 @@ if __name__ == '__main__':
     elif args.cmd == 'offsite':
         r = offsite_copy()
         print(json.dumps(r, indent=2, ensure_ascii=False))
-        sys.exit(1 if r.get('status') == 'error' else 0)
+        sys.exit(_offsite_exit_code(r, allow_skip=args.allow_skip))
     elif args.cmd == 'daily':
         s = snapshot()
         snapshot_ok = s.get('status') == 'complete' and s.get('published') is True
