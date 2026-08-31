@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import date, datetime, timedelta
+from datetime import date, datetime
 import json
 from pathlib import Path
 import sqlite3
@@ -24,6 +24,8 @@ def test_backup_is_restorable_and_bundle_cloneable(tmp_path, monkeypatch):
     backup_dir.mkdir()
     monkeypatch.setattr(bm, "BASE_DIR", root)
     monkeypatch.setattr(bm, "BACKUP_DIR", backup_dir)
+    monkeypatch.setattr(bm, "REQUIRED_TARGETS", [])
+    monkeypatch.setattr(bm, "REQUIRED_SQLITE_TARGETS", ["nexustrader.db"])
 
     feature_path = root / "data" / "disclosure_features.jsonl"
     feature_path.parent.mkdir()
@@ -127,6 +129,8 @@ def test_backup_snapshot_includes_evidence_directory_files(tmp_path, monkeypatch
     backup_dir.mkdir()
     monkeypatch.setattr(bm, "BASE_DIR", root)
     monkeypatch.setattr(bm, "BACKUP_DIR", backup_dir)
+    monkeypatch.setattr(bm, "REQUIRED_TARGETS", [])
+    monkeypatch.setattr(bm, "REQUIRED_SQLITE_TARGETS", [])
 
     evidence_dir = root / "logs" / "verification_manifests"
     evidence_dir.mkdir(parents=True)
@@ -173,6 +177,8 @@ def test_backup_snapshot_survives_a_missing_evidence_directory(tmp_path, monkeyp
     backup_dir.mkdir()
     monkeypatch.setattr(bm, "BASE_DIR", root)
     monkeypatch.setattr(bm, "BACKUP_DIR", backup_dir)
+    monkeypatch.setattr(bm, "REQUIRED_TARGETS", [])
+    monkeypatch.setattr(bm, "REQUIRED_SQLITE_TARGETS", [])
     # logs/verification_manifests/ を意図的に作らない。
 
     result = bm.snapshot(date(2026, 8, 30))
@@ -189,6 +195,7 @@ def test_offsite_skips_when_rclone_is_not_installed(tmp_path, monkeypatch):
     (tmp_path / "20260612").mkdir()
     monkeypatch.setattr(bm.shutil, "which", lambda _: None)
     monkeypatch.setattr(bm, "RCLONE_FALLBACK_PATHS", ())
+    monkeypatch.setattr(bm, "verify_snapshot", lambda *_a, **_k: {"status": "ok"})
 
     result = bm.offsite_copy(date(2026, 6, 12))
 
@@ -199,6 +206,7 @@ def test_offsite_finds_homebrew_rclone_when_cron_path_is_minimal(tmp_path, monke
     monkeypatch.setattr(bm, "BACKUP_DIR", tmp_path)
     (tmp_path / "20260612").mkdir()
     monkeypatch.setattr(bm.shutil, "which", lambda _: None)
+    monkeypatch.setattr(bm, "verify_snapshot", lambda *_a, **_k: {"status": "ok"})
     original_exists = Path.exists
 
     def fake_exists(path):
@@ -212,7 +220,7 @@ def test_offsite_finds_homebrew_rclone_when_cron_path_is_minimal(tmp_path, monke
         commands.append(cmd)
         if cmd[1] == "listremotes":
             return subprocess.CompletedProcess(cmd, 0, stdout="crypt-gdrive:\n", stderr="")
-        if cmd[1] == "copy":
+        if cmd[1] in {"sync", "check"}:
             return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
         raise AssertionError(cmd)
 
@@ -221,8 +229,139 @@ def test_offsite_finds_homebrew_rclone_when_cron_path_is_minimal(tmp_path, monke
     result = bm.offsite_copy(date(2026, 6, 12), runner=fake_runner)
 
     assert result["status"] == "copied"
+    assert result["verified"] is True
     assert commands[0][0] == "/opt/homebrew/bin/rclone"
     assert commands[1][0] == "/opt/homebrew/bin/rclone"
+    assert commands[1][1] == "sync"
+    assert commands[2][1] == "check"
+
+
+def test_offsite_never_reports_copied_when_remote_check_fails(tmp_path, monkeypatch):
+    monkeypatch.setattr(bm, "BACKUP_DIR", tmp_path)
+    (tmp_path / "20260612").mkdir()
+    monkeypatch.setattr(bm, "verify_snapshot", lambda *_a, **_k: {"status": "ok"})
+    monkeypatch.setattr(bm, "_find_rclone", lambda: "/usr/bin/rclone")
+
+    def fake_runner(cmd, **kwargs):
+        if cmd[1] == "listremotes":
+            return subprocess.CompletedProcess(cmd, 0, stdout="crypt-gdrive:\n", stderr="")
+        if cmd[1] == "sync":
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+        if cmd[1] == "check":
+            return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="hash mismatch")
+        raise AssertionError(cmd)
+
+    result = bm.offsite_copy(date(2026, 6, 12), runner=fake_runner)
+
+    assert result["status"] == "error"
+    assert "remote_verification_failed" in result["reason"]
+
+
+def test_snapshot_rerun_replaces_generation_without_stale_files(tmp_path, monkeypatch):
+    root = tmp_path / "repo"
+    root.mkdir()
+    backup_dir = root / "backups"
+    backup_dir.mkdir()
+    monkeypatch.setattr(bm, "BASE_DIR", root)
+    monkeypatch.setattr(bm, "BACKUP_DIR", backup_dir)
+    monkeypatch.setattr(bm, "TARGETS", ["account.json", "optional.json"])
+    monkeypatch.setattr(bm, "REQUIRED_TARGETS", ["account.json"])
+    monkeypatch.setattr(bm, "SQLITE_TARGETS", [])
+    monkeypatch.setattr(bm, "REQUIRED_SQLITE_TARGETS", [])
+    monkeypatch.setattr(bm, "EVIDENCE_DIRECTORIES", [])
+    (root / "account.json").write_text('{"cash": 1}', encoding="utf-8")
+    (root / "optional.json").write_text('{"old": true}', encoding="utf-8")
+
+    first = bm.snapshot(date(2026, 8, 31))
+    assert first["published"] is True
+    (root / "optional.json").unlink()
+    (root / "account.json").write_text('{"cash": 2}', encoding="utf-8")
+    second = bm.snapshot(date(2026, 8, 31))
+
+    published = backup_dir / "20260831"
+    assert second["published"] is True
+    assert not (published / "optional.json").exists()
+    assert json.loads((published / "account.json").read_text()) == {"cash": 2}
+    assert not list(backup_dir.glob(".20260831.previous.*"))
+
+
+def test_incomplete_rerun_cannot_replace_a_complete_generation(tmp_path, monkeypatch):
+    root = tmp_path / "repo"
+    root.mkdir()
+    backup_dir = root / "backups"
+    backup_dir.mkdir()
+    monkeypatch.setattr(bm, "BASE_DIR", root)
+    monkeypatch.setattr(bm, "BACKUP_DIR", backup_dir)
+    monkeypatch.setattr(bm, "TARGETS", ["account.json"])
+    monkeypatch.setattr(bm, "REQUIRED_TARGETS", ["account.json"])
+    monkeypatch.setattr(bm, "SQLITE_TARGETS", [])
+    monkeypatch.setattr(bm, "REQUIRED_SQLITE_TARGETS", [])
+    monkeypatch.setattr(bm, "EVIDENCE_DIRECTORIES", [])
+    account = root / "account.json"
+    account.write_text('{"cash": 1}', encoding="utf-8")
+    assert bm.snapshot(date(2026, 8, 31))["published"] is True
+    original_hash = bm._sha256(backup_dir / "20260831" / "account.json")
+    account.unlink()
+
+    failed = bm.snapshot(date(2026, 8, 31))
+
+    assert failed["status"] == "incomplete"
+    assert failed["published"] is False
+    assert bm._sha256(backup_dir / "20260831" / "account.json") == original_hash
+
+
+def test_verify_snapshot_detects_extra_and_modified_files(tmp_path, monkeypatch):
+    root = tmp_path / "repo"
+    root.mkdir()
+    backup_dir = root / "backups"
+    backup_dir.mkdir()
+    monkeypatch.setattr(bm, "BASE_DIR", root)
+    monkeypatch.setattr(bm, "BACKUP_DIR", backup_dir)
+    monkeypatch.setattr(bm, "TARGETS", ["account.json"])
+    monkeypatch.setattr(bm, "REQUIRED_TARGETS", ["account.json"])
+    monkeypatch.setattr(bm, "SQLITE_TARGETS", [])
+    monkeypatch.setattr(bm, "REQUIRED_SQLITE_TARGETS", [])
+    monkeypatch.setattr(bm, "EVIDENCE_DIRECTORIES", [])
+    (root / "account.json").write_text('{"cash": 1}', encoding="utf-8")
+    bm.snapshot(date(2026, 8, 31))
+    published = backup_dir / "20260831"
+    assert bm.verify_snapshot("20260831")["status"] == "ok"
+
+    (published / "unexpected.txt").write_text("stale", encoding="utf-8")
+    assert bm.verify_snapshot("20260831")["status"] == "error"
+    (published / "unexpected.txt").unlink()
+    (published / "account.json").write_text('{"cash": 999}', encoding="utf-8")
+    result = bm.verify_snapshot("20260831")
+    assert result["status"] == "error"
+    assert any(row.get("reason") == "sha256_mismatch" for row in result["issues"])
+
+
+def test_restore_rejects_traversal_and_dry_run_has_no_side_effect(tmp_path, monkeypatch):
+    root = tmp_path / "repo"
+    root.mkdir()
+    backup_dir = root / "backups"
+    backup_dir.mkdir()
+    monkeypatch.setattr(bm, "BASE_DIR", root)
+    monkeypatch.setattr(bm, "BACKUP_DIR", backup_dir)
+    monkeypatch.setattr(bm, "TARGETS", ["account.json"])
+    monkeypatch.setattr(bm, "REQUIRED_TARGETS", ["account.json"])
+    monkeypatch.setattr(bm, "SQLITE_TARGETS", [])
+    monkeypatch.setattr(bm, "REQUIRED_SQLITE_TARGETS", [])
+    monkeypatch.setattr(bm, "EVIDENCE_DIRECTORIES", [])
+    account = root / "account.json"
+    account.write_text('{"cash": 1}', encoding="utf-8")
+    bm.snapshot(date(2026, 8, 31))
+    account.write_text('{"cash": 2}', encoding="utf-8")
+
+    assert bm.restore("../20260831", "account.json", confirm=True) is False
+    assert bm.restore("20260831", "../outside.json", confirm=True) is False
+    assert bm.restore("20260831", "account.json", confirm=False) is False
+    assert not (root / "account.json.bak").exists()
+    assert json.loads(account.read_text()) == {"cash": 2}
+
+    assert bm.restore("20260831", "account.json", confirm=True) is True
+    assert json.loads(account.read_text()) == {"cash": 1}
+    assert json.loads((root / "account.json.bak").read_text()) == {"cash": 2}
 
 
 def test_outcome_catchup_requires_explicit_apply(tmp_path):
