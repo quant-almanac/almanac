@@ -902,6 +902,64 @@ def test_execution_plan_would_filter_is_advisory_in_observe_mode(tmp_path):
     assert any(row["code"] == "execution_plan_observe_conflict" for row in result["execution_advisories"])
 
 
+def test_derived_usd_notional_cannot_exceed_discretionary_budget(tmp_path):
+    now = datetime(2026, 7, 14, 6, 0, tzinfo=JST)
+    _write_base(tmp_path, now)
+    (tmp_path / "account.json").write_text(json.dumps({
+        "last_updated": now.isoformat(), "usd_balance": 10_000,
+        "fx_rate_usdjpy": 150,
+    }), encoding="utf-8")
+    (tmp_path / "holdings.json").write_text(json.dumps({
+        "XLF_fixture": {
+            "ticker": "XLF", "owner": "husband", "broker": "楽天証券",
+            "account": "一般", "note": "楽天CSV保有同期 2026-07-14",
+        },
+    }), encoding="utf-8")
+
+    result = classify_execution_readiness({
+        "ticker": "XLF", "type": "buy", "order_type": "limit",
+        "limit_price": 55, "quantity": 20,
+        "execution_owner": "husband", "execution_broker": "rakuten",
+        "execution_account": "一般",
+    }, base_dir=tmp_path, now=now)
+
+    funding_reason = next(
+        row for row in result["execution_block_reasons"]
+        if row["code"] == "approved_discretionary_funding_exceeded"
+    )
+    assert funding_reason["requested_notional_jpy"] == 165_000
+    assert funding_reason["available_jpy"] == 100_000
+
+
+def test_derived_notional_does_not_coerce_string_quantity(tmp_path):
+    now = datetime(2026, 7, 14, 6, 0, tzinfo=JST)
+    _write_base(tmp_path, now)
+
+    result = classify_execution_readiness({
+        "ticker": "XLF", "type": "buy", "order_type": "limit",
+        "limit_price": 55, "quantity": "1",
+    }, base_dir=tmp_path, now=now)
+
+    assert "discretionary_funding_notional_unresolved" in {
+        row["code"] for row in result["execution_block_reasons"]
+    }
+
+
+def test_scheduled_contribution_flag_cannot_exempt_plain_buy(tmp_path):
+    now = datetime(2026, 7, 14, 6, 0, tzinfo=JST)
+    _write_base(tmp_path, now)
+    (tmp_path / "execution_plan_state.json").unlink()
+
+    result = classify_execution_readiness({
+        "ticker": "XLF", "type": "buy", "order_type": "limit",
+        "limit_price": 55, "quantity": 1, "scheduled_contribution": True,
+    }, base_dir=tmp_path, now=now)
+
+    assert "discretionary_funding_unresolved" in {
+        row["code"] for row in result["execution_block_reasons"]
+    }
+
+
 def test_exit_with_opposite_active_plan_is_review_not_blocked(tmp_path):
     now = datetime(2026, 7, 14, 6, 0, tzinfo=JST)
     _write_base(tmp_path, now, ticker="XLF")
@@ -1225,11 +1283,16 @@ def test_jpx_holiday_more_than_24h_before_open_requires_next_morning_analysis(tm
 def test_fund_market_order_is_exempt_from_equity_spread_rule(tmp_path):
     now = datetime(2026, 7, 14, 6, 0, tzinfo=JST)
     _write_base(tmp_path, now, ticker="SLIM_SP500")
+    (tmp_path / "execution_plan_state.json").unlink()
     result = classify_execution_readiness({
         "ticker": "SLIM_SP500", "type": "dca", "urgency": "low", "order_type": "market",
         "scheduled_contribution": True,
     }, base_dir=tmp_path, now=now)
     assert result["execution_readiness"] == "ready"
+    assert not any(
+        str(row.get("code") or "").startswith("discretionary_funding")
+        for row in result["execution_block_reasons"]
+    )
 
 
 def test_observe_plan_conflict_is_advisory_while_other_guards_still_block(tmp_path):

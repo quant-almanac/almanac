@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 from datetime import date, datetime, timedelta, timezone
+import math
+from numbers import Real
 from pathlib import Path
 from zoneinfo import ZoneInfo
 import json
@@ -200,6 +202,14 @@ def _positive_number(value: object) -> float | None:
     return number if number > 0 else None
 
 
+def _strict_positive_number(value: object) -> float | None:
+    """Return a finite positive JSON number without coercing strings/bools."""
+    if isinstance(value, bool) or not isinstance(value, Real):
+        return None
+    number = float(value)
+    return number if math.isfinite(number) and number > 0 else None
+
+
 def _requested_exit_quantity(action: dict) -> float | None:
     """Return only deterministic quantity fields.
 
@@ -264,6 +274,71 @@ def _requested_buy_notional(action: dict, *, currency: str) -> float | None:
         if estimated is not None:
             return estimated
     return None
+
+
+def _action_currency(action: dict) -> str | None:
+    explicit = str(action.get("currency") or "").strip().upper()
+    if explicit:
+        return explicit if explicit in {"JPY", "USD"} else None
+    ticker = str(action.get("ticker") or "").strip().upper()
+    if ticker.endswith(".T") or ticker.startswith(FUND_PREFIXES):
+        return "JPY"
+    return "USD" if ticker else None
+
+
+def _is_scheduled_contribution(action: dict) -> bool:
+    """Accept the cash/funding exemption only for an explicit DCA action."""
+    action_type = str(action.get("type") or action.get("action_type") or "").lower()
+    return action_type == "dca" and action.get("scheduled_contribution") is True
+
+
+def _requested_buy_notional_jpy(action: dict, *, base_dir: Path) -> object:
+    """Resolve a strict JPY order notional for the discretionary budget.
+
+    An explicit ``estimated_notional_jpy`` remains authoritative and is
+    returned unchanged so that the funding contract can reject strings,
+    booleans and non-finite values.  Otherwise only deterministic quantity ×
+    price inputs are converted.  Missing/invalid FX fails closed rather than
+    manufacturing a budget estimate.
+    """
+    if "estimated_notional_jpy" in action:
+        return action.get("estimated_notional_jpy")
+    amount_jpy = action.get("amount_jpy")
+    if amount_jpy is not None:
+        return amount_jpy
+
+    quantity = next(
+        (
+            value
+            for key in ("requested_buy_quantity", "quantity")
+            if (value := _strict_positive_number(action.get(key))) is not None
+        ),
+        None,
+    )
+    price = next(
+        (
+            value
+            for key in ("limit_price", "decision_price", "price", "current_price")
+            if (value := _strict_positive_number(action.get(key))) is not None
+        ),
+        None,
+    )
+    if quantity is None or price is None:
+        return None
+    native_notional = quantity * price
+    currency = _action_currency(action)
+    if currency == "JPY":
+        return native_notional
+    if currency != "USD":
+        return None
+
+    account = _load_json_object(base_dir / "account.json") or {}
+    fx_rate = _strict_positive_number(
+        action.get("fx_rate_usdjpy", account.get("fx_rate_usdjpy"))
+    )
+    if fx_rate is None or not 50 < fx_rate < 500:
+        return None
+    return native_notional * fx_rate
 
 
 def _business_days_between(start: datetime, end: datetime) -> int:
@@ -598,7 +673,7 @@ def evaluate_cash_buying_power(
     action_type = str(action.get("type") or action.get("action_type") or "").lower()
     if action_type not in {"buy", "add", "dca"}:
         return {"required": False, "readiness": "ready", "reasons": []}
-    if action.get("scheduled_contribution"):
+    if _is_scheduled_contribution(action):
         return {
             "required": False,
             "readiness": "ready",
@@ -624,8 +699,16 @@ def evaluate_cash_buying_power(
             }],
         }
 
-    ticker = str(action.get("ticker") or "").upper()
-    currency = str(action.get("currency") or ("JPY" if ticker.endswith(".T") else "USD")).upper()
+    currency = _action_currency(action)
+    if currency is None:
+        return {
+            "required": True,
+            "readiness": "blocked",
+            "reasons": [{
+                "code": "cash_currency_unresolved",
+                "message": "買付通貨を一意に確定できません",
+            }],
+        }
     resource_identity = AccountResourceIdentity(
         owner=owner,
         broker=broker,
@@ -1254,9 +1337,9 @@ def classify_execution_readiness(
     # チェックが一切無かった。ここでは対象ポジション固有の証券会社snapshot
     # と、その後に同一identityへ発生した約定イベントだけを見る。時間経過
     # だけでは失効させず、既知の後続約定があれば再照合までreviewにする。
-    if (action_type in EXIT_ACTION_TYPES or risk_increasing) and not action.get(
-        "scheduled_contribution"
-    ):
+    if (
+        action_type in EXIT_ACTION_TYPES or risk_increasing
+    ) and not _is_scheduled_contribution(action):
         from position_identity import position_identity_for_action, position_freshness
 
         position = position_identity_for_action(action)
@@ -1330,11 +1413,18 @@ def classify_execution_readiness(
                 execution_position_keys=action.get("execution_position_keys") or [],
             )
 
-    funding = evaluate_discretionary_funding(
-        action_type,
-        plan_state=load_execution_plan_state(base_dir),
-        now=now,
-        requested_notional_jpy=action.get("estimated_notional_jpy"),
+    funding = (
+        {"required": False, "allowed": True, "reason_code": None}
+        if _is_scheduled_contribution(action)
+        else evaluate_discretionary_funding(
+            action_type,
+            plan_state=load_execution_plan_state(base_dir),
+            now=now,
+            requested_notional_jpy=_requested_buy_notional_jpy(
+                action,
+                base_dir=base_dir,
+            ),
+        )
     )
     if funding.get("required") and not funding.get("allowed"):
         add(
@@ -1435,7 +1525,7 @@ def classify_execution_readiness(
             "取引所カレンダーを確認できないため、発注前に市場セッションを再確認する",
             **market_context,
         )
-    if risk_increasing and not action.get("scheduled_contribution"):
+    if risk_increasing and not _is_scheduled_contribution(action):
         snapshot = portfolio_snapshot_health(base_dir, now=now)
         if snapshot["status"] in {"invalidated", "unknown", "legacy_unverified"}:
             add(
