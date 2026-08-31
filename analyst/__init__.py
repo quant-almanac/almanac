@@ -3893,7 +3893,13 @@ def _load_catalyst_context_for_opus(
             revision_state_path=BASE_DIR / "revision_state.json",
             scenario_state_path=BASE_DIR / "scenario_state.json",
             proxy_seed_map_path=BASE_DIR / "proxy_seed_map.json",
-            legacy_analysis_path=BASE_DIR / "ai_portfolio_analysis.json",
+            # The formal result from the previous run is not an independent
+            # catalyst source.  Feeding it back here makes yesterday's model
+            # opinion evidence for today's model opinion and can reinforce a
+            # recommendation without any new market observation.  The
+            # catalyst layer still receives revision/scenario/screener inputs,
+            # which all have their own lineage.
+            legacy_analysis_path=None,
             catalyst_log_path=BASE_DIR / "catalyst_hypothesis_log.jsonl",
             screener_payloads={
                 "short": load_json(BASE_DIR / "short_candidates.json", {}),

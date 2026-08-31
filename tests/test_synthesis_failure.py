@@ -46,6 +46,7 @@ def test_catalyst_layer_receives_the_run_analysis_id(monkeypatch, tmp_path):
         analysis_id="analysis-from-run",
     ) == ""
     assert captured["analysis_id"] == "analysis-from-run"
+    assert captured["legacy_analysis_path"] is None
 
 
 def test_screen_candidate_bullish_support_accepts_current_debate_schema():

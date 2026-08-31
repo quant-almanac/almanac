@@ -21,6 +21,7 @@ _JST = ZoneInfo("Asia/Tokyo")
 _FUTURE_TOLERANCE_HOURS = 1.0
 from pathlib import Path
 from fastapi import APIRouter
+from technical_quality import describe_unusable, technical_row_is_usable
 
 router = APIRouter()
 BASE_DIR = Path(__file__).parent.parent.parent
@@ -292,6 +293,17 @@ def _get_indicators() -> dict:
     fg_obj = vix.get("fear_greed", {}) if isinstance(vix.get("fear_greed"), dict) else {}
     ts_obj = vix.get("vix_term_structure", {}) if isinstance(vix.get("vix_term_structure"), dict) else {}
 
+    raw_tickers = tech.get("tickers") or {}
+    projected_tickers = {}
+    if isinstance(raw_tickers, dict):
+        for ticker, row in raw_tickers.items():
+            if not isinstance(row, dict):
+                projected_tickers[str(ticker)] = describe_unusable(row)
+            elif technical_row_is_usable(row, allow_degraded=False):
+                projected_tickers[str(ticker)] = dict(row)
+            else:
+                projected_tickers[str(ticker)] = describe_unusable(row)
+
     return {
         "data_health": _build_data_health(state, geo, tech, vix, macro),
         "vix": {
@@ -317,7 +329,10 @@ def _get_indicators() -> dict:
         },
         "technical": {
             "market_breadth": tech.get("market_breadth", {}),
-            "tickers": tech.get("tickers", {}),
+            # API consumers must not receive stale/rebuild-unresolved numeric
+            # values that scenario_engine itself would reject.  Keep only the
+            # reason and data_as_of for unusable rows.
+            "tickers": projected_tickers,
             "cached_at": tech.get("cached_at"),
         },
         "geopolitical": {
