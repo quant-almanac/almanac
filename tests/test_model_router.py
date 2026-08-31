@@ -28,8 +28,8 @@ def test_margin_and_shortsell_route_to_deepseek_v4_pro():
 
 def test_red_team_uses_diverse_models():
     import model_router as mr
-    red = [mr.get_model(f"red_team_{i}") for i in (1, 2, 3)]
-    assert len(set(red)) >= 2, f"red team should use >=2 distinct models: {red}"
+    red = [mr.get_model(f"red_team_{i}") for i in (1, 2, 3, 4)]
+    assert len(set(red)) >= 3, f"red team should use >=3 distinct models: {red}"
 
 
 def test_downgraded_roles_not_opus():

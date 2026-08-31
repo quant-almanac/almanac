@@ -2790,12 +2790,136 @@ def _call_openai_compat_redteam(base_url: str, api_key: str, model_id: str,
             m = _re.search(r"(\{.*\})", raw, _re.DOTALL)
         if m:
             parsed = json.loads(m.group(1))
-            if parsed.get("attacks"):
-                return parsed
+            validated = _validate_redteam_payload(parsed)
+            if validated is not None:
+                return validated
     except Exception as e:
         # PrivacyViolation を含め fail-closed（送信せず空を返す）。型名でガード作動を可視化。
         print(f"  [RedTeam/{model_id}] スキップ: {type(e).__name__}: {str(e)[:120]}")
     return {"attacks": [], "underutilized": []}
+
+
+def _validate_redteam_payload(payload: object) -> dict | None:
+    """Validate the machine-readable Red Team contract, including valid zero."""
+    import math
+
+    if not isinstance(payload, dict):
+        return None
+    attacks = payload.get("attacks")
+    underutilized = payload.get("underutilized")
+    if not isinstance(attacks, list) or not isinstance(underutilized, list):
+        return None
+    if len(attacks) > 12 or len(underutilized) > 12:
+        return None
+    if not all(isinstance(item, str) and 0 < len(item) <= 500 for item in underutilized):
+        return None
+
+    normalized: list[dict] = []
+    for row in attacks:
+        if not isinstance(row, dict):
+            return None
+        required_text = ("ticker", "action", "rationale", "risk_note")
+        if not all(isinstance(row.get(key), str) and str(row.get(key)).strip()
+                   for key in required_text):
+            return None
+        expected = row.get("expected_return_pct")
+        if isinstance(expected, bool):
+            return None
+        try:
+            expected_num = float(expected)
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(expected_num) or not -100 <= expected_num <= 1000:
+            return None
+        normalized.append({
+            **row,
+            "ticker": str(row["ticker"]).upper().strip(),
+            "expected_return_pct": expected_num,
+        })
+    return {"attacks": normalized, "underutilized": list(underutilized)}
+
+
+def _parse_redteam_text(raw: object) -> dict | None:
+    text = str(raw or "").strip()
+    if text.startswith("```"):
+        text = text.strip("`").strip()
+        if text.lower().startswith("json"):
+            text = text[4:].strip()
+    try:
+        parsed = json.loads(text)
+    except Exception:
+        return None
+    return _validate_redteam_payload(parsed)
+
+
+def _call_routed_redteam(role: str, system: str, user: str) -> dict:
+    """Call a model-router role through the public-payload and accounting gate."""
+    try:
+        from almanac.llm_safety import Payload, call_external_llm
+        from llm_adapters import call_by_role
+        from model_router import get_model
+
+        model_id = get_model(role)
+
+        def _transport(**kwargs):
+            result = call_by_role(
+                role,
+                kwargs["system"],
+                kwargs["user"],
+                max_tokens=kwargs["max_tokens"],
+                temperature=kwargs["temperature"],
+                json_mode=True,
+                request_timeout=120,
+            )
+            if result.get("error"):
+                raise RuntimeError(str(result["error"])[:500])
+            usage = result.get("usage") or {}
+            validated = _parse_redteam_text(result.get("content"))
+            if validated is None:
+                raise ValueError("red_team_schema_invalid")
+            # Semantic validation happens before call_external_llm writes its
+            # success accounting row.  A 200 response with malformed JSON is
+            # therefore never recorded as a successful Red Team result.
+            return json.dumps(validated, ensure_ascii=False), {
+                "input_tokens": usage.get("prompt_tokens"),
+                "output_tokens": usage.get("completion_tokens"),
+            }
+
+        response = call_external_llm(
+            Payload(kind="anonymized_market_gap", system=system, user=user),
+            base_url="router-managed",
+            api_key="router-managed",
+            model_id=model_id,
+            role=role,
+            max_tokens=1200,
+            temperature=__import__('utils').get_llm_temperature(default=0.7),
+            transport=_transport,
+        )
+        validated = _parse_redteam_text(response.content)
+        if validated is None:
+            raise ValueError("red_team_schema_invalid")
+        return {**validated, "transport_status": "ok", "model_id": model_id}
+    except Exception as exc:
+        try:
+            from analyst.llm_client import _append_llm_call_log
+            _append_llm_call_log({
+                "ts": datetime.now().isoformat(),
+                "role": role,
+                "model": locals().get("model_id"),
+                "adapter": "model_router",
+                "use_tool": False,
+                "status": "error",
+                "error": f"{type(exc).__name__}: {str(exc)[:300]}",
+            })
+        except Exception:
+            pass
+        print(f"  [RedTeam/{role}] error: {type(exc).__name__}: {str(exc)[:160]}")
+        return {
+            "attacks": [],
+            "underutilized": [],
+            "transport_status": "error",
+            "error": f"{type(exc).__name__}: {str(exc)[:300]}",
+        }
 
 
 # ── Red Team アタッカー（最大リターン追求仮説生成） ──────────────
@@ -2870,7 +2994,7 @@ def _analyze_redteam(data: dict, shared_ctx: str = "", beliefs: list | None = No
     後段 Opus が検証・採択を判断する（Phase 2D）。
     tier_hints: Sonnet ティア分析が出した high_return_* を Red Team の参考情報として注入。
     """
-    _empty = {"attacks": [], "underutilized": []}
+    _empty = {"attacks": [], "underutilized": [], "transport_status": "error"}
     _model = "claude-haiku-4-5-20251001"
     _audit_fields = [
         "positions.ticker",
@@ -2894,7 +3018,7 @@ def _analyze_redteam(data: dict, shared_ctx: str = "", beliefs: list | None = No
         )
     except ImportError as e:
         print(f"  ⚠️ Red Team/Haiku: privacy safety unavailable; refusing book-aware call: {e}")
-        return _empty
+        return {**_empty, "error": f"privacy_safety_unavailable: {e}"}
 
     try:
         assert_book_aware_allowed(provider="anthropic")
@@ -2907,7 +3031,7 @@ def _analyze_redteam(data: dict, shared_ctx: str = "", beliefs: list | None = No
             error=str(e),
         )
         print("  🔒 Red Team/Haiku: book-aware call blocked by privacy mode")
-        return _empty
+        return {**_empty, "transport_status": "blocked", "error": str(e)}
 
     positions = data.get("positions", [])
     pos_summary = [
@@ -2964,10 +3088,11 @@ required JSON output:
             fields=_audit_fields,
             status="ok",
         )
-        if isinstance(result, dict) and result.get("attacks"):
-            print(f"  ⚔️ Red Team仮説: {len(result['attacks'])}件生成")
-            return result
-        return _empty
+        validated = _validate_redteam_payload(result)
+        if validated is not None:
+            print(f"  ⚔️ Red Team仮説: {len(validated['attacks'])}件生成")
+            return {**validated, "transport_status": "ok", "model_id": _model}
+        return {**_empty, "error": "red_team_schema_invalid"}
     except Exception as e:
         log_book_aware_call(
             role="red_team_haiku",
@@ -2977,7 +3102,7 @@ required JSON output:
             error=str(e),
         )
         print(f"  ⚠️ Red Team分析スキップ: {e}")
-        return _empty
+        return {**_empty, "error": f"{type(e).__name__}: {str(e)[:300]}"}
 
 
 # ── Red Team マルチモデル版 ───────────────────────────────────────
@@ -3011,82 +3136,19 @@ def _analyze_redteam_multi(data: dict, shared_ctx: str = "",
         return _analyze_redteam(data, shared_ctx, beliefs, tier_hints=tier_hints)
 
     def _deepseek():
-        key = os.environ.get("DEEPSEEK_API_KEY", "")
-        if not key:
-            return {"attacks": [], "underutilized": []}
-        return _call_openai_compat_redteam(
-            base_url="https://api.deepseek.com",
-            api_key=key, model_id="deepseek-chat",
-            system=_SYSTEM, user=_USER,
-        )
+        return _call_routed_redteam("red_team_1", _SYSTEM, _USER)
 
     def _groq():
-        key = os.environ.get("GROQ_API_KEY", "")
-        if not key:
-            return {"attacks": [], "underutilized": []}
-        # モデル ID は model_router で一元管理する。ここに直書きすると
-        # 提供終了に気づけず、Red Team の枠が黙って減る。
-        try:
-            from model_router import MODEL_REGISTRY as _REG
-            _groq_model = _REG.get("groq_open", "openai/gpt-oss-120b")
-        except Exception:
-            _groq_model = "openai/gpt-oss-120b"
-        return _call_openai_compat_redteam(
-            base_url="https://api.groq.com/openai/v1",
-            api_key=key, model_id=_groq_model,
-            system=_SYSTEM, user=_USER,
-        )
+        return _call_routed_redteam("red_team_4", _SYSTEM, _USER)
 
     def _gemini():
-        """
-        Red Team macro 視点。Gemini 無料枠 quota=0 の運用が続いているため、
-        2026-04-20 Fix F: Gemini で attacks が得られなかった場合は
-        DeepSeek R1 (`deepseek-reasoner`) にフォールバックして推論特化モデルの
-        マクロ視点を代替取得する（model_router の deepseek_r を再利用）。
-        """
-        # GEMINI_API_KEY / GOOGLE_AI_API_KEY の両方受け入れ（secrets の慣習に合わせる）
-        key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_AI_API_KEY") or ""
-        result: dict = {"attacks": [], "underutilized": []}
-
-        if key:
-            # model_router 経由でモデル ID を解決（現行: gemini-flash-latest）
-            try:
-                from model_router import get_model as _gm
-                _gemini_model = _gm("red_team_3")
-            except Exception:
-                _gemini_model = "gemini-flash-latest"
-            result = _call_openai_compat_redteam(
-                base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
-                api_key=key, model_id=_gemini_model,
-                system=_SYSTEM, user=_USER,
-            )
-
-        # Gemini quota 切れ or 未設定時の fallback: DeepSeek R1 (推論特化)
-        if not result.get("attacks"):
-            dk = os.environ.get("DEEPSEEK_API_KEY", "")
-            if dk:
-                print("  [RedTeam/gemini] attacks=0 → DeepSeek R1 にフォールバック")
-                try:
-                    from model_router import MODEL_REGISTRY as _REG
-                    _r1_model = _REG.get("deepseek_r", "deepseek-reasoner")
-                except Exception:
-                    _r1_model = "deepseek-reasoner"
-                result = _call_openai_compat_redteam(
-                    base_url="https://api.deepseek.com",
-                    api_key=dk, model_id=_r1_model,
-                    system=_SYSTEM, user=_USER,
-                )
-        return result
+        # A schema-valid empty answer is a legitimate "no attack" result, not
+        # a transport failure.  Do not silently buy a second model call merely
+        # because attacks is empty; provider health is reported separately.
+        return _call_routed_redteam("red_team_3", _SYSTEM, _USER)
 
     def _qwen():
-        key = os.environ.get("OPENROUTER_API_KEY", "")
-        if not key:
-            return {"attacks": [], "underutilized": []}
-        return _call_openai_compat_redteam(
-            base_url="https://openrouter.ai/api/v1",
-            api_key=key, model_id="qwen/qwen3-235b-a22b-2507",
-            system=_SYSTEM, user=_USER,
-        )
+        return _call_routed_redteam("red_team_2", _SYSTEM, _USER)
 
     from concurrent.futures import ThreadPoolExecutor as _TPE, wait as _cf_wait
     providers = {"haiku": _haiku, "deepseek": _deepseek, "groq": _groq, "gemini": _gemini, "qwen": _qwen}
@@ -3124,14 +3186,17 @@ def _analyze_redteam_multi(data: dict, shared_ctx: str = "",
     # いない状態が数週間続いても、行ごとに散っていると気づけなかった
     # (2026-08-20 時点で llama は提供終了404・qwen はクレジット不足402)。
     # 反証の多様性そのものが Red Team の価値なので、欠けたら数字で言う。
-    _rt_live = sorted(n for n, r in results.items() if r.get("attacks"))
-    _rt_dead = sorted(n for n in providers if n not in _rt_live)
+    _rt_available = sorted(
+        n for n, r in results.items() if r.get("transport_status") == "ok"
+    )
+    _rt_productive = sorted(n for n, r in results.items() if r.get("attacks"))
+    _rt_dead = sorted(n for n in providers if n not in _rt_available)
     print(
-        f"  ⚔️ Red Team 稼働: {len(_rt_live)}/{len(providers)}"
-        + (f" (稼働: {', '.join(_rt_live)})" if _rt_live else "")
+        f"  ⚔️ Red Team 応答: {len(_rt_available)}/{len(providers)}"
+        + (f" (仮説あり: {', '.join(_rt_productive)})" if _rt_productive else "")
         + (f" / 無応答: {', '.join(_rt_dead)}" if _rt_dead else "")
     )
-    if len(_rt_live) * 2 < len(providers):
+    if len(_rt_available) * 2 < len(providers):
         print(
             "  ⚠️ Red Team の過半数が無応答です。反証の多様性が設計より落ちています"
             " — モデルIDの提供終了・APIクレジット・キー設定を確認してください。"
@@ -3160,7 +3225,19 @@ def _analyze_redteam_multi(data: dict, shared_ctx: str = "",
 
     active = [k for k, v in results.items() if v.get("attacks")]
     print(f"  ⚔️ Red Team マルチモデル: {len(merged_attacks)}件（{', '.join(active)}）")
-    return {"attacks": merged_attacks, "underutilized": deduped_under[:6]}
+    return {
+        "attacks": merged_attacks,
+        "underutilized": deduped_under[:6],
+        "provider_status": {
+            name: {
+                "status": res.get("transport_status", "unknown"),
+                "model_id": res.get("model_id"),
+                "error": res.get("error"),
+                "attack_count": len(res.get("attacks") or []),
+            }
+            for name, res in results.items()
+        },
+    }
 
 
 # ── DeepSeek-R1 Judge Agent ──────────────────────────────

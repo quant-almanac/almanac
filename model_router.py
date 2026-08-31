@@ -116,6 +116,7 @@ ROLE_ROUTING: dict[str, str] = {
     "red_team_1":              "deepseek",      # 技術分析寄り
     "red_team_2":              "qwen",          # 中国・新興市場視点
     "red_team_3":              "gemini_flash",  # マクロ寄り
+    "red_team_4":              "groq_open",     # open-weight の独立視点
 
     "news_topic_deepdive":     "deepseek",
     "news_topic_fallback":     "qwen",

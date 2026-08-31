@@ -28,6 +28,7 @@ __all__ = [
     "call_deepseek",
     "call_qwen",
     "call_gemini",
+    "call_groq",
     "call_by_role",
     "AdapterResult",
 ]
@@ -282,6 +283,30 @@ def call_gemini(system: str, user: str, *,
     }
 
 
+def call_groq(system: str, user: str, *,
+              model: str = "openai/gpt-oss-120b",
+              max_tokens: int = 2000,
+              temperature: float = 0.7,
+              json_mode: bool = False,
+              request_timeout: float | None = None) -> AdapterResult:
+    """Groq OpenAI-compatible endpoint through the same structured contract."""
+    api_key = os.environ.get("GROQ_API_KEY", "")
+    if not api_key:
+        return {"content": "", "error": "GROQ_API_KEY not set", "adapter": "groq_open", "model": model}
+    return _retry_openai_compat(
+        base_url="https://api.groq.com/openai/v1",
+        api_key=api_key,
+        model=model,
+        system=system,
+        user=user,
+        max_tokens=max_tokens,
+        temperature=temperature,
+        json_mode=json_mode,
+        adapter_name="groq_open",
+        request_timeout=request_timeout,
+    )
+
+
 def call_by_role(role: str, system: str, user: str, *,
                  max_tokens: int = 2000,
                  temperature: float = 0.7,
@@ -330,6 +355,10 @@ def call_by_role(role: str, system: str, user: str, *,
         return call_gemini(system, user, model=model_id, max_tokens=max_tokens,
                            temperature=temperature, json_mode=json_mode,
                            request_timeout=request_timeout)
+    if adapter == "groq_open":
+        return call_groq(system, user, model=model_id, max_tokens=max_tokens,
+                         temperature=temperature, json_mode=json_mode,
+                         request_timeout=request_timeout)
 
     return {"content": "", "error": f"unknown adapter: {adapter}", "adapter": adapter, "model": model_id}
 

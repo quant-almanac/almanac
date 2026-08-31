@@ -76,7 +76,9 @@ def test_haiku_redteam_is_blocked_before_transport_in_strict_local(monkeypatch) 
         tier_hints={"long": "private-tier-hint"},
     )
 
-    assert result == {"attacks": [], "underutilized": []}
+    assert result["attacks"] == []
+    assert result["underutilized"] == []
+    assert result["transport_status"] == "blocked"
     assert calls == []
     assert len(audits) == 1
     assert audits[0]["role"] == "red_team_haiku"
@@ -90,7 +92,10 @@ def test_haiku_redteam_runs_and_audits_when_anthropic_book_aware(monkeypatch) ->
     def _fake_call_claude(**kwargs):
         calls.append(kwargs)
         return {
-            "attacks": [{"ticker": "NVDA", "action": "add"}],
+            "attacks": [{
+                "ticker": "NVDA", "action": "add", "expected_return_pct": 20,
+                "rationale": "momentum", "risk_note": "valuation",
+            }],
             "underutilized": [],
         }
 
@@ -106,6 +111,7 @@ def test_haiku_redteam_runs_and_audits_when_anthropic_book_aware(monkeypatch) ->
     result = analyst._analyze_redteam(book, shared_ctx="private-context")
 
     assert result["attacks"]
+    assert result["transport_status"] == "ok"
     assert len(calls) == 1
     assert book["positions"][0]["ticker"] in calls[0]["user"]
     assert len(audits) == 1
@@ -139,6 +145,111 @@ def test_external_leg_fail_closes_on_book_payload() -> None:
         user='{"value_jpy": 2500000, "unrealized_pct": 15.3}',
     )
     assert res == {"attacks": [], "underutilized": []}
+
+
+def test_routed_redteam_treats_schema_valid_zero_as_success(monkeypatch) -> None:
+    from types import SimpleNamespace
+    import llm_adapters
+    import model_router
+    import almanac.llm_safety as safety
+
+    calls = []
+    monkeypatch.setattr(model_router, "get_model", lambda role: f"model-for-{role}")
+    monkeypatch.setattr(
+        llm_adapters,
+        "call_by_role",
+        lambda role, *_args, **_kwargs: calls.append(role) or {
+            "content": '{"attacks":[],"underutilized":[]}',
+            "usage": {"prompt_tokens": 1, "completion_tokens": 2},
+        },
+    )
+
+    def fake_external(payload, **kwargs):
+        content, _usage = kwargs["transport"](
+            system=payload.system,
+            user=payload.user,
+            max_tokens=kwargs["max_tokens"],
+            temperature=kwargs["temperature"],
+        )
+        return SimpleNamespace(content=content)
+
+    monkeypatch.setattr(safety, "call_external_llm", fake_external)
+
+    result = analyst._call_routed_redteam("red_team_3", "system", "public market")
+    assert result["transport_status"] == "ok"
+    assert result["attacks"] == []
+    assert result["model_id"] == "model-for-red_team_3"
+    assert calls == ["red_team_3"]
+
+
+def test_routed_redteam_logs_schema_failure_as_error(monkeypatch) -> None:
+    import llm_adapters
+    import almanac.llm_safety as safety
+    from analyst import llm_client
+
+    audit = []
+    monkeypatch.setattr(
+        llm_adapters,
+        "call_by_role",
+        lambda *_args, **_kwargs: {"content": '{"attacks":"not-a-list"}', "usage": {}},
+    )
+    monkeypatch.setattr(
+        safety,
+        "call_external_llm",
+        lambda payload, **kwargs: kwargs["transport"](
+            system=payload.system,
+            user=payload.user,
+            max_tokens=kwargs["max_tokens"],
+            temperature=kwargs["temperature"],
+        ),
+    )
+    monkeypatch.setattr(llm_client, "_append_llm_call_log", lambda row: audit.append(row) or True)
+
+    result = analyst._call_routed_redteam("red_team_1", "system", "public")
+    assert result["transport_status"] == "error"
+    assert "schema_invalid" in result["error"]
+    assert len(audit) == 1
+    assert audit[0]["status"] == "error"
+    assert audit[0]["role"] == "red_team_1"
+
+
+def test_redteam_multi_calls_each_router_role_once_without_empty_fallback(monkeypatch) -> None:
+    calls = []
+
+    monkeypatch.setattr(
+        analyst,
+        "_analyze_redteam",
+        lambda *_args, **_kwargs: {
+            "attacks": [], "underutilized": [], "transport_status": "ok",
+        },
+    )
+    monkeypatch.setattr(
+        analyst,
+        "_call_routed_redteam",
+        lambda role, *_args: calls.append(role) or {
+            "attacks": [], "underutilized": [], "transport_status": "ok",
+            "model_id": role,
+        },
+    )
+
+    result = analyst._analyze_redteam_multi(_data_with_book(), shared_ctx="public")
+    assert sorted(calls) == ["red_team_1", "red_team_2", "red_team_3", "red_team_4"]
+    assert result["attacks"] == []
+    assert all(row["status"] == "ok" for row in result["provider_status"].values())
+
+
+def test_redteam_schema_rejects_partial_or_nonfinite_attacks() -> None:
+    assert analyst._validate_redteam_payload({
+        "attacks": [{"ticker": "AAPL", "action": "buy"}],
+        "underutilized": [],
+    }) is None
+    assert analyst._validate_redteam_payload({
+        "attacks": [{
+            "ticker": "AAPL", "action": "buy", "rationale": "x",
+            "risk_note": "y", "expected_return_pct": float("nan"),
+        }],
+        "underutilized": [],
+    }) is None
 
 
 # ---------------------------------------------------------------------------
