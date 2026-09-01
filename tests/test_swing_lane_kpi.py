@@ -1,5 +1,5 @@
 """tests/test_swing_lane_kpi.py — 攻めバックログ 2026-07 項目5(前半): Swingレーン KPI"""
-from pathlib import Path
+import os
 
 import pytest
 
@@ -142,11 +142,13 @@ def test_unknown_ticker_with_no_events_is_skipped_not_error(tmp_db):
     assert result["verdict"] == "insufficient_data"
 
 
+@pytest.mark.skipif(
+    os.environ.get("ALMANAC_RUN_PRODUCTION_SMOKE") != "1",
+    reason="本番DBを読むsmokeは ALMANAC_RUN_PRODUCTION_SMOKE=1 の明示時だけ実行",
+)
 def test_default_tickers_and_real_production_data_smoke():
     # 本番DB(引数なし)に対する読み取り専用smoke test。TXN/ANETは実際にクローズ済みのため
     # クラッシュしないこと、かつ n_closed >= 2 (実データ) であることを確認する。
-    if not (Path(__file__).resolve().parents[1] / "tickers.json").exists():
-        pytest.skip("private production event ledger is intentionally excluded")
     result = sk.compute_swing_kpis()
     assert result["n_closed"] >= 2
     assert result["verdict"] in {"insufficient_data", "promote", "maintain", "demote"}
