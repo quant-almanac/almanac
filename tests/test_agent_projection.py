@@ -259,7 +259,9 @@ class TestAgentOptionsHaveNoTools:
         assert kwargs["tools"] == []
         assert kwargs["allowed_tools"] == []
         assert kwargs["setting_sources"] == []
-        assert kwargs["max_turns"] == 1
+        # StructuredOutput のschema不一致をCLIが1回だけ自己修正できる。
+        # 実ツールは引き続き0件で、無制限な反復は許さない。
+        assert kwargs["max_turns"] == 2
 
     def test_file_tools_are_explicitly_denied(self):
         """allowed_tools が空であることの二重の担保。SDK の既定が将来

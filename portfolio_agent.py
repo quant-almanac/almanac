@@ -39,6 +39,7 @@ from agent_projection import (
     AgentOutputError,
     AgentProtocolViolation,
     MODES,
+    STRUCTURED_OUTPUT_TOOL_NAME,
     assert_no_forbidden_tool_use,
     build_agent_options,
     build_agent_projection,
@@ -122,11 +123,17 @@ async def _run_locked(mode: str) -> int:
 
     result_payload = None
     cost_usd = None
+    structured_output_transport_seen = False
+    forbidden_tool_use_seen = False
     try:
         async for message in query(prompt=prompt, options=options):
             if isinstance(message, AssistantMessage):
                 for block in message.content:
                     if isinstance(block, ToolUseBlock):
+                        if block.name == STRUCTURED_OUTPUT_TOOL_NAME:
+                            structured_output_transport_seen = True
+                        else:
+                            forbidden_tool_use_seen = True
                         # 構造化出力の配信機構 (STRUCTURED_OUTPUT_TOOL_NAME)
                         # だけは通す。それ以外は禁止ツールの使用として契約違反。
                         assert_no_forbidden_tool_use(block)
@@ -147,7 +154,10 @@ async def _run_locked(mode: str) -> int:
                     print(f"💴 コスト: ${cost_usd:.4f} (model={resolve_agent_model()})")
                 if message.subtype != "success":
                     _log_agent_result(mode=mode, prompt=prompt, started=started,
-                                      status=message.subtype, cost_usd=cost_usd)
+                                      status=message.subtype, cost_usd=cost_usd,
+                                      structured_output_transport_seen=(
+                                          structured_output_transport_seen),
+                                      forbidden_tool_use_seen=forbidden_tool_use_seen)
                     print(f"❌ エラー: {message.subtype}")
                     return 1
                 result_payload = message
@@ -157,12 +167,18 @@ async def _run_locked(mode: str) -> int:
         # (レビューで指摘)。API 側は _run_agent_locked の except で記録して
         # いるのに、CLI 側だけ抜けていた。
         _log_agent_result(mode=mode, prompt=prompt, started=started,
-                          status="protocol_violation", cost_usd=cost_usd, error=exc)
+                          status="protocol_violation", cost_usd=cost_usd, error=exc,
+                          structured_output_transport_seen=(
+                              structured_output_transport_seen),
+                          forbidden_tool_use_seen=forbidden_tool_use_seen)
         print(f"\n❌ プロトコル違反: {exc}")
         return 1
     except Exception as exc:
         _log_agent_result(mode=mode, prompt=prompt, started=started,
-                          status="error", cost_usd=cost_usd, error=exc)
+                          status="error", cost_usd=cost_usd, error=exc,
+                          structured_output_transport_seen=(
+                              structured_output_transport_seen),
+                          forbidden_tool_use_seen=forbidden_tool_use_seen)
         print(f"\n❌ Agent エラー: {exc}")
         print("ヒント: ANTHROPIC_API_KEY が設定されているか確認してください")
         return 1
@@ -174,7 +190,10 @@ async def _run_locked(mode: str) -> int:
         verified = validate_agent_output(raw, projection, base_dir=BASE_DIR)
     except AgentOutputError as exc:
         _log_agent_result(mode=mode, prompt=prompt, started=started,
-                          status="output_rejected", cost_usd=cost_usd, error=exc)
+                          status="output_rejected", cost_usd=cost_usd, error=exc,
+                          structured_output_transport_seen=(
+                              structured_output_transport_seen),
+                          forbidden_tool_use_seen=forbidden_tool_use_seen)
         print(f"\n❌ 出力の検証に失敗、保存しません: {exc}")
         return 2
 
@@ -185,12 +204,18 @@ async def _run_locked(mode: str) -> int:
         saved = save_verified_result(path, verified, as_of=now.isoformat())
     except OSError as exc:
         _log_agent_result(mode=mode, prompt=prompt, started=started,
-                          status="persistence_error", cost_usd=cost_usd, error=exc)
+                          status="persistence_error", cost_usd=cost_usd, error=exc,
+                          structured_output_transport_seen=(
+                              structured_output_transport_seen),
+                          forbidden_tool_use_seen=forbidden_tool_use_seen)
         print(f"\n❌ 保存に失敗しました: {exc}")
         return 1
     _log_agent_result(mode=mode, prompt=prompt, started=started,
                       status="success" if saved else "skipped_stale_write",
-                      cost_usd=cost_usd)
+                      cost_usd=cost_usd,
+                      structured_output_transport_seen=(
+                          structured_output_transport_seen),
+                      forbidden_tool_use_seen=forbidden_tool_use_seen)
     if not saved:
         print(f"\n⚠️ より新しい結果が既に保存済み。この run は書きません: {path.name}")
         return 0

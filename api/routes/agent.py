@@ -22,12 +22,14 @@ from fastapi import APIRouter
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from agent_projection import (
+    AGENT_MAX_TURNS,
     AGENT_RUN_LOCK_NAME,
     AGENT_RUN_LOCK_TIMEOUT_SECONDS,
     ENABLED_MODES,
     AgentOutputError,
     AgentProtocolViolation,
     MODES,
+    STRUCTURED_OUTPUT_TOOL_NAME,
     assert_no_forbidden_tool_use,
     build_agent_options,
     build_agent_projection,
@@ -76,6 +78,8 @@ def _log_agent_result(
     status: str,
     cost_usd=None,
     error: Exception | None = None,
+    structured_output_transport_seen: bool = False,
+    forbidden_tool_use_seen: bool = False,
 ) -> dict:
     """会計ログへ1行記録し、その行を返す (常に返す —— 書き込みの成否に
     関わらず)。呼び出し側は返り値の cost_usd/model/status を SSE へ載せる
@@ -92,7 +96,11 @@ def _log_agent_result(
         "role": "agent_sdk_run",
         "model": model,
         "use_tool": False,  # ツールは与えていない (round 11 以降)
-        "max_turns": 1,
+        "max_turns": AGENT_MAX_TURNS,
+        # StructuredOutput は SDK/CLI の構造化出力搬送であり、実ツール使用
+        # とは区別する。監査時に両者を use_tool=False の1値へ潰さない。
+        "structured_output_transport_seen": bool(structured_output_transport_seen),
+        "forbidden_tool_use_seen": bool(forbidden_tool_use_seen),
         "elapsed_sec": round(time.monotonic() - started, 2),
         "prompt_chars": len(prompt),
         "mode": mode,
@@ -187,11 +195,17 @@ async def _run_agent_locked(mode: str) -> AsyncIterator[str]:
 
     result_payload = None
     cost = None
+    structured_output_transport_seen = False
+    forbidden_tool_use_seen = False
     try:
         async for message in query(prompt=prompt, options=options):
             if isinstance(message, AssistantMessage):
                 for block in message.content:
                     if isinstance(block, ToolUseBlock):
+                        if block.name == STRUCTURED_OUTPUT_TOOL_NAME:
+                            structured_output_transport_seen = True
+                        else:
+                            forbidden_tool_use_seen = True
                         # 構造化出力の配信機構 (STRUCTURED_OUTPUT_TOOL_NAME)
                         # だけは通す。それ以外は禁止ツールの使用として契約違反。
                         assert_no_forbidden_tool_use(block)
@@ -208,7 +222,10 @@ async def _run_agent_locked(mode: str) -> AsyncIterator[str]:
                 cost = getattr(message, "total_cost_usd", None)
                 if message.subtype != "success":
                     row = _log_agent_result(mode=mode, prompt=prompt, started=started,
-                                            status=message.subtype, cost_usd=cost)
+                                            status=message.subtype, cost_usd=cost,
+                                            structured_output_transport_seen=(
+                                                structured_output_transport_seen),
+                                            forbidden_tool_use_seen=forbidden_tool_use_seen)
                     # ⚠️ status を明示的に含める。error フィールドは
                     # message.subtype と同じ値だが、他の失敗系 SSE は
                     # 全て "status" というキー名で会計行の状態を運ぶので、
@@ -222,12 +239,18 @@ async def _run_agent_locked(mode: str) -> AsyncIterator[str]:
             await asyncio.sleep(0)  # イベントループに制御を返す
     except AgentProtocolViolation as e:
         row = _log_agent_result(mode=mode, prompt=prompt, started=started,
-                                status="protocol_violation", error=e)
+                                status="protocol_violation", error=e,
+                                structured_output_transport_seen=(
+                                    structured_output_transport_seen),
+                                forbidden_tool_use_seen=forbidden_tool_use_seen)
         yield _sse_error(f"プロトコル違反: {e}", row)
         return
     except Exception as e:
         row = _log_agent_result(mode=mode, prompt=prompt, started=started,
-                                status="error", error=e)
+                                status="error", error=e,
+                                structured_output_transport_seen=(
+                                    structured_output_transport_seen),
+                                forbidden_tool_use_seen=forbidden_tool_use_seen)
         yield _sse_error(str(e), row)
         return
 
@@ -239,7 +262,10 @@ async def _run_agent_locked(mode: str) -> AsyncIterator[str]:
         verified = validate_agent_output(raw, projection, base_dir=BASE_DIR)
     except AgentOutputError as e:
         row = _log_agent_result(mode=mode, prompt=prompt, started=started,
-                                status="output_rejected", cost_usd=cost, error=e)
+                                status="output_rejected", cost_usd=cost, error=e,
+                                structured_output_transport_seen=(
+                                    structured_output_transport_seen),
+                                forbidden_tool_use_seen=forbidden_tool_use_seen)
         yield _sse_error(f"出力の検証に失敗、保存しません: {e}", row)
         return
 
@@ -252,13 +278,19 @@ async def _run_agent_locked(mode: str) -> AsyncIterator[str]:
                                      as_of=now.isoformat())
     except OSError as e:
         row = _log_agent_result(mode=mode, prompt=prompt, started=started,
-                                status="persistence_error", cost_usd=cost, error=e)
+                                status="persistence_error", cost_usd=cost, error=e,
+                                structured_output_transport_seen=(
+                                    structured_output_transport_seen),
+                                forbidden_tool_use_seen=forbidden_tool_use_seen)
         yield _sse_error(f"保存に失敗しました: {e}", row)
         return
     # 検証を通ってから、最終 status と実コストを1行だけ記録する。
     _log_agent_result(mode=mode, prompt=prompt, started=started,
                       status="success" if saved else "skipped_stale_write",
-                      cost_usd=cost)
+                      cost_usd=cost,
+                      structured_output_transport_seen=(
+                          structured_output_transport_seen),
+                      forbidden_tool_use_seen=forbidden_tool_use_seen)
     yield _sse("done", {
         "success": True,
         "saved": OUTPUT_FILES[mode] if saved else None,

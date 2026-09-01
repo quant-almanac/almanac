@@ -78,6 +78,8 @@ def test_a_protocol_violation_still_logs_a_row(monkeypatch, sandbox):
     assert code == 1
     assert rows, "プロトコル違反が会計ログに1行も残らなかった"
     assert rows[-1]["status"] == "protocol_violation"
+    assert rows[-1]["forbidden_tool_use_seen"] is True
+    assert rows[-1]["structured_output_transport_seen"] is False
 
 
 def test_a_query_exception_still_logs_a_row(monkeypatch, sandbox):
@@ -102,7 +104,7 @@ def test_a_persistence_failure_after_a_known_cost_still_logs_a_row(monkeypatch, 
 
     class AssistantMessage:
         def __init__(self):
-            self.content = [_TextBlock("x")]
+            self.content = [_ToolUseBlock("StructuredOutput", {})]
 
     async def fake_query(prompt, options):
         yield AssistantMessage()
@@ -137,3 +139,5 @@ def test_a_persistence_failure_after_a_known_cost_still_logs_a_row(monkeypatch, 
     row = rows[-1]
     assert row["status"] == "persistence_error"
     assert row["cost_usd"] == 0.0789
+    assert row["structured_output_transport_seen"] is True
+    assert row["forbidden_tool_use_seen"] is False

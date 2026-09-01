@@ -131,8 +131,10 @@ def test_agent_sdk_result_logs_cost_accounting(monkeypatch, sandbox):
     assert row["mode"] == "default"
     assert row["status"] == "success"
     assert row["cost_usd"] == 0.0123
-    # ツール無し・1ターンの契約になった。
-    assert row["max_turns"] == 1
+    # 実ツール無し。StructuredOutputのschema修正だけ1回再試行できる。
+    assert row["max_turns"] == 2
+    assert row["structured_output_transport_seen"] is False
+    assert row["forbidden_tool_use_seen"] is False
 
 
 def test_a_tool_use_block_is_a_protocol_violation(monkeypatch, sandbox):
@@ -156,8 +158,35 @@ def test_a_tool_use_block_is_a_protocol_violation(monkeypatch, sandbox):
     assert any("event: error" in chunk for chunk in chunks)
     assert not any("event: done" in chunk for chunk in chunks)
     assert rows[-1]["status"] == "protocol_violation"
+    assert rows[-1]["forbidden_tool_use_seen"] is True
+    assert rows[-1]["structured_output_transport_seen"] is False
     # 違反時は保存しない。
     assert not (sandbox / "agent_briefing.json").exists()
+
+
+def test_structured_output_transport_is_audited_separately(monkeypatch, sandbox):
+    """構造化出力の搬送は実ツール使用ではないが、監査上は観測できる。
+
+    2026-09-01 の本番失敗はこの搬送に対する schema error 後、修正ターンを
+    max_turns=1 が止めたものだった。success 行にも搬送の有無を残すことで、
+    禁止ツール使用と混同せず運用確認できる。
+    """
+    rows: list[dict] = []
+    _install_fake_sdk(
+        monkeypatch,
+        blocks=[_ToolUseBlock("StructuredOutput", {"synthetic": True})],
+        result=_valid_agent_output(sandbox),
+    )
+    monkeypatch.setattr(agent, "_append_llm_call_log", lambda row: rows.append(row),
+                        raising=False)
+
+    chunks = asyncio.run(_collect_agent_chunks("default"))
+
+    assert any("event: done" in chunk for chunk in chunks)
+    assert rows[-1]["status"] == "success"
+    assert rows[-1]["structured_output_transport_seen"] is True
+    assert rows[-1]["forbidden_tool_use_seen"] is False
+    assert rows[-1]["use_tool"] is False
 
 
 def test_a_rejected_output_is_not_saved(monkeypatch, sandbox):

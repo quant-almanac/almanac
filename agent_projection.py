@@ -1155,6 +1155,13 @@ def resolve_agent_model() -> str:
         # 明示的に失敗させる —— 課金経路で「どのモデルか不明」は許さない。
         raise ProjectionError("cannot resolve the agent model from model_router")
 AGENT_MAX_BUDGET_USD = 0.50
+#: StructuredOutput は内部的には tool_use -> tool_result で配信される。
+#: 1回目の出力が JSON Schema に合わない場合、CLI は tool_result で誤りを
+#: モデルへ返し、次の1ターンで自己修正する。max_turns=1 だとこの安全な
+#: schema 再試行を error_max_turns で打ち切る（2026-09-01 本番で実測）。
+#: 実ツールは引き続き0件、費用上限も別に固定しているため、許すのは
+#: schema 修正用の追加1ターンだけとする。
+AGENT_MAX_TURNS = 2
 
 
 def build_agent_options_kwargs() -> dict:
@@ -1189,7 +1196,7 @@ def build_agent_options_kwargs() -> dict:
         # 無視され**、本番だけ自由形式出力になる
         # (Codex レビュー round 12: 生成コマンドに --json-schema が無かった)。
         "output_format": {"type": "json_schema", "schema": OUTPUT_SCHEMA},
-        "max_turns": 1,
+        "max_turns": AGENT_MAX_TURNS,
         # 課金経路なので model と上限を明示する。既定任せにしない
         # (Codex レビュー round 13: model=None / max_budget_usd=None だった)。
         "model": resolve_agent_model(),
