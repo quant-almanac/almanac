@@ -226,6 +226,13 @@ def test_a_verified_output_is_saved_with_the_projection_hash(monkeypatch, sandbo
 
     saved = json.loads((sandbox / "agent_briefing.json").read_text(encoding="utf-8"))
     assert len(saved["projection_sha256"]) == 64
+    assert saved["validation_scope"] == [{
+        "candidate_id": saved["actions"][0]["candidate_id"],
+        "canonical_instrument_id": "VT",
+        "allowed_actions": ["buy", "watch", "hold"],
+        "max_actionability": "watch_only",
+    }]
+    assert saved["validation_context"]["max_overall_stance"] == "neutral"
     assert saved["actions"][0]["ticker"] == "VT"
     assert saved["as_of"]
 

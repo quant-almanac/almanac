@@ -130,6 +130,25 @@ def projection_sha256(payload: dict) -> str:
     return hashlib.sha256(canonical_json(payload).encode("utf-8")).hexdigest()
 
 
+def validation_scope_snapshot(projection: dict) -> list[dict]:
+    """Return the sanitized authorization envelope used for validation.
+
+    The complete projection hash identifies an input exactly, but its source
+    files can legitimately change after a scheduled run.  Persisting this
+    already-sanitized subset makes the original action-scope validation
+    replayable later without exposing raw portfolio inputs.
+    """
+    rows = []
+    for entry in projection.get("action_scope", []):
+        rows.append({
+            "candidate_id": entry["candidate_id"],
+            "canonical_instrument_id": entry["canonical_instrument_id"],
+            "allowed_actions": list(entry["allowed_actions"]),
+            "max_actionability": entry["max_actionability"],
+        })
+    return sorted(rows, key=lambda row: row["candidate_id"])
+
+
 def _file_hash(path: Path) -> str | None:
     """入力ファイルの内容ハッシュ。"""
     try:
@@ -1087,6 +1106,15 @@ def validate_agent_output(
         "mode": projection["mode"],
         "evaluation_as_of": projection["evaluation_as_of"],
         "projection_sha256": projection_sha256(projection),
+        # A later technical refresh changes the complete projection hash.
+        # Keep the exact sanitized authorization envelope so an operator can
+        # still replay the action checks after that normal state transition.
+        "validation_scope": validation_scope_snapshot(projection),
+        "validation_context": {
+            "max_overall_stance": (
+                projection.get("portfolio_context") or {}
+            ).get("max_overall_stance"),
+        },
         "headline": headline,
         "overall_stance": stance,
         "actions": sorted(resolved, key=lambda a: a["rank"]),

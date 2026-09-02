@@ -104,6 +104,7 @@ def verify_canary(
     base_dir = Path(base_dir)
     since_utc = since.astimezone(timezone.utc)
     checks: list[dict] = []
+    warnings: list[dict] = []
 
     def check(name: str, ok: bool, detail: object) -> None:
         checks.append({"name": name, "ok": bool(ok), "detail": detail})
@@ -175,19 +176,63 @@ def verify_canary(
     )
     check("cost_within_cap", cost_ok, cost)
 
+    digest = briefing.get("projection_sha256")
+    digest_ok = isinstance(digest, str) and len(digest) == 64
+    if digest_ok:
+        try:
+            int(digest, 16)
+        except ValueError:
+            digest_ok = False
+    check("projection_hash_present", digest_ok, digest)
+
     evaluation_at = _parse_time(briefing.get("evaluation_as_of"))
     if evaluation_at is None:
         check("projection_rebuild", False, "missing evaluation_as_of")
     else:
+        saved_scope = briefing.get("validation_scope")
+        saved_context = briefing.get("validation_context")
+        scope_replayed = False
+        if isinstance(saved_scope, list) and isinstance(saved_context, dict):
+            replay_projection = {
+                "mode": "default",
+                "evaluation_as_of": briefing.get("evaluation_as_of"),
+                "portfolio_context": saved_context,
+                "action_scope": saved_scope,
+            }
+            try:
+                validate_agent_output(_raw_output(briefing), replay_projection)
+                check("action_scope", True, len(briefing.get("actions", [])))
+                scope_replayed = True
+            except Exception as exc:
+                check("action_scope", False, f"{type(exc).__name__}: {exc}")
         try:
             projection = build_agent_projection(
                 "default", base_dir=base_dir, now=evaluation_at)
-            digest_ok = projection_sha256(projection) == briefing.get("projection_sha256")
-            check("projection_hash", digest_ok, briefing.get("projection_sha256"))
-            validate_agent_output(_raw_output(briefing), projection)
-            check("action_scope", True, len(briefing.get("actions", [])))
+            current_digest = projection_sha256(projection)
+            if current_digest != digest:
+                # This is normal after a later technical-state refresh.  The
+                # saved validation_scope is the durable authorization proof.
+                # Older artifacts lack it, so validate against the current
+                # scope but disclose that exact replay is unavailable.
+                warnings.append({
+                    "name": "projection_inputs_changed_after_run",
+                    "detail": {"saved": digest, "current": current_digest},
+                })
+            if not scope_replayed:
+                validate_agent_output(_raw_output(briefing), projection)
+                check("action_scope", True, len(briefing.get("actions", [])))
+                warnings.append({
+                    "name": "legacy_artifact_without_validation_scope",
+                    "detail": "scope was checked against current projection",
+                })
         except Exception as exc:
-            check("projection_rebuild", False, f"{type(exc).__name__}: {exc}")
+            if scope_replayed:
+                warnings.append({
+                    "name": "current_projection_unavailable",
+                    "detail": f"{type(exc).__name__}: {exc}",
+                })
+            else:
+                check("projection_rebuild", False, f"{type(exc).__name__}: {exc}")
 
     failed = [item for item in checks if not item["ok"]]
     return {
@@ -197,6 +242,7 @@ def verify_canary(
         "briefing_as_of": briefing_at.isoformat(),
         "accounting_rows": len(rows),
         "checks": checks,
+        "warnings": warnings,
     }
 
 
