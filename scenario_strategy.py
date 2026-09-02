@@ -5,10 +5,13 @@
 """
 import json
 from pathlib import Path
-from datetime import datetime
-from typing import Optional
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
+
+from almanac.runtime_config import get_env
 
 BASE_DIR = Path(__file__).parent
+_FUTURE_TOLERANCE = timedelta(hours=1)
 
 SCENARIOS = {
     "BULL": {
@@ -116,24 +119,51 @@ SCENARIOS = {
 }
 
 
-def _load_regime() -> dict:
+def _local_timezone() -> ZoneInfo:
+    return ZoneInfo(
+        get_env(
+            "ALMANAC_LOCAL_TIMEZONE",
+            "Asia/Tokyo",
+            legacy_name="KAIROS_LOCAL_TIMEZONE",
+        ) or "Asia/Tokyo"
+    )
+
+
+def _load_regime(*, now: datetime | None = None) -> dict:
     path = BASE_DIR / "regime_state.json"
     fallback = None
     if path.exists():
-        with open(path, encoding="utf-8") as f:
-            fallback = json.load(f)
-        if not _is_regime_stale(fallback):
+        try:
+            with open(path, encoding="utf-8") as f:
+                loaded = json.load(f)
+            fallback = loaded if isinstance(loaded, dict) else None
+        except (OSError, json.JSONDecodeError):
+            fallback = None
+        if fallback is not None and not _is_regime_stale(fallback, now=now):
             fallback["_source"] = "regime_state.json"
             return fallback
 
-    screen_regime = _load_screen_market_regime()
+    screen_regime = _load_screen_market_regime(now=now)
     if screen_regime:
         return screen_regime
     if fallback:
-        fallback["_source"] = "regime_state.json"
-        fallback["_stale"] = True
-        return fallback
-    return {"spy_above": True, "nk_above": True, "_source": "default"}
+        # Retain the last observation time for diagnosis, but stale direction
+        # must not continue authorising a BULL/BEAR strategy.
+        return {
+            "spy_above": None,
+            "nk_above": None,
+            "updated": fallback.get("updated") or fallback.get("cached_at") or "",
+            "_source": "regime_state.json",
+            "_stale": True,
+        }
+    # Missing market evidence is uncertainty, not evidence for a bull market.
+    # ``detect_scenario`` maps the explicit unknowns to NEUTRAL.
+    return {
+        "spy_above": None,
+        "nk_above": None,
+        "_source": "unavailable",
+        "_stale": True,
+    }
 
 
 def _parse_dt(value: str) -> datetime | None:
@@ -151,21 +181,52 @@ def _parse_dt(value: str) -> datetime | None:
     return None
 
 
-def _is_regime_stale(regime: dict, max_age_hours: float = 24.0) -> bool:
-    ts = _parse_dt(str(regime.get("updated") or regime.get("cached_at") or ""))
+def _timestamp_is_stale(
+    value: object,
+    *,
+    max_age_hours: float,
+    now: datetime | None = None,
+) -> bool:
+    """Treat missing, malformed, old, and materially future timestamps as stale."""
+    ts = _parse_dt(str(value or ""))
     if ts is None:
-        return False
-    return (datetime.now() - ts).total_seconds() / 3600 > max_age_hours
+        return True
+    local_tz = _local_timezone()
+    if ts.tzinfo is None or ts.utcoffset() is None:
+        ts = ts.replace(tzinfo=local_tz)
+    else:
+        ts = ts.astimezone(local_tz)
+    current = now or datetime.now(local_tz)
+    if current.tzinfo is None or current.utcoffset() is None:
+        current = current.replace(tzinfo=local_tz)
+    else:
+        current = current.astimezone(local_tz)
+    age = current - ts
+    return age < -_FUTURE_TOLERANCE or age > timedelta(hours=max_age_hours)
 
 
-def _load_screen_market_regime(max_age_hours: float = 24.0) -> dict | None:
+def _is_regime_stale(
+    regime: dict,
+    max_age_hours: float = 24.0,
+    *,
+    now: datetime | None = None,
+) -> bool:
+    raw_timestamp = regime.get("updated") or regime.get("cached_at")
+    return _timestamp_is_stale(raw_timestamp, max_age_hours=max_age_hours, now=now)
+
+
+def _load_screen_market_regime(
+    max_age_hours: float = 24.0,
+    *,
+    now: datetime | None = None,
+) -> dict | None:
     path = BASE_DIR / "screen_results.json"
     if not path.exists():
         return None
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
-        ts = _parse_dt(str(data.get("timestamp") or data.get("generated_at") or ""))
-        if ts is not None and (datetime.now() - ts).total_seconds() / 3600 > max_age_hours:
+        raw_timestamp = data.get("timestamp") or data.get("generated_at")
+        if _timestamp_is_stale(raw_timestamp, max_age_hours=max_age_hours, now=now):
             return None
         mm = data.get("market_meta") or {}
         spy_label = mm.get("sp500")
@@ -205,13 +266,23 @@ def _load_briefing() -> dict:
     return {}
 
 
-def _load_short_candidates() -> list:
+def _load_short_candidates(*, now: datetime | None = None) -> list:
     path = BASE_DIR / "short_candidates.json"
-    if path.exists():
+    if not path.exists():
+        return []
+    try:
         with open(path, encoding="utf-8") as f:
             data = json.load(f)
-            return data.get("candidates", [])
-    return []
+        if not isinstance(data, dict) or _timestamp_is_stale(
+            data.get("as_of") or data.get("generated_at") or data.get("timestamp"),
+            max_age_hours=72,
+            now=now,
+        ):
+            return []
+        rows = data.get("candidates") or []
+        return [row for row in rows if isinstance(row, dict)] if isinstance(rows, list) else []
+    except (OSError, json.JSONDecodeError):
+        return []
 
 
 def _load_short_product_controls() -> dict[str, bool]:
@@ -256,13 +327,27 @@ def _apply_tunable_cash_target(scenario_key: str, scenario: dict) -> dict:
     return scenario
 
 
-def _load_long_term_candidates() -> list:
+def _load_long_term_candidates(*, now: datetime | None = None) -> list:
     path = BASE_DIR / "long_term_screen_results.json"
-    if path.exists():
+    if not path.exists():
+        return []
+    try:
         with open(path, encoding="utf-8") as f:
             data = json.load(f)
-            return data.get("candidates", [])
-    return []
+        if not isinstance(data, dict) or _timestamp_is_stale(
+            data.get("as_of") or data.get("generated_at") or data.get("timestamp"),
+            max_age_hours=14 * 24,
+            now=now,
+        ):
+            return []
+        # The canonical producer writes ``passed``.  ``candidates`` is kept as
+        # backward-compatible input for older/public snapshots only.
+        rows = data.get("passed")
+        if rows is None:
+            rows = data.get("candidates")
+        return [row for row in rows if isinstance(row, dict)] if isinstance(rows, list) else []
+    except (OSError, json.JSONDecodeError):
+        return []
 
 
 def detect_scenario(regime: dict, guard: dict) -> str:
@@ -275,15 +360,15 @@ def detect_scenario(regime: dict, guard: dict) -> str:
     """
     daily_pnl = guard.get("daily_pnl_pct", 0) or 0
     monthly_pnl = guard.get("monthly_pnl_pct", 0) or 0
-    spy_above = regime.get("spy_above", True)
-    nk_above = regime.get("nk_above", True)
+    spy_above = regime.get("spy_above")
+    nk_above = regime.get("nk_above")
 
     # behavioral_guard stores decimal ratios: -0.05 == -5%.
     if daily_pnl <= -0.05 or monthly_pnl <= -0.10:
         return "CRASH"
-    if spy_above and nk_above:
+    if spy_above is True and nk_above is True:
         return "BULL"
-    if not spy_above and not nk_above:
+    if spy_above is False and nk_above is False:
         return "BEAR"
     return "NEUTRAL"
 
@@ -369,10 +454,10 @@ if __name__ == "__main__":
     else:
         print(f"現在のシナリオ: {result['scenario_icon']} {result['scenario_name']}")
         print(f"現金比率目標: {result['cash_ratio_target']}%")
-        print(f"推奨アクション:")
+        print("推奨アクション:")
         for a in result["actions"]:
             print(f"  • {a}")
         if result["high_return_opportunities"]:
-            print(f"\n高リターン機会:")
+            print("\n高リターン機会:")
             for op in result["high_return_opportunities"]:
                 print(f"  {op['icon']} {op.get('ticker')} — {op.get('reason')}")
