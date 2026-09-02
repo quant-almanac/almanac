@@ -24,7 +24,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Iterable, Optional
+from typing import Iterable, Optional
 
 SCHEMA_VERSION = "topic_lane_v1"
 
@@ -72,12 +72,24 @@ _QUOTA_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Some adapters return a structured stop reason through their ``error`` field
+# instead of returning truncated content plus usage.  Treat those explicit
+# output-limit signals as truncation so the caller can split the batch.  Quota
+# detection must run first because credit errors can also mention max_tokens.
+_TRUNCATION_ERROR_RE = re.compile(
+    r"stop_reason\s*[=:]\s*['\"]?max_tokens|"
+    r"finish_reason\s*[=:]\s*['\"]?(?:length|max_tokens)",
+    re.IGNORECASE,
+)
+
 
 def classify_error(error: object) -> str:
     """アダプタが返した error 文字列を分類する。"""
     text = str(error or "")
     if _QUOTA_RE.search(text):
         return ERROR_QUOTA
+    if _TRUNCATION_ERROR_RE.search(text):
+        return ERROR_TRUNCATION
     return ERROR_TRANSPORT
 
 

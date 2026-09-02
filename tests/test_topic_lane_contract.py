@@ -87,6 +87,45 @@ def test_quota_errors_are_classified_separately_from_transport():
     assert tlc.is_quota_error("Connection reset by peer") is False
 
 
+def test_adapter_output_limit_error_is_classified_as_truncation():
+    """The live adapter can put stop/finish reasons in ``error``.
+
+    2026-09-01 b2 returned this shape with completion_tokens=4000.  Treating it
+    as transport_error bypassed the split retry and made the whole lane
+    partial even though retry was specifically designed for this condition.
+    """
+    error = "stop_reason=max_tokens; finish_reason=length"
+    assert tlc.classify_error(error) == tlc.ERROR_TRUNCATION
+
+    # A credit error mentioning max_tokens is still quota, not retryable
+    # truncation.  Quota classification therefore has precedence.
+    quota = "402: fewer max_tokens required; can only afford 972"
+    assert tlc.classify_error(quota) == tlc.ERROR_QUOTA
+
+
+def test_news_batch_preserves_adapter_output_limit_as_retryable(monkeypatch):
+    import news_topic_analyzer as nt
+
+    monkeypatch.setattr(nt, "call_by_role", lambda *a, **k: {
+        "content": "",
+        "error": "stop_reason=max_tokens; finish_reason=length",
+        "usage": {"completion_tokens": nt.MAX_TOKENS_PER_BATCH},
+        "adapter": "synthetic",
+        "model": "synthetic-model",
+    })
+    monkeypatch.setattr(nt, "_log_adapter_usage", lambda **kwargs: True)
+
+    result = nt._run_one_batch(
+        [{"ticker": "AAA", "sentiment_score": 70, "top_headlines": []}],
+        role="news_topic_deepdive",
+        run_id="test-run",
+        batch_id="test-run#b1",
+    )
+
+    assert result["status"] == "error"
+    assert result["failure_kind"] == tlc.ERROR_TRUNCATION
+
+
 # ---------------------------------------------------------------------------
 # スキーマ検証: 「JSON が読めた」と「使える分析がある」は別
 # ---------------------------------------------------------------------------
