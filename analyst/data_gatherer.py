@@ -1406,13 +1406,25 @@ def gather_data() -> dict:
 
     # ── account / cash を rebalance より先に読み込む（P0-6 で rebalance に渡すため）──
     account_raw = load_json(BASE_DIR / "account.json", {})
-    # P0-1: FX rate を utils.get_fx_rate_cached() 経由で取得（TTL 10分 + stale fallback）
+    # P0-1: FX rate を TTL cache + stale fallback 経由で取得。
+    # 判断スナップショットは account.json の保存日ではなく、この分析が
+    # 実際に使った rate/source/observed_at を凍結する。account.json の更新は
+    # cash attestation を失効させるため、読取り分析からは書き換えない。
+    fx_source = "unknown"
+    fx_observed_at = None
     try:
-        from utils import get_fx_rate_cached
-        _fx, _ = get_fx_rate_cached(account_json_path=BASE_DIR / "account.json")
-        fx_rate = float(_fx)
+        from utils import get_fx_rate_observation
+
+        _fx_observation = get_fx_rate_observation(
+            account_json_path=BASE_DIR / "account.json",
+        )
+        fx_rate = float(_fx_observation["rate"])
+        fx_source = str(_fx_observation.get("source") or "unknown")
+        fx_observed_at = _fx_observation.get("observed_at")
     except Exception:
         fx_rate = account_raw.get("fx_rate_usdjpy", 150)
+        fx_source = "account_stale" if account_raw.get("fx_rate_usdjpy") else "hardcoded"
+        fx_observed_at = account_raw.get("fx_rate_usdjpy_as_of")
     usd_balance = account_raw.get("usd_balance", 0)
     jpy_balance = account_raw.get("balance", 0)
     total_cash_jpy = jpy_balance + round(usd_balance * fx_rate)
@@ -1420,6 +1432,8 @@ def gather_data() -> dict:
         "jpy_cash": jpy_balance,
         "usd_cash": usd_balance,
         "fx_rate_usdjpy": fx_rate,
+        "fx_rate_source": fx_source,
+        "fx_rate_usdjpy_as_of": fx_observed_at,
         "usd_as_jpy": round(usd_balance * fx_rate),
         "total_cash_jpy": total_cash_jpy,
         "account_last_updated": account_raw.get("last_updated"),

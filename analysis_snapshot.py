@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
@@ -422,12 +423,47 @@ def build_base_snapshot_from_data(
     after ``gather_data()`` and reuse the returned object for every later stage;
     rebuilding it from disk would create a second, non-authoritative view.
     """
-    base = build_base_snapshot(base_dir=base_dir, now=now)
+    snapshot_now = now or datetime.now()
+    base = build_base_snapshot(base_dir=base_dir, now=snapshot_now)
+    cash_info = data.get("cash_info") if isinstance(data.get("cash_info"), dict) else {}
+    fx_source = str(cash_info.get("fx_rate_source") or "unknown")
+    fx_as_of = _parse_timestamp_value(cash_info.get("fx_rate_usdjpy_as_of"))
+    try:
+        fx_rate = float(cash_info.get("fx_rate_usdjpy"))
+        fx_rate_valid = math.isfinite(fx_rate) and 0 < fx_rate < 1000
+    except (TypeError, ValueError):
+        fx_rate_valid = False
+    # Only a rate whose acquisition path and observation time are both known
+    # can authorize a decision.  ``hardcoded`` and legacy payloads without the
+    # provenance fields remain unknown even if account.json happens to contain
+    # a recent timestamp.
+    fx_status = (
+        _freshness_status(
+            fx_as_of,
+            now=snapshot_now,
+            max_age_hours=stale_after_hours("fx"),
+        )
+        if fx_rate_valid and fx_source in {"live", "cache", "account_stale"}
+        else "unknown"
+    )
+    fx_observation = {
+        "rate": cash_info.get("fx_rate_usdjpy"),
+        "source": fx_source,
+        "observed_at": cash_info.get("fx_rate_usdjpy_as_of"),
+    }
+    consumed_fx = SourceProvenance(
+        source=f"fx_observation:{fx_source}",
+        source_as_of=fx_as_of.isoformat() if fx_as_of else None,
+        retrieved_at=snapshot_now.isoformat(),
+        freshness_status=fx_status,
+        max_age_policy_hours=stale_after_hours("fx"),
+        artifact_hash=_payload_hash(fx_observation),
+    )
     payloads = {
         "holdings": data.get("positions"),
-        "cash": data.get("cash_info"),
+        "cash": cash_info,
         "prices": data.get("technical_state"),
-        "fx": (data.get("cash_info") or {}).get("fx_rate_usdjpy"),
+        "fx": cash_info.get("fx_rate_usdjpy"),
         "macro": {
             "market_meta": data.get("market_meta"),
             "regime": data.get("regime"),
@@ -445,10 +481,15 @@ def build_base_snapshot_from_data(
             "catalyst_context": data.get("catalyst_context"),
         },
     }
-    return BaseSnapshot(**{
+    provenances = {
         key: replace(getattr(base, key), payload_hash=_payload_hash(payload))
         for key, payload in payloads.items()
-    })
+    }
+    provenances["fx"] = replace(
+        consumed_fx,
+        payload_hash=_payload_hash(cash_info.get("fx_rate_usdjpy")),
+    )
+    return BaseSnapshot(**provenances)
 
 
 def decision_freshness_issues(enriched: EnrichedSnapshot) -> list[dict]:

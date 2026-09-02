@@ -214,7 +214,14 @@ def test_snapshot_claims_and_action_claim_preserve_parent_quality(tmp_path):
     }.items():
         (tmp_path / name).write_text(json.dumps(payload), encoding="utf-8")
     base = snapshot.build_base_snapshot_from_data(
-        {"positions": [], "cash_info": {"fx_rate_usdjpy": 150}},
+        {
+            "positions": [],
+            "cash_info": {
+                "fx_rate_usdjpy": 150,
+                "fx_rate_source": "live",
+                "fx_rate_usdjpy_as_of": now.timestamp(),
+            },
+        },
         base_dir=tmp_path,
         now=now,
     )

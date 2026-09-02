@@ -6,6 +6,7 @@ import errno
 import fcntl
 import json
 import logging
+import math
 import os
 import tempfile
 import time
@@ -329,6 +330,66 @@ def get_fx_rate_cached(pair: str = 'USDJPY=X',
     # 4. 最終フォールバック
     _logger.error(f"[fx] ハードコードフォールバック使用: {FX_HARDCODED_FALLBACK}")
     return FX_HARDCODED_FALLBACK, 'hardcoded'
+
+
+def get_fx_rate_observation(pair: str = 'USDJPY=X',
+                            ttl_sec: int = FX_CACHE_TTL_SEC,
+                            account_json_path: Optional[Path] = None,
+                            ) -> dict:
+    """Return the exact FX value consumed together with its provenance.
+
+    ``account.json`` is durable broker-cash state, not the market-data cache.
+    A formal analysis must therefore be able to prove that it consumed a
+    current live/cache observation without rewriting that financial file (and
+    invalidating a user attestation as a side effect).  Existing callers that
+    only need ``(rate, source)`` keep using :func:`get_fx_rate_cached`.
+    """
+    requested_at = time.time()
+    rate, source = get_fx_rate_cached(
+        pair,
+        ttl_sec=ttl_sec,
+        account_json_path=account_json_path,
+    )
+    observed_at: Optional[float] = None
+
+    if source in {'live', 'cache'}:
+        cached = _fx_cache.get(pair)
+        if isinstance(cached, tuple) and len(cached) == 2:
+            try:
+                cached_rate = float(cached[0])
+                cached_at = float(cached[1])
+                if (
+                    math.isfinite(cached_rate)
+                    and math.isfinite(cached_at)
+                    and cached_at >= 946_684_800
+                    and abs(cached_rate - float(rate)) < 1e-9
+                ):
+                    observed_at = cached_at
+            except (TypeError, ValueError):
+                observed_at = None
+        # A real live return always populates _fx_cache first.  This fallback
+        # only preserves the contract for injected/test providers that report
+        # source=live without sharing the module cache.
+        if source == 'live' and observed_at is None:
+            observed_at = requested_at
+    elif source == 'account_stale':
+        try:
+            account = load_json(
+                account_json_path or (Path(__file__).parent / 'account.json'),
+                default={},
+            )
+            raw_as_of = account.get('fx_rate_usdjpy_as_of')
+            parsed_as_of = float(raw_as_of)
+            if math.isfinite(parsed_as_of) and parsed_as_of >= 946_684_800:
+                observed_at = parsed_as_of
+        except (TypeError, ValueError):
+            observed_at = None
+
+    return {
+        'rate': float(rate),
+        'source': str(source),
+        'observed_at': observed_at,
+    }
 
 
 def _fx_cache_clear() -> None:

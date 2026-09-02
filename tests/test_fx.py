@@ -32,6 +32,35 @@ def test_fx_cache_hit(monkeypatch, tmp_path):
     assert r1 == r2 == 150.5
 
 
+def test_fx_observation_preserves_the_original_live_and_cache_timestamp(monkeypatch, tmp_path):
+    """A read-only analysis can prove FX freshness without rewriting account.json."""
+    utils._fx_cache_clear()
+    acc = tmp_path / 'account.json'
+    original = '{"fx_rate_usdjpy": 149.0}\n'
+    acc.write_text(original, encoding='utf-8')
+
+    class _Fake:
+        @property
+        def fast_info(self):
+            return {'lastPrice': 150.5}
+
+    class _FakeMod:
+        def Ticker(self, _pair):
+            return _Fake()
+
+    monkeypatch.setitem(__import__('sys').modules, 'yfinance', _FakeMod())
+
+    live = utils.get_fx_rate_observation('USDJPY=X', account_json_path=acc)
+    cached = utils.get_fx_rate_observation('USDJPY=X', account_json_path=acc)
+
+    assert live['source'] == 'live'
+    assert cached['source'] == 'cache'
+    assert live['rate'] == cached['rate'] == 150.5
+    assert live['observed_at'] == cached['observed_at']
+    assert isinstance(live['observed_at'], float)
+    assert acc.read_text(encoding='utf-8') == original
+
+
 def test_live_fx_refresh_recomputes_account_cash_totals(monkeypatch, tmp_path):
     utils._fx_cache_clear()
     calls = {'n': 0}
@@ -112,6 +141,31 @@ def test_fx_stale_fallback(monkeypatch, tmp_path):
     r, src = utils.get_fx_rate_cached('USDJPY=X', account_json_path=acc)
     assert src == 'account_stale'
     assert r == 148.0
+
+
+def test_fx_observation_keeps_account_fallback_timestamp(monkeypatch, tmp_path):
+    utils._fx_cache_clear()
+    acc = tmp_path / 'account.json'
+    observed_at = time.time() - 3600
+    acc.write_text(json.dumps({
+        'fx_rate_usdjpy': 148.0,
+        'fx_rate_usdjpy_as_of': observed_at,
+    }), encoding='utf-8')
+
+    class _BadMod:
+        def Ticker(self, *a, **k):
+            raise RuntimeError('network down')
+
+    monkeypatch.setitem(__import__('sys').modules, 'yfinance', _BadMod())
+    observation = utils.get_fx_rate_observation(
+        'USDJPY=X', account_json_path=acc,
+    )
+
+    assert observation == {
+        'rate': 148.0,
+        'source': 'account_stale',
+        'observed_at': observed_at,
+    }
 
 
 def test_fx_hardcoded(monkeypatch, tmp_path):

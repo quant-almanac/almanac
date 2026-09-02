@@ -270,6 +270,73 @@ def test_in_memory_payload_hash_changes_even_when_artifact_is_unchanged(tmp_path
     assert first.holdings.payload_hash != second.holdings.payload_hash
 
 
+def test_in_memory_live_fx_observation_overrides_stale_account_market_timestamp(tmp_path):
+    """Freeze the FX value actually consumed by the analysis.
+
+    ``account.json`` can remain unchanged for days because dashboard reads are
+    intentionally read-only.  The formal analysis nevertheless fetches a live
+    rate.  Using only the durable account timestamp made every later analysis
+    review-only even though its in-memory FX input was current.
+    """
+    now = datetime(2026, 9, 2, 6, 20, 0)
+    _write(tmp_path, "account.json", {
+        "last_updated": "2026-08-26",
+        "fx_rate_usdjpy": 159.0,
+        "fx_rate_usdjpy_as_of": datetime(2026, 8, 31, 5, 0).timestamp(),
+    })
+
+    base = snap.build_base_snapshot_from_data({
+        "cash_info": {
+            "fx_rate_usdjpy": 160.14,
+            "fx_rate_source": "live",
+            "fx_rate_usdjpy_as_of": now.timestamp(),
+        },
+    }, base_dir=tmp_path, now=now)
+
+    assert base.fx.source == "fx_observation:live"
+    assert base.fx.source_as_of == now.isoformat()
+    assert base.fx.freshness_status == "fresh"
+    assert not any(
+        issue["category"] == "fx"
+        for issue in snap.decision_freshness_issues(
+            snap.build_enriched_snapshot(base, now=now)
+        )
+    )
+
+
+def test_in_memory_fx_without_source_or_timestamp_remains_unknown(tmp_path):
+    """A rate value alone is not evidence that the market observation is current."""
+    now = datetime(2026, 9, 2, 6, 20, 0)
+    _write(tmp_path, "account.json", {
+        "last_updated": now.isoformat(),
+        "fx_rate_usdjpy": 160.0,
+        "fx_rate_usdjpy_as_of": now.timestamp(),
+    })
+
+    base = snap.build_base_snapshot_from_data(
+        {"cash_info": {"fx_rate_usdjpy": 150.0}},
+        base_dir=tmp_path,
+        now=now,
+    )
+
+    assert base.fx.source == "fx_observation:unknown"
+    assert base.fx.freshness_status == "unknown"
+
+
+@pytest.mark.parametrize("rate", [None, "bad", float("nan"), float("inf"), -1])
+def test_current_fx_provenance_cannot_authorize_an_invalid_rate(tmp_path, rate):
+    now = datetime(2026, 9, 2, 6, 20, 0)
+    base = snap.build_base_snapshot_from_data({
+        "cash_info": {
+            "fx_rate_usdjpy": rate,
+            "fx_rate_source": "live",
+            "fx_rate_usdjpy_as_of": now.timestamp(),
+        },
+    }, base_dir=tmp_path, now=now)
+
+    assert base.fx.freshness_status == "unknown"
+
+
 def test_base_snapshot_freezes_market_regime_v2_payload(tmp_path):
     now = datetime(2026, 7, 27, 12, 0, 0)
     first = snap.build_base_snapshot_from_data(

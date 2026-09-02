@@ -180,6 +180,26 @@ def test_gather_data_exposes_short_candidate_meta(tmp_path, monkeypatch):
     }
 
 
+def test_gather_data_carries_the_consumed_fx_observation(tmp_path, monkeypatch):
+    """The producer must preserve provenance for the snapshot consumer."""
+    _install_gather_data_test_stubs(monkeypatch, tmp_path)
+    _seed_active_china_shock_state(tmp_path)
+
+    import utils
+
+    monkeypatch.setattr(utils, "get_fx_rate_observation", lambda **_kwargs: {
+        "rate": 151.25,
+        "source": "live",
+        "observed_at": 1_786_736_400.0,
+    })
+
+    result = dg.gather_data()
+
+    assert result["cash_info"]["fx_rate_usdjpy"] == 151.25
+    assert result["cash_info"]["fx_rate_source"] == "live"
+    assert result["cash_info"]["fx_rate_usdjpy_as_of"] == 1_786_736_400.0
+
+
 def test_scenario_monitoring_formatter_does_not_emit_restricted_tickers_from_gathered_context(tmp_path, monkeypatch):
     scenario_monitoring = _china_shock_monitoring_context(tmp_path, monkeypatch)
 
