@@ -1334,6 +1334,61 @@ def test_observe_plan_conflict_is_advisory_while_other_guards_still_block(tmp_pa
     assert sum(row["execution_readiness"] == "ready" for row in rows) == 0
 
 
+def test_closed_session_quote_does_not_downgrade_a_limit_plan_by_itself(tmp_path):
+    """The scheduled US analysis runs after the close by design.
+
+    A closed-session bid/ask cannot validate spread, but for a limit plan whose
+    next opening is within 24h it is an execution-time confirmation, not a
+    reason to make every overnight recommendation review-only.
+    """
+    now = datetime(2026, 7, 14, 6, 0, tzinfo=JST)
+    _write_base(tmp_path, now, ticker="XLF")
+    (tmp_path / "account.json").write_text(json.dumps({
+        "last_updated": now.isoformat(), "usd_balance": 10_000,
+        "fx_rate_usdjpy": 150,
+    }), encoding="utf-8")
+    (tmp_path / "holdings.json").write_text(json.dumps({
+        "XLF_fixture": {
+            "ticker": "XLF", "owner": "owner_a", "broker": "broker_a",
+            "account": "taxable_a", "note": "broker fixture synced 2026-07-14",
+        },
+    }), encoding="utf-8")
+    action = {
+        "ticker": "XLF",
+        "type": "buy",
+        "urgency": "medium",
+        "order_type": "limit",
+        "limit_price": 55.00,
+        "decision_price": 55.10,
+        "quantity": 1,
+        "execution_owner": "owner_a",
+        "execution_broker": "broker_a",
+        "execution_account": "taxable_a",
+    }
+    without_quote = classify_execution_readiness(
+        action, base_dir=tmp_path, now=now,
+    )
+    result = classify_execution_readiness({
+        **action,
+        "quote_bid": 54.80,
+        "quote_ask": 55.20,
+        "quote_as_of": now.isoformat(),
+    }, base_dir=tmp_path, now=now)
+
+    assert result["execution_readiness"] == without_quote["execution_readiness"]
+    assert {
+        row["code"] for row in result["execution_block_reasons"]
+    } == {
+        row["code"] for row in without_quote["execution_block_reasons"]
+    }
+    assert "market_quote_session_closed" not in {
+        row["code"] for row in result["execution_block_reasons"]
+    }
+    assert "market_quote_session_closed" in {
+        row["code"] for row in result["execution_advisories"]
+    }
+
+
 def test_unverified_claim_provenance_is_advisory(tmp_path):
     now = datetime(2026, 7, 21, 6, 15, tzinfo=JST)
     _write_base(tmp_path, now, ticker="1489.T")

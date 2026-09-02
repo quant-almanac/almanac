@@ -1706,17 +1706,23 @@ def classify_execution_readiness(
     elif quote_validation.get("status") == "session_closed":
         # 取引所が時間外。板が薄く composite/last-trade が混ざるので、この
         # spread は実際に発注する次のセッションのコストではない。行き先は
-        # 「spread不明」= 発注前に確認、であって「異常に広い」ではない。
-        # action 側の spread_bps も同じ時間外クオート由来なので拾い直さない。
-        add(
-            "review",
-            "market_quote_session_closed",
-            str(quote_validation.get("message") or "取引所が時間外のためspreadを検証できない"),
-            quote_code=quote_validation.get("code"),
-            bid=quote_validation.get("bid"),
-            ask=quote_validation.get("ask"),
-            observed_spread_bps=quote_validation.get("observed_spread_bps"),
-        )
+        # 「spread不明」= 発注前に確認、であって「必ず review」ではない。
+        # この分析は米国引け後に定期実行されるため、ここで毎回 review に
+        # 下げると、上の market_session_context が明示する「次の開場が
+        # 24h以内なら ready + 発注時確認」を別consumerが無効化する。
+        # 長期休場・calendar不明はすでに上のセッション判定が review を
+        # 追加する。低urgency成行などspread必須の注文も後段が別途止める。
+        advisories.append({
+            "code": "market_quote_session_closed",
+            "message": str(
+                quote_validation.get("message")
+                or "取引所が時間外のためspreadを検証できない"
+            ),
+            "quote_code": quote_validation.get("code"),
+            "bid": quote_validation.get("bid"),
+            "ask": quote_validation.get("ask"),
+            "observed_spread_bps": quote_validation.get("observed_spread_bps"),
+        })
         spread = None
     elif quote_validation.get("status") == "valid":
         spread = quote_validation.get("spread_bps")
