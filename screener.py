@@ -7,7 +7,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from almanac.runtime_config import get_env
 from regime_params import get_params, get_regime
-from utils import init_yfinance_timeout
+from utils import LockBusy, init_yfinance_timeout, process_lock
 
 init_yfinance_timeout()
 
@@ -1544,7 +1544,14 @@ def run_full_screen(
     return selected, market_meta, meta_text
 
 
-if __name__ == "__main__":
+def main(argv: list[str] | None = None) -> int:
+    """Run one screener process at a time across cron and LaunchAgent.
+
+    This host has historically had both an 18:00 cron entry and an 18:05
+    LaunchAgent entry for the same full-screen command.  A normal full scan can
+    run past 18:05, so a process-local flag cannot prevent duplicate downloads
+    and last-writer-wins replacement of ``screen_results.json``.
+    """
     import argparse
     parser = argparse.ArgumentParser(description='ALMANAC 全市場スクリーナー')
     parser.add_argument('--us-only', action='store_true',
@@ -1555,10 +1562,20 @@ if __name__ == "__main__":
                         help='朝バッチモード（出力先を screen_results_morning.json に分離）')
     parser.add_argument('--ai-comments', action='store_true',
                         help='候補へのLLMコメントを明示的に有効化')
-    args = parser.parse_args()
-    run_full_screen(
-        us_only=args.us_only,
-        jp_only=args.jp_only,
-        morning=args.morning,
-        ai_comments=args.ai_comments,
-    )
+    args = parser.parse_args(argv)
+    try:
+        with process_lock("momentum_screener", timeout=0):
+            run_full_screen(
+                us_only=args.us_only,
+                jp_only=args.jp_only,
+                morning=args.morning,
+                ai_comments=args.ai_comments,
+            )
+    except LockBusy:
+        print("[screener] 別プロセスが実行中のため、この重複起動をスキップ")
+        return 0
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
