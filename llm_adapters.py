@@ -46,7 +46,8 @@ def _retry_openai_compat(base_url: str, api_key: str, model: str,
                          system: str, user: str,
                          max_tokens: int, temperature: float,
                          json_mode: bool, adapter_name: str,
-                         request_timeout: float | None = None) -> AdapterResult:
+                         request_timeout: float | None = None,
+                         thinking_mode: str | None = None) -> AdapterResult:
     """OpenAI SDK 互換のエンドポイント共通呼び出し（DeepSeek / Qwen）"""
     try:
         from openai import OpenAI
@@ -66,6 +67,20 @@ def _retry_openai_compat(base_url: str, api_key: str, model: str,
     if json_mode:
         # DeepSeek / Qwen は response_format={"type": "json_object"} を一部サポート
         kwargs["response_format"] = {"type": "json_object"}
+    if thinking_mode is not None:
+        if thinking_mode not in {"enabled", "disabled"}:
+            return {
+                "content": "",
+                "error": f"invalid thinking_mode: {thinking_mode}",
+                "adapter": adapter_name,
+                "model": model,
+            }
+        # ``thinking`` is a DeepSeek extension not present in the OpenAI SDK's
+        # typed request. ``extra_body`` adds it at the API top level. Structured
+        # extraction lanes do not benefit from hidden reasoning; leaving the
+        # provider default (enabled) consumed the entire 4k output budget even
+        # for a single ticker and discarded otherwise short JSON responses.
+        kwargs["extra_body"] = {"thinking": {"type": thinking_mode}}
 
     # max_tokens に比例した per-request タイムアウト（60s〜300s）。
     # tier runner から明示 timeout が来た場合はそれを優先する。
@@ -133,7 +148,8 @@ def call_deepseek(system: str, user: str, *,
                    max_tokens: int = 2000,
                    temperature: float = 0.7,
                    json_mode: bool = False,
-                   request_timeout: float | None = None) -> AdapterResult:
+                   request_timeout: float | None = None,
+                   thinking_mode: str | None = None) -> AdapterResult:
     """DeepSeek V4-flash chat / R1 reasoner を呼び出す。"""
     try:
         from utils import load_environment_secrets
@@ -154,6 +170,7 @@ def call_deepseek(system: str, user: str, *,
         json_mode=json_mode,
         adapter_name="deepseek",
         request_timeout=request_timeout,
+        thinking_mode=thinking_mode,
     )
 
 
@@ -311,7 +328,8 @@ def call_by_role(role: str, system: str, user: str, *,
                  max_tokens: int = 2000,
                  temperature: float = 0.7,
                  json_mode: bool = False,
-                 request_timeout: float | None = None) -> AdapterResult:
+                 request_timeout: float | None = None,
+                 thinking_mode: str | None = None) -> AdapterResult:
     """
     model_router に基づき role → adapter を dispatch する。
     Anthropic 系 role を渡しても動く（analyst/llm_client.call_claude 経由）。
@@ -346,7 +364,8 @@ def call_by_role(role: str, system: str, user: str, *,
     if adapter == "deepseek":
         return call_deepseek(system, user, model=model_id, max_tokens=max_tokens,
                               temperature=temperature, json_mode=json_mode,
-                              request_timeout=request_timeout)
+                              request_timeout=request_timeout,
+                              thinking_mode=thinking_mode)
     if adapter == "qwen":
         return call_qwen(system, user, model=model_id, max_tokens=max_tokens,
                          temperature=temperature, json_mode=json_mode,

@@ -63,7 +63,6 @@ from topic_lane_contract import (  # noqa: E402
     build_run_record,
     classify_error,
     extract_json,
-    is_quota_error,
     load_and_gate,
     looks_truncated,
     validate_rows,
@@ -376,6 +375,11 @@ def _run_one_batch(
             max_tokens=MAX_TOKENS_PER_BATCH,
             temperature=0.2,
             json_mode=True,
+            # DeepSeek V4 defaults to thinking mode. Its hidden reasoning is
+            # counted inside max_tokens and caused even one-ticker JSON output
+            # to hit 4000 tokens in the 2026-09-02 scheduled run. This lane is
+            # schema-bound extraction, so disable reasoning explicitly.
+            thinking_mode="disabled",
         )
     except Exception as exc:  # アダプタが例外を投げた場合も run 全体は続ける
         res = {"content": "", "error": f"{type(exc).__name__}: {exc}"}

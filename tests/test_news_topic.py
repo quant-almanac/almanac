@@ -53,6 +53,7 @@ def test_analyze_logs_llm_usage_for_deepdive(tmp_path, monkeypatch):
 
     def fake_call_by_role(role, system, user, **kwargs):
         assert role == "news_topic_deepdive"
+        assert kwargs["thinking_mode"] == "disabled"
         return {
             "content": json.dumps(
                 {
