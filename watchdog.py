@@ -20,7 +20,6 @@ from __future__ import annotations
 import argparse
 from datetime import date
 import math
-import os
 import shutil
 import sys
 import time
@@ -91,6 +90,11 @@ EXPECTED_INTERVALS = {
     # complete no-op for alerting, silently reproducing the exact gap it was
     # meant to close (Codex review, 2026-08-24).
     'portfolio_analyst': {'max_stale_sec': 26 * 3600, 'weekday_only': True, 'warn_is_error': True},
+    # default Agent は平日06:35の正式な自動運用へ昇格済み。以前は実行ログと
+    # 会計行だけがあり heartbeat 未登録だったため、LaunchAgent停止や失敗を
+    # watchdog が永続的に見逃していた。CLIの全終了経路がこのキーを更新する。
+    'portfolio_agent':  {'max_stale_sec': 26 * 3600, 'weekday_only': True,
+                         'warn_is_error': True},
     # 'analyzer' は --delta-only 運用で 'analyzer_delta' に heartbeat されるため
     # こちらを監視する（旧 'analyzer' キーは永遠に空で false positive の原因だった）。
     'analyzer_delta':    {'max_stale_sec': 24 * 3600, 'weekday_only': True},
@@ -136,7 +140,7 @@ EXPECTED_INTERVALS = {
     # Monthly report generation only.  It never promotes or retires a lane.
     'monthly_governance_report': {'max_stale_sec': 40 * 24 * 3600, 'weekday_only': False},
     # 以下は heartbeat 未登録・優先度低のため監視対象外（必要になったら復活）:
-    #   'short_screener', 'weekly_report', 'portfolio_agent'
+    #   'short_screener', 'weekly_report'
 }
 
 # FX as-of が古すぎる閾値
@@ -154,6 +158,7 @@ NOTIFY_STALE_SCRIPTS = {
     'data_fetcher',
     'margin_manager',
     'monthly_governance_report',
+    'portfolio_agent',
     # EXPECTED_INTERVALS に載せるだけでは通知されない (通知対象はこの集合)。
     # 両レーンとも「止まっても誰も気づかない」状態を実際に長期間続けたので、
     # 検知だけでなく通知まで届かせる。
@@ -934,7 +939,7 @@ def _notification_fingerprint(report: dict) -> str:
         'errors': sorted((e.get('script'), str(e.get('error'))[:80]) for e in report.get('errors', [])),
         'fx_stale': bool(report.get('fx_stale')),
         'schema': sorted((s.get('file'), s.get('issue')) for s in report.get('schema_issues', [])),
-        'llm': sorted((l.get('file'), l.get('issue')) for l in report.get('llm_issues', [])),
+        'llm': sorted((row.get('file'), row.get('issue')) for row in report.get('llm_issues', [])),
         'integrity': sorted(
             (i.get('check'), i.get('ticker'), i.get('execution_id'), str(i.get('message'))[:80])
             for i in report.get('integrity_issues', [])
@@ -985,8 +990,8 @@ def _build_watchdog_message(report: dict) -> str:
             msg_lines.append(f"  ... 他 {len(report['schema_issues']) - 5} 件")
     if report.get('llm_issues'):
         msg_lines.append('\n🤖 AI分析出力異常:')
-        for l in report['llm_issues'][:5]:
-            msg_lines.append(f"  • {l['file']}: {l['issue']}")
+        for row in report['llm_issues'][:5]:
+            msg_lines.append(f"  • {row['file']}: {row['issue']}")
         if len(report['llm_issues']) > 5:
             msg_lines.append(f"  ... 他 {len(report['llm_issues']) - 5} 件")
     if report.get('integrity_issues'):

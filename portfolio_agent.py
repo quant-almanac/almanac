@@ -27,7 +27,6 @@ holdings.json の note / owner / broker / account まで見えていた。
 import argparse
 import asyncio
 import json
-import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -38,7 +37,6 @@ from agent_projection import (
     ENABLED_MODES,
     AgentOutputError,
     AgentProtocolViolation,
-    MODES,
     STRUCTURED_OUTPUT_TOOL_NAME,
     assert_no_forbidden_tool_use,
     build_agent_options,
@@ -49,7 +47,7 @@ from agent_projection import (
     save_verified_result,
     validate_agent_output,
 )
-from utils import LockBusy, process_lock
+from utils import LockBusy, heartbeat, process_lock
 
 BASE_DIR = Path(__file__).parent
 
@@ -92,10 +90,35 @@ async def run_analysis(mode: str = "default") -> int:
     """
     try:
         with process_lock(AGENT_RUN_LOCK_NAME, timeout=AGENT_RUN_LOCK_TIMEOUT_SECONDS):
-            return await _run_locked(mode)
+            exit_code = await _run_locked(mode)
     except LockBusy:
+        heartbeat(
+            "portfolio_agent",
+            status="warn",
+            error="agent_run_lock_busy",
+            extra={"mode": mode, "exit_code": 1},
+        )
         print("⚠️ 別の Agent 実行が進行中です。二重起動しません。")
         return 1
+    except Exception as exc:
+        # _run_locked の想定外例外も「プロセスが落ちた」だけで消さない。
+        # heartbeat 自体は内部で書込み失敗を握ってログへ残すため、元の例外を
+        # 保ったまま監視状態だけ更新できる。
+        heartbeat(
+            "portfolio_agent",
+            status="error",
+            error=f"{type(exc).__name__}: {str(exc)[:300]}",
+            extra={"mode": mode, "exit_code": 1},
+        )
+        raise
+
+    heartbeat(
+        "portfolio_agent",
+        status="ok" if exit_code == 0 else "error",
+        error=None if exit_code == 0 else f"agent_exit_code_{exit_code}",
+        extra={"mode": mode, "exit_code": exit_code},
+    )
+    return exit_code
 
 
 async def _run_locked(mode: str) -> int:

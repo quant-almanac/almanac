@@ -6,10 +6,10 @@ AgentProtocolViolation / query() 例外パスに _log_agent_result 呼び出し�
 (Codex レビュー round 17 で指摘)。
 """
 import asyncio
+import contextlib
 import json
 import sys
 import types
-from pathlib import Path
 
 import pytest
 
@@ -141,3 +141,49 @@ def test_a_persistence_failure_after_a_known_cost_still_logs_a_row(monkeypatch, 
     assert row["cost_usd"] == 0.0789
     assert row["structured_output_transport_seen"] is True
     assert row["forbidden_tool_use_seen"] is False
+
+
+@pytest.mark.parametrize(
+    ("exit_code", "expected_status", "expected_error"),
+    [
+        (0, "ok", None),
+        (2, "error", "agent_exit_code_2"),
+    ],
+)
+def test_cli_run_records_a_monitored_heartbeat_for_every_normal_exit(
+    monkeypatch, exit_code, expected_status, expected_error,
+):
+    """自動Agentが成功・検証拒否のどちらでも生存結果を残す。"""
+    rows: list[tuple] = []
+
+    async def fake_run(mode):
+        assert mode == "default"
+        return exit_code
+
+    monkeypatch.setattr(cli, "_run_locked", fake_run)
+    monkeypatch.setattr(
+        cli, "process_lock", lambda *a, **k: contextlib.nullcontext())
+    monkeypatch.setattr(
+        cli,
+        "heartbeat",
+        lambda *a, **k: rows.append((a, k)),
+    )
+
+    assert asyncio.run(cli.run_analysis("default")) == exit_code
+    assert rows == [(('portfolio_agent',), {
+        "status": expected_status,
+        "error": expected_error,
+        "extra": {"mode": "default", "exit_code": exit_code},
+    })]
+
+
+def test_automatic_agent_heartbeat_is_monitored_and_notified():
+    import watchdog
+
+    spec = watchdog.EXPECTED_INTERVALS["portfolio_agent"]
+    assert spec == {
+        "max_stale_sec": 26 * 3600,
+        "weekday_only": True,
+        "warn_is_error": True,
+    }
+    assert "portfolio_agent" in watchdog.NOTIFY_STALE_SCRIPTS
