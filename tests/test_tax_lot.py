@@ -7,6 +7,22 @@ import event_ledger as el
 import tax_lot as tl
 
 
+@pytest.mark.parametrize("configured,expected", [
+    (None, "total_average"), ("", "total_average"),
+    ("invalid", "total_average"), ("COMPARE", "compare"),
+    ("compare", "compare"), ("legacy", "legacy"),
+    ("total_average", "total_average"),
+])
+def test_system_tax_mode_matches_realized_pnl(tmp_db, monkeypatch, configured, expected):
+    import feature_controls
+    import tax_lot
+
+    monkeypatch.delenv("ALMANAC_TAX_BASIS_MODE", raising=False)
+    if configured is not None:
+        monkeypatch.setenv("ALMANAC_TAX_BASIS_MODE", configured)
+    report = tax_lot.realized_pnl_in_year_v2(2026, db_path=tmp_db)
+    assert feature_controls._tax_basis_status()["mode"] == report["basis_mode"] == expected
+
 @pytest.fixture
 def tmp_db(tmp_path, monkeypatch):
     db = tmp_path / "test_lots.db"

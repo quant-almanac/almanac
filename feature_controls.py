@@ -552,13 +552,13 @@ def _options_status(root: Path) -> dict[str, Any]:
 
 
 def _tax_basis_status() -> dict[str, Any]:
-    mode = str(os.environ.get("ALMANAC_TAX_BASIS_MODE", "compare")).strip().lower()
-    if mode not in {"legacy", "compare", "total_average"}:
-        mode = "compare"
+    from tax_lot import resolve_tax_basis_mode
+
+    mode = resolve_tax_basis_mode()
     reason = {
-        "legacy": "旧計算を表示元にしています",
-        "compare": "旧計算と総平均法を同一入力で比較しています",
-        "total_average": "総平均法の計算を表示元にしています",
+        "legacy": "旧計算は監査用の比較値です。税務用の確定損益は未確定扱いです",
+        "compare": "旧計算と総平均法を比較しています。税務用の確定損益は未確定扱いです",
+        "total_average": "総平均法モードです。入力が完全な場合のみ税務用の確定損益へ反映します",
     }[mode]
     return _read_only_status(
         key="tax_basis",
@@ -571,7 +571,7 @@ def _tax_basis_status() -> dict[str, Any]:
         reason=reason,
         source="ALMANAC_TAX_BASIS_MODE + tax_lot.py",
         max_age_hours=None,
-        source_note="モードは算出元だけを変え、API schemaは共通です",
+        source_note="損益APIと共通のモード判定。データ完全性・権威性は損益APIで別途検証します",
         control_hint="環境変数 ALMANAC_TAX_BASIS_MODE が権威です",
     )
 

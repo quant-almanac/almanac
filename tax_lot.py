@@ -482,6 +482,12 @@ def realized_pnl_in_year(
     }
 
 
+def resolve_tax_basis_mode(mode: Optional[str] = None) -> str:
+    """Shared mode authority for the realized-P&L API and operational UI."""
+    value = str(mode or os.environ.get("ALMANAC_TAX_BASIS_MODE", "total_average")).lower()
+    return value if value in {"legacy", "compare", "total_average"} else "total_average"
+
+
 def realized_pnl_in_year_v2(
     year: int,
     *,
@@ -501,9 +507,7 @@ def realized_pnl_in_year_v2(
     account 名に "NISA" を含むかどうかで taxable/nisa を分ける
     (tax_harvest_scanner.py の NISA 除外判定と同じ規約)。
     """
-    mode = str(mode or os.environ.get("ALMANAC_TAX_BASIS_MODE", "total_average")).lower()
-    if mode not in {"legacy", "compare", "total_average"}:
-        mode = "total_average"
+    mode = resolve_tax_basis_mode(mode)
     legacy = realized_pnl_in_year(year, tickers=tickers, db_path=db_path)
     total_average = realized_pnl_in_year_total_average(
         year, tickers=tickers, db_path=db_path
