@@ -1004,8 +1004,8 @@ def _ginn_status(root: Path) -> dict[str, Any]:
         "mutable": False,
         "mode": "promoted_bundle_only",
         "auto_order_enabled": False,
-        "roadmap_status": "future_update",
-        "roadmap_label": "将来更新",
+        "roadmap_status": "active" if effective else "future_update",
+        "roadmap_label": "昇格済み" if effective else "将来更新",
         "reason": reason,
         "blockers": [] if effective else [
             "disabled_by_env" if disabled else str(rejection_reason)
@@ -1051,10 +1051,10 @@ def _ginn_status(root: Path) -> dict[str, Any]:
             {
                 "title": "現在の判断",
                 "body": (
-                    "GINNという考え方を否定した状態ではありません。現在候補の実測が"
-                    "GJR-GARCH基準を満たさないため、投資判断にはGJR-GARCHだけを使います。"
-                    "上のvalidation値は最新manifestから動的に表示します。forward評価の"
-                    "パイプラインは未実装で、予約フィールドの0件を実績とは数えません。"
+                    f"{reason}。"
+                    + ("現在のモデル選択はGINNです。" if effective else "現在のモデル選択はGJR-GARCHです。")
+                    + "上のvalidation値は表示対象manifestから取得しています。"
+                    "未取得・計算不能の指標は『—』と表示し、性能の証拠とはみなしません。"
                 ),
             },
             {

@@ -80,6 +80,30 @@ const FRESHNESS_LABEL: Record<string, string> = {
 
 const REVIEW_SPEC_URL = 'https://github.com/quant-almanac/almanac/blob/main/docs/SYSTEM_SPEC.ja.md'
 
+export function featureActivityLabel(feature: FeatureStatus): string {
+  if (feature.status_resolution_failed) return '状態取得失敗'
+  if (!feature.configured_enabled) return 'OFF'
+  if (!feature.effective_enabled && feature.blockers.length > 0) return '設定ON・安全停止'
+  // Observation can run while application is disabled (e.g. the plan gate).
+  // Conversely, effective_enabled=true for shadow never means live application.
+  if (['shadow', 'observe', 'compare'].includes(feature.mode)) {
+    if (!feature.effective_enabled && feature.mode !== 'observe') return '設定ON・稼働未確認'
+    return feature.mode === 'compare' ? '比較検証中（本適用なし）' : '観測・記録中（本適用なし）'
+  }
+  if (!feature.effective_enabled) return '設定ON・稼働未確認'
+  const labels: Record<string, string> = {
+    human_execution_only: '候補生成ON（発注は手動）',
+    analysis_signal_only: '分析入力として利用中',
+    advisory: '分析判断に利用中',
+    promoted_bundle_only: '検証済みモデルを利用中',
+    frozen_context: '分析入力を記録中',
+    broker_snapshot: '照合情報を利用中',
+    apply: '自動適用ON',
+    enforce: '候補の制約チェックON',
+  }
+  return feature.key === 'privacy_mode' ? '情報送信ルール適用中' : labels[feature.mode] ?? '機能有効'
+}
+
 export default function FeatureControls() {
   const { data, error, isLoading, mutate } = useSWR<FeatureResponse>(
     '/api/features',
@@ -127,8 +151,9 @@ export default function FeatureControls() {
       </span>
     </div>
     <p style={{ color: OPS.sub, fontSize: 12, lineHeight: 1.7, margin: '7px 0 13px' }}>
-      設定ONと実効ONを分けて表示します。入力不足や期限切れでは設定がONでも安全側に停止します。
-      「影実行」は計算と記録だけ、「将来更新」は理論を残しつつ現実装を判断から外した状態です。
+      各機能が何をしているかを表示します。「観測・記録中」は稼働していますが、実際の判断・配分は変更しません。
+      「この画面では変更不可」は設定の操作場所を示し、停止中という意味ではありません。
+      入力不足や期限切れでは、設定がONでも安全側に停止します。
       空売りを含め、この画面から自動注文は有効になりません。
       {' '}<a href={REVIEW_SPEC_URL} target="_blank" rel="noreferrer" style={{ color: OPS.blue }}>
         レビュー用の詳細仕様・確認手順
@@ -139,22 +164,16 @@ export default function FeatureControls() {
     {isLoading && <div style={{ color: OPS.dim, fontSize: 12 }}>機能状態を確認中…</div>}
     <div style={{ display: 'flex', flexDirection: 'column' }}>
       {data?.features.map(feature => {
+        const effectiveLabel = featureActivityLabel(feature)
         const effectiveColor = feature.status_resolution_failed
           ? OPS.redSoft
+          : effectiveLabel.includes('本適用なし')
+          ? OPS.blue
           : feature.effective_enabled
           ? OPS.green
           : feature.configured_enabled
             ? OPS.amber
             : OPS.dim
-        const effectiveLabel = feature.status_resolution_failed
-          ? '状態取得失敗'
-          : feature.effective_enabled
-          ? '実効 ON'
-          : feature.configured_enabled && feature.blockers.length > 0
-            ? '設定ON・安全停止'
-            : feature.configured_enabled
-              ? '設定ON・観測中'
-            : 'OFF'
         return <div
           key={feature.key}
           data-testid={`feature-${feature.key}`}
@@ -295,7 +314,7 @@ export default function FeatureControls() {
                   <span style={knobStyle(feature.configured_enabled)} />
                   <span>{busy === feature.key ? '…' : feature.configured_enabled ? 'ON' : 'OFF'}</span>
                 </button>
-              : <span style={{ color: OPS.dim, fontFamily: OPS.mono, fontSize: 10 }}>参照のみ</span>}
+              : <span style={{ color: OPS.dim, fontFamily: OPS.mono, fontSize: 10 }}>この画面では変更不可</span>}
           </div>
         </div>
       })}

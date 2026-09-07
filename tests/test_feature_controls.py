@@ -215,7 +215,10 @@ def test_ginn_status_reuses_the_central_gate_for_five_minutes(
     )
     fc._GINN_GATE_CACHE.clear()
 
-    assert fc._ginn_status(tmp_path)["effective_enabled"] is True
+    status = fc._ginn_status(tmp_path)
+    assert status["effective_enabled"] is True
+    assert status["roadmap_label"] == "昇格済み"
+    assert "現在のモデル選択はGINNです" in status["detail_sections"][0]["body"]
     assert fc._ginn_status(tmp_path)["effective_enabled"] is True
     assert calls["resolve"] == 1
 
@@ -253,6 +256,7 @@ def test_ginn_status_surfaces_latest_rejected_candidate_without_activating_it(
     assert status["source"] == "models/ginn/<latest candidate>/manifest.json"
     assert status["model_version"] == "candidate-v2"
     assert status["operating_model"] == "gjr_garch"
+    assert "現在のモデル選択はGJR-GARCHです" in status["detail_sections"][0]["body"]
     assert status["operating_model_source"] == "central_fail_closed_fallback"
     assert status["audit_candidate_version"] == "candidate-v2"
     assert status["blockers"][0].startswith("garch_ratio_degraded")

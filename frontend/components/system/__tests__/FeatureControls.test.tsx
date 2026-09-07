@@ -2,7 +2,7 @@ import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-li
 import { SWRConfig } from 'swr'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
-import FeatureControls from '../FeatureControls'
+import FeatureControls, { featureActivityLabel, type FeatureStatus } from '../FeatureControls'
 
 const features = [
   {
@@ -158,7 +158,7 @@ describe('FeatureControls', () => {
     expect(within(ginn).getByText('設定ON・安全停止')).toBeInTheDocument()
     expect(within(ginn).getByText('FAIL-CLOSED')).toBeInTheDocument()
     expect(within(ginn).getByText('将来更新')).toBeInTheDocument()
-    expect(within(ginn).getByText('参照のみ')).toBeInTheDocument()
+    expect(within(ginn).getByText('この画面では変更不可')).toBeInTheDocument()
     expect(within(ginn).getByText('現在の判断')).toBeInTheDocument()
     expect(within(ginn).getByText(/GINNという考え方を否定/)).toBeInTheDocument()
     expect(within(ginn).getByText('原論文との差')).toBeInTheDocument()
@@ -185,5 +185,21 @@ describe('FeatureControls', () => {
       expect.objectContaining({ method: 'POST' }),
     ))
     await screen.findByText('米国株の空売りをONにしました。')
+    expect(within(screen.getByTestId('feature-us_short')).getByText('候補生成ON（発注は手動）')).toBeInTheDocument()
+  })
+
+  it.each([
+    ['shadow', true, '観測・記録中（本適用なし）'],
+    ['observe', false, '観測・記録中（本適用なし）'],
+    ['compare', true, '比較検証中（本適用なし）'],
+    ['apply', true, '自動適用ON'],
+    ['enforce', true, '候補の制約チェックON'],
+    ['shadow', false, '設定ON・稼働未確認'],
+  ])('distinguishes %s from live application', (mode, effective, label) => {
+    const feature = { ...features[0], configured_enabled: true, effective_enabled: effective, mode } as FeatureStatus
+    expect(featureActivityLabel(feature)).toBe(label)
+    expect(featureActivityLabel({ ...feature, effective_enabled: false, blockers: ['stale'] })).toBe('設定ON・安全停止')
+    expect(featureActivityLabel({ ...feature, configured_enabled: false })).toBe('OFF')
+    expect(featureActivityLabel({ ...feature, status_resolution_failed: true })).toBe('状態取得失敗')
   })
 })
