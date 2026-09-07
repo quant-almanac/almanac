@@ -5416,7 +5416,7 @@ def _recommendation_state_label(
     return "[推奨のみ・未約定]"
 
 
-def _load_earnings_blackout(within_business_days: int = 5) -> set:
+def _load_earnings_blackout(within_business_days: int = 5, *, today=None) -> set:
     """earnings_hedge_suggestions.json から決算 0〜N 営業日以内の銘柄集合を返す。"""
     eh_path = BASE_DIR / "earnings_hedge_suggestions.json"
     if not eh_path.exists():
@@ -5425,13 +5425,27 @@ def _load_earnings_blackout(within_business_days: int = 5) -> set:
         data = json.loads(eh_path.read_text(encoding="utf-8"))
     except Exception:
         return set()
+    from datetime import date, timedelta
+    from zoneinfo import ZoneInfo
+
+    current_date = today or datetime.now(ZoneInfo("Asia/Tokyo")).date()
     blackout = set()
     for entry in list(data.get("suggestions") or []) + list(data.get("skipped") or []):
-        bdays = entry.get("business_days", entry.get("bdays"))
+        if not isinstance(entry, dict):
+            continue
         tk    = entry.get("ticker")
-        if tk and bdays is not None:
+        if tk:
             try:
-                if 0 <= int(bdays) <= within_business_days:
+                event_date = date.fromisoformat(str(entry.get("earnings_date") or entry.get("earnings")))
+                if event_date < current_date:
+                    continue
+                # Stored bdays describes the scan day, not today's buy gate.
+                # Match the producer's weekday-only convention.
+                cursor, bdays = current_date, 0
+                while cursor < event_date and bdays <= within_business_days:
+                    cursor += timedelta(days=1)
+                    bdays += cursor.weekday() < 5
+                if bdays <= within_business_days:
                     blackout.add(tk)
             except Exception:
                 continue
