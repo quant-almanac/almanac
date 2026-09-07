@@ -2870,6 +2870,11 @@ def _call_routed_redteam(role: str, system: str, user: str) -> dict:
                 temperature=kwargs["temperature"],
                 json_mode=True,
                 request_timeout=120,
+                # Red Team legs are schema-bound extraction calls.  DeepSeek
+                # defaults to reasoning mode, whose hidden tokens can exhaust
+                # this 1,200-token JSON budget before the payload completes.
+                # call_by_role ignores this option for non-DeepSeek adapters.
+                thinking_mode="disabled",
             )
             if result.get("error"):
                 raise RuntimeError(str(result["error"])[:500])

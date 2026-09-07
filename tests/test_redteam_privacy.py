@@ -154,14 +154,21 @@ def test_routed_redteam_treats_schema_valid_zero_as_success(monkeypatch) -> None
     import almanac.llm_safety as safety
 
     calls = []
+    call_kwargs = []
     monkeypatch.setattr(model_router, "get_model", lambda role: f"model-for-{role}")
+
+    def fake_call_by_role(role, *_args, **kwargs):
+        calls.append(role)
+        call_kwargs.append(kwargs)
+        return {
+            "content": '{"attacks":[],"underutilized":[]}',
+            "usage": {"prompt_tokens": 1, "completion_tokens": 2},
+        }
+
     monkeypatch.setattr(
         llm_adapters,
         "call_by_role",
-        lambda role, *_args, **_kwargs: calls.append(role) or {
-            "content": '{"attacks":[],"underutilized":[]}',
-            "usage": {"prompt_tokens": 1, "completion_tokens": 2},
-        },
+        fake_call_by_role,
     )
 
     def fake_external(payload, **kwargs):
@@ -180,6 +187,7 @@ def test_routed_redteam_treats_schema_valid_zero_as_success(monkeypatch) -> None
     assert result["attacks"] == []
     assert result["model_id"] == "model-for-red_team_3"
     assert calls == ["red_team_3"]
+    assert call_kwargs[0]["thinking_mode"] == "disabled"
 
 
 def test_routed_redteam_logs_schema_failure_as_error(monkeypatch) -> None:
