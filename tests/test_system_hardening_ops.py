@@ -469,8 +469,74 @@ def test_backup_required_targets_are_real_targets_and_include_risk_authorities()
         "guard_state.json",
         "execution_invalidation_state.json",
         "execution_reconciliation_state.json",
-        "drawdown_state.json",
     }.issubset(bm.REQUIRED_TARGETS)
+    assert bm.CONDITIONAL_REQUIRED_TARGETS == {
+        "drawdown_state.json": "drawdown_controller_promoted",
+    }
+
+
+def _write_drawdown_ledger(root: Path, *, promoted: bool) -> None:
+    con = sqlite3.connect(root / "almanac.db")
+    try:
+        con.execute("CREATE TABLE ledger_events (event_type TEXT NOT NULL)")
+        if promoted:
+            con.execute(
+                "INSERT INTO ledger_events(event_type) VALUES (?)",
+                ("drawdown_controller_promoted",),
+            )
+        con.commit()
+    finally:
+        con.close()
+
+
+def test_prepromotion_missing_drawdown_state_does_not_block_snapshot(
+    tmp_path, monkeypatch,
+):
+    root = tmp_path / "repo"
+    root.mkdir()
+    backup_dir = root / "backups"
+    backup_dir.mkdir()
+    _write_drawdown_ledger(root, promoted=False)
+
+    monkeypatch.setattr(bm, "BASE_DIR", root)
+    monkeypatch.setattr(bm, "BACKUP_DIR", backup_dir)
+    monkeypatch.setattr(bm, "TARGETS", ["drawdown_state.json"])
+    monkeypatch.setattr(bm, "REQUIRED_TARGETS", [])
+    monkeypatch.setattr(bm, "SQLITE_TARGETS", ["almanac.db"])
+    monkeypatch.setattr(bm, "REQUIRED_SQLITE_TARGETS", ["almanac.db"])
+    monkeypatch.setattr(bm, "EVIDENCE_DIRECTORIES", [])
+    monkeypatch.setattr(bm, "NESTED_REPOSITORIES", [])
+
+    result = bm.snapshot(date(2026, 9, 2))
+
+    assert result["status"] == "complete"
+    assert result["published"] is True
+    assert result["missing_required"] == []
+    assert result["missing_optional"] == ["drawdown_state.json"]
+
+
+def test_promoted_missing_drawdown_state_blocks_snapshot(tmp_path, monkeypatch):
+    root = tmp_path / "repo"
+    root.mkdir()
+    backup_dir = root / "backups"
+    backup_dir.mkdir()
+    _write_drawdown_ledger(root, promoted=True)
+
+    monkeypatch.setattr(bm, "BASE_DIR", root)
+    monkeypatch.setattr(bm, "BACKUP_DIR", backup_dir)
+    monkeypatch.setattr(bm, "TARGETS", ["drawdown_state.json"])
+    monkeypatch.setattr(bm, "REQUIRED_TARGETS", [])
+    monkeypatch.setattr(bm, "SQLITE_TARGETS", ["almanac.db"])
+    monkeypatch.setattr(bm, "REQUIRED_SQLITE_TARGETS", ["almanac.db"])
+    monkeypatch.setattr(bm, "EVIDENCE_DIRECTORIES", [])
+    monkeypatch.setattr(bm, "NESTED_REPOSITORIES", [])
+
+    result = bm.snapshot(date(2026, 9, 2))
+
+    assert result["status"] == "incomplete"
+    assert result["published"] is False
+    assert result["missing_required"] == ["drawdown_state.json"]
+    assert result["missing_optional"] == []
 
 
 def test_restore_rejects_traversal_and_dry_run_has_no_side_effect(tmp_path, monkeypatch):

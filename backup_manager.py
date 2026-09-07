@@ -124,17 +124,27 @@ REQUIRED_TARGETS = [
     'action_executions.json',
     'execution_invalidation_state.json',
     'execution_reconciliation_state.json',
-    'drawdown_state.json',
     'trade_history.csv',
     'nisa_portfolio.json',
     'cash_transactions.json',
 ]
 OPTIONAL_TARGETS = [rel for rel in TARGETS if rel not in REQUIRED_TARGETS]
 
+# ``drawdown_state.json`` does not exist before the flow-adjusted controller is
+# manually promoted. Treating it as unconditionally required made every
+# pre-promotion daily generation non-publishable. After promotion, however,
+# losing the mutable state must fail closed; the append-only ledger is the
+# authority that distinguishes those two cases.
+CONDITIONAL_REQUIRED_TARGETS = {
+    'drawdown_state.json': 'drawdown_controller_promoted',
+}
+
 if len(TARGETS) != len(set(TARGETS)):
     raise RuntimeError('backup TARGETS contains duplicate paths')
 if not set(REQUIRED_TARGETS).issubset(TARGETS):
     raise RuntimeError('REQUIRED_TARGETS must be a subset of TARGETS')
+if not set(CONDITIONAL_REQUIRED_TARGETS).issubset(TARGETS):
+    raise RuntimeError('CONDITIONAL_REQUIRED_TARGETS must be a subset of TARGETS')
 
 # ⚠️ TARGETS はファイルの明示リストであって、snapshot() のコピーは
 # shutil.copy2(src, dst) を直に呼ぶ。ここへディレクトリを1行足すと
@@ -197,6 +207,62 @@ def _backup_sqlite(src: Path, dst: Path) -> None:
     finally:
         target.close()
         source.close()
+
+
+def _ledger_event_recorded(root: Path, event_type: str) -> bool | None:
+    """Read one append-only authority without creating SQLite sidecars.
+
+    ``False`` means the database is readable and contains no such event. A
+    missing database/table is also pre-authority state; the database itself is
+    independently required by ``REQUIRED_SQLITE_TARGETS``. Other read errors
+    return ``None`` so callers can fail closed.
+    """
+    db_path = root / 'almanac.db'
+    if not db_path.is_file():
+        return False
+    try:
+        con = sqlite3.connect(f"{db_path.resolve().as_uri()}?mode=ro&immutable=1", uri=True)
+        try:
+            table = con.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='ledger_events'"
+            ).fetchone()
+            if table is None:
+                return False
+            return con.execute(
+                "SELECT 1 FROM ledger_events WHERE event_type = ? LIMIT 1",
+                (event_type,),
+            ).fetchone() is not None
+        finally:
+            con.close()
+    except sqlite3.Error:
+        return None
+
+
+def _required_targets_for_root(root: Path) -> set[str]:
+    required = set(REQUIRED_TARGETS)
+    for rel, event_type in CONDITIONAL_REQUIRED_TARGETS.items():
+        recorded = _ledger_event_recorded(root, event_type)
+        if recorded is True or recorded is None:
+            required.add(rel)
+    return required
+
+
+def _reclassify_conditional_missing(results: dict, root: Path) -> None:
+    """Classify conditional files against the SQLite image in ``root``.
+
+    Snapshot uses the copied database rather than the live one. This closes
+    the promotion ordering window: promotion writes the ledger event before
+    the JSON state, so a backup containing that event can never publish without
+    also containing ``drawdown_state.json``.
+    """
+    required = _required_targets_for_root(root)
+    for rel in CONDITIONAL_REQUIRED_TARGETS:
+        if rel not in results['missing'] or rel not in required:
+            continue
+        if rel in results['missing_optional']:
+            results['missing_optional'].remove(rel)
+        if rel not in results['missing_required']:
+            results['missing_required'].append(rel)
 
 
 def _create_git_bundle(
@@ -345,6 +411,11 @@ def snapshot(
                 results['copied'].append(rel)
                 results['sqlite_backups'].append(rel)
                 results['hashes'][rel] = _sha256(dst)
+
+            # Conditional authorities must be classified from the database
+            # image that belongs to this generation, not from a live query
+            # performed before/after the capture window.
+            _reclassify_conditional_missing(results, target_dir)
 
     # ⚠️ portfolio lock の外。財務state と違って書込み一貫性を要らず、
     # ディレクトリが育つほど時間もかかる — repo_bundle 等と同じ理由
@@ -844,10 +915,11 @@ def verify(*, include_offsite: bool = False) -> dict:
     ok = []
     missing_required = []
     missing_optional = []
+    required_targets = _required_targets_for_root(BASE_DIR)
     for rel in TARGETS:
         p = BASE_DIR / rel
         if not p.exists():
-            (missing_required if rel in REQUIRED_TARGETS else missing_optional).append(rel)
+            (missing_required if rel in required_targets else missing_optional).append(rel)
             continue
         if p.suffix == '.csv':
             # CSV は非空チェックのみ
