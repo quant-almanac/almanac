@@ -18,8 +18,6 @@ import sys
 import time
 from datetime import date, datetime, timedelta
 from pathlib import Path
-from typing import Any
-
 from pseudo_tickers import is_non_earnings_ticker
 
 BASE_DIR = Path(__file__).parent
@@ -267,7 +265,8 @@ def _atm_straddle(tk: str, target_date: date) -> dict | None:
         if calls is None or calls.empty or puts is None or puts.empty:
             return None
         # ATM: |strike - spot| 最小
-        calls = calls.copy(); puts = puts.copy()
+        calls = calls.copy()
+        puts = puts.copy()
         calls["diff"] = (calls["strike"] - spot).abs()
         puts["diff"]  = (puts["strike"]  - spot).abs()
         c_row = calls.sort_values("diff").iloc[0]
@@ -303,7 +302,8 @@ def _historical_beat_rate(tk: str) -> float | None:
         if eh is None or (hasattr(eh, "empty") and eh.empty):
             return None
         # epsEstimate vs epsActual
-        beats = 0; total = 0
+        beats = 0
+        total = 0
         cols = set(eh.columns) if hasattr(eh, "columns") else set()
         act_col = "epsActual" if "epsActual" in cols else ("actual" if "actual" in cols else None)
         est_col = "epsEstimate" if "epsEstimate" in cols else ("estimate" if "estimate" in cols else None)
@@ -311,7 +311,8 @@ def _historical_beat_rate(tk: str) -> float | None:
             return None
         for _, row in eh.iterrows():
             try:
-                a = float(row[act_col]); e = float(row[est_col])
+                a = float(row[act_col])
+                e = float(row[est_col])
             except Exception:
                 continue
             if a is None or e is None:
@@ -326,7 +327,7 @@ def _historical_beat_rate(tk: str) -> float | None:
         return None
 
 
-def scan(dry_run: bool = False) -> dict:
+def _scan_once(dry_run: bool = False) -> dict:
     holdings = _load_holdings()
     total_jpy = _total_portfolio_jpy()
     print(f"[earnings] scanning {len(holdings)} US holdings, portfolio=¥{total_jpy:,.0f}")
@@ -340,7 +341,8 @@ def scan(dry_run: bool = False) -> dict:
     suggestions: list[dict] = []
     skipped: list[dict] = []  # 観測性: なぜ hedge 対象から外されたかを記録
     for h in holdings:
-        tk = h["ticker"]; sh = h["shares"]
+        tk = h["ticker"]
+        sh = h["shares"]
         earnings_record = _next_earnings_with_source(tk)
         if not earnings_record:
             skipped.append({"ticker": tk, "reason": "no_earnings_date"})
@@ -429,11 +431,8 @@ def scan(dry_run: bool = False) -> dict:
         "skipped":           skipped,  # 観測性: なぜ 0 suggestion かを Opus に伝えるため保持
     }
     if not dry_run:
-        try:
-            from utils import atomic_write_json
-            atomic_write_json(OUTPUT, out)
-        except Exception:
-            OUTPUT.write_text(json.dumps(out, indent=2, ensure_ascii=False), encoding="utf-8")
+        from utils import atomic_write_json
+        atomic_write_json(OUTPUT, out)
         print(f"[earnings] wrote {OUTPUT.name}: {len(suggestions)} suggestions, {len(skipped)} skipped")
         if skipped:
             reason_counts: dict[str, int] = {}
@@ -441,6 +440,41 @@ def scan(dry_run: bool = False) -> dict:
                 reason_counts[s["reason"]] = reason_counts.get(s["reason"], 0) + 1
             print(f"[earnings] skip reasons: {reason_counts}")
     return out
+
+
+def _load_current_snapshot() -> dict | None:
+    """Load today's schema-valid snapshot, or return ``None`` fail-closed."""
+    if not snapshot_is_current():
+        return None
+    try:
+        data = json.loads(OUTPUT.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def scan(dry_run: bool = False, *, reuse_current: bool = False) -> dict:
+    """Run one scan, serializing scheduled producers across processes.
+
+    The legacy cron and the formal analysis LaunchAgent both start at 06:15.
+    A write-only lock would still run the same network scan twice in sequence,
+    so scheduled callers set ``reuse_current=True`` and the second caller
+    rechecks the published snapshot *after* acquiring the shared lock.
+    ``--force`` and programmatic callers can retain the historical refresh
+    behavior by leaving ``reuse_current`` false.
+    """
+    if dry_run:
+        return _scan_once(dry_run=True)
+
+    from utils import process_lock
+
+    with process_lock("earnings_proximity", timeout=300.0):
+        if reuse_current:
+            current = _load_current_snapshot()
+            if current is not None:
+                print("[earnings] current snapshot already published; duplicate scan skipped")
+                return current
+        return _scan_once(dry_run=False)
 
 
 def format_for_prompt(max_entries: int = 6) -> str:
@@ -494,6 +528,6 @@ def format_for_prompt(max_entries: int = 6) -> str:
 
 if __name__ == "__main__":
     dry = "--dry-run" in sys.argv
-    out = scan(dry_run=dry)
+    out = scan(dry_run=dry, reuse_current=not dry and "--force" not in sys.argv)
     if dry:
         print(json.dumps(out, indent=2, ensure_ascii=False))

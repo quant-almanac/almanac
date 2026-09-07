@@ -11541,7 +11541,7 @@ def run_analysis(force: bool = False) -> dict:
     try:
         import earnings_proximity_manager as _earnings
         if not _earnings.snapshot_is_current():
-            _earnings.scan(dry_run=False)
+            _earnings.scan(dry_run=False, reuse_current=True)
             print("  🔄 earnings_hedge_suggestions.json 再生成 (決算日override・当日鮮度保証)")
     except Exception as _ee:
         # Existing blackout loading fails closed only for known dated rows; log
