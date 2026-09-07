@@ -53,9 +53,12 @@ def test_snapshot_requires_current_schema_and_matching_override(monkeypatch, tmp
             },
         },
     }), encoding="utf-8")
+    holdings = [{"ticker": "META", "shares": 1.0, "currency": "USD"}]
     output_path.write_text(json.dumps({
-        "schema_version": 2,
+        "schema_version": earnings.OUTPUT_SCHEMA_VERSION,
         "generated_at": "2026-07-24 05:30:00",
+        "holdings_scanned": 1,
+        "holdings_snapshot_sha256": earnings._holdings_snapshot_sha256(holdings),
         "suggestions": [],
         "skipped": [{
             "ticker": "META",
@@ -65,6 +68,7 @@ def test_snapshot_requires_current_schema_and_matching_override(monkeypatch, tmp
     }), encoding="utf-8")
     monkeypatch.setattr(earnings, "EARNINGS_OVERRIDES", override_path)
     monkeypatch.setattr(earnings, "OUTPUT", output_path)
+    monkeypatch.setattr(earnings, "_load_holdings", lambda: holdings)
 
     assert earnings.snapshot_is_current(today=date(2026, 7, 24)) is True
 

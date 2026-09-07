@@ -13,7 +13,9 @@ earnings_proximity_manager.py (Part E-6)
 """
 from __future__ import annotations
 
+import hashlib
 import json
+import math
 import sys
 import time
 from datetime import date, datetime, timedelta
@@ -31,7 +33,7 @@ IMPL_MOVE_FUDGE        = 0.85  # ATM straddle → implied move 係数 (Bachelier
 DAMAGE_PCT_THRESHOLD   = 0.015 # total_portfolio の 1.5% で hedge 推奨
 BEAT_RATE_FORCE_TRIM   = 0.50
 YFIN_RETRY_ATTEMPTS    = 3     # yfinance .calendar の intermittent 404/rate-limit 対策リトライ
-OUTPUT_SCHEMA_VERSION  = 2
+OUTPUT_SCHEMA_VERSION  = 3
 
 
 def _business_days_until(target: date) -> int:
@@ -50,14 +52,25 @@ def _business_days_until(target: date) -> int:
 
 def _load_holdings() -> list[dict]:
     if not HOLDINGS.exists():
-        return []
+        raise FileNotFoundError(f"holdings source is missing: {HOLDINGS}")
     try:
         h = json.loads(HOLDINGS.read_text(encoding="utf-8"))
-    except Exception:
-        return []
-    rows = h.get("positions") if isinstance(h, dict) and "positions" in h else (
-        list(h.values()) if isinstance(h, dict) else (h if isinstance(h, list) else [])
-    )
+    except Exception as exc:
+        raise ValueError(f"holdings source is unreadable: {exc}") from exc
+    if isinstance(h, dict) and "positions" in h:
+        raw_positions = h.get("positions")
+        if isinstance(raw_positions, dict):
+            rows = list(raw_positions.values())
+        elif isinstance(raw_positions, list):
+            rows = raw_positions
+        else:
+            raise ValueError("holdings positions must be a list or object")
+    elif isinstance(h, dict):
+        rows = list(h.values())
+    elif isinstance(h, list):
+        rows = h
+    else:
+        raise ValueError("holdings source must be a list or object")
     out = []
     for r in rows:
         if not isinstance(r, dict):
@@ -73,7 +86,7 @@ def _load_holdings() -> list[dict]:
             sh = float(r.get("shares") or 0)
         except Exception:
             sh = 0.0
-        if sh <= 0:
+        if not math.isfinite(sh) or sh <= 0:
             continue
         out.append({"ticker": tk, "shares": sh, "currency": r.get("currency", "USD")})
     # 同 ticker を aggregate
@@ -84,6 +97,30 @@ def _load_holdings() -> list[dict]:
             agg[k] = {"ticker": k, "shares": 0.0, "currency": r["currency"]}
         agg[k]["shares"] += r["shares"]
     return list(agg.values())
+
+
+def _holdings_snapshot_sha256(holdings: list[dict]) -> str:
+    """Hash the exact position inputs that drive earnings damage sizing.
+
+    A same-day artifact is reusable only while ticker, aggregate shares, and
+    currency still match.  A count alone cannot distinguish a replacement
+    holding or a position-size change.
+    """
+    normalized = sorted(
+        (
+            str(row.get("ticker") or "").strip().upper(),
+            float(row.get("shares")),
+            str(row.get("currency") or "USD").strip().upper(),
+        )
+        for row in holdings
+    )
+    encoded = json.dumps(
+        normalized,
+        ensure_ascii=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def _total_portfolio_jpy() -> float:
@@ -123,18 +160,40 @@ def _official_earnings_override(tk: str, *, today: date | None = None) -> dict |
 
 
 def snapshot_is_current(*, today: date | None = None) -> bool:
-    """True only when today's snapshot includes every active issuer override."""
+    """True only when today's snapshot covers the current holdings exactly."""
     today = today or datetime.now().date()
     try:
         data = json.loads(OUTPUT.read_text(encoding="utf-8"))
         generated = datetime.fromisoformat(str(data.get("generated_at"))).date()
         if data.get("schema_version") != OUTPUT_SCHEMA_VERSION or generated != today:
             return False
-        rows = {
-            str(row.get("ticker") or "").upper(): row
-            for row in list(data.get("suggestions") or []) + list(data.get("skipped") or [])
-            if isinstance(row, dict)
+        holdings = _load_holdings()
+        holdings_scanned = data.get("holdings_scanned")
+        if (
+            isinstance(holdings_scanned, bool)
+            or not isinstance(holdings_scanned, int)
+            or holdings_scanned != len(holdings)
+            or data.get("holdings_snapshot_sha256") != _holdings_snapshot_sha256(holdings)
+        ):
+            return False
+        result_rows = list(data.get("suggestions") or []) + list(data.get("skipped") or [])
+        if not all(isinstance(row, dict) for row in result_rows):
+            return False
+        result_tickers = [
+            str(row.get("ticker") or "").strip().upper()
+            for row in result_rows
+        ]
+        expected_tickers = {
+            str(row.get("ticker") or "").strip().upper()
+            for row in holdings
         }
+        if (
+            any(not ticker for ticker in result_tickers)
+            or len(result_tickers) != len(set(result_tickers))
+            or set(result_tickers) != expected_tickers
+        ):
+            return False
+        rows = {str(row.get("ticker") or "").upper(): row for row in result_rows}
         overrides = json.loads(EARNINGS_OVERRIDES.read_text(encoding="utf-8")).get("overrides") or {}
         for ticker in overrides:
             override = _official_earnings_override(ticker, today=today)
@@ -422,6 +481,7 @@ def _scan_once(dry_run: bool = False) -> dict:
         "schema_version":    OUTPUT_SCHEMA_VERSION,
         "generated_at":      time.strftime("%Y-%m-%d %H:%M:%S"),
         "holdings_scanned":  len(holdings),
+        "holdings_snapshot_sha256": _holdings_snapshot_sha256(holdings),
         "portfolio_jpy":     total_jpy,
         "usd_jpy":           round(fx, 2),
         "prox_days":         PROX_DAYS,
@@ -478,7 +538,7 @@ def scan(dry_run: bool = False, *, reuse_current: bool = False) -> dict:
 
 
 def format_for_prompt(max_entries: int = 6) -> str:
-    if not OUTPUT.exists():
+    if not snapshot_is_current():
         return ""
     try:
         if time.time() - OUTPUT.stat().st_mtime > 24 * 3600:
