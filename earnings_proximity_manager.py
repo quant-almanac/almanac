@@ -18,14 +18,17 @@ import json
 import math
 import sys
 import time
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
+from freshness_policy import stale_after_hours
 from pseudo_tickers import is_non_earnings_ticker
 
 BASE_DIR = Path(__file__).parent
 OUTPUT   = BASE_DIR / "earnings_hedge_suggestions.json"
 HOLDINGS = BASE_DIR / "holdings.json"
 ANALYSIS = BASE_DIR / "ai_portfolio_analysis.json"
+GUARD_STATE = BASE_DIR / "guard_state.json"
+ACCOUNT = BASE_DIR / "account.json"
 EARNINGS_OVERRIDES = BASE_DIR / "earnings_calendar_overrides.json"
 
 PROX_DAYS              = 10    # 決算 10 営業日前から監視 (IV 膨張は 5-7 日前で顕在化だが、AAPL 等 8bd も救済)
@@ -33,7 +36,10 @@ IMPL_MOVE_FUDGE        = 0.85  # ATM straddle → implied move 係数 (Bachelier
 DAMAGE_PCT_THRESHOLD   = 0.015 # total_portfolio の 1.5% で hedge 推奨
 BEAT_RATE_FORCE_TRIM   = 0.50
 YFIN_RETRY_ATTEMPTS    = 3     # yfinance .calendar の intermittent 404/rate-limit 対策リトライ
-OUTPUT_SCHEMA_VERSION  = 3
+OUTPUT_SCHEMA_VERSION  = 4
+PORTFOLIO_INPUT_MAX_AGE_HOURS = 24.0  # hourly guard producer; prior formal analysis is fallback
+FX_INPUT_MAX_AGE_HOURS = stale_after_hours("fx")
+FUTURE_TOLERANCE_HOURS = 1.0
 
 
 def _business_days_until(target: date) -> int:
@@ -123,19 +129,128 @@ def _holdings_snapshot_sha256(holdings: list[dict]) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
-def _total_portfolio_jpy() -> float:
-    """ai_portfolio_analysis.json の portfolio_total をベースに"""
-    if ANALYSIS.exists():
+def _aware_now(now: datetime | None = None) -> datetime:
+    current = now or datetime.now().astimezone()
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=datetime.now().astimezone().tzinfo)
+    return current.astimezone(timezone.utc)
+
+
+def _parse_input_timestamp(value: object) -> datetime | None:
+    if value in (None, "") or isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
         try:
-            data = json.loads(ANALYSIS.read_text(encoding="utf-8"))
-            pt = data.get("portfolio_total")
-            if isinstance(pt, dict):
-                return float(pt.get("total_jpy") or pt.get("total") or 0)
-            if isinstance(pt, (int, float)):
-                return float(pt)
-        except Exception:
-            pass
-    return 30_000_000.0  # fallback
+            epoch = float(value)
+            if not math.isfinite(epoch) or epoch < 946_684_800:
+                return None
+            if epoch >= 10_000_000_000:
+                epoch /= 1000.0
+            if epoch < 946_684_800:
+                return None
+            return datetime.fromtimestamp(epoch, tz=timezone.utc)
+        except (OSError, OverflowError, TypeError, ValueError):
+            return None
+    try:
+        parsed = datetime.fromisoformat(str(value).strip().replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=datetime.now().astimezone().tzinfo)
+    return parsed.astimezone(timezone.utc)
+
+
+def _input_age_hours(value: object, *, now: datetime | None = None) -> float:
+    parsed = _parse_input_timestamp(value)
+    if parsed is None:
+        raise ValueError("input timestamp is missing or invalid")
+    age = (_aware_now(now) - parsed).total_seconds() / 3600.0
+    if age < -FUTURE_TOLERANCE_HOURS:
+        raise ValueError("input timestamp is future-dated")
+    return max(0.0, age)
+
+
+def _positive_finite(value: object, *, label: str) -> float:
+    if isinstance(value, bool):
+        raise ValueError(f"{label} is not numeric")
+    try:
+        number = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{label} is not numeric") from exc
+    if not math.isfinite(number) or number <= 0:
+        raise ValueError(f"{label} must be positive and finite")
+    return number
+
+
+def _read_json_object(path: Path) -> dict:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise ValueError(f"{path.name} is missing or unreadable: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise ValueError(f"{path.name} must contain an object")
+    return payload
+
+
+def _portfolio_total_observation(*, now: datetime | None = None) -> dict:
+    """Resolve a recent portfolio denominator without a magic-number fallback."""
+    failures: list[str] = []
+    candidates = (
+        (GUARD_STATE, "guard_state", "portfolio_value", "last_updated"),
+        (ANALYSIS, "formal_analysis", "portfolio_total", "as_of"),
+    )
+    for path, source, value_key, timestamp_key in candidates:
+        try:
+            payload = _read_json_object(path)
+            raw_value = payload.get(value_key)
+            if isinstance(raw_value, dict):
+                raw_value = raw_value.get("total_jpy") or raw_value.get("total")
+            value_jpy = _positive_finite(raw_value, label=f"{source}.{value_key}")
+            as_of = payload.get(timestamp_key)
+            age_hours = _input_age_hours(as_of, now=now)
+            if age_hours > PORTFOLIO_INPUT_MAX_AGE_HOURS:
+                raise ValueError(
+                    f"{source}.{timestamp_key} is stale ({age_hours:.1f}h)"
+                )
+            return {
+                "value_jpy": value_jpy,
+                "source": source,
+                "as_of": as_of,
+            }
+        except ValueError as exc:
+            failures.append(str(exc))
+    raise RuntimeError(
+        "current portfolio total is unavailable; " + "; ".join(failures)
+    )
+
+
+def _fx_rate_observation(*, now: datetime | None = None) -> dict:
+    """Require a recent observed FX rate; never turn 150 into market data."""
+    from utils import get_fx_rate_observation
+
+    observation = get_fx_rate_observation(account_json_path=ACCOUNT)
+    if not isinstance(observation, dict):
+        raise RuntimeError("FX observation is not an object")
+    try:
+        rate = _positive_finite(observation.get("rate"), label="fx.rate")
+    except ValueError as exc:
+        raise RuntimeError(f"FX observation rate is invalid: {exc}") from exc
+    if not 50 < rate < 500:
+        raise RuntimeError(f"FX observation is outside sanity range: {rate}")
+    source = str(observation.get("source") or "unknown")
+    if source not in {"live", "cache", "account_stale"}:
+        raise RuntimeError(f"FX observation source is not usable: {source}")
+    try:
+        age_hours = _input_age_hours(observation.get("observed_at"), now=now)
+    except ValueError as exc:
+        raise RuntimeError(f"FX observation timestamp is invalid: {exc}") from exc
+    if age_hours > FX_INPUT_MAX_AGE_HOURS:
+        raise RuntimeError(f"FX observation is stale ({age_hours:.1f}h)")
+    return {
+        "rate": rate,
+        "source": source,
+        "observed_at": observation.get("observed_at"),
+    }
 
 
 def _official_earnings_override(tk: str, *, today: date | None = None) -> dict | None:
@@ -166,6 +281,17 @@ def snapshot_is_current(*, today: date | None = None) -> bool:
         data = json.loads(OUTPUT.read_text(encoding="utf-8"))
         generated = datetime.fromisoformat(str(data.get("generated_at"))).date()
         if data.get("schema_version") != OUTPUT_SCHEMA_VERSION or generated != today:
+            return False
+        if (
+            data.get("portfolio_jpy_source") not in {"guard_state", "formal_analysis"}
+            or _parse_input_timestamp(data.get("portfolio_jpy_as_of")) is None
+            or data.get("fx_rate_source") not in {"live", "cache", "account_stale"}
+            or _parse_input_timestamp(data.get("fx_rate_usdjpy_as_of")) is None
+        ):
+            return False
+        _positive_finite(data.get("portfolio_jpy"), label="snapshot.portfolio_jpy")
+        fx_rate = _positive_finite(data.get("usd_jpy"), label="snapshot.usd_jpy")
+        if not 50 < fx_rate < 500:
             return False
         holdings = _load_holdings()
         holdings_scanned = data.get("holdings_scanned")
@@ -388,14 +514,11 @@ def _historical_beat_rate(tk: str) -> float | None:
 
 def _scan_once(dry_run: bool = False) -> dict:
     holdings = _load_holdings()
-    total_jpy = _total_portfolio_jpy()
+    portfolio_observation = _portfolio_total_observation()
+    total_jpy = portfolio_observation["value_jpy"]
     print(f"[earnings] scanning {len(holdings)} US holdings, portfolio=¥{total_jpy:,.0f}")
-    # 為替 USD→JPY
-    try:
-        import yfinance as yf
-        fx = float(yf.Ticker("JPY=X").fast_info.last_price or 150.0)
-    except Exception:
-        fx = 150.0
+    fx_observation = _fx_rate_observation()
+    fx = fx_observation["rate"]
 
     suggestions: list[dict] = []
     skipped: list[dict] = []  # 観測性: なぜ hedge 対象から外されたかを記録
@@ -483,7 +606,11 @@ def _scan_once(dry_run: bool = False) -> dict:
         "holdings_scanned":  len(holdings),
         "holdings_snapshot_sha256": _holdings_snapshot_sha256(holdings),
         "portfolio_jpy":     total_jpy,
+        "portfolio_jpy_source": portfolio_observation["source"],
+        "portfolio_jpy_as_of": portfolio_observation["as_of"],
         "usd_jpy":           round(fx, 2),
+        "fx_rate_source":    fx_observation["source"],
+        "fx_rate_usdjpy_as_of": fx_observation["observed_at"],
         "prox_days":         PROX_DAYS,
         "damage_threshold_pct": round(DAMAGE_PCT_THRESHOLD * 100, 2),
         "suggestion_count":  len(suggestions),

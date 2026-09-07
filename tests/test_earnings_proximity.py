@@ -3,10 +3,9 @@ from __future__ import annotations
 
 import importlib
 import json
-import sys
+import time
 from contextlib import contextmanager
-from datetime import date, timedelta
-from types import SimpleNamespace
+from datetime import date, datetime, timedelta, timezone
 
 import pytest
 
@@ -73,15 +72,15 @@ def test_scan_never_falls_back_to_non_atomic_output_write(monkeypatch, tmp_path)
     output.write_text("sentinel", encoding="utf-8")
     monkeypatch.setattr(m, "OUTPUT", output)
     monkeypatch.setattr(m, "_load_holdings", lambda: [])
-    monkeypatch.setattr(m, "_total_portfolio_jpy", lambda: 30_000_000.0)
-    monkeypatch.setitem(
-        sys.modules,
-        "yfinance",
-        SimpleNamespace(
-            Ticker=lambda _ticker: SimpleNamespace(
-                fast_info=SimpleNamespace(last_price=150.0),
-            ),
-        ),
+    monkeypatch.setattr(
+        m,
+        "_portfolio_total_observation",
+        lambda: {"value_jpy": 30_000_000.0, "source": "guard_state", "as_of": "2026-09-07T06:00:00"},
+    )
+    monkeypatch.setattr(
+        m,
+        "_fx_rate_observation",
+        lambda: {"rate": 150.0, "source": "live", "observed_at": time.time()},
     )
 
     def fail_atomic_write(_path, _payload):
@@ -104,6 +103,12 @@ def _current_snapshot(m, holdings, *, result_rows=None):
         "generated_at": f"{date.today().isoformat()} 06:15:00",
         "holdings_scanned": len(holdings),
         "holdings_snapshot_sha256": m._holdings_snapshot_sha256(holdings),
+        "portfolio_jpy": 30_000_000.0,
+        "portfolio_jpy_source": "guard_state",
+        "portfolio_jpy_as_of": time.time(),
+        "usd_jpy": 150.0,
+        "fx_rate_source": "live",
+        "fx_rate_usdjpy_as_of": time.time(),
         "suggestions": [],
         "skipped": rows,
     }
@@ -176,22 +181,24 @@ def test_scan_persists_exact_holdings_fingerprint(monkeypatch, tmp_path):
     ]
     monkeypatch.setattr(m, "OUTPUT", output)
     monkeypatch.setattr(m, "_load_holdings", lambda: holdings)
-    monkeypatch.setattr(m, "_total_portfolio_jpy", lambda: 30_000_000.0)
-    monkeypatch.setattr(m, "_next_earnings_with_source", lambda _ticker: None)
-    monkeypatch.setitem(
-        sys.modules,
-        "yfinance",
-        SimpleNamespace(
-            Ticker=lambda _ticker: SimpleNamespace(
-                fast_info=SimpleNamespace(last_price=150.0),
-            ),
-        ),
+    monkeypatch.setattr(
+        m,
+        "_portfolio_total_observation",
+        lambda: {"value_jpy": 30_000_000.0, "source": "guard_state", "as_of": "2026-09-07T06:00:00"},
     )
+    monkeypatch.setattr(
+        m,
+        "_fx_rate_observation",
+        lambda: {"rate": 150.0, "source": "cache", "observed_at": time.time()},
+    )
+    monkeypatch.setattr(m, "_next_earnings_with_source", lambda _ticker: None)
 
     out = m._scan_once(dry_run=False)
 
     assert out["holdings_scanned"] == 2
     assert out["holdings_snapshot_sha256"] == m._holdings_snapshot_sha256(holdings)
+    assert out["portfolio_jpy_source"] == "guard_state"
+    assert out["fx_rate_source"] == "cache"
     assert {row["ticker"] for row in out["skipped"]} == {"SYNTH_A", "SYNTH_B"}
 
 
@@ -228,3 +235,94 @@ def test_corrupt_holdings_never_publish_an_empty_current_snapshot(monkeypatch, t
         m._scan_once(dry_run=False)
 
     assert output.read_text(encoding="utf-8") == "sentinel"
+
+
+def test_portfolio_total_uses_recent_guard_then_recent_formal_analysis(monkeypatch, tmp_path):
+    m = importlib.import_module("earnings_proximity_manager")
+    guard = tmp_path / "guard_state.json"
+    analysis = tmp_path / "ai_portfolio_analysis.json"
+    now = datetime(2026, 9, 7, 6, 15, tzinfo=timezone.utc)
+    guard.write_text(json.dumps({
+        "portfolio_value": 31_000_000,
+        "last_updated": "2026-09-07T05:15:00+00:00",
+    }), encoding="utf-8")
+    analysis.write_text(json.dumps({
+        "portfolio_total": 30_000_000,
+        "as_of": "2026-09-07T04:15:00+00:00",
+    }), encoding="utf-8")
+    monkeypatch.setattr(m, "GUARD_STATE", guard)
+    monkeypatch.setattr(m, "ANALYSIS", analysis)
+
+    assert m._portfolio_total_observation(now=now) == {
+        "value_jpy": 31_000_000.0,
+        "source": "guard_state",
+        "as_of": "2026-09-07T05:15:00+00:00",
+    }
+
+    guard.write_text(json.dumps({
+        "portfolio_value": 31_000_000,
+        "last_updated": "2026-09-05T05:15:00+00:00",
+    }), encoding="utf-8")
+    assert m._portfolio_total_observation(now=now) == {
+        "value_jpy": 30_000_000.0,
+        "source": "formal_analysis",
+        "as_of": "2026-09-07T04:15:00+00:00",
+    }
+
+
+def test_portfolio_total_never_uses_magic_fallback(monkeypatch, tmp_path):
+    m = importlib.import_module("earnings_proximity_manager")
+    guard = tmp_path / "guard_state.json"
+    analysis = tmp_path / "ai_portfolio_analysis.json"
+    guard.write_text('{"portfolio_value": "not-a-number"}', encoding="utf-8")
+    analysis.write_text('{"portfolio_total": null}', encoding="utf-8")
+    monkeypatch.setattr(m, "GUARD_STATE", guard)
+    monkeypatch.setattr(m, "ANALYSIS", analysis)
+
+    with pytest.raises(RuntimeError, match="current portfolio total is unavailable"):
+        m._portfolio_total_observation(
+            now=datetime(2026, 9, 7, 6, 15, tzinfo=timezone.utc),
+        )
+
+
+@pytest.mark.parametrize(
+    ("observation", "message"),
+    [
+        ({"rate": 150.0, "source": "hardcoded", "observed_at": None}, "source is not usable"),
+        ({
+            "rate": 150.0,
+            "source": "account_stale",
+            "observed_at": datetime(2026, 9, 5, tzinfo=timezone.utc).timestamp(),
+        }, "FX observation is stale"),
+        ({
+            "rate": float("nan"),
+            "source": "live",
+            "observed_at": datetime(2026, 9, 7, 6, tzinfo=timezone.utc).timestamp(),
+        }, "must be positive and finite"),
+    ],
+)
+def test_fx_observation_rejects_unverifiable_inputs(monkeypatch, observation, message):
+    m = importlib.import_module("earnings_proximity_manager")
+    import utils
+
+    monkeypatch.setattr(utils, "get_fx_rate_observation", lambda **_kwargs: observation)
+    with pytest.raises(RuntimeError, match=message):
+        m._fx_rate_observation(
+            now=datetime(2026, 9, 7, 6, 15, tzinfo=timezone.utc),
+        )
+
+
+def test_snapshot_contract_requires_valuation_provenance(monkeypatch, tmp_path):
+    m = importlib.import_module("earnings_proximity_manager")
+    output = tmp_path / "earnings_hedge_suggestions.json"
+    overrides = tmp_path / "earnings_calendar_overrides.json"
+    overrides.write_text('{"overrides": {}}', encoding="utf-8")
+    holdings = [{"ticker": "SYNTH_A", "shares": 1.0, "currency": "USD"}]
+    payload = _current_snapshot(m, holdings)
+    payload.pop("fx_rate_source")
+    output.write_text(json.dumps(payload), encoding="utf-8")
+    monkeypatch.setattr(m, "OUTPUT", output)
+    monkeypatch.setattr(m, "EARNINGS_OVERRIDES", overrides)
+    monkeypatch.setattr(m, "_load_holdings", lambda: holdings)
+
+    assert m.snapshot_is_current() is False

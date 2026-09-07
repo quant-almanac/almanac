@@ -59,6 +59,12 @@ def test_snapshot_requires_current_schema_and_matching_override(monkeypatch, tmp
         "generated_at": "2026-07-24 05:30:00",
         "holdings_scanned": 1,
         "holdings_snapshot_sha256": earnings._holdings_snapshot_sha256(holdings),
+        "portfolio_jpy": 30_000_000.0,
+        "portfolio_jpy_source": "formal_analysis",
+        "portfolio_jpy_as_of": "2026-07-24T05:00:00+09:00",
+        "usd_jpy": 150.0,
+        "fx_rate_source": "cache",
+        "fx_rate_usdjpy_as_of": "2026-07-24T05:00:00+09:00",
         "suggestions": [],
         "skipped": [{
             "ticker": "META",
