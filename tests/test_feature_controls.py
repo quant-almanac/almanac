@@ -9,6 +9,43 @@ import pytest
 import feature_controls as fc
 
 
+@pytest.mark.parametrize("mse,baseline", [
+    (float("nan"), 1.0), (float("inf"), 1.0),
+    (1.0, float("inf")), (1.0, float("nan")),
+    (1e308, 1e-308),
+])
+def test_ginn_nonfinite_ratio_is_unavailable(tmp_path, monkeypatch, mse, baseline):
+    candidate = tmp_path / "models" / "ginn" / "candidate-v2"
+    candidate.mkdir(parents=True)
+    (candidate / "model.pt").write_bytes(b"candidate")
+    (candidate / "manifest.json").write_text(json.dumps({
+        "trained_at": datetime.now(timezone.utc).isoformat(),
+        "validation_metrics": {"mse": mse, "garch_baseline_mse": baseline},
+    }))
+    monkeypatch.setattr(fc, "BASE_DIR", tmp_path)
+    fc._GINN_GATE_CACHE.clear()
+    status = fc._ginn_status(tmp_path)
+    assert {"label": "GARCH比MSE", "value": None} in status["metrics"]
+    assert status["effective_enabled"] is False
+    json.dumps(status, allow_nan=False)
+
+
+@pytest.mark.parametrize("invalid", [float("nan"), float("inf"), float("-inf")])
+def test_feature_serialization_failure_is_isolated(monkeypatch, invalid):
+    from starlette.responses import JSONResponse
+
+    def status(key, **kwargs):
+        return {"key": key, "metrics": [{"value": invalid if key == "ginn" else 1}]}
+
+    monkeypatch.setattr(fc, "get_feature_status", status)
+    result = fc.list_feature_statuses()
+    JSONResponse(result)
+    rows = {row["key"]: row for row in result["features"]}
+    assert rows["ginn"]["status_resolution_failed"] is True
+    assert rows["ginn"]["effective_enabled"] is False
+    assert rows["us_short"]["metrics"] == [{"value": 1}]
+
+
 def _write_us_source(root, *, tickers: dict | None = None) -> None:
     path = root / "data" / "broker_short_us.json"
     path.parent.mkdir(parents=True, exist_ok=True)

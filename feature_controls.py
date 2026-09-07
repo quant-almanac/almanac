@@ -11,6 +11,7 @@ are reported for visibility but retain their existing authorities.
 from __future__ import annotations
 
 import json
+import math
 import os
 import time
 from datetime import date, datetime, timezone
@@ -978,11 +979,16 @@ def _ginn_status(root: Path) -> dict[str, Any]:
     validation_mse = validation_metrics.get("mse")
     garch_mse = validation_metrics.get("garch_baseline_mse")
     try:
+        validation_mse = float(validation_mse)
+        garch_mse = float(garch_mse)
         garch_ratio = (
-            round(float(validation_mse) / float(garch_mse), 2)
-            if float(garch_mse) > 0
+            round(validation_mse / garch_mse, 2)
+            if math.isfinite(validation_mse) and math.isfinite(garch_mse)
+            and validation_mse >= 0 and garch_mse > 0
             else None
         )
+        if garch_ratio is not None and not math.isfinite(garch_ratio):
+            garch_ratio = None
     except (TypeError, ValueError):
         garch_ratio = None
     return {
@@ -1230,7 +1236,11 @@ def list_feature_statuses(
     features = []
     for key in keys:
         try:
-            features.append(get_feature_status(key, base_dir=base_dir))
+            status = get_feature_status(key, base_dir=base_dir)
+            # Serialization is part of status resolution: one invalid feature
+            # must not break both the Features and System endpoints.
+            json.dumps(status, allow_nan=False)
+            features.append(status)
         except Exception as exc:
             features.append({
                 "key": key,
