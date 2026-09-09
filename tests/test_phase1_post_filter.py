@@ -3047,6 +3047,33 @@ def test_tax_loss_conflict_rejects_override_above_cap(monkeypatch):
     assert result["decision_boundary_audit"]["rejected_counts"]["ai_bounded_rejected"] == 1
 
 
+def test_s3_observation_does_not_change_post_filter_actions(monkeypatch, tmp_path):
+    import copy
+    import earnings_blackout_observation as shadow
+
+    _silence_external_filters(monkeypatch)
+    monkeypatch.setattr(tunable_params, "get", _tp_get)
+    monkeypatch.setattr(analyst, "_load_earnings_blackout", lambda within_business_days=5: {"SYNTH_A"})
+    synthesis = {"overall_stance": "neutral", "priority_actions": [{
+        "ticker": "SYNTH_A", "type": "buy", "amount_jpy": 150_000,
+        "confidence_pct": 77, "earnings_event_trade": True,
+        "earnings_event_reason": "bounded event", "action": "synthetic event buy",
+    }]}
+    def run():
+        return analyst._phase1_post_filter(
+            copy.deepcopy(synthesis), 30_000_000, base_dir=tmp_path,
+            now=datetime(2026, 9, 9, 7, tzinfo=ZoneInfo("Asia/Tokyo")), side_effects=False)
+    before = run()
+    with shadow.observation_scope():
+        # Entire shadow input fails, while the existing gate must stay intact.
+        after = run()
+        observation = shadow._CURRENT.get().record("synthetic-run")
+    assert before == after
+    assert observation["consumer_reads"][0]["consumer"] == "post_filter"
+    assert observation["consumer_reads"][0]["legacy"] == ["SYNTH_A"]
+    assert after["priority_actions"][0]["cap_applied_jpy"] == 150_000
+
+
 def test_earnings_blackout_allows_event_trade_only_with_cap(monkeypatch):
     _silence_external_filters(monkeypatch)
     monkeypatch.setattr(analyst, "_load_earnings_blackout", lambda within_business_days=5: {"NVDA"})

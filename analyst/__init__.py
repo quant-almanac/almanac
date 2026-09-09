@@ -22,6 +22,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from technical_quality import DEGRADED, UNUSABLE, classify_technical_row
+import earnings_blackout_observation as _earnings_shadow
 
 BASE_DIR = Path(__file__).parent.parent
 sys.path.insert(0, str(BASE_DIR))
@@ -7716,6 +7717,7 @@ def _format_earnings_blackout_for_prompt(within_business_days: int = 5) -> str:
     """決算 N 営業日以内の銘柄を Opus プロンプト向けに整形。
     buy/add/dca 推奨を出さないよう促す。"""
     blackout = _load_earnings_blackout(within_business_days=within_business_days)
+    _earnings_shadow.capture("prompt", within_business_days, blackout)
     if not blackout:
         return ""
     lines = [f"## 決算 blackout（EARNINGS_BLACKOUT — 決算 0〜{within_business_days} 営業日以内）"]
@@ -8159,6 +8161,7 @@ def _phase1_post_filter(
         recent_7d = _load_recent_recommendations(days=_cd_days)   # 連日重複抑制用
     cancelled_rec_keys = _load_cancelled_recommendation_keys()
     blackout   = _load_earnings_blackout(within_business_days=_eb_days2)
+    _earnings_shadow.capture("post_filter", _eb_days2, blackout)
     def _with_optional_now(func, *, days: int):
         # Several downstream extensions/tests still provide the legacy
         # ``func(days=...)`` callable.  Preserve that interface while native
@@ -11137,6 +11140,7 @@ def _build_candidate_funnel(
         except Exception:
             earnings_blackout_tickers = set()
             earnings_blackout_resolved = False
+    _earnings_shadow.capture("candidate_funnel", 7, earnings_blackout_tickers or set(), earnings_blackout_resolved)
     earnings_blackout_tickers = {
         canonical_ticker(value) for value in earnings_blackout_tickers or set()
     }
@@ -11145,6 +11149,7 @@ def _build_candidate_funnel(
     if not isinstance(passed, list):
         errors.append({"tier": "screening", "field": "long_term.passed", "code": "candidate_field_invalid"})
         passed = []
+    _earnings_shadow.capture_candidates("candidate_funnel", passed)
     for raw in passed:
         if not isinstance(raw, dict):
             continue
@@ -11502,7 +11507,7 @@ def _with_analysis_run_context(function):
             from action_stage_log import new_analysis_id
         from llm_run_context import analysis_run_context
 
-        with analysis_run_context(new_analysis_id()):
+        with analysis_run_context(new_analysis_id()), _earnings_shadow.observation_scope():
             return function(*args, **kwargs)
 
     return wrapper
@@ -11561,6 +11566,10 @@ def run_analysis(force: bool = False) -> dict:
         # Existing blackout loading fails closed only for known dated rows; log
         # the degraded state prominently instead of pretending no earnings.
         print(f"  ⚠️ earnings proximity 鮮度保証スキップ: {_ee}")
+
+    # Shadow only: never replace any legacy gate or prompt input.
+    import earnings_proximity_manager as _earnings_observation_source
+    _earnings_shadow.freeze_current(_earnings_observation_source)
 
     try:
         from vix_tracker import get_vix_context as _get_vix_context
@@ -13065,6 +13074,7 @@ def run_analysis(force: bool = False) -> dict:
     # で deterministic にフィルタする。プロンプト依頼ではなくコード側で執行する。
     _fallback_policy_context = None
     if isinstance(synthesis, dict) and isinstance(synthesis.get("priority_actions"), list):
+        _earnings_shadow.capture_candidates("pre_policy", synthesis["priority_actions"])
         try:
             from policy_engine import apply_policy_gate, build_context_from_synthesis_inputs
 
@@ -13078,10 +13088,17 @@ def run_analysis(force: bool = False) -> dict:
             #   _blackout_tickers が常に [] になり policy engine の決算ゲートへ届かなかった。
             #   blackout 銘柄 set を返す既存ヘルパーを直接呼び、確実に配線する。
             _blackout_tickers = []
+            _blackout_read_failed = False
             try:
                 _blackout_tickers = sorted(_load_earnings_blackout(within_business_days=5))
             except Exception:
                 _blackout_tickers = []
+                _blackout_read_failed = True
+
+            # None means the legacy loader does not expose validation status;
+            # a swallowed outer exception is explicitly unresolved, not clear.
+            _earnings_shadow.capture("policy", 5, _blackout_tickers,
+                                     False if _blackout_read_failed else None)
 
             _policy_macro = dict(data.get("market_meta") or {}) if isinstance(data, dict) else {}
             if isinstance(data, dict):
@@ -13687,6 +13704,10 @@ def run_analysis(force: bool = False) -> dict:
         "redteam":                     redteam_analysis,
     }
 
+    # Diagnostics stay outside synthesis/data and are not prompt inputs.
+    result["earnings_blackout_observation"] = _earnings_shadow.finish_synthesis(
+        BASE_DIR, _asl_analysis_id, synthesis,
+    )
     save_cache(result)
 
     # AI推奨を事後検証ログに記録

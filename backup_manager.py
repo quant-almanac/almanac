@@ -89,6 +89,7 @@ TARGETS = [
     # O2: PIT / outcome / audit stores. JSONL files are validated line-by-line.
     'data/disclosure_features.jsonl',
     'catalyst_hypothesis_log.jsonl',
+    'earnings_blackout_observation.jsonl',  # Optional shadow evidence, not recovery-critical state.
     'catalyst_outcome_log.jsonl',
     'sell_decision_log.jsonl',
     'sell_outcome_log.jsonl',

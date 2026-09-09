@@ -72,6 +72,7 @@ The large orchestration implementation lives in the `analyst/` package; see §15
 | live | `data_fetcher.py`, `technical_signals.py`, `technical_quality.py`, `chart_analyzer.py`, `options_fetcher.py`, `proposed_ticker_registry.py` | Price history, technicals, the shared usability contract for technical rows, decision chart, options context and model-proposed-ticker coverage tracking |
 | live | `macro_fetcher.py`, `macro_event_calendar.py`, `event_calendar.py`, `follow_rate_analyzer.py` | Macro/rates and event calendars |
 | live | `news_fetcher.py`, `geopolitical_monitor.py`, `earnings_proximity_manager.py`, `earnings_season.py` | News/geopolitics and earnings blackouts |
+| shadow | `earnings_blackout_observation.py` | Frozen earnings inputs and legacy-consumer comparisons; no trading authority or automatic promotion |
 | live | `sector_rotation.py`, `sector_strength_updater.py` | Sector state |
 | shared | `instrument_metadata.py`, `pseudo_tickers.py`, `download_tickers.py`, `expand_tickers.py` | Instrument identity, synthetic IDs and universe files |
 | maintenance | `parquet_rebuilder.py`, `sync_jp_universe_prices.py` | Local price-store repair and JP-universe synchronization |

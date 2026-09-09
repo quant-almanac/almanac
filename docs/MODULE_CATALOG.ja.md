@@ -72,6 +72,7 @@
 | live | `data_fetcher.py`, `technical_signals.py`, `technical_quality.py`, `chart_analyzer.py`, `options_fetcher.py`, `proposed_ticker_registry.py` | price history、technical、テクニカル行の利用可否契約、chart、options、AI提案銘柄のカバレッジ追跡 |
 | live | `macro_fetcher.py`, `macro_event_calendar.py`, `event_calendar.py`, `follow_rate_analyzer.py` | macro/rates/event calendar |
 | live | `news_fetcher.py`, `geopolitical_monitor.py`, `earnings_proximity_manager.py`, `earnings_season.py` | news/geopolitics/earnings blackout |
+| shadow | `earnings_blackout_observation.py` | 決算入力の凍結と既存consumerの判定比較。売買権限・自動昇格は持たない |
 | live | `sector_rotation.py`, `sector_strength_updater.py` | sector state |
 | shared | `instrument_metadata.py`, `pseudo_tickers.py`, `download_tickers.py`, `expand_tickers.py` | instrument identity、synthetic ID、universe |
 | maintenance | `parquet_rebuilder.py`, `sync_jp_universe_prices.py` | local price store修復、JP同期 |

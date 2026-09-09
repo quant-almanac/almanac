@@ -71,7 +71,12 @@ def main(argv: list[str] | None = None) -> int:
 
     synthesis = result.get("synthesis", {}) if isinstance(result, dict) else {}
     actions = synthesis.get("priority_actions", []) if isinstance(synthesis, dict) else []
-    if telegram_ok:
+    observation = result.get("earnings_blackout_observation") if isinstance(result, dict) else None
+    observation_failed = isinstance(observation, dict) and (
+        observation.get("recorded") is not True or observation.get("resolved") is not True
+        or bool(observation.get("error"))
+    )
+    if telegram_ok and not observation_failed:
         heartbeat(
             "portfolio_analyst",
             "ok",
@@ -87,7 +92,11 @@ def main(argv: list[str] | None = None) -> int:
         heartbeat(
             "portfolio_analyst",
             "warn",
-            "Telegram送信に失敗（分析は正常終了）",
+            "; ".join(reason for reason in (
+                "Telegram送信に失敗（分析は正常終了）" if not telegram_ok else None,
+                "earnings blackout観測に失敗: " + str(observation.get("error") or "unresolved")
+                if observation_failed else None,
+            ) if reason),
             extra={
                 "as_of": result.get("as_of") if isinstance(result, dict) else None,
                 "priority_actions": len(actions) if isinstance(actions, list) else None,
