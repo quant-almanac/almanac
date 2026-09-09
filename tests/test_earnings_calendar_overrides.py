@@ -1,5 +1,6 @@
-from datetime import date
+from datetime import date, datetime
 import json
+from zoneinfo import ZoneInfo
 
 import earnings_proximity_manager as earnings
 
@@ -76,10 +77,16 @@ def test_snapshot_requires_current_schema_and_matching_override(monkeypatch, tmp
     monkeypatch.setattr(earnings, "OUTPUT", output_path)
     monkeypatch.setattr(earnings, "_load_holdings", lambda: holdings)
 
-    assert earnings.snapshot_is_current(today=date(2026, 7, 24)) is True
+    # S2: snapshot_is_current は消費時点での NAV/FX 実年齢と generated_at の
+    # 未来拒否も検証するため、実時計の「今日」ではなく、この fixture の
+    # タイムスタンプ（2026-07-24 05:00/05:30 JST）に近い固定 now を注入する
+    # （fix_plan_v2.md の P7 対応方針: 固定 now の注入に統一）。
+    fixed_now = datetime(2026, 7, 24, 5, 35, tzinfo=ZoneInfo("Asia/Tokyo"))
+
+    assert earnings.snapshot_is_current(today=date(2026, 7, 24), now=fixed_now) is True
 
     data = json.loads(output_path.read_text(encoding="utf-8"))
     data["skipped"][0]["earnings"] = "2026-07-30"
     output_path.write_text(json.dumps(data), encoding="utf-8")
 
-    assert earnings.snapshot_is_current(today=date(2026, 7, 24)) is False
+    assert earnings.snapshot_is_current(today=date(2026, 7, 24), now=fixed_now) is False

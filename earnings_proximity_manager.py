@@ -299,25 +299,60 @@ def _official_earnings_override(tk: str, *, today: date | None = None) -> dict |
         return None
 
 
-def snapshot_is_current(*, today: date | None = None) -> bool:
-    """True only when today's snapshot covers the current holdings exactly."""
-    today = today or datetime.now().date()
+def _read_and_validate_snapshot(
+    *, today: date | None = None, now: datetime | None = None,
+) -> dict | None:
+    """OUTPUT を一度だけ読み、その場で検証し、同じ dict を返す（検証済みなら）。
+
+    以前は ``snapshot_is_current()``（検証のみ、内部で1回読む）と、
+    ``_load_current_snapshot()``/``format_for_prompt()``（それぞれ独自に
+    もう一度読む）が分離していたため、**検証した内容と実際に返す/表示する
+    内容が同じ瞬間の同じデータである保証が無かった**（TOCTOU: 検証と
+    読み込みの間に別プロセスが再スキャンして書き換え得る）。
+
+    加えて以下2点も未検証だった（fix_plan_v2.md S2 節）:
+    - ``generated_at`` が未来日時でも拒否しない
+      （時計ずれ・書き込みバグでの誤って新しい日付を弾けない）。
+    - NAV/FX は「パース可能か」しか見ておらず、**消費時点での実年齢**
+      （生成時に検証した鮮度がそのまま「今も新鮮」を意味しない）を
+      再検証していなかった。生成直後は新鮮でも、同じ JST 日のうちに
+      ``PORTFOLIO_INPUT_MAX_AGE_HOURS``/``FX_INPUT_MAX_AGE_HOURS`` を
+      超えた NAV/FX がそのまま「有効」として使われ続け得た。
+
+    ``snapshot_is_current()`` はこの関数の真偽値版の互換ラッパー、
+    ``_load_current_snapshot()``/``format_for_prompt()`` はこの関数の
+    戻り値をそのまま使う（追加の読み込みをしない）。
+    """
+    now = _aware_now(now)
+    today = today or now.astimezone(_NAIVE_TIMESTAMP_TZ).date()
     try:
         data = json.loads(OUTPUT.read_text(encoding="utf-8"))
-        generated = datetime.fromisoformat(str(data.get("generated_at"))).date()
-        if data.get("schema_version") != OUTPUT_SCHEMA_VERSION or generated != today:
-            return False
+        generated_raw = data.get("generated_at")
+        # _input_age_hours は「パース不能」と「FUTURE_TOLERANCE_HOURS を
+        # 超えた未来日時」の両方で ValueError を投げる（呼出元の生成時刻
+        # 検証と同じ許容幅を再利用する）。
+        _input_age_hours(generated_raw, now=now)
+        generated = _parse_input_timestamp(generated_raw)
+        if generated is None:
+            return None
+        if generated.astimezone(_NAIVE_TIMESTAMP_TZ).date() != today:
+            return None
+        if data.get("schema_version") != OUTPUT_SCHEMA_VERSION:
+            return None
         if (
             data.get("portfolio_jpy_source") not in {"guard_state", "formal_analysis"}
-            or _parse_input_timestamp(data.get("portfolio_jpy_as_of")) is None
             or data.get("fx_rate_source") not in {"live", "cache", "account_stale"}
-            or _parse_input_timestamp(data.get("fx_rate_usdjpy_as_of")) is None
         ):
-            return False
+            return None
+        # 生成時点のパース可能性だけでなく、消費時点での実年齢を再検証する。
+        if _input_age_hours(data.get("portfolio_jpy_as_of"), now=now) > PORTFOLIO_INPUT_MAX_AGE_HOURS:
+            return None
+        if _input_age_hours(data.get("fx_rate_usdjpy_as_of"), now=now) > FX_INPUT_MAX_AGE_HOURS:
+            return None
         _positive_finite(data.get("portfolio_jpy"), label="snapshot.portfolio_jpy")
         fx_rate = _positive_finite(data.get("usd_jpy"), label="snapshot.usd_jpy")
         if not 50 < fx_rate < 500:
-            return False
+            return None
         holdings = _load_holdings()
         holdings_scanned = data.get("holdings_scanned")
         if (
@@ -326,10 +361,10 @@ def snapshot_is_current(*, today: date | None = None) -> bool:
             or holdings_scanned != len(holdings)
             or data.get("holdings_snapshot_sha256") != _holdings_snapshot_sha256(holdings)
         ):
-            return False
+            return None
         result_rows = list(data.get("suggestions") or []) + list(data.get("skipped") or [])
         if not all(isinstance(row, dict) for row in result_rows):
-            return False
+            return None
         result_tickers = [
             str(row.get("ticker") or "").strip().upper()
             for row in result_rows
@@ -343,7 +378,7 @@ def snapshot_is_current(*, today: date | None = None) -> bool:
             or len(result_tickers) != len(set(result_tickers))
             or set(result_tickers) != expected_tickers
         ):
-            return False
+            return None
         rows = {str(row.get("ticker") or "").upper(): row for row in result_rows}
         overrides = json.loads(EARNINGS_OVERRIDES.read_text(encoding="utf-8")).get("overrides") or {}
         for ticker in overrides:
@@ -356,10 +391,20 @@ def snapshot_is_current(*, today: date | None = None) -> bool:
                 or str(row.get("earnings") or row.get("earnings_date") or "") != override["date"].isoformat()
                 or str(row.get("earnings_source") or "") != override["source"]
             ):
-                return False
-        return True
+                return None
+        return data
     except Exception:
-        return False
+        return None
+
+
+def snapshot_is_current(
+    *, today: date | None = None, now: datetime | None = None,
+) -> bool:
+    """True only when today's snapshot covers the current holdings exactly.
+
+    ``_read_and_validate_snapshot`` の真偽値版の互換ラッパー（S2）。
+    """
+    return _read_and_validate_snapshot(today=today, now=now) is not None
 
 
 def _next_earnings_from_yfinance(tk: str):
@@ -654,15 +699,10 @@ def _scan_once(dry_run: bool = False) -> dict:
     return out
 
 
-def _load_current_snapshot() -> dict | None:
-    """Load today's schema-valid snapshot, or return ``None`` fail-closed."""
-    if not snapshot_is_current():
-        return None
-    try:
-        data = json.loads(OUTPUT.read_text(encoding="utf-8"))
-    except Exception:
-        return None
-    return data if isinstance(data, dict) else None
+def _load_current_snapshot(*, now: datetime | None = None) -> dict | None:
+    """Load today's schema-valid, consumption-time-fresh snapshot, or
+    ``None`` fail-closed. Reads OUTPUT exactly once (S2)."""
+    return _read_and_validate_snapshot(now=now)
 
 
 def _record_run_history(*, kind: str, status: str, reused: bool,
@@ -761,14 +801,13 @@ def scan(dry_run: bool = False, *, reuse_current: bool = False, kind: str = "man
         raise
 
 
-def format_for_prompt(max_entries: int = 6) -> str:
-    if not snapshot_is_current():
-        return ""
-    try:
-        if time.time() - OUTPUT.stat().st_mtime > 24 * 3600:
-            return ""
-        data = json.loads(OUTPUT.read_text(encoding="utf-8"))
-    except Exception:
+def format_for_prompt(max_entries: int = 6, *, now: datetime | None = None) -> str:
+    # OUTPUT を一度だけ読み、検証したその同じ dict を表示に使う（S2）。
+    # 旧実装は snapshot_is_current()・mtime・自身の json.loads の3回読んで
+    # おり、mtime を generated_at とは独立の鮮度権威として使っていた
+    # （fix_plan_v2.md の明示的な禁止事項）。
+    data = _read_and_validate_snapshot(now=now)
+    if data is None:
         return ""
     sug = data.get("suggestions", [])[:max_entries]
     skipped = data.get("skipped", []) or []
@@ -776,14 +815,28 @@ def format_for_prompt(max_entries: int = 6) -> str:
     if not sug and not skipped:
         return ""
 
-    lines = ["## 🎯 Earnings Proximity Hedge / Trim 候補", ""]
-    if sug:
-        for s in sug:
-            lines.append(
+    # 全体契約（schema/鮮度/hash等）が有効でも、個々の行の表示用の値だけが
+    # 壊れていることがある。1行の欠陥で全件（この alpha ブロック丸ごと）を
+    # 失わせない ―― 壊れた行だけ省略し、件数と理由を残す
+    # （呼出元 analyst/__init__.py はこの関数の例外を捕捉して alpha
+    # ブロック全体をスキップするため、ここで捕捉しないと「1行の欠陥で
+    # 全件消失」になる）。「対象なし」とは表示しない。
+    omitted: list[str] = []
+
+    sug_lines: list[str] = []
+    for s in sug:
+        try:
+            sug_lines.append(
                 f"- **{s['ticker']}** T-{s['business_days']}bd ({s['earnings_date']}) "
                 f"impl-move {s['implied_move_pct']:.1f}% / damage {s['damage_pct']:.2f}% "
                 f"→ {s['recommended_action']}"
             )
+        except (KeyError, ValueError, TypeError) as e:
+            omitted.append(f"{s.get('ticker', '?')}: {e}")
+
+    lines = ["## 🎯 Earnings Proximity Hedge / Trim 候補", ""]
+    if sug_lines:
+        lines.extend(sug_lines)
         lines.append("")
         lines.append(f"→ damage_pct > {data.get('damage_threshold_pct', 1.5)}% の銘柄は priority_actions に hedge/trim として確実に注入。"
                      "beat_rate < 0.5 の銘柄は前日 trim_50pct を強制採用。")
@@ -795,18 +848,29 @@ def format_for_prompt(max_entries: int = 6) -> str:
                        if s.get("reason") in ("damage_below_threshold", "no_option_chain")
                        and s.get("bdays") is not None and 0 <= s["bdays"] <= 10]
     if in_window_skips:
-        lines.append("")
-        lines.append("### 📅 決算接近銘柄（hedge 閾値下 or option chain 未取得）")
+        skip_lines: list[str] = []
         for s in in_window_skips[:8]:
-            if s["reason"] == "damage_below_threshold":
-                lines.append(
-                    f"- {s['ticker']} T-{s['bdays']}bd ({s['earnings']}) "
-                    f"impl-move {s.get('implied_move_pct','?')}% / damage {s.get('damage_pct','?')}% "
-                    f"(pos {s.get('position_pct','?')}%) → monitor のみ"
-                )
-            else:
-                lines.append(f"- {s['ticker']} T-{s['bdays']}bd ({s['earnings']}) option chain 取得失敗 → 決算前日 trim_25pct 検討")
-        lines.append("→ priority_actions には含めず hold_notes / risk_warnings で言及すること。")
+            try:
+                if s["reason"] == "damage_below_threshold":
+                    skip_lines.append(
+                        f"- {s['ticker']} T-{s['bdays']}bd ({s['earnings']}) "
+                        f"impl-move {s.get('implied_move_pct','?')}% / damage {s.get('damage_pct','?')}% "
+                        f"(pos {s.get('position_pct','?')}%) → monitor のみ"
+                    )
+                else:
+                    skip_lines.append(f"- {s['ticker']} T-{s['bdays']}bd ({s['earnings']}) option chain 取得失敗 → 決算前日 trim_25pct 検討")
+            except (KeyError, ValueError, TypeError) as e:
+                omitted.append(f"{s.get('ticker', '?')}: {e}")
+        if skip_lines:
+            lines.append("")
+            lines.append("### 📅 決算接近銘柄（hedge 閾値下 or option chain 未取得）")
+            lines.extend(skip_lines)
+            lines.append("→ priority_actions には含めず hold_notes / risk_warnings で言及すること。")
+
+    if omitted:
+        lines.append("")
+        lines.append(f"⚠️ 表示不可のため {len(omitted)}件 省略: " + "; ".join(omitted))
+
     return "\n".join(lines)
 
 

@@ -98,9 +98,19 @@ def _current_snapshot(m, holdings, *, result_rows=None):
         {"ticker": row["ticker"], "reason": "no_earnings_date"}
         for row in holdings
     ]
+    # 実時計の少し前・かつ必ず today と同じ暦日にする。固定 "06:15:00" を
+    # date.today() と組み合わせると、実行時刻が 06:15 より前（深夜0時台）
+    # だと未来日時になり S2 の未来拒否チェックに引っかかる。単純な「5分前」も
+    # 日境界をまたぐと today と一致しなくなる（いずれも 00:0x JST 実行で
+    # 実際に再現・自己レビューで発見）。
+    _now = datetime.now()
+    _candidate = _now - timedelta(minutes=5)
+    if _candidate.date() != _now.date():
+        _candidate = datetime.combine(_now.date(), datetime.min.time())
+    generated_at = _candidate.strftime("%Y-%m-%d %H:%M:%S")
     return {
         "schema_version": m.OUTPUT_SCHEMA_VERSION,
-        "generated_at": f"{date.today().isoformat()} 06:15:00",
+        "generated_at": generated_at,
         "holdings_scanned": len(holdings),
         "holdings_snapshot_sha256": m._holdings_snapshot_sha256(holdings),
         "portfolio_jpy": 30_000_000.0,
