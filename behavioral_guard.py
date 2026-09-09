@@ -4,14 +4,25 @@ ALMANAC v4.0 - 行動ガードレール
 """
 
 import json
+import math
 import os
 import sys
 import time
 from datetime import datetime, date, timedelta
 from pathlib import Path
 
-from utils import atomic_write_json, redact_secret
+from utils import atomic_write_json, heartbeat, positive_finite, redact_secret
 from risk_policy import POLICY, RISK_POLICY_VERSION, loss_guard_state
+
+
+class PortfolioValuationUnavailable(RuntimeError):
+    """snapshot_portfolio_pnl() が現在評価額を取得できなかった。
+
+    元の実装はこれを内部で握り潰し、直近の (再評価されていない) state を
+    そのまま返していた。CLI の ``snapshot --eod`` はこれを検知する手段が無く、
+    評価に失敗した run でも古い portfolio_value を無条件に翌日の EOD 基準として
+    確定していた（2026-09 レビュー・平日17:35 cron の実際の失敗経路で再現）。
+    """
 
 BASE_DIR = Path(__file__).parent
 STATE_FILE = BASE_DIR / 'guard_state.json'
@@ -313,6 +324,12 @@ def _default_state() -> dict:
         'last_eod_portfolio_value': 0.0,  # P0-2: 前日EOD評価額（日次P&L計算の基準、日またぎで更新）
         'monthly_pnl_jpy':   0.0,   # 実態は直近30日ローリング（外部互換のためキー名維持）
         'monthly_pnl_pct':   0.0,   # 実態は直近30日ローリング（外部互換のためキー名維持）
+        # _update_rolling30 がこの値を計算した際に使った date.today()。
+        # excluded_days<=0（窓内に欠損無し）だけでは「その計算自体がいつ
+        # 行われたか」を問わないため、cron 停止中に最後に計算された古い
+        # window がそのまま「確認済み」として使われ続け得た
+        # （2026-09 レビュー Codex 4ラウンド目 指摘 #2）。
+        'monthly_pnl_computed_for_date': None,
         'pnl_history':       [],     # [{'date': 'YYYY-MM-DD', 'pnl_jpy': float}, ...]（日次P&L履歴）
         'portfolio_value':   0.0,
         # 実際に再評価した writer だけが進める（update_pnl / snapshot_portfolio_pnl）。
@@ -320,6 +337,18 @@ def _default_state() -> dict:
         # ならない ―― 外部（earnings_proximity_manager）が評価額の鮮度を検証する
         # ためにこのフィールドを読む（2026-09 レビュー S1）。
         'portfolio_value_as_of': None,
+        # daily_pnl_jpy を計算した際に基準として使った
+        # last_eod_portfolio_value_as_of の値を、その計算時点で凍結した
+        # スナップショット。--eod による last_eod_portfolio_value_as_of の
+        # 書き換え（翌日向けの先取りステージング）から独立させるためのフィールド
+        # （2026-09 レビュー Codex 指摘 #1）。
+        'daily_pnl_basis_as_of': None,
+        # daily_pnl_basis_as_of と対になる金額版。today の最初の評価で
+        # last_eod_portfolio_value を凍結し、同日内の以後の再評価では
+        # 再読込みしない ―― さもないと、間に挟まった --eod が翌日向けに
+        # ステージング済みの値を「今日の基準」として読み直し、確定済みの
+        # 当日損益を壊す（2026-09 レビュー Codex 3ラウンド目 指摘 #1）。
+        'daily_pnl_baseline_jpy': 0.0,
         'active_trades':     0,
         'short_positions':   0,
         'new_entry_allowed':      True,
@@ -336,24 +365,169 @@ def _default_state() -> dict:
     }
 
 
+def _expected_prior_business_day(d: date) -> date:
+    """``d`` の直前の営業日（土日のみ除外。祝日は他モジュールと同じ既存の
+    weekday-only 規約に合わせて未対応 ―― known limit として明示済み）。"""
+    prev = d - timedelta(days=1)
+    while prev.weekday() >= 5:  # 5=Sat, 6=Sun
+        prev -= timedelta(days=1)
+    return prev
+
+
+def _daily_pnl_basis_is_valid(state: dict, *, as_of_date: str) -> bool:
+    """``daily_pnl_jpy`` が ``as_of_date`` の値として信頼できるかを判定する。
+
+    2条件を両方満たす必要がある:
+      (a) daily_pnl_basis_as_of ―― 実際に daily_pnl_jpy を計算したときの
+          基準日を、計算時点で凍結したスナップショット ―― が
+          as_of_date の直前営業日と厳密に一致する。
+      (b) portfolio_value_as_of の日付が as_of_date と一致する
+          （as_of_date 中に実際に計算が走った）。
+
+    last_eod_portfolio_value_as_of を直接読まない。そのフィールドは
+    (1) 当日を通じて daily_pnl_jpy を計算する基準、と
+    (2) --eod が「翌日の新基準」を先取りしてステージングする場所、の
+    2つの役割を兼ねる。正常な EOD 確定（失敗ではない）が当日中に (2) として
+    その日自身の日付を書き込むと、直後の再評価が (1) の意味で
+    delta=0 を「無効」と誤判定し、正常な当日損益まで無効化していた
+    （2026-09 レビュー Codex 指摘 #1・実際に平日17:35 cron の正常経路で再現）。
+    daily_pnl_basis_as_of は update_pnl/snapshot_portfolio_pnl が
+    計算のたびに凍結するため、後から --eod が
+    last_eod_portfolio_value_as_of を書き換えても影響を受けない。
+
+    単純な暦日差レンジ (旧: 1〜4日) もやめた。火曜基準のまま水曜が欠測した
+    状態で木曜に評価すると、旧実装は暦日差2として「有効」を返していた
+    （2026-09 レビュー Codex 指摘 #3: 平日の欠測を素通りさせていた）。
+    直前営業日との完全一致にすることで、土日はまたぐが平日の欠測は
+    許容しない。
+    """
+    pv_date = str(state.get('portfolio_value_as_of') or '')[:10]
+    if pv_date != str(as_of_date):
+        return False
+    basis_iso = state.get('daily_pnl_basis_as_of')
+    if not basis_iso:
+        return False
+    try:
+        basis = date.fromisoformat(str(basis_iso)[:10])
+        current = date.fromisoformat(str(as_of_date))
+    except (ValueError, TypeError):
+        return False
+    return basis == _expected_prior_business_day(current)
+
+
+def _finite_signed(value: object) -> float | None:
+    """有限の実数として解釈できる値だけを通す。bool・None・NaN/inf・
+    非数値は None（未確認）に倒す。P&L は負数も正当な値のため
+    utils.positive_finite は使えない（0以下も拒否してしまう）。
+
+    再現 (2026-09 レビュー Codex 3ラウンド目 指摘 #4): 従来は
+    ``float(x or 0.0)`` で None/False/欠損を無条件に「確認済み0%」へ
+    丸め、NaN は ``float(nan)`` が例外を投げないためそのまま通過して
+    比較が常時 False になる（`daily <= 閾値` が成立しない）ことで
+    「安全」に見えていた。実測: None/False/NaN いずれも daily_pnl_pct に
+    与えると loss_guard が ok を返していた。
+    """
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(number):
+        return None
+    return number
+
+
+def resolve_loss_guard_inputs(guard_state: dict | None, *, as_of_date: str | None = None) -> dict:
+    """guard_state.json （またはそれと同じ形の dict）から
+    ``{"daily": float|None, "rolling": float|None}`` を解決する。
+
+    behavioral_guard.evaluate() 自身に加え、guard_state.json を直接読む
+    他の consumer（execution_preflight._guard_metrics,
+    analyst/data_gatherer._loss_guard_from_guard_state）もこの関数を
+    経由させる。以前はそれぞれが daily_pnl_pct/monthly_pnl_pct を生の値
+    として個別に読んでおり、guard 自身が data_confidence_caution と
+    判定した同じ state に対して、他の consumer は daily_block などの
+    別の結論に達し得た（2026-09 独立レビュー Codex 指摘 #2）。
+
+    rolling は monthly_pnl_basis_excluded_days が 1 以上（30日集計の一部が
+    未確認で除外された）なら None にする ―― 除外件数を保存はするが判定に
+    反映していなかった（同 Codex 指摘 #4: 除外1日を含む状態でも
+    30日損益0・stage=ok・新規リスク許可になっていた）。
+
+    as_of_date 無指定時は実際の今日（date.today()）を使う。以前は
+    guard_state 自身の 'date' フィールドへフォールバックしており、cron が
+    何日も止まっていても guard_state が内部的に自己整合してさえいれば
+    「確認済み」として通ってしまっていた（2026-09 独立レビュー Codex
+    3ラウンド目 指摘 #3・実機再現: 1週間 stale な state の daily=-20% が
+    execution_preflight/analyst 側で確認済み扱いになった）。
+    evaluate() は自身の as_of_date を明示的に渡すため、この既定値変更の
+    影響を受けない。
+    """
+    if not isinstance(guard_state, dict) or not guard_state:
+        return {"daily": None, "rolling": None}
+
+    as_of_date = as_of_date or date.today().isoformat()
+
+    daily_basis_valid = _daily_pnl_basis_is_valid(guard_state, as_of_date=as_of_date)
+    daily = _finite_signed(guard_state.get("daily_pnl_pct")) if daily_basis_valid else None
+
+    excluded_days_raw = guard_state.get('monthly_pnl_basis_excluded_days', 0)
+    try:
+        excluded_days = int(excluded_days_raw)
+    except (TypeError, ValueError):
+        excluded_days = 1  # 形式不正は「除外あり」扱い、安全側
+    # excluded_days<=0（窓内に欠損無し）だけでは、その計算自体が「いつ」
+    # 行われたかを問わない。cron が丸ごと止まっていても、最後に計算された
+    # 時点でたまたま窓に欠損が無ければ、古い window がそのまま
+    # 「確認済み」として使われ続け得た。実測: 1ヶ月以上前に計算された
+    # excluded_days=0 の state が、実際の今日を as_of_date として渡しても
+    # stage_3（全リスク増加凍結）に達した（2026-09 レビュー Codex 4ラウンド目
+    # 指摘 #2）。computed_for_date が as_of_date と厳密一致する場合だけ
+    # 信頼する。
+    computed_for_date = guard_state.get('monthly_pnl_computed_for_date')
+    rolling_confirmed = excluded_days <= 0 and str(computed_for_date) == str(as_of_date)
+    rolling = _finite_signed(guard_state.get("monthly_pnl_pct")) if rolling_confirmed else None
+
+    return {"daily": daily, "rolling": rolling}
+
+
 def _update_rolling30(state: dict) -> None:
     """
     pnl_history（日次P&Lの履歴）から直近30日のローリングP&Lを計算して state を更新する。
     今日の daily_pnl_jpy も含めて合計する。
     結果は monthly_pnl_jpy / monthly_pnl_pct に書き込む（外部互換のためキー名を維持）。
+
+    pnl_jpy が None（基準無効で記録された日、_daily_pnl_basis_is_valid 参照）の
+    履歴行は合計から除外する。今日分も基準が無効なら除外する ―― 確認済みの
+    残り日数分のローリング値を殺さないため、rolling 全体を None にはしない
+    （2026-09 レビュー S1b・Codex 指摘1: 判明している制約は維持する）。
     """
     cutoff = (date.today() - timedelta(days=30)).isoformat()
     today_str = date.today().isoformat()
 
     # 30日超の古い履歴を削除
-    history = [e for e in state.get('pnl_history', []) if e['date'] >= cutoff]
+    history = [e for e in state.get('pnl_history', []) if e.get('date', '') >= cutoff]
     state['pnl_history'] = history
 
-    # 過去日（today以外）の合計 + 今日の日次P&Lを加算
-    past_total = sum(e['pnl_jpy'] for e in history if e['date'] != today_str)
-    rolling_jpy = past_total + state.get('daily_pnl_jpy', 0.0)
+    # 過去日（today以外）の合計。基準無効で pnl_jpy=None の日は除外する
+    # （旧実装は無条件 sum() で None 混入時に TypeError していた）。
+    past_total = sum(
+        e['pnl_jpy'] for e in history
+        if e.get('date') != today_str and e.get('pnl_jpy') is not None
+    )
+    excluded_days = sum(1 for e in history if e.get('pnl_jpy') is None)
+
+    today_valid = _daily_pnl_basis_is_valid(state, as_of_date=state.get('date') or today_str)
+    today_component = state.get('daily_pnl_jpy', 0.0) if today_valid else 0.0
+    if not today_valid:
+        excluded_days += 1
+
+    rolling_jpy = past_total + today_component
 
     state['monthly_pnl_jpy'] = rolling_jpy
+    state['monthly_pnl_basis_excluded_days'] = excluded_days
+    state['monthly_pnl_computed_for_date'] = today_str
     pv = state.get('portfolio_value', 0)
     state['monthly_pnl_pct'] = rolling_jpy / pv if pv > 0 else 0.0
 
@@ -367,20 +541,72 @@ def load_state() -> dict:
         if state.get('date') != today_str:
             prev_date = state.get('date', '')
             prev_pnl  = state.get('daily_pnl_jpy', 0.0)
-            if prev_date and prev_pnl != 0.0:
+            pv_date = str(state.get('portfolio_value_as_of') or '')[:10]
+            # 前日分を「確定値」として記録できるのは、_daily_pnl_basis_is_valid
+            # が前日を確認済みと判定する場合だけ。この関数は (a) 前日の計算に
+            # 使われた基準（daily_pnl_basis_as_of ―― 計算時点の凍結値。
+            # last_eod_portfolio_value_as_of ではない、後述）が前日の直前
+            # 営業日と一致し、かつ (b) 前日中に実際に評価が成功した
+            # （portfolio_value_as_of が前日を指す）ことを両方要求する。
+            # (a) だけでは足りない ―― 基準は新鮮でも、その日一日評価が一度も
+            # 成功しなかった（daily_pnl_jpy がロールオーバー既定値 0.0 のまま）
+            # ケースを「確認済みゼロ変化」と誤認してしまう
+            # （2026-09 レビュー・自己レビューで発見: 全休止日が無記録のまま
+            # 30日集計へ黙って0寄与していた）。
+            prev_day_confirmed = bool(prev_date) and _daily_pnl_basis_is_valid(
+                state, as_of_date=prev_date)
+            # 土日は「予定された評価が欠測した日」ではなく、そもそも評価を
+            # 予定していない日。読み取り専用のはずの status 表示ですら
+            # load_state() を呼んで即 save_state() するため（_print_status）、
+            # 金曜EOD確定→土曜status→日曜status、という経路だけで土日2日分が
+            # 「基準未確認」として pnl_history に記録され、月曜の正常な snapshot
+            # まで monthly_pnl_basis_excluded_days 経由で data_confidence_caution/
+            # new_entry_allowed=False に巻き込んでいた（2026-09 レビュー
+            # Codex 3ラウンド目 指摘 #2・実機再現）。不正な日付形式は安全側
+            # （従来どおり平日として扱い記録する）。
+            try:
+                prev_is_weekday = date.fromisoformat(prev_date).weekday() < 5 if prev_date else True
+            except (ValueError, TypeError):
+                prev_is_weekday = True
+            if prev_date and prev_is_weekday:
                 history = state.get('pnl_history', [])
                 # 同一日付のエントリーがあれば上書き、なければ追記
                 existing = next((e for e in history if e['date'] == prev_date), None)
-                if existing:
-                    existing['pnl_jpy'] = prev_pnl
+                if prev_day_confirmed:
+                    if existing:
+                        existing['pnl_jpy'] = prev_pnl
+                        existing.pop('basis_valid', None)
+                    elif prev_pnl != 0.0:
+                        history.append({'date': prev_date, 'pnl_jpy': prev_pnl})
                 else:
-                    history.append({'date': prev_date, 'pnl_jpy': prev_pnl})
+                    # 基準が前日を確認できていない、または前日中に評価が
+                    # 一度も成功していない ―― prev_pnl は複数日分の差分か、
+                    # 単に「未計測」かもしれないので、それを1日分の確定値
+                    # として残さない。「不明」であることを明示的に記録する
+                    # （2026-09 レビュー S1b・Codex 指摘1）。
+                    if existing:
+                        existing['pnl_jpy'] = None
+                        existing['basis_valid'] = False
+                    else:
+                        history.append({'date': prev_date, 'pnl_jpy': None,
+                                        'basis_valid': False})
                 state['pnl_history'] = history
             state['date']          = today_str
             state['daily_pnl_jpy'] = 0.0
             state['daily_pnl_pct'] = 0.0
-            # P0-2: 前日 EOD 評価額を今日の基準として確定（昨日最後に記録された portfolio_value）
-            state['last_eod_portfolio_value'] = state.get('portfolio_value', 0.0)
+            # P0-2: 前日 EOD 評価額を今日の基準として確定（昨日最後に記録された portfolio_value）。
+            # ただし portfolio_value 自体が前日を確認済みで評価されていた場合に限る
+            # ―― でなければ、何日も前の評価額を「今日確定した」基準として
+            # 上書きしてしまう（2026-09 レビュー・平日17:35 cron の実際の失敗
+            # 経路で再現。詳細は tests/test_guard_eod_failure_handling.py）。
+            # こちらは prev_basis_valid を要求しない ―― 旧基準が古くても、
+            # 今まさに得られた新しい評価額を新基準として採用するのが正しい
+            # 自己回復動作（基準が古い間ずっと固まったままにしない）。
+            # 確認できなければ既存の last_eod_portfolio_value をそのまま保持する
+            # ―― _daily_pnl_basis_is_valid() がその古さを検知する。
+            if pv_date == prev_date:
+                state['last_eod_portfolio_value'] = state.get('portfolio_value', 0.0)
+                state['last_eod_portfolio_value_as_of'] = state.get('portfolio_value_as_of')
             state['realized_pnl_jpy_today']   = 0.0
         # 旧形式（month/monthly_pnl）があれば移行: 旧monthly値をpnl_historyに取り込まない
         # （旧月次P&Lは30日ローリングと互換性がないため破棄）
@@ -513,23 +739,41 @@ def evaluate(state: dict) -> dict:
     available.  ``risk_factor`` is retained at 1.0 for compatibility but is
     no longer an automatic sizing instruction.
     """
-    daily = float(state.get("daily_pnl_pct") or 0.0)
-    rolling = float(state.get("monthly_pnl_pct") or 0.0)
+    # daily_pnl_pct は基準（last_eod_portfolio_value）が対象日の前日を確認済み
+    # 評価している場合だけ信頼する。EOD 評価の失敗が続くと基準は古いまま
+    # 据え置かれるため（load_state 参照）、その古さを検知せずに daily を渡すと
+    # 複数日分の差分を1日分として日次ショック制御に食わせてしまう
+    # （2026-09 レビュー S1b・Codex 指摘1）。数値そのものは消さず、判定にだけ
+    # None を渡す ―― 履歴/30日集計/表示は元の値を使い続けられる。
+    resolved = resolve_loss_guard_inputs(
+        state, as_of_date=state.get('date') or date.today().isoformat())
+    daily = resolved["daily"]
+    rolling = resolved["rolling"]
     decision = loss_guard_state(
         daily_pnl_decimal=daily,
         rolling_30_pnl_decimal=rolling,
     )
-    stage_by_name = {"ok": 0, "daily_block": 0, "stage_1": 1, "stage_2": 2, "stage_3": 3}
+    stage_by_name = {
+        "ok": 0, "daily_block": 0, "stage_1": 1, "stage_2": 2, "stage_3": 3,
+        "data_confidence_caution": 0,
+    }
     loss_stage = str(decision["loss_guard_stage"])
     stage = stage_by_name[loss_stage]
     now = datetime.now().isoformat()
     alerts: list[dict] = []
     if loss_stage != "ok":
+        # dict リテラルは選ばれなかったキーの値も含めて全て即時評価されるため、
+        # rolling=None（除外日数あり、Codex 指摘 #4 対応）のまま stage_1〜3 の
+        # f-string を組み立てると daily_block 選択時にも TypeError になる
+        # （自己レビューで発見）。daily 側と同じく NaN 表示にフォールバックする。
+        daily_pct_display = daily * 100 if daily is not None else float("nan")
+        rolling_pct_display = rolling * 100 if rolling is not None else float("nan")
         labels = {
-            "daily_block": f"日次P&L {daily * 100:.2f}% が -3% 日次ショック制御に到達",
-            "stage_1": f"30日P&L {rolling * 100:.2f}% が -6% に到達",
-            "stage_2": f"30日P&L {rolling * 100:.2f}% が -9% に到達",
-            "stage_3": f"30日P&L {rolling * 100:.2f}% が -12% に到達：リスク増加を凍結し人間レビュー",
+            "daily_block": f"日次P&L {daily_pct_display:.2f}% が -3% 日次ショック制御に到達",
+            "stage_1": f"30日P&L {rolling_pct_display:.2f}% が -6% に到達",
+            "stage_2": f"30日P&L {rolling_pct_display:.2f}% が -9% に到達",
+            "stage_3": f"30日P&L {rolling_pct_display:.2f}% が -12% に到達：リスク増加を凍結し人間レビュー",
+            "data_confidence_caution": "日次/30日P&Lの確認可能な基準が不足（EOD評価失敗または移行直後）",
         }
         alerts.append({
             "level": "critical" if stage >= 2 else "warning",
@@ -579,6 +823,31 @@ def evaluate(state: dict) -> dict:
 # P&L 更新
 # ============================================================
 
+def _resolve_daily_pnl_baseline(state: dict, *, today_str: str) -> float:
+    """今日の daily_pnl 計算に使う基準額を返す。
+
+    今日まだ一度も凍結していなければ（portfolio_value_as_of が今日を
+    指していなければ）、今この瞬間の last_eod_portfolio_value(_as_of) を
+    daily_pnl_basis_as_of / daily_pnl_baseline_jpy へ凍結してから返す。
+    既に今日凍結済みなら（同日内2回目以降の呼出し）その凍結値をそのまま
+    再利用し、last_eod_portfolio_value(_as_of) を再読込みしない。
+
+    再読込みすると、間に挟まった --eod が翌日向けにステージング済みの
+    今日自身の値を「今日の基準」として読み直してしまい、確定済みの
+    当日 daily_pnl を破壊する ―― 実測: EOD確定→同日再評価で
+    daily_pnl_pct が正しい値から 0.00%、stage が ok から
+    data_confidence_caution へ変化することを確認（2026-09 レビュー
+    Codex 3ラウンド目 指摘 #1）。update_pnl/snapshot_portfolio_pnl の
+    どちらか一方だけを直しても、もう一方の writer 経由で再現するため
+    共通化した。
+    """
+    pv_date = str(state.get('portfolio_value_as_of') or '')[:10]
+    if pv_date != today_str:
+        state['daily_pnl_basis_as_of'] = state.get('last_eod_portfolio_value_as_of')
+        state['daily_pnl_baseline_jpy'] = state.get('last_eod_portfolio_value', 0.0)
+    return state.get('daily_pnl_baseline_jpy', 0.0)
+
+
 def update_pnl(pnl_jpy: float, portfolio_value: float) -> dict:
     """
     トレードのP&Lを記録し、ガードレールを再評価する。
@@ -594,15 +863,31 @@ def update_pnl(pnl_jpy: float, portfolio_value: float) -> dict:
     Returns:
         更新後の状態
     """
+    # snapshot_portfolio_pnl と同じ検証。alert.update_guard_state() から
+    # 呼ばれる実経路であり、0・負数・bool がそのまま保存され得た
+    # （2026-09 レビュー Codex 3ラウンド目 指摘 #5）。state を一切
+    # 変更する前に検証することで、拒否された呼出しが state に触れない
+    # ことも保証する。
+    validated_value = positive_finite(portfolio_value, label="update_pnl.portfolio_value")
+
     state = load_state()
 
-    state['portfolio_value']         = portfolio_value
+    # portfolio_value_as_of を上書きする前に「今日は既に計算済みか」を
+    # 判定する。先に上書きしてしまうと _resolve_daily_pnl_baseline が
+    # 常に「今日は既に計算済み」と誤判定し、当日1回目の呼出しでも基準を
+    # 凍結できなくなる（2026-09 レビュー Codex 3ラウンド目 指摘 #1・
+    # 自己レビューで発見: snapshot_portfolio_pnl は元から正しい順序だった
+    # が、update_pnl はこの並び順の誤りを最初から持っていた）。
+    # P0-2: daily_pnl_jpy = 現在評価額 - 前日EOD基準（評価額ベースで一本化）
+    baseline = _resolve_daily_pnl_baseline(state, today_str=date.today().isoformat())
+
+    state['portfolio_value']         = validated_value
     state['portfolio_value_as_of']   = datetime.now().isoformat()
     state['realized_pnl_jpy_today'] += pnl_jpy
-
-    # P0-2: daily_pnl_jpy = 現在評価額 - 前日EOD基準（評価額ベースで一本化）
-    baseline = state.get('last_eod_portfolio_value', 0.0) or portfolio_value
-    state['daily_pnl_jpy'] = portfolio_value - baseline
+    if baseline <= 0:
+        baseline = state['portfolio_value']
+        state['daily_pnl_baseline_jpy'] = baseline
+    state['daily_pnl_jpy'] = state['portfolio_value'] - baseline
     if baseline > 0:
         state['daily_pnl_pct'] = state['daily_pnl_jpy'] / baseline
     else:
@@ -903,17 +1188,28 @@ def snapshot_portfolio_pnl() -> dict:
     try:
         import portfolio_manager
         snapshot = portfolio_manager.build_portfolio_snapshot()
-        current_value = snapshot.get("total_jpy", 0)
+        # 読み取り側（earnings_proximity_manager）は NAV/FX を検証するのに
+        # 書込み側にはこの検証が無く、0・負数・bool がそのまま
+        # portfolio_value として保存され得た（2026-09 レビュー Codex 指摘
+        # #5）。ValueError はこの except で PortfolioValuationUnavailable に
+        # 揃えて扱う ―― 「評価額を取得できなかった」と「取得はできたが
+        # 使い物にならない値だった」を区別する理由が呼出元には無い。
+        current_value = positive_finite(
+            snapshot.get("total_jpy", 0), label="portfolio_manager.total_jpy")
     except Exception as e:
         print(f"[SNAPSHOT] ポートフォリオ取得失敗: {e}")
-        return load_state()
+        # ここで load_state() を返して「成功」に見せかけない。呼出元
+        # （CLI の --eod）が失敗を検知できず、未再評価の state を翌日の
+        # EOD 基準として確定してしまっていた（2026-09 レビュー）。
+        raise PortfolioValuationUnavailable(str(e)) from e
 
     state = load_state()
-    baseline = state.get('last_eod_portfolio_value', 0.0)
+    baseline = _resolve_daily_pnl_baseline(state, today_str=date.today().isoformat())
 
     # 初回 / 移行時: 今日の値をベースラインとして確定（P&L はゼロ）
     if baseline <= 0 and current_value > 0:
         state['last_eod_portfolio_value'] = current_value
+        state['daily_pnl_baseline_jpy'] = current_value
         baseline = current_value
 
     if baseline > 0 and current_value > 0:
@@ -961,6 +1257,60 @@ def snapshot_portfolio_pnl() -> dict:
     return state
 
 
+def _run_snapshot_cli(args: list[str]) -> int:
+    """``behavioral_guard.py snapshot [--eod]`` を処理する。
+
+    __main__ の平坦な dispatch から分離し、EOD 確定の失敗時ハンドリング
+    （2026-09 レビュー S1b）を直接テスト可能にする。
+
+    Args:
+        args: ``sys.argv[1:]`` 相当。``args[0]`` は ``'snapshot'``。
+
+    Returns:
+        プロセス終了コード。
+    """
+    # 使い方: python behavioral_guard.py snapshot [--eod]
+    # data_fetcher 後に毎日実行 → 評価額の前日比を guard_state に反映
+    # --eod: 現在評価額を「今日のEOD基準」として明示的に確定（17:00 cron 用）
+    try:
+        state = snapshot_portfolio_pnl()
+    except PortfolioValuationUnavailable as _e:
+        # 評価そのものが失敗した run。EOD 確定も _print_status も実行しない
+        # ―― 未再評価の state を「今日確定した」ように見せてはいけない。
+        # LockBusy と同種の「予想される外部データ異常」として扱い、
+        # traceback は出さず non-zero で終了する。
+        print(f"[SNAPSHOT] ⚠️ 評価額取得失敗のため EOD 確定・状態更新をスキップ: {_e}")
+        heartbeat('behavioral_guard_snapshot', 'warn', str(_e)[:500])
+        return 1
+    except Exception as _e:
+        # snapshot_portfolio_pnl() 内部の評価額取得より後（例: save_state の
+        # atomic_write_json 書き込み失敗）で起きた未知の例外は
+        # PortfolioValuationUnavailable を経由しないため上の except では
+        # 捕まらない。無音のまま伝播させず、下の --eod ブロックと同じく
+        # heartbeat=error を記録してから re-raise する（2026-09 レビュー
+        # Codex 2ラウンド目 指摘 #8）。
+        heartbeat('behavioral_guard_snapshot', 'error', str(_e)[:500])
+        raise
+
+    try:
+        if '--eod' in args[1:]:
+            # P0-2: 明示的なEOD確定。翌日以降の日次P&L計算基準に使用される。
+            # portfolio_value_as_of は上の snapshot_portfolio_pnl() 成功時に
+            # 今まさに更新されているので、その値をそのまま基準時刻として使う
+            # （datetime.now() を取り直すと実測時刻とズレる）。
+            s = load_state()
+            s['last_eod_portfolio_value'] = s.get('portfolio_value', 0.0)
+            s['last_eod_portfolio_value_as_of'] = s.get('portfolio_value_as_of')
+            save_state(s)
+            print(f"[SNAPSHOT] EOD基準を確定: ¥{s['last_eod_portfolio_value']:,.0f}")
+        _print_status()
+        heartbeat('behavioral_guard_snapshot', 'ok')
+        return 0
+    except Exception as _e:
+        heartbeat('behavioral_guard_snapshot', 'error', str(_e)[:500])
+        raise
+
+
 if __name__ == '__main__':
     args = sys.argv[1:]
 
@@ -968,29 +1318,7 @@ if __name__ == '__main__':
         _print_status()
 
     elif args[0] == 'snapshot':
-        # 使い方: python behavioral_guard.py snapshot [--eod]
-        # data_fetcher 後に毎日実行 → 評価額の前日比を guard_state に反映
-        # --eod: 現在評価額を「今日のEOD基準」として明示的に確定（17:00 cron 用）
-        # P2-9: ヘルスチェック用ハートビート
-        try:
-            from utils import heartbeat as _hb
-        except Exception:
-            _hb = None
-        try:
-            state = snapshot_portfolio_pnl()
-            if '--eod' in args[1:]:
-                # P0-2: 明示的なEOD確定。翌日以降の日次P&L計算基準に使用される。
-                s = load_state()
-                s['last_eod_portfolio_value'] = s.get('portfolio_value', 0.0)
-                save_state(s)
-                print(f"[SNAPSHOT] EOD基準を確定: ¥{s['last_eod_portfolio_value']:,.0f}")
-            _print_status()
-            if _hb:
-                _hb('behavioral_guard_snapshot', 'ok')
-        except Exception as _e:
-            if _hb:
-                _hb('behavioral_guard_snapshot', 'error', str(_e)[:500])
-            raise
+        sys.exit(_run_snapshot_cli(args))
 
     elif args[0] == 'pnl' and len(args) == 3:
         # 使い方: python behavioral_guard.py pnl <pnl_jpy> <portfolio_value>

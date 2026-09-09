@@ -626,3 +626,23 @@ def test_run_check_counts_heartbeat_lock_issues_in_problem_count(monkeypatch, tm
     assert problem_count == 1
     state = json.loads(state_path.read_text())
     assert state["consecutive_failures"] == 3
+
+
+def test_behavioral_guard_snapshot_warn_is_treated_as_error():
+    """snapshot_portfolio_pnl の評価失敗は heartbeat=warn で記録される
+    （behavioral_guard._run_snapshot_cli 参照）。warn_is_error が無いと
+    evaluate_heartbeats はこれを ok と区別できず、EOD 未確定という
+    重要な失敗が watchdog に一切現れない（2026-09 レビュー S1b）。
+    """
+    hb = {
+        'behavioral_guard_snapshot': {
+            'last_run_ts': time.time(),
+            'status': 'warn',
+            'error': 'valuation source unavailable',
+        },
+    }
+    result = wd.evaluate_heartbeats(hb)
+    assert any(e['script'] == 'behavioral_guard_snapshot' for e in result['errors']), (
+        "behavioral_guard_snapshot の warn が errors に現れない（warn_is_error 未設定）"
+    )
+    assert 'behavioral_guard_snapshot' not in result['ok']

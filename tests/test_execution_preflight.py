@@ -275,9 +275,24 @@ def test_preflight_reads_risk_snapshot_and_live_promoted_drawdown(tmp_path, monk
 
 
 def test_token_free_preflight_decision_never_loads_signing_key(tmp_path, monkeypatch):
-    (tmp_path / "guard_state.json").write_text(
-        '{"daily_pnl_pct": 0.0, "monthly_pnl_pct": 0.0}', encoding="utf-8",
-    )
+    # daily/rolling が「確認済み」と解決されるには、_guard_metrics が
+    # behavioral_guard.resolve_loss_guard_inputs を経由するため、その有効性
+    # フィールドも揃っている必要がある（2026-09 独立レビュー Codex 指摘 #2 対応
+    # 後の contract。日付をハードコードせず date.today() 基準で計算し、
+    # テスト実行日に依存しないようにする）。
+    from datetime import date as _date
+    from behavioral_guard import _expected_prior_business_day as _prior_bday
+    today = _date.today()
+    prior_bday = _prior_bday(today)
+    (tmp_path / "guard_state.json").write_text(json.dumps({
+        "date": today.isoformat(),
+        "daily_pnl_pct": 0.0,
+        "monthly_pnl_pct": 0.0,
+        "monthly_pnl_basis_excluded_days": 0,
+        "monthly_pnl_computed_for_date": today.isoformat(),
+        "portfolio_value_as_of": f"{today.isoformat()}T09:00:00",
+        "daily_pnl_basis_as_of": f"{prior_bday.isoformat()}T17:35:00",
+    }), encoding="utf-8")
     (tmp_path / "ai_portfolio_analysis.json").write_text(
         '{"as_of": "2026-08-19T06:00:00+09:00", "risk_snapshot": '
         '{"source": "test", "var_95_decimal": 0.01}}', encoding="utf-8",

@@ -102,6 +102,32 @@ def reset_yfinance_session(timeout: int = YF_TIMEOUT) -> None:
         pass  # yfinance 未インストール/内部 API 変更時も常駐処理を止めない
 
 
+def positive_finite(value: object, *, label: str) -> float:
+    """値が有限の正数であることを検証する。bool は拒否する
+    （``True``/``False`` は int のサブクラスで ``True == 1`` が
+    通ってしまうため、明示的に弾かないと ``portfolio_value=True`` の
+    ような取り違えが数値として保存され得る）。
+
+    元は earnings_proximity_manager.py の読み取り側（NAV/FX の検証）専用
+    だったが、behavioral_guard.py の書込み側（評価額の受け取り）にも同じ
+    検証が必要だと判明したため utils.py へ共通化した
+    （2026-09 レビュー Codex 指摘 #5: 読み取り側は検証するのに
+    書込み側は無検証で、0・負数・bool がそのまま保存され得た）。
+
+    Raises:
+        ValueError: 数値でない、bool、非有限（NaN/inf）、0以下のいずれか。
+    """
+    if isinstance(value, bool):
+        raise ValueError(f"{label} is not numeric")
+    try:
+        number = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{label} is not numeric") from exc
+    if not math.isfinite(number) or number <= 0:
+        raise ValueError(f"{label} must be positive and finite")
+    return number
+
+
 def load_json(path, default=None):
     """JSONファイルを安全に読み込む。ファイル不在やパースエラー時は default を返す。
 

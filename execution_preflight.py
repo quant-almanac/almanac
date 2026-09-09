@@ -138,12 +138,21 @@ def _as_decimal(value: Any) -> float | None:
 
 
 def _guard_metrics(base_dir: Path) -> tuple[float | None, float | None]:
+    """behavioral_guard.evaluate() と同じ有効性判定を経由して daily/rolling
+    を解決する。以前は guard_state.json の daily_pnl_pct/monthly_pnl_pct を
+    無条件の生値として読んでおり、guard 自身が data_confidence_caution と
+    判定する同じ state に対してここだけ daily_block などの別結論に達し得た
+    （2026-09 独立レビュー Codex 指摘 #2）。
+    """
     path = base_dir / "guard_state.json"
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
     except Exception:
         return None, None
-    return _as_decimal(raw.get("daily_pnl_pct")), _as_decimal(raw.get("monthly_pnl_pct"))
+    from behavioral_guard import resolve_loss_guard_inputs
+
+    resolved = resolve_loss_guard_inputs(raw if isinstance(raw, dict) else None)
+    return resolved["daily"], resolved["rolling"]
 
 
 def _current_short_positions(base_dir: Path) -> int | None:

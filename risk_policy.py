@@ -79,8 +79,20 @@ def loss_guard_state(
 
     ``actual_dd_stage`` is retained temporarily for downstream compatibility,
     but is explicitly a loss-guard state, never a drawdown measurement.
+
+    Daily and rolling-30 confidence are evaluated independently.  The
+    previous both-or-neither early return let a missing/unconfirmed daily
+    basis (e.g. an EOD valuation failure) silently drop a *confirmed*
+    rolling-30 stage — reproduced: ``daily=None, rolling=-0.13`` returned
+    ``data_confidence_caution`` instead of ``stage_3`` (2026-09 review).
+    Whichever side is known and breaches its threshold still governs; only
+    when *both* sides are unknown, or one side is unknown while the other is
+    known-clean, do we report reduced confidence rather than claim "ok".
     """
-    if daily_pnl_decimal is None or rolling_30_pnl_decimal is None:
+    daily_known = daily_pnl_decimal is not None
+    rolling_known = rolling_30_pnl_decimal is not None
+
+    if not daily_known and not rolling_known:
         return {
             "loss_guard_stage": "data_confidence_caution",
             "actual_dd_stage": "data_confidence_caution",
@@ -88,10 +100,12 @@ def loss_guard_state(
             "trading_allowed": True,
             "reason_code": "loss_guard_data_unavailable",
         }
-    daily = float(daily_pnl_decimal)
-    rolling = float(rolling_30_pnl_decimal)
-    daily_block = daily <= POLICY.daily_loss_block_decimal
-    if rolling <= POLICY.rolling_30_stage3_decimal:
+
+    daily = float(daily_pnl_decimal) if daily_known else None
+    rolling = float(rolling_30_pnl_decimal) if rolling_known else None
+    daily_block = daily_known and daily <= POLICY.daily_loss_block_decimal
+
+    if rolling_known and rolling <= POLICY.rolling_30_stage3_decimal:
         return {
             "loss_guard_stage": "stage_3",
             "actual_dd_stage": "stage_3",
@@ -102,7 +116,7 @@ def loss_guard_state(
             "trading_allowed": True,
             "reason_code": "rolling_30_risk_increase_freeze",
         }
-    if rolling <= POLICY.rolling_30_stage2_decimal:
+    if rolling_known and rolling <= POLICY.rolling_30_stage2_decimal:
         return {
             "loss_guard_stage": "stage_2",
             "actual_dd_stage": "stage_2",
@@ -110,7 +124,7 @@ def loss_guard_state(
             "trading_allowed": True,
             "reason_code": "rolling_30_stage_2",
         }
-    if rolling <= POLICY.rolling_30_stage1_decimal:
+    if rolling_known and rolling <= POLICY.rolling_30_stage1_decimal:
         return {
             "loss_guard_stage": "stage_1",
             "actual_dd_stage": "stage_1",
@@ -125,6 +139,16 @@ def loss_guard_state(
             "new_risk_allowed": False,
             "trading_allowed": True,
             "reason_code": "daily_loss_block",
+        }
+    if not daily_known or not rolling_known:
+        # One side is confirmed-clear but the other is unknown: don't
+        # report a clean bill of health when part of the picture is missing.
+        return {
+            "loss_guard_stage": "data_confidence_caution",
+            "actual_dd_stage": "data_confidence_caution",
+            "new_risk_allowed": None,
+            "trading_allowed": True,
+            "reason_code": "loss_guard_partial_data",
         }
     return {
         "loss_guard_stage": "ok",

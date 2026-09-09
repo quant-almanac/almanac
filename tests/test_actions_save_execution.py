@@ -482,8 +482,24 @@ def _risk_shock_isolated(isolated, monkeypatch) -> dict:
         "fx_rate_usdjpy": 150.0, "total_cash": 500_000.0,
     })
     _write_json(isolated["analysis"], {"risk": {"var_95_decimal": 0.01}})
+    # daily が「確認済み」と解決されるには、_guard_metrics が
+    # behavioral_guard.resolve_loss_guard_inputs を経由するため、その有効性
+    # フィールドも揃っている必要がある（2026-09 独立レビュー Codex 指摘 #2 対応
+    # 後の contract。日付をハードコードせず date.today() 基準で計算し、
+    # テスト実行日に依存しないようにする）。
+    from datetime import date as _date
+    from behavioral_guard import _expected_prior_business_day as _prior_bday
+    today = _date.today()
+    prior_bday = _prior_bday(today)
     (isolated["holdings"].parent / "guard_state.json").write_text(
-        json.dumps({"daily_pnl_pct": -0.0301, "monthly_pnl_pct": -0.001}),
+        json.dumps({
+            "date": today.isoformat(),
+            "daily_pnl_pct": -0.0301,
+            "monthly_pnl_pct": -0.001,
+            "monthly_pnl_basis_excluded_days": 0,
+            "portfolio_value_as_of": f"{today.isoformat()}T09:00:00",
+            "daily_pnl_basis_as_of": f"{prior_bday.isoformat()}T17:35:00",
+        }),
         encoding="utf-8",
     )
     monkeypatch.setattr(preflight, "load_api_key", lambda: "test-preflight-key")

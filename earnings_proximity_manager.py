@@ -24,7 +24,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 from freshness_policy import stale_after_hours
 from pseudo_tickers import is_non_earnings_ticker
-from utils import LockBusy, heartbeat
+from utils import LockBusy, heartbeat, positive_finite as _positive_finite
 
 BASE_DIR = Path(__file__).parent
 OUTPUT   = BASE_DIR / "earnings_hedge_suggestions.json"
@@ -184,18 +184,6 @@ def _input_age_hours(value: object, *, now: datetime | None = None) -> float:
     if age < -FUTURE_TOLERANCE_HOURS:
         raise ValueError("input timestamp is future-dated")
     return max(0.0, age)
-
-
-def _positive_finite(value: object, *, label: str) -> float:
-    if isinstance(value, bool):
-        raise ValueError(f"{label} is not numeric")
-    try:
-        number = float(value)
-    except (TypeError, ValueError) as exc:
-        raise ValueError(f"{label} is not numeric") from exc
-    if not math.isfinite(number) or number <= 0:
-        raise ValueError(f"{label} must be positive and finite")
-    return number
 
 
 def _read_json_object(path: Path) -> dict:

@@ -1540,21 +1540,18 @@ def gather_data() -> dict:
             """Return P&L shock controls without calling them drawdown."""
             if not isinstance(guard, dict) or not guard:
                 return None
-            try:
-                daily_pct = float(guard.get("daily_pnl_pct"))
-                monthly_pct = float(guard.get("monthly_pnl_pct"))
-            except (TypeError, ValueError):
-                return None
+            from behavioral_guard import resolve_loss_guard_inputs
+            resolved = resolve_loss_guard_inputs(guard)
             from risk_policy import loss_guard_state
             decision = loss_guard_state(
-                daily_pnl_decimal=daily_pct, rolling_30_pnl_decimal=monthly_pct,
+                daily_pnl_decimal=resolved["daily"], rolling_30_pnl_decimal=resolved["rolling"],
             )
             return {
                 "loss_guard_source": "guard_state_snapshot_pnl",
                 "loss_guard_stage": decision["loss_guard_stage"],
                 "loss_guard_reason_code": decision["reason_code"],
-                "daily_pnl_decimal": daily_pct,
-                "rolling_30_pnl_decimal": monthly_pct,
+                "daily_pnl_decimal": resolved["daily"],
+                "rolling_30_pnl_decimal": resolved["rolling"],
             }
 
         def _clean_nav_drawdown_shadow() -> dict | None:
