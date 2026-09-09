@@ -1273,7 +1273,7 @@ def _run_snapshot_cli(args: list[str]) -> int:
     # data_fetcher 後に毎日実行 → 評価額の前日比を guard_state に反映
     # --eod: 現在評価額を「今日のEOD基準」として明示的に確定（17:00 cron 用）
     try:
-        state = snapshot_portfolio_pnl()
+        snapshot_portfolio_pnl()
     except PortfolioValuationUnavailable as _e:
         # 評価そのものが失敗した run。EOD 確定も _print_status も実行しない
         # ―― 未再評価の state を「今日確定した」ように見せてはいけない。
