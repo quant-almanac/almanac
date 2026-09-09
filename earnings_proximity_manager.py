@@ -13,6 +13,7 @@ earnings_proximity_manager.py (Part E-6)
 """
 from __future__ import annotations
 
+import argparse
 import hashlib
 import json
 import math
@@ -22,6 +23,7 @@ from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from freshness_policy import stale_after_hours
 from pseudo_tickers import is_non_earnings_ticker
+from utils import LockBusy, heartbeat
 
 BASE_DIR = Path(__file__).parent
 OUTPUT   = BASE_DIR / "earnings_hedge_suggestions.json"
@@ -30,6 +32,11 @@ ANALYSIS = BASE_DIR / "ai_portfolio_analysis.json"
 GUARD_STATE = BASE_DIR / "guard_state.json"
 ACCOUNT = BASE_DIR / "account.json"
 EARNINGS_OVERRIDES = BASE_DIR / "earnings_calendar_overrides.json"
+# 起動区分（scheduled/manual）ごとの実行を追記のみで記録する。
+# --scheduled だけが watchdog 可視の heartbeat を更新するため、手動実行や
+# analyst の self-heal 経由の scan() はそこには現れない。それでも
+# 「今日なぜ2回走ったか」を追える durable な記録として残す（2026-09 レビュー S0）。
+RUN_HISTORY_PATH = BASE_DIR / "earnings_proximity_run_history.jsonl"
 
 PROX_DAYS              = 10    # 決算 10 営業日前から監視 (IV 膨張は 5-7 日前で顕在化だが、AAPL 等 8bd も救済)
 IMPL_MOVE_FUDGE        = 0.85  # ATM straddle → implied move 係数 (Bachelier/近似)
@@ -640,7 +647,47 @@ def _load_current_snapshot() -> dict | None:
     return data if isinstance(data, dict) else None
 
 
-def scan(dry_run: bool = False, *, reuse_current: bool = False) -> dict:
+def _record_run_history(*, kind: str, status: str, reused: bool,
+                         generated_at: str | None = None,
+                         holdings_snapshot_sha256: str | None = None,
+                         error: str | None = None) -> bool:
+    """Append one row per non-dry-run scan() invocation, regardless of caller.
+
+    Distinct from the ``earnings_proximity`` heartbeat: only a ``kind="scheduled"``
+    (cron) call moves that watchdog-visible signal (see :func:`main`). A manual
+    run or the analyst's self-heal call (``kind="manual"``, the default) never
+    touches the heartbeat, so without this file those quieter invocations would
+    leave no durable trace at all. Appending, not read-modify-write, so a
+    failed write here can never corrupt an earlier row.
+
+    Returns:
+        ``True`` if the row was written, ``False`` on failure. This is an
+        observational aid only — its failure must never abort ``scan()`` —
+        but a silent ``None`` return left even the *scheduled* success path
+        unable to tell watchdog that the audit trail itself had gone dark
+        (2026-09 review, Codex round 2 #9).
+    """
+    row = {
+        "ts": time.time(),
+        "iso": datetime.now(timezone.utc).isoformat(),
+        "kind": kind,
+        "status": status,
+        "reused": reused,
+        "generated_at": generated_at,
+        "holdings_snapshot_sha256": holdings_snapshot_sha256,
+        "error": error,
+    }
+    try:
+        with open(RUN_HISTORY_PATH, "a", encoding="utf-8") as f:
+            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+        return True
+    except Exception as e:
+        # 観測用の補助記録であり、これ自体の失敗で scan() を止めない。
+        print(f"[earnings] run history 記録失敗（継続）: {e}", file=sys.stderr)
+        return False
+
+
+def scan(dry_run: bool = False, *, reuse_current: bool = False, kind: str = "manual") -> dict:
     """Run one scan, serializing scheduled producers across processes.
 
     The legacy cron and the formal analysis LaunchAgent both start at 06:15.
@@ -649,19 +696,51 @@ def scan(dry_run: bool = False, *, reuse_current: bool = False) -> dict:
     rechecks the published snapshot *after* acquiring the shared lock.
     ``--force`` and programmatic callers can retain the historical refresh
     behavior by leaving ``reuse_current`` false.
+
+    Args:
+        kind: ``"scheduled"`` for the cron invocation, ``"manual"`` (default)
+            for everything else — a manual CLI run or the analyst's self-heal
+            call. Purely for :func:`_record_run_history`; never used for gating.
     """
     if dry_run:
         return _scan_once(dry_run=True)
 
-    from utils import process_lock
+    from utils import process_lock  # LockBusy is imported at module level
 
-    with process_lock("earnings_proximity", timeout=300.0):
-        if reuse_current:
-            current = _load_current_snapshot()
-            if current is not None:
-                print("[earnings] current snapshot already published; duplicate scan skipped")
-                return current
-        return _scan_once(dry_run=False)
+    try:
+        with process_lock("earnings_proximity", timeout=300.0):
+            if reuse_current:
+                current = _load_current_snapshot()
+                if current is not None:
+                    print("[earnings] current snapshot already published; duplicate scan skipped")
+                    recorded = _record_run_history(
+                        kind=kind, status="ok", reused=True,
+                        generated_at=current.get("generated_at"),
+                        holdings_snapshot_sha256=current.get("holdings_snapshot_sha256"),
+                    )
+                    current["run_history_recorded"] = recorded
+                    return current
+            try:
+                out = _scan_once(dry_run=False)
+            except LockBusy:
+                # _scan_once() does not itself take the "earnings_proximity"
+                # lock today, so this branch is not currently reachable —
+                # but if that ever changes, let the outer handler own the
+                # single lock_busy record rather than double-recording here.
+                raise
+            except Exception as exc:
+                _record_run_history(kind=kind, status="error", reused=False, error=str(exc)[:500])
+                raise
+            recorded = _record_run_history(
+                kind=kind, status="ok", reused=False,
+                generated_at=out.get("generated_at"),
+                holdings_snapshot_sha256=out.get("holdings_snapshot_sha256"),
+            )
+            out["run_history_recorded"] = recorded
+            return out
+    except LockBusy:
+        _record_run_history(kind=kind, status="lock_busy", reused=False)
+        raise
 
 
 def format_for_prompt(max_entries: int = 6) -> str:
@@ -713,8 +792,68 @@ def format_for_prompt(max_entries: int = 6) -> str:
     return "\n".join(lines)
 
 
-if __name__ == "__main__":
-    dry = "--dry-run" in sys.argv
-    out = scan(dry_run=dry, reuse_current=not dry and "--force" not in sys.argv)
-    if dry:
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        description="Part E-6 Earnings Proximity Manager")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="scan して結果を表示するだけ。監視記録も成果物も更新しない。")
+    parser.add_argument("--force", action="store_true",
+                        help="reuse_current を無効化し常に再スキャンする。")
+    parser.add_argument(
+        "--scheduled", action="store_true",
+        help="cron からの起動であることを明示する。このフラグを付けた実行だけが"
+             " earnings_proximity heartbeat（watchdog 可視）を更新する ―― 手動実行や"
+             " analyst の self-heal 経由の成功実行が cron 停止を隠さないため。",
+    )
+    args = parser.parse_args(argv)
+
+    if args.dry_run:
+        out = scan(dry_run=True)
         print(json.dumps(out, indent=2, ensure_ascii=False))
+        return 0
+
+    kind = "scheduled" if args.scheduled else "manual"
+
+    try:
+        out = scan(dry_run=False, reuse_current=not args.force, kind=kind)
+    except LockBusy:
+        print("⚠️ 別の earnings scan が進行中です。二重起動しません。")
+        if args.scheduled:
+            heartbeat("earnings_proximity", "warn",
+                      error="earnings_proximity_lock_busy",
+                      extra={"scheduled": True})
+        return 1
+    except Exception as exc:
+        if args.scheduled:
+            heartbeat("earnings_proximity", "error", str(exc)[:500],
+                      extra={"scheduled": True})
+        raise
+
+    if args.scheduled:
+        run_history_recorded = out.get("run_history_recorded", True)
+        # scan() 自体は成功しているので rc は変えない ―― run history は
+        # 補助的な監視記録であり、その書込み失敗で「スキャンが失敗した」
+        # ように見せない。ただし記録するだけで誰も読まないのでは
+        # ラウンド2の指摘への対応が名目だけになる: 既存の warn_is_error
+        # 経路（earnings_proximity は EXPECTED_INTERVALS で既に設定済み）
+        # へ実際に接続し、watchdog が ok と区別できるようにする
+        # （2026-09 レビュー Codex 3ラウンド目 指摘 #6・実機再現:
+        # run_history_recorded=False でも producer→watchdog が終始 ok
+        # のままだった）。
+        heartbeat(
+            "earnings_proximity",
+            "ok" if run_history_recorded else "warn",
+            error=None if run_history_recorded else "run_history_write_failed",
+            extra={
+                "scheduled": True,
+                "suggestion_count": out.get("suggestion_count"),
+                "holdings_scanned": out.get("holdings_scanned"),
+                "generated_at": out.get("generated_at"),
+                "run_history_recorded": run_history_recorded,
+            },
+        )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -26,6 +26,7 @@ import time
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, Optional
+from zoneinfo import ZoneInfo
 
 import json as _json
 
@@ -95,6 +96,22 @@ EXPECTED_INTERVALS = {
     # watchdog が永続的に見逃していた。CLIの全終了経路がこのキーを更新する。
     'portfolio_agent':  {'max_stale_sec': 26 * 3600, 'weekday_only': True,
                          'warn_is_error': True},
+    # earnings_proximity_manager.py（平日06:15 cron）。b9f3f9d/1e95b38 で
+    # holdings 破損・NAV/FX 未検証を fail-closed 例外化したが、その例外が
+    # 監視されておらず未捕捉のまま cron が消えても誰も気づけなかった
+    # （2026-09 レビュー）。--scheduled 実行だけがこのキーを更新するため、
+    # 手動実行や分析内 self-heal の成功が cron 停止を隠すことはない。
+    # expected_after_jst: 導入直後〜初回実行 06:15 完了(想定06:45)までの
+    # never_run 誤検知を防ぐ（portfolio_agent 導入時に実際に20回超発火し
+    # Telegram 通知まで送られた事象の再発防止）。
+    # 既知の制約 (2026-09 レビュー Codex 3ラウンド目 指摘 #7b、未対応):
+    # 締切（この場合06:45）を過ぎた時刻に本エントリを新規デプロイすると、
+    # 初回の実行機会が一度も無いまま即 never_run と誤検知する。「このエントリ
+    # がいつ最初にチェックされたか」を記録する仕組みが無いため未実装。
+    # 発生条件はエントリの新規デプロイ時（このリスト自体の変更時）のみ・
+    # 最大1日限りのノイズであり、発生頻度は低い。
+    'earnings_proximity': {'max_stale_sec': 26 * 3600, 'weekday_only': True,
+                           'warn_is_error': True, 'expected_after_jst': '06:45'},
     # 'analyzer' は --delta-only 運用で 'analyzer_delta' に heartbeat されるため
     # こちらを監視する（旧 'analyzer' キーは永遠に空で false positive の原因だった）。
     'analyzer_delta':    {'max_stale_sec': 24 * 3600, 'weekday_only': True},
@@ -117,7 +134,11 @@ EXPECTED_INTERVALS = {
                           'warn_is_error': True},
     'social_topic':      {'max_stale_sec': 72 * 3600, 'weekday_only': True,
                           'warn_is_error': True},
-    'behavioral_guard_snapshot': {'max_stale_sec': 26 * 3600, 'weekday_only': True},
+    # warn_is_error: behavioral_guard._run_snapshot_cli() は評価額取得失敗を
+    # status='warn' で記録する（EOD 未確定・S1b）。無いと warn は ok と
+    # 区別されず watchdog に一切現れない（2026-09 レビュー）。
+    'behavioral_guard_snapshot': {'max_stale_sec': 26 * 3600, 'weekday_only': True,
+                                   'warn_is_error': True},
     # Written from the immutable decision snapshot. A primary-source fallback
     # must be visible rather than silently remaining degraded.
     'macro_event_calendar': {
@@ -159,6 +180,7 @@ NOTIFY_STALE_SCRIPTS = {
     'margin_manager',
     'monthly_governance_report',
     'portfolio_agent',
+    'earnings_proximity',
     # EXPECTED_INTERVALS に載せるだけでは通知されない (通知対象はこの集合)。
     # 両レーンとも「止まっても誰も気づかない」状態を実際に長期間続けたので、
     # 検知だけでなく通知まで届かせる。
@@ -733,17 +755,69 @@ def _is_monday_morning_grace() -> bool:
     return lt.tm_wday == 0 and lt.tm_hour < 9
 
 
-def evaluate_heartbeats(heartbeats: dict | None = None) -> Dict:
+def _daily_deadline_dt_jst(hhmm: str, *, now_ts: float) -> Optional[datetime]:
+    """``now_ts`` と同じ JST 暦日における HH:MM 締切の datetime を返す。
+
+    形式不正なら None（締切なし、として扱う）。
+    """
+    try:
+        hour, minute = (int(x) for x in str(hhmm).split(':', 1))
+        if not (0 <= hour <= 23 and 0 <= minute <= 59):
+            return None
+    except (ValueError, AttributeError):
+        return None
+    now_dt = datetime.fromtimestamp(now_ts, tz=ZoneInfo("Asia/Tokyo"))
+    return now_dt.replace(hour=hour, minute=minute, second=0, microsecond=0)
+
+
+def _is_before_daily_deadline_jst(hhmm: str, *, now_ts: float) -> bool:
+    """``now_ts`` (unix epoch) が当日の JST HH:MM 締切より前かを返す。
+
+    _is_weekend/_is_monday_morning_grace と違い ``time.localtime()`` は使わない
+    ―― ホストの TZ 環境変数に依存すると、同じ瞬間でも実行環境ごとに判定結果が
+    変わり得る（naive timestamp を host TZ で解釈していた
+    earnings_proximity_manager.py の欠陥と同根、2026-09 レビュー Codex 指摘）。
+    形式不正な締切は「締切なし」とみなし常に False を返す（安全側 = 通常どおり
+    stale/never_run 判定させる）。
+    """
+    deadline_dt = _daily_deadline_dt_jst(hhmm, now_ts=now_ts)
+    if deadline_dt is None:
+        return False
+    now_dt = datetime.fromtimestamp(now_ts, tz=ZoneInfo("Asia/Tokyo"))
+    return now_dt < deadline_dt
+
+
+def evaluate_heartbeats(heartbeats: dict | None = None, *, now: float | None = None) -> Dict:
     """Evaluate heartbeat freshness without running the other watchdog checks."""
     hb = heartbeats if isinstance(heartbeats, dict) else load_json(HEARTBEAT_PATH, default={})
-    now = time.time()
+    now = now if now is not None else time.time()
     stale = []
     errors = []
     ok = []
     for script, cfg in EXPECTED_INTERVALS.items():
         entry = hb.get(script)
         if entry is None:
-            if _is_weekend() or _is_monday_morning_grace():
+            # 週末はどのスクリプトにも一律で猶予する（そもそも稼働日ではない）。
+            if _is_weekend():
+                continue
+            deadline = cfg.get('expected_after_jst')
+            if deadline and _is_before_daily_deadline_jst(deadline, now_ts=now):
+                # A weekday-scheduled script that has never had a chance to
+                # run yet today is not the same as a script that missed its
+                # run.  Without this, adding a brand-new EXPECTED_INTERVALS
+                # entry mid-day false-positives as "never_run" until its
+                # first scheduled slot — reproduced against portfolio_agent's
+                # real rollout (20+ never_run hits and a sent Telegram alert
+                # before its 06:35 first run, 2026-09 review).
+                continue
+            # 月曜朝の一律猶予（週末分の未実行を責めない）は、自スクリプトの
+            # 締切を持たないスクリプトにだけ適用する。締切を持つスクリプト
+            # では締切自体が既に「まだ機会が無かっただけ」かどうかを判定
+            # 済みなので、猶予がそれを上書きしてはいけない ―― earnings_proximity
+            # の 06:45 締切は月曜9:00までの猶予期間にすっぽり収まるため、
+            # 月曜だけ never_run 検知が実質無効化されていた
+            # （2026-09 レビュー Codex 3ラウンド目 指摘 #7a・実機再現）。
+            if not deadline and _is_monday_morning_grace():
                 continue
             stale.append({
                 'script': script,
@@ -755,8 +829,49 @@ def evaluate_heartbeats(heartbeats: dict | None = None) -> Dict:
         last = float(entry.get('last_run_ts', 0))
         age = now - last
         status = entry.get('status', 'ok')
-        if cfg.get('weekday_only') and (_is_weekend() or _is_monday_morning_grace()):
-            if status == 'error':
+        is_error_status = status == 'error' or (status == 'warn' and cfg.get('warn_is_error'))
+
+        deadline = cfg.get('expected_after_jst')
+        missed_todays_deadline = False
+        if deadline:
+            deadline_dt = _daily_deadline_dt_jst(deadline, now_ts=now)
+            if deadline_dt is not None:
+                now_dt = datetime.fromtimestamp(now, tz=ZoneInfo("Asia/Tokyo"))
+                last_dt = datetime.fromtimestamp(last, tz=ZoneInfo("Asia/Tokyo"))
+                # 前回の成功記録が「今日より前」の暦日で、かつ今日の締切も
+                # 既に過ぎている ―― まだ max_stale_sec には達していなくても
+                # 今日の実行分は欠落している。max_stale_sec だけに頼ると、
+                # 前回成功が前日で締切超過済みでも age がまだ閾値未満の間隙
+                # (実測 24.7h < 26h) が検知されないまま放置されていた
+                # （2026-09 レビュー Codex 指摘 #7）。
+                missed_todays_deadline = last_dt.date() < now_dt.date() and now_dt >= deadline_dt
+
+        if cfg.get('weekday_only') and _is_weekend():
+            # 週末はどのスクリプトにも一律で猶予する（そもそも稼働日ではない）。
+            # ただし error/warn_is_error の可視性は猶予中でも失わない
+            # （旧実装は status=='error' しか見ておらず、warn_is_error の
+            # warn は猶予ブロック内で無条件 ok に落ちていた）。
+            if is_error_status:
+                errors.append({
+                    'script': script,
+                    'error': entry.get('error'),
+                    'age_hours': round(age / 3600, 1),
+                })
+            else:
+                ok.append(script)
+            continue
+
+        if cfg.get('weekday_only') and _is_monday_morning_grace() and not missed_todays_deadline:
+            # 月曜朝の一律猶予は、自スクリプトの締切をまだ過ぎていない場合
+            # にだけ適用する。実行履歴がある分岐でもこれを外していなかった
+            # ため、earnings_proximity の06:45締切は月曜9:00までの猶予に
+            # 完全に収まり、月曜だけ missed_todays_deadline 検知（entry is
+            # None 分岐は既に3ラウンド目で対応済み）も warn_is_error による
+            # 可視化も丸ごと無効化されていた（2026-09 レビュー Codex
+            # 4ラウンド目 指摘 #1・実機再現: 金曜成功履歴のみ→月曜未実行、
+            # および月曜中の run history 保存失敗による status=warn、
+            # いずれも月曜07:00の時点で ok に潰れていた）。
+            if is_error_status:
                 errors.append({
                     'script': script,
                     'error': entry.get('error'),
@@ -772,7 +887,13 @@ def evaluate_heartbeats(heartbeats: dict | None = None) -> Dict:
                 'age_hours': round(age / 3600, 1),
                 'reason': f'older_than_{cfg["max_stale_sec"] // 3600}h',
             })
-        elif status == 'error' or (status == 'warn' and cfg.get('warn_is_error')):
+        elif missed_todays_deadline:
+            stale.append({
+                'script': script,
+                'age_hours': round(age / 3600, 1),
+                'reason': 'missed_todays_deadline',
+            })
+        elif is_error_status:
             errors.append({
                 'script': script,
                 'error': entry.get('error'),
