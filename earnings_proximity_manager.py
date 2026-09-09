@@ -362,7 +362,11 @@ def _read_and_validate_snapshot(
             or data.get("holdings_snapshot_sha256") != _holdings_snapshot_sha256(holdings)
         ):
             return None
-        result_rows = list(data.get("suggestions") or []) + list(data.get("skipped") or [])
+        # Consumers slice/iterate these arrays. Empty dict/None must not pass
+        # validation as empty rows and subsequently break rendering.
+        if not isinstance(data.get("suggestions"), list) or not isinstance(data.get("skipped"), list):
+            return None
+        result_rows = data["suggestions"] + data["skipped"]
         if not all(isinstance(row, dict) for row in result_rows):
             return None
         result_tickers = [
@@ -844,9 +848,20 @@ def format_for_prompt(max_entries: int = 6, *, now: datetime | None = None) -> s
         lines.append(f"*閾値超の hedge 対象は現在なし (damage>{data.get('damage_threshold_pct', 1.5)}% 条件)。*")
 
     # 決算週間近だが閾値下 or option chain 無しの銘柄も Opus に伝える（hedge ではなく monitor として）
-    in_window_skips = [s for s in skipped
-                       if s.get("reason") in ("damage_below_threshold", "no_option_chain")
-                       and s.get("bdays") is not None and 0 <= s["bdays"] <= 10]
+    in_window_skips = []
+    for s in skipped:
+        if s.get("reason") not in ("damage_below_threshold", "no_option_chain"):
+            continue
+        days = s.get("bdays")
+        if days is None:
+            continue
+        # Validate before comparing: a malformed row must not suppress every
+        # otherwise valid row in the earnings prompt.
+        if isinstance(days, bool) or not isinstance(days, (int, float)) or not math.isfinite(days):
+            omitted.append(f"{s.get('ticker', '?')}: invalid bdays")
+            continue
+        if 0 <= days <= 10:
+            in_window_skips.append(s)
     if in_window_skips:
         skip_lines: list[str] = []
         for s in in_window_skips[:8]:

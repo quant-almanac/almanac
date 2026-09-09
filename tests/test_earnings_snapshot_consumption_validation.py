@@ -255,6 +255,34 @@ def test_snapshot_accepts_fresh_nav_fx_at_consumption_time(m, monkeypatch):
 
 # ── 再現の核心 6: 1行の表示崩壊で全件を失わない ─────────────────────────
 
+@pytest.mark.parametrize("field", ["suggestions", "skipped"])
+@pytest.mark.parametrize("invalid", [{}, None, ""])
+def test_snapshot_rejects_non_array_collections(m, monkeypatch, field, invalid):
+    now = datetime(2026, 9, 9, 8, tzinfo=timezone(timedelta(hours=9)))
+    monkeypatch.setattr(m, "_load_holdings", lambda: [])
+    payload = _current_snapshot(m, [], generated_at=now.isoformat(),
+                                portfolio_jpy_as_of=now.isoformat(), fx_rate_usdjpy_as_of=now.isoformat())
+    payload[field] = invalid
+    m.OUTPUT.write_text(json.dumps(payload))
+    assert m._read_and_validate_snapshot(now=now) is None
+    assert m.format_for_prompt(now=now) == ""
+
+@pytest.mark.parametrize("bad_days", ["2", True, float("nan"), float("inf"), {}, []])
+def test_skipped_row_invalid_days_does_not_remove_good_rows(m, monkeypatch, bad_days):
+    now = datetime(2026, 9, 9, 8, tzinfo=timezone(timedelta(hours=9)))
+    holdings = [{"ticker": ticker, "shares": 1, "currency": "USD"}
+                for ticker in ("SYNTH_A", "SYNTH_B")]
+    monkeypatch.setattr(m, "_load_holdings", lambda: holdings)
+    rows = [
+        {"ticker": "SYNTH_A", "reason": "no_option_chain", "bdays": 2, "earnings": "2026-09-11"},
+        {"ticker": "SYNTH_B", "reason": "no_option_chain", "bdays": bad_days, "earnings": "2026-09-11"},
+    ]
+    _write(m, holdings, result_rows=rows, generated_at=now.isoformat(),
+           portfolio_jpy_as_of=now.isoformat(), fx_rate_usdjpy_as_of=now.isoformat())
+    result = m.format_for_prompt(now=now)
+    assert "SYNTH_A T-2bd" in result
+    assert "1件 省略: SYNTH_B: invalid bdays" in result
+
 def test_format_for_prompt_omits_a_single_malformed_row_without_crashing(m, monkeypatch):
     holdings = [
         {"ticker": "SYNTH_A", "shares": 1.0, "currency": "USD"},
