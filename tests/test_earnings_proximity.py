@@ -238,13 +238,20 @@ def test_corrupt_holdings_never_publish_an_empty_current_snapshot(monkeypatch, t
 
 
 def test_portfolio_total_uses_recent_guard_then_recent_formal_analysis(monkeypatch, tmp_path):
+    """guard_state の timestamp key は portfolio_value_as_of（last_updated ではない）。
+
+    last_updated は behavioral_guard.save_state が全 save で更新するため、値を
+    再評価しない writer でも進み得る。portfolio_value_as_of は実際に再評価した
+    writer だけが書く（2026-09 レビュー S1）。より詳細な新旧逆転ケースは
+    tests/test_earnings_portfolio_freshness_jst.py を参照。
+    """
     m = importlib.import_module("earnings_proximity_manager")
     guard = tmp_path / "guard_state.json"
     analysis = tmp_path / "ai_portfolio_analysis.json"
     now = datetime(2026, 9, 7, 6, 15, tzinfo=timezone.utc)
     guard.write_text(json.dumps({
         "portfolio_value": 31_000_000,
-        "last_updated": "2026-09-07T05:15:00+00:00",
+        "portfolio_value_as_of": "2026-09-07T05:15:00+00:00",
     }), encoding="utf-8")
     analysis.write_text(json.dumps({
         "portfolio_total": 30_000_000,
@@ -261,7 +268,7 @@ def test_portfolio_total_uses_recent_guard_then_recent_formal_analysis(monkeypat
 
     guard.write_text(json.dumps({
         "portfolio_value": 31_000_000,
-        "last_updated": "2026-09-05T05:15:00+00:00",
+        "portfolio_value_as_of": "2026-09-05T05:15:00+00:00",
     }), encoding="utf-8")
     assert m._portfolio_total_observation(now=now) == {
         "value_jpy": 30_000_000.0,

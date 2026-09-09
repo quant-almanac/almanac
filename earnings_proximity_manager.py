@@ -21,6 +21,7 @@ import sys
 import time
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
 from freshness_policy import stale_after_hours
 from pseudo_tickers import is_non_earnings_ticker
 from utils import LockBusy, heartbeat
@@ -136,10 +137,18 @@ def _holdings_snapshot_sha256(holdings: list[dict]) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+# この producer が読む naive timestamp (guard_state.last_updated /
+# ai_portfolio_analysis.as_of 等) はいずれも JST を前提に書かれている。
+# ホスト TZ 環境変数 (datetime.now().astimezone().tzinfo) で補完すると、同じ
+# 文字列でも実行環境ごとに異なる絶対時刻へ解釈され、鮮度判定が環境依存になる
+# （TZ=UTC で 9 時間ズレることを確認・2026-09 レビュー Codex 指摘）。
+_NAIVE_TIMESTAMP_TZ = ZoneInfo("Asia/Tokyo")
+
+
 def _aware_now(now: datetime | None = None) -> datetime:
-    current = now or datetime.now().astimezone()
+    current = now or datetime.now(_NAIVE_TIMESTAMP_TZ)
     if current.tzinfo is None:
-        current = current.replace(tzinfo=datetime.now().astimezone().tzinfo)
+        current = current.replace(tzinfo=_NAIVE_TIMESTAMP_TZ)
     return current.astimezone(timezone.utc)
 
 
@@ -163,7 +172,7 @@ def _parse_input_timestamp(value: object) -> datetime | None:
     except (TypeError, ValueError):
         return None
     if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=datetime.now().astimezone().tzinfo)
+        parsed = parsed.replace(tzinfo=_NAIVE_TIMESTAMP_TZ)
     return parsed.astimezone(timezone.utc)
 
 
@@ -200,12 +209,24 @@ def _read_json_object(path: Path) -> dict:
 
 
 def _portfolio_total_observation(*, now: datetime | None = None) -> dict:
-    """Resolve a recent portfolio denominator without a magic-number fallback."""
+    """Resolve the freshest verifiable portfolio denominator.
+
+    Evaluates every candidate rather than returning on the first success.
+    ``behavioral_guard.save_state`` stamps a shared ``last_updated`` on every
+    save — including writers (position count updates, overrides, status
+    display) that never touch ``portfolio_value`` — so that field cannot
+    prove revaluation.  ``portfolio_value_as_of`` is a dedicated field that
+    only a writer which actually recomputed the valuation sets.  Even so, an
+    unrevalued-but-present guard_state must never outrank a genuinely newer
+    formal_analysis value just because it happens to be checked first
+    (2026-09 review).
+    """
     failures: list[str] = []
     candidates = (
-        (GUARD_STATE, "guard_state", "portfolio_value", "last_updated"),
+        (GUARD_STATE, "guard_state", "portfolio_value", "portfolio_value_as_of"),
         (ANALYSIS, "formal_analysis", "portfolio_total", "as_of"),
     )
+    resolved: list[tuple[datetime, dict]] = []
     for path, source, value_key, timestamp_key in candidates:
         try:
             payload = _read_json_object(path)
@@ -219,13 +240,22 @@ def _portfolio_total_observation(*, now: datetime | None = None) -> dict:
                 raise ValueError(
                     f"{source}.{timestamp_key} is stale ({age_hours:.1f}h)"
                 )
-            return {
+            parsed_as_of = _parse_input_timestamp(as_of)
+            if parsed_as_of is None:
+                # _input_age_hours already required a parseable, non-future
+                # timestamp above; this is unreachable unless that changes.
+                raise ValueError(f"{source}.{timestamp_key} is unparseable")
+            resolved.append((parsed_as_of, {
                 "value_jpy": value_jpy,
                 "source": source,
                 "as_of": as_of,
-            }
+            }))
         except ValueError as exc:
             failures.append(str(exc))
+    if resolved:
+        # Stable sort: a tie keeps candidates' declared order (guard_state first).
+        resolved.sort(key=lambda pair: pair[0], reverse=True)
+        return resolved[0][1]
     raise RuntimeError(
         "current portfolio total is unavailable; " + "; ".join(failures)
     )

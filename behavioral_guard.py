@@ -315,6 +315,11 @@ def _default_state() -> dict:
         'monthly_pnl_pct':   0.0,   # 実態は直近30日ローリング（外部互換のためキー名維持）
         'pnl_history':       [],     # [{'date': 'YYYY-MM-DD', 'pnl_jpy': float}, ...]（日次P&L履歴）
         'portfolio_value':   0.0,
+        # 実際に再評価した writer だけが進める（update_pnl / snapshot_portfolio_pnl）。
+        # last_updated は save_state が全 save で更新するため「再評価の証拠」に
+        # ならない ―― 外部（earnings_proximity_manager）が評価額の鮮度を検証する
+        # ためにこのフィールドを読む（2026-09 レビュー S1）。
+        'portfolio_value_as_of': None,
         'active_trades':     0,
         'short_positions':   0,
         'new_entry_allowed':      True,
@@ -592,6 +597,7 @@ def update_pnl(pnl_jpy: float, portfolio_value: float) -> dict:
     state = load_state()
 
     state['portfolio_value']         = portfolio_value
+    state['portfolio_value_as_of']   = datetime.now().isoformat()
     state['realized_pnl_jpy_today'] += pnl_jpy
 
     # P0-2: daily_pnl_jpy = 現在評価額 - 前日EOD基準（評価額ベースで一本化）
@@ -919,6 +925,7 @@ def snapshot_portfolio_pnl() -> dict:
         state['daily_pnl_pct'] = 0.0
 
     state['portfolio_value'] = current_value
+    state['portfolio_value_as_of'] = datetime.now().isoformat()
 
     # ポジション数を更新
     positions = snapshot.get("positions", [])
