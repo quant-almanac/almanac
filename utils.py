@@ -482,36 +482,78 @@ def reraise_with_secret_redacted(exc: Exception, secret: str) -> None:
 
 # ── ハートビート（P2-9） ──────────────────────────
 HEARTBEAT_PATH = Path(__file__).parent / 'heartbeats.json'
+HEARTBEAT_LOCK_NAME = 'heartbeats'
+HEARTBEAT_LOCK_TIMEOUT_SECONDS = 2.0
+# heartbeat() が共有 JSON を書けなかった時の退避記録（追記のみ）。
+# read-modify-write ではなく単純追記にすることで、この記録自体が同じ
+# lost-update を再現する経路を持たない（2026-09 レビュー S0-d）。
+HEARTBEAT_LOCK_FAILURES_PATH = Path(__file__).parent / 'heartbeat_lock_failures.jsonl'
 
 
 def heartbeat(script_name: str,
               status: str = 'ok',
               error: Optional[str] = None,
-              extra: Optional[dict] = None) -> None:
+              extra: Optional[dict] = None) -> bool:
     """
     スクリプトの生存シグナルを heartbeats.json に記録する。
 
     watchdog.py が定期的にこのファイルを読み、想定周期を超過したスクリプトや
     status='error' のスクリプトを Telegram で通知する。
 
+    書込みは共有ロックで直列化する。近接した cron（例: 18:25/18:47/18:50/18:55）
+    が同時に heartbeat() を呼ぶと、旧実装の read-modify-write は片方の更新を
+    無言で失う lost-update を起こし得た。ロックが有限時間内に取れない場合は
+    ――「ロック無しで書いて他プロセスの更新を上書きする」のではなく――
+    共有 JSON への書込みを諦め、独立の退避記録
+    (:data:`HEARTBEAT_LOCK_FAILURES_PATH`) へ残す（2026-09 レビュー）。
+
     Args:
         script_name: スクリプト名（例: 'analyzer', 'data_fetcher'）
         status: 'ok' | 'error' | 'warn'
         error: エラー時のメッセージ
         extra: 任意の追加情報（dict）
+
+    Returns:
+        共有 heartbeats.json への書込みに成功したら True。ロック競合や
+        その他の書込み失敗では False（呼出元へ例外は伝播させない）。
     """
+    entry = {
+        'last_run_ts': time.time(),
+        'last_run_iso': time.strftime('%Y-%m-%dT%H:%M:%S%z'),
+        'status': status,
+        'error': error,
+        'extra': extra or {},
+    }
     try:
-        data = load_json(HEARTBEAT_PATH, default={})
-        data[script_name] = {
-            'last_run_ts': time.time(),
-            'last_run_iso': time.strftime('%Y-%m-%dT%H:%M:%S%z'),
-            'status': status,
-            'error': error,
-            'extra': extra or {},
-        }
-        atomic_write_json(HEARTBEAT_PATH, data)
+        with process_lock(HEARTBEAT_LOCK_NAME, timeout=HEARTBEAT_LOCK_TIMEOUT_SECONDS):
+            data = load_json(HEARTBEAT_PATH, default={})
+            data[script_name] = entry
+            atomic_write_json(HEARTBEAT_PATH, data)
+        return True
+    except LockBusy:
+        _logger.error(f"[heartbeat] ロック取得失敗のため書込スキップ {script_name}")
+        _record_heartbeat_lock_failure(script_name, entry, reason='heartbeat_lock_busy')
+        return False
     except Exception as e:
         _logger.warning(f"[heartbeat] 書込失敗 {script_name}: {e}")
+        _record_heartbeat_lock_failure(script_name, entry, reason=str(e)[:200])
+        return False
+
+
+def _record_heartbeat_lock_failure(script_name: str, entry: dict, *, reason: str) -> None:
+    """heartbeat() が抑止した更新を追記のみで記録する（watchdog が拾う）。"""
+    try:
+        row = {
+            'script': script_name,
+            'attempted_at': entry.get('last_run_iso'),
+            'attempted_ts': entry.get('last_run_ts'),
+            'status': entry.get('status'),
+            'reason': reason,
+        }
+        with open(HEARTBEAT_LOCK_FAILURES_PATH, 'a', encoding='utf-8') as f:
+            f.write(json.dumps(row, ensure_ascii=False) + '\n')
+    except Exception as e:
+        _logger.warning(f"[heartbeat] フォールバック記録も失敗 {script_name}: {e}")
 
 
 # ── プロセス間排他 (P1-15) ──────────────────────────

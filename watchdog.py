@@ -258,6 +258,51 @@ def _check_price_sanity() -> list:
     return [row for row in latest.values() if row.get("status") == "review_required"]
 
 
+HEARTBEAT_LOCK_FAILURES_WINDOW_SEC = 26 * 3600
+
+
+def _check_heartbeat_lock_failures(*, now: float | None = None,
+                                    window_sec: int = HEARTBEAT_LOCK_FAILURES_WINDOW_SEC) -> list:
+    """utils.heartbeat() がロック競合で共有 heartbeats.json を書けなかった記録を拾う。
+
+    heartbeat() は近接した cron 間の lost-update を防ぐため、ロックが有限時間内に
+    取れないと共有 JSON を書かず heartbeat_lock_failures.jsonl へ追記するだけになった
+    (2026-09 レビュー)。これ自体は正しい選択だが、誰もこのファイルを見ていなければ
+    「書けなかった」がそのまま新しい静かな失敗経路になる。
+    """
+    path = BASE_DIR / 'heartbeat_lock_failures.jsonl'
+    if not path.exists():
+        return []
+    now = now if now is not None else time.time()
+    issues: list = []
+    try:
+        lines = path.read_text(encoding='utf-8').splitlines()
+    except OSError:
+        return []
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            row = _json.loads(line)
+        except Exception:
+            continue
+        if not isinstance(row, dict):
+            continue
+        try:
+            ts = float(row.get('attempted_ts'))
+        except (TypeError, ValueError):
+            continue
+        if now - ts > window_sec:
+            continue
+        issues.append({
+            'script': row.get('script'),
+            'attempted_at': row.get('attempted_at'),
+            'reason': row.get('reason'),
+        })
+    return issues
+
+
 def _check_measurement_tables() -> list:
     """
     P1-3: 計測テーブル (daily_performance / benchmark_daily) の最終日付 stale 検知。
@@ -815,6 +860,7 @@ def evaluate_health() -> Dict:
     disk_space_issues = _check_disk_space()
     backup_issues = _check_backup_offsite(hb)
     lane_registry_issues = _check_lane_registry()
+    heartbeat_lock_issues = _check_heartbeat_lock_failures(now=now)
 
     return {
         'stale': stale,
@@ -836,6 +882,7 @@ def evaluate_health() -> Dict:
         'disk_space_issues': disk_space_issues,
         'backup_issues': backup_issues,
         'lane_registry_issues': lane_registry_issues,
+        'heartbeat_lock_issues': heartbeat_lock_issues,
     }
 
 
@@ -912,6 +959,10 @@ def _notification_report(report: dict) -> dict:
         # で抑える（同一深刻度が続く限り 1 日 1 通）。
         'disk_space_issues': report.get('disk_space_issues', []),
         'backup_issues': _blocking_backup_issues(report),
+        # stale と違い NOTIFY_STALE_SCRIPTS のようなスクリプト単位の許可リストは
+        # 要求しない ―― 監視の書込機構そのものが抑止された事実であり、他の
+        # 'errors' と同じ扱い（無条件通知対象）にする。
+        'heartbeat_lock_issues': report.get('heartbeat_lock_issues', []),
     }
 
 
@@ -930,6 +981,7 @@ def _notification_problem_count(report: dict) -> int:
         + len(report.get('disk_space_issues', []))
         + len(report.get('backup_issues', []))
         + len(report.get('lane_registry_issues', []))
+        + len(report.get('heartbeat_lock_issues', []))
     )
 
 
@@ -954,6 +1006,9 @@ def _notification_fingerprint(report: dict) -> str:
         # 実際の残量はメッセージ本文で伝える。
         'disk': sorted((i.get('path'), i.get('severity')) for i in report.get('disk_space_issues', [])),
         'backup': sorted((i.get('severity'), i.get('status'), i.get('reason')) for i in report.get('backup_issues', [])),
+        'heartbeat_lock': sorted(
+            (i.get('script'), i.get('reason')) for i in report.get('heartbeat_lock_issues', [])
+        ),
     }
     return _json.dumps(payload, ensure_ascii=False, sort_keys=True)
 
@@ -974,6 +1029,12 @@ def _build_watchdog_message(report: dict) -> str:
             msg_lines.append(f"  • {e['script']}: {(e.get('error') or '')[:120]}")
         if len(report['errors']) > 5:
             msg_lines.append(f"  ... 他 {len(report['errors']) - 5} 件")
+    if report.get('heartbeat_lock_issues'):
+        msg_lines.append('\n🔒 heartbeat 書込抑止（ロック競合）:')
+        for i in report['heartbeat_lock_issues'][:5]:
+            msg_lines.append(f"  • {i.get('script')}: {i.get('reason')}")
+        if len(report['heartbeat_lock_issues']) > 5:
+            msg_lines.append(f"  ... 他 {len(report['heartbeat_lock_issues']) - 5} 件")
     if report.get('fx_stale'):
         fx_age_hours = report.get('fx_age_hours')
         if fx_age_hours is None:
@@ -1064,6 +1125,7 @@ def run_check(notify: bool = True) -> int:
         + len(report.get('disk_space_issues', []))
         + len(blocking_backup_issues)
         + len(report.get('lane_registry_issues', []))
+        + len(report.get('heartbeat_lock_issues', []))
     )
 
     notify_report = _notification_report(report)

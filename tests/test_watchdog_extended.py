@@ -597,3 +597,32 @@ def test_disk_warning_reaches_the_telegram_message_body():
     message = wd._build_watchdog_message(wd._notification_report(report))
     assert "12.16GB free" in message
     assert "warning" in message
+
+
+def _heartbeat_lock_only_report() -> dict:
+    """heartbeat_lock_issues だけが立っている report（他は全て健全）。"""
+    report = _notification_test_report()
+    report["errors"] = []
+    report["heartbeat_lock_issues"] = [
+        {"script": "update_pnl", "reason": "lock_busy", "ts": "2026-09-08T09:00:00"},
+    ]
+    return report
+
+
+def test_run_check_counts_heartbeat_lock_issues_in_problem_count(monkeypatch, tmp_path):
+    """再現 (Codex 2ラウンド目 #6): heartbeat_lock_issues は
+    _notification_report/_notification_problem_count 経由の通知判定には
+    含まれるのに、run_check() 自身の problem_count 集計から漏れていた。
+    その結果、heartbeat のロック取得失敗が3回連続しても
+    consecutive_failures が 0 のままリセットされ続け、「すべて OK」表示・
+    通知トリガーなしのまま実質無音化していた。"""
+    state_path = tmp_path / "watchdog_state.json"
+    monkeypatch.setattr(wd, "WATCHDOG_STATE", state_path)
+    monkeypatch.setattr(wd, "evaluate_health", _heartbeat_lock_only_report)
+
+    for _ in range(3):
+        problem_count = wd.run_check(notify=True)
+
+    assert problem_count == 1
+    state = json.loads(state_path.read_text())
+    assert state["consecutive_failures"] == 3
