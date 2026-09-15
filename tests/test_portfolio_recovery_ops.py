@@ -33,6 +33,19 @@ def prepare():
     )
 
 
+def confirmed_fixture_route():
+    holdings = json.loads(cash.HOLDINGS_FILE.read_text())
+    for broker in cash.CashBroker:
+        for owner in cash.CashOwner:
+            try:
+                key = cash._holdings_key(cash.CashCurrency.JPY, broker, owner)
+            except HTTPException:
+                continue
+            if 'available_to_trade_jpy' in holdings.get(key, {}):
+                return broker, owner
+    pytest.fail('confirmed fixture route is missing')
+
+
 def test_missing_database_diagnostic_never_creates_it(tmp_path):
     path = tmp_path / 'missing' / 'ledger.db'
     result = ledger.read_portfolio_recovery_status(db_path=path)
@@ -89,14 +102,7 @@ def test_cash_writer_leaves_state_untouched_when_recovery_pending(state, operati
                 from_currency='USD', to_currency='JPY', from_amount=1, fx_rate_usdjpy=100,
                 idempotency_key='synthetic-fx-key', source='synthetic confirmation')))
         else:
-            holdings = json.loads(cash.HOLDINGS_FILE.read_text())
-            broker, owner = next(
-                (broker, owner)
-                for broker in cash.CashBroker for owner in cash.CashOwner
-                if 'available_to_trade_jpy' in holdings.get(
-                    cash._holdings_key(cash.CashCurrency.JPY, broker, owner), {}
-                )
-            )
+            broker, owner = confirmed_fixture_route()
             asyncio.run(cash.reconcile_cash(cash.CashReconcileRequest(
                 broker=broker, owner=owner, currency='JPY', reported_balance=500, reported_as_of='2026-09-15', source='synthetic confirmation')))
     assert error.value.status_code == 409
