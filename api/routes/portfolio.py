@@ -10,18 +10,32 @@ import sys
 import time
 from pathlib import Path
 from typing import Optional
-from fastapi import APIRouter
+from functools import wraps
+from fastapi import APIRouter, HTTPException
 
 router = APIRouter()
 
 BASE_DIR = Path(__file__).parent.parent.parent
 HOLDINGS_FILE = BASE_DIR / "holdings.json"
 sys.path.insert(0, str(BASE_DIR))
-from utils import load_json as _load_json, atomic_write_json as _save_json
+from utils import load_json as _load_json, atomic_write_json as _save_json, process_lock, LockBusy, load_json_strict
 
 _snapshot_cache: Optional[dict] = None
 _snapshot_time: float = 0
 _CACHE_TTL = 300  # 5分
+
+
+def _guard_holding_write(function):
+    @wraps(function)
+    async def guarded(*args, **kwargs):
+        from event_ledger import PortfolioRecoveryRequired, require_portfolio_recovery_clear
+        try:
+            with process_lock('portfolio_ledger'):
+                require_portfolio_recovery_clear()
+                return await function(*args, **kwargs)
+        except (PortfolioRecoveryRequired, LockBusy) as exc:
+            raise HTTPException(status_code=409, detail={'code': 'portfolio_write_requires_reconciliation_or_retry'}) from exc
+    return guarded
 
 
 def get_cached_snapshot() -> dict:
@@ -60,9 +74,10 @@ async def get_holdings():
 
 
 @router.put("/api/holdings/{key}")
+@_guard_holding_write
 async def update_holding(key: str, body: dict):
     """既存銘柄を更新"""
-    holdings = _load_json(HOLDINGS_FILE, {})
+    holdings = load_json_strict(HOLDINGS_FILE)
     if key not in holdings:
         return {"ok": False, "error": f"'{key}' が見つかりません"}
 
@@ -80,13 +95,14 @@ async def update_holding(key: str, body: dict):
 
 
 @router.post("/api/holdings")
+@_guard_holding_write
 async def add_holding(body: dict):
     """新規銘柄を追加"""
     key = body.get("key", "").strip()
     if not key:
         return {"ok": False, "error": "key は必須です"}
 
-    holdings = _load_json(HOLDINGS_FILE, {})
+    holdings = load_json_strict(HOLDINGS_FILE)
     if key in holdings:
         return {"ok": False, "error": f"'{key}' は既に存在します"}
 
@@ -111,9 +127,10 @@ async def add_holding(body: dict):
 
 
 @router.delete("/api/holdings/{key}")
+@_guard_holding_write
 async def delete_holding(key: str):
     """銘柄を削除"""
-    holdings = _load_json(HOLDINGS_FILE, {})
+    holdings = load_json_strict(HOLDINGS_FILE)
     if key not in holdings:
         return {"ok": False, "error": f"'{key}' が見つかりません"}
 

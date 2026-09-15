@@ -6,9 +6,10 @@ import json
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
+from copy import deepcopy
 from utils import (
     atomic_write_json, load_json, init_yfinance_timeout, reset_yfinance_session,
-    redact_secret, reraise_with_secret_redacted,
+    redact_secret, reraise_with_secret_redacted, process_lock, load_json_strict,
 )
 
 init_yfinance_timeout()
@@ -166,8 +167,15 @@ def load_holdings():
     """保有銘柄を読み込む"""
     return load_json(HOLDINGS_FILE, default={})
 
-def save_holdings(holdings):
-    atomic_write_json(HOLDINGS_FILE, holdings)
+def save_holdings(holdings, *, expected_before):
+    """Do not overwrite a fill/reconciliation that arrived during price lookup."""
+    from event_ledger import require_portfolio_recovery_clear
+    with process_lock('portfolio_ledger'):
+        require_portfolio_recovery_clear()
+        current = load_json_strict(HOLDINGS_FILE)
+        if json.dumps(current, sort_keys=True, allow_nan=False) != json.dumps(expected_before, sort_keys=True, allow_nan=False):
+            raise RuntimeError('holdings_changed_during_alert_check')
+        atomic_write_json(HOLDINGS_FILE, holdings)
 
 
 def is_quiet_hours():
@@ -428,6 +436,8 @@ def check_alerts():
     if not holdings:
         return
 
+    holdings_before = deepcopy(holdings)
+
     log     = load_alert_log()
     updated = False
 
@@ -460,7 +470,7 @@ def check_alerts():
 
     save_alert_log(log)
     if updated:
-        save_holdings(holdings)
+        save_holdings(holdings, expected_before=holdings_before)
 
 
 def update_guard_state():

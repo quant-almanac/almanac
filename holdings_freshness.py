@@ -34,7 +34,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-from utils import atomic_write_json, load_json, load_json_strict
+from utils import atomic_write_json, load_json, load_json_strict, process_lock
 
 BASE_DIR = Path(__file__).parent
 
@@ -45,6 +45,57 @@ EXECUTION_FILE_NAME = "action_executions.json"
 
 # 表明できる対象。snapshot 側の holdings / cash カテゴリに 1:1 で対応する。
 ATTESTABLE_SCOPES = ("holdings", "cash")
+
+
+def _apply_rollforward_locked(*, base_dir: Path, now: Optional[datetime]) -> dict:
+    """plan_rollforward の差分を holdings.json と約定台帳へ適用する。
+
+    holdings 側は数量とロールフォワード由来の provenance を更新し、約定側は
+    ``portfolio_applied`` を立てる。後者により
+    ``is_complete_broker_confirmed_fill`` が True となり、Stage 0B の
+    ポジション権威が約定時刻まで前進する。
+    """
+    base_dir = Path(base_dir)
+    now = now or datetime.now()
+    plan = plan_rollforward(base_dir=base_dir)
+    if not plan["planned"]:
+        return {**plan, "applied": 0}
+
+    holdings_path = base_dir / HOLDINGS_FILE_NAME
+    # holdings は台帳系なので strict 読み: 壊れたファイルを default {} で
+    # 握りつぶすと、空の holdings を書き戻して保有を消しかねない。
+    holdings = load_json_strict(holdings_path)
+    applied_ids: set[str] = set()
+    for item in plan["planned"]:
+        entry = holdings.get(item["key"])
+        if not isinstance(entry, dict):
+            continue
+        entry["shares"] = item["after"]
+        entry["source_as_of"] = item["authority_at"] or now.isoformat()
+        entry["rollforward_applied_at"] = now.isoformat()
+        entry["rollforward_execution_id"] = item["execution_id"]
+        entry["note"] = (
+            f"約定ロールフォワード {item['side']} {abs(item['delta'])} "
+            f"({item['before']}→{item['after']})"
+        )
+        applied_ids.add(str(item["execution_id"]))
+    atomic_write_json(holdings_path, holdings)
+
+    # 約定側に適用済みフラグを立てる (二重適用防止 + Stage 0B の権威前進)。
+    # load_effective_execution_records は route 補正を重ねた *読み取り用* の
+    # コピーを返すので、書き戻しは生の台帳ファイルに対して行う。
+    exec_path = base_dir / EXECUTION_FILE_NAME
+    executions = load_json_strict(exec_path)
+    if isinstance(executions, list):
+        for row in executions:
+            if not isinstance(row, dict):
+                continue
+            if str(row.get("execution_id") or row.get("id")) in applied_ids:
+                row["portfolio_applied"] = True
+                row["portfolio_applied_at"] = now.isoformat()
+        atomic_write_json(exec_path, executions)
+
+    return {**plan, "applied": len(applied_ids)}
 
 
 def _attestation_path(base_dir: Path) -> Path:
@@ -350,54 +401,11 @@ def plan_rollforward(*, base_dir: Path = BASE_DIR) -> dict:
 
 
 def apply_rollforward(*, base_dir: Path = BASE_DIR, now: Optional[datetime] = None) -> dict:
-    """plan_rollforward の差分を holdings.json と約定台帳へ適用する。
-
-    holdings 側は数量とロールフォワード由来の provenance を更新し、約定側は
-    ``portfolio_applied`` を立てる。後者により
-    ``is_complete_broker_confirmed_fill`` が True となり、Stage 0B の
-    ポジション権威が約定時刻まで前進する。
-    """
-    base_dir = Path(base_dir)
-    now = now or datetime.now()
-    plan = plan_rollforward(base_dir=base_dir)
-    if not plan["planned"]:
-        return {**plan, "applied": 0}
-
-    holdings_path = base_dir / HOLDINGS_FILE_NAME
-    # holdings は台帳系なので strict 読み: 壊れたファイルを default {} で
-    # 握りつぶすと、空の holdings を書き戻して保有を消しかねない。
-    holdings = load_json_strict(holdings_path)
-    applied_ids: set[str] = set()
-    for item in plan["planned"]:
-        entry = holdings.get(item["key"])
-        if not isinstance(entry, dict):
-            continue
-        entry["shares"] = item["after"]
-        entry["source_as_of"] = item["authority_at"] or now.isoformat()
-        entry["rollforward_applied_at"] = now.isoformat()
-        entry["rollforward_execution_id"] = item["execution_id"]
-        entry["note"] = (
-            f"約定ロールフォワード {item['side']} {abs(item['delta'])} "
-            f"({item['before']}→{item['after']})"
-        )
-        applied_ids.add(str(item["execution_id"]))
-    atomic_write_json(holdings_path, holdings)
-
-    # 約定側に適用済みフラグを立てる (二重適用防止 + Stage 0B の権威前進)。
-    # load_effective_execution_records は route 補正を重ねた *読み取り用* の
-    # コピーを返すので、書き戻しは生の台帳ファイルに対して行う。
-    exec_path = base_dir / EXECUTION_FILE_NAME
-    executions = load_json_strict(exec_path)
-    if isinstance(executions, list):
-        for row in executions:
-            if not isinstance(row, dict):
-                continue
-            if str(row.get("execution_id") or row.get("id")) in applied_ids:
-                row["portfolio_applied"] = True
-                row["portfolio_applied_at"] = now.isoformat()
-        atomic_write_json(exec_path, executions)
-
-    return {**plan, "applied": len(applied_ids)}
+    """Serialize the legacy maintenance writer; never bypass pending recovery."""
+    from event_ledger import require_portfolio_recovery_clear
+    with process_lock('portfolio_ledger'):
+        require_portfolio_recovery_clear(base_dir=Path(base_dir))
+        return _apply_rollforward_locked(base_dir=base_dir, now=now)
 
 
 def main() -> int:

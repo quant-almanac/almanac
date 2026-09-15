@@ -45,6 +45,18 @@ from portfolio_manager import get_fx_rate as _get_fx_rate
 # P0-8: Portfolio snapshot cache invalidation
 # 単一 ledger event 適用後に必ず呼ぶ。
 # ============================================================
+def _require_portfolio_recovery_clear(event_id: Optional[str]) -> None:
+    """Keep later fill facts, but do not derive balances from torn state."""
+    from event_ledger import PortfolioRecoveryRequired, require_portfolio_recovery_clear
+    try:
+        require_portfolio_recovery_clear(recovering_event_id=event_id)
+    except PortfolioRecoveryRequired as exc:
+        raise PortfolioApplicationPending(
+            exc.code,
+            '残高の復旧確認が必要なため、約定事実を保持して残高適用を保留します',
+        ) from exc
+
+
 def _invalidate_portfolio_cache() -> None:
     try:
         from api.routes import portfolio as _p
@@ -1749,6 +1761,7 @@ def _apply_event_to_ledger(
 
     if direction == "hold" or status in ("skip", "cancelled", "ordered"):
         return no_op
+    _require_portfolio_recovery_clear(event_id)
     recovered = _recover_prepared_portfolio_application(event_id)
     if recovered is not None:
         return recovered
@@ -2322,6 +2335,26 @@ def _recover_prepared_portfolio_application(event_id: Optional[str]) -> Optional
     account_after = json.loads(str(journal["account_after_json"]))
     event_kwargs = json.loads(str(journal["event_kwargs_json"]))
     result = json.loads(str(journal["result_json"]))
+    # Caller holds the portfolio writer lock. Inspect BOTH files before writing
+    # either: an old prepared intent must not roll back a subsequent update.
+    # This is not a cross-file CAS against writers that ignore that lock.
+    try:
+        for path, before_key, after in (
+            (HOLDINGS_FILE, 'holdings_before_json', holdings_after),
+            (ACCOUNT_FILE, 'account_before_json', account_after),
+        ):
+            current = json.loads(Path(path).read_text(encoding='utf-8'))
+            before = journal.get(before_key)
+            allowed = [after] + ([json.loads(before)] if before is not None else [])
+            normalized = json.dumps(current, sort_keys=True, allow_nan=False)
+            if normalized not in [json.dumps(value, sort_keys=True, allow_nan=False)
+                                  for value in allowed]:
+                raise ValueError('portfolio state diverged')
+    except (OSError, ValueError, TypeError) as exc:
+        raise HTTPException(
+            status_code=409,
+            detail='portfolio recovery state mismatch; reconciliation required',
+        ) from exc
     _save_json(HOLDINGS_FILE, holdings_after)
     _save_json(ACCOUNT_FILE, account_after)
     if not _ledger_event_exists(event_id):
@@ -2342,7 +2375,11 @@ def _commit_portfolio_event(*, holdings_before: dict, account_before: dict,
     """
     wrote_holdings = False
     wrote_account = False
+    intent_prepared = False
     event_id = str(event_kwargs.get("event_id") or "")
+    # Backstop for callers that compute an after-image outside the main entry.
+    # Check before entering rollback handling: do not discard another intent.
+    _require_portfolio_recovery_clear(event_id)
     try:
         _sync_cash_mirrors_from_account(holdings_after, account_after)
         if event_id:
@@ -2353,7 +2390,10 @@ def _commit_portfolio_event(*, holdings_before: dict, account_before: dict,
                 account_after=account_after,
                 event_kwargs=event_kwargs,
                 result=recovery_result,
+                holdings_before=holdings_before,
+                account_before=account_before,
             )
+            intent_prepared = True
         _save_json(HOLDINGS_FILE, holdings_after)
         wrote_holdings = True
         _save_json(ACCOUNT_FILE, account_after)
@@ -2371,7 +2411,7 @@ def _commit_portfolio_event(*, holdings_before: dict, account_before: dict,
             _save_json(HOLDINGS_FILE, holdings_before)
         if wrote_account:
             _save_json(ACCOUNT_FILE, account_before)
-        if event_id:
+        if event_id and intent_prepared:
             from event_ledger import discard_portfolio_application
             discard_portfolio_application(event_id)
         raise e

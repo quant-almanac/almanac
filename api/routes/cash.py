@@ -45,6 +45,16 @@ from utils import (  # noqa: E402
 from execution_safety import SYSTEM_LOCAL_TZ  # noqa: E402
 
 
+def _require_recovery_clear() -> None:
+    from event_ledger import PortfolioRecoveryRequired, require_portfolio_recovery_clear
+    try:
+        require_portfolio_recovery_clear()
+    except PortfolioRecoveryRequired as exc:
+        raise HTTPException(status_code=409, detail={
+            'code': exc.code, 'message': '先行する残高更新の復旧確認が必要です。今回の変更は未適用です',
+        }) from exc
+
+
 def _load_required_dict(path: Path, label: str) -> dict:
     try:
         data = _load_json_strict(path)
@@ -488,6 +498,7 @@ def _apply_cash_change(req: CashRequest, tx_type: TxType) -> dict:
     """
     try:
         with process_lock("portfolio_ledger"):
+            _require_recovery_clear()
             original_account, original_holdings, original_tx_log, next_state, fx_for_event = _prepare_cash_change(req, tx_type)
             result = _commit_cash_change(
                 req=req,
@@ -610,6 +621,7 @@ def _confirm_movement(
             )
             if replay is not None:
                 return replay
+            _require_recovery_clear()
             account, holdings, tx_log = deepcopy(original_account), deepcopy(original_holdings), deepcopy(original_tx_log)
             routes = apply_legs(account, holdings)
             _sync_account_cash_totals(account)
@@ -689,6 +701,7 @@ async def reconcile_cash(req: CashReconcileRequest):
         )
     try:
         with process_lock("portfolio_ledger"):
+            _require_recovery_clear()
             holdings = _load_required_dict(HOLDINGS_FILE, "holdings.json")
             row = holdings.get(key)
             if not isinstance(row, dict):

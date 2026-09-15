@@ -93,6 +93,11 @@ def save_cache(data: dict) -> None:
         # may lag conservatively; the reverse ordering exposed a new analysis
         # through history while execution still used the old cache.
         atomic_write_json(CACHE_PATH, data)
+        try:
+            from analysis_pipeline_observation import publish_saved_analysis
+            publish_saved_analysis(CACHE_PATH)
+        except Exception:
+            print("[analysis_observation] unavailable; formal cache is preserved")
         atomic_write_json(HISTORY_PATH, hist)
 
 

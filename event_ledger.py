@@ -111,6 +111,12 @@ CREATE TABLE IF NOT EXISTS portfolio_application_journal (
     created_at          TEXT NOT NULL,
     updated_at          TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS portfolio_application_preconditions (
+    event_id TEXT PRIMARY KEY,
+    holdings_before_json TEXT NOT NULL,
+    account_before_json TEXT NOT NULL
+);
 """
 
 VALID_EVENT_TYPES = {
@@ -149,6 +155,86 @@ AMOUNT_REQUIRED_EVENT_TYPES = {
 # ============================================================
 # Connection
 # ============================================================
+
+def read_portfolio_recovery_status(*, db_path: Optional[Path] = None) -> dict:
+    """Read counts only; no DB creation, migration, replay or authority."""
+    report = dict(status='unknown', reason='recovery_journal_unavailable',
+                  pending_count=None, unbound_count=None, invalid_status_count=None,
+                  scope='portfolio_application_journal_only', execution_authorized=False)
+    path = Path(db_path) if db_path is not None else Path(DB_PATH)
+    connection = None
+    try:
+        connection = sqlite3.connect(path.absolute().as_uri() + '?mode=ro', uri=True, timeout=1)
+        connection.execute('PRAGMA query_only=ON')
+        connection.execute('BEGIN')
+        counts = connection.execute('''SELECT COUNT(*),
+            COALESCE(SUM(CASE WHEN COALESCE(status,'') != 'prepared' THEN 1 ELSE 0 END),0)
+            FROM portfolio_application_journal WHERE COALESCE(status,'') != 'complete' ''').fetchone()
+        has_preconditions = connection.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='portfolio_application_preconditions'").fetchone()
+        unbound = counts[0]
+        if has_preconditions:
+            unbound = connection.execute('''SELECT COUNT(*) FROM portfolio_application_journal j
+                LEFT JOIN portfolio_application_preconditions p ON p.event_id=j.event_id
+                WHERE COALESCE(j.status,'') != 'complete' AND p.event_id IS NULL''').fetchone()[0]
+        return {**report, 'status': 'needs_reconciliation' if counts[0] else 'clear',
+                'reason': 'unresolved_portfolio_applications' if counts[0] else 'no_unresolved_portfolio_applications',
+                'pending_count': counts[0], 'unbound_count': unbound,
+                'invalid_status_count': counts[1]}
+    except (sqlite3.Error, OSError, ValueError):
+        return report
+    finally:
+        if connection is not None:
+            connection.close()
+
+
+def require_portfolio_recovery_clear(*, recovering_event_id: Optional[str] = None, base_dir: Optional[Path] = None) -> None:
+    """Call under the shared portfolio lock BEFORE any balance write/recovery."""
+    from broker_recovery import ImportRecoveryRequired, require_import_recovery_clear
+    try:
+        root = Path(base_dir) if base_dir is not None else BASE_DIR
+        require_import_recovery_clear(root / 'broker_balance_journal.jsonl')
+    except ImportRecoveryRequired as exc:
+        raise PortfolioRecoveryRequired(str(exc)) from exc
+    require_execution_recovery_clear(recovering_event_id=recovering_event_id,
+                                     db_path=resolve_db_path(root) if base_dir is not None else None)
+
+
+def require_execution_recovery_clear(*, recovering_event_id: Optional[str] = None, db_path: Optional[Path] = None) -> None:
+    """Execution journal only; importer checks its own journal before recovery."""
+    try:
+        pending = unresolved_portfolio_application_ids(recovering_event_id=recovering_event_id, db_path=db_path)
+    except sqlite3.Error as exc:
+        raise PortfolioRecoveryRequired('portfolio_application_journal_unavailable') from exc
+    if pending:
+        raise PortfolioRecoveryRequired('earlier_portfolio_application_unresolved')
+
+
+class PortfolioRecoveryRequired(RuntimeError):
+    """Host-visible reason code without original account or journal payloads."""
+
+    def __init__(self, code: str):
+        self.code = code
+        super().__init__(code)
+
+
+def unresolved_portfolio_application_ids(
+    *, recovering_event_id: Optional[str] = None, db_path: Optional[Path] = None,
+) -> tuple[str, ...]:
+    """Read unresolved intents under the host's portfolio writer lock.
+
+    Only the current event's prepared intent is exempt for its own recovery.
+    Unknown statuses remain unresolved, not equivalent to completion. These
+    whole-file intents cannot establish that another account is disjoint.
+    """
+    init_schema(db_path)
+    with _conn(db_path) as c:
+        return tuple(row[0] for row in c.execute('''
+            SELECT event_id FROM portfolio_application_journal
+            WHERE COALESCE(status, '') != 'complete'
+              AND (event_id IS NOT ? OR COALESCE(status, '') != 'prepared')
+            ORDER BY created_at, event_id
+        ''', (recovering_event_id,)))
+
 
 @contextmanager
 def _conn(db_path: Optional[Path] = None) -> Iterator[sqlite3.Connection]:
@@ -282,37 +368,51 @@ def prepare_portfolio_application(
     account_after: dict,
     event_kwargs: dict,
     result: dict,
+    holdings_before: Optional[dict] = None,
+    account_before: Optional[dict] = None,
     db_path: Optional[Path] = None,
 ) -> None:
-    """Persist the exact after-state before touching JSON portfolio files."""
+    """Persist immutable before/after intent before touching JSON files.
+
+    Legacy callers without a before-state remain representable, but recovery
+    can then only acknowledge files already equal to the recorded after-state.
+    Never attach guessed preconditions to an existing legacy intent on retry.
+    """
+    if (holdings_before is None) != (account_before is None):
+        raise ValueError('both portfolio preconditions are required')
+    def encoded(value):
+        if not isinstance(value, dict):
+            raise ValueError('portfolio journal objects are required')
+        return json.dumps(value, ensure_ascii=False, sort_keys=True, allow_nan=False)
+    payload = tuple(encoded(value) for value in (
+        holdings_after, account_after, event_kwargs, result))
+    preconditions = (None if holdings_before is None else
+                     (encoded(holdings_before), encoded(account_before)))
     init_schema(db_path)
     now = datetime.now().isoformat(timespec="seconds")
-    values = (
-        event_id,
-        json.dumps(holdings_after, ensure_ascii=False, sort_keys=True),
-        json.dumps(account_after, ensure_ascii=False, sort_keys=True),
-        json.dumps(event_kwargs, ensure_ascii=False, sort_keys=True),
-        json.dumps(result, ensure_ascii=False, sort_keys=True),
-        now,
-        now,
-    )
     with _conn(db_path) as c:
+        c.execute('BEGIN IMMEDIATE')
+        old = c.execute('''SELECT holdings_after_json,account_after_json,
+            event_kwargs_json,result_json FROM portfolio_application_journal
+            WHERE event_id=?''', (event_id,)).fetchone()
+        previous = c.execute('''SELECT holdings_before_json,account_before_json
+            FROM portfolio_application_preconditions WHERE event_id=?''', (event_id,)).fetchone()
+        if old is not None:
+            if tuple(old) != payload or (tuple(previous) if previous else None) != preconditions:
+                raise ValueError('conflicting portfolio application retry')
+            return  # Preserve original availability and completed status.
         c.execute(
             """
             INSERT INTO portfolio_application_journal (
                 event_id, holdings_after_json, account_after_json,
                 event_kwargs_json, result_json, status, created_at, updated_at
             ) VALUES (?, ?, ?, ?, ?, 'prepared', ?, ?)
-            ON CONFLICT(event_id) DO UPDATE SET
-                holdings_after_json=excluded.holdings_after_json,
-                account_after_json=excluded.account_after_json,
-                event_kwargs_json=excluded.event_kwargs_json,
-                result_json=excluded.result_json,
-                status='prepared',
-                updated_at=excluded.updated_at
             """,
-            values,
+            (event_id, *payload, now, now),
         )
+        if preconditions is not None:
+            c.execute('INSERT INTO portfolio_application_preconditions VALUES (?,?,?)',
+                      (event_id, *preconditions))
 
 
 def get_portfolio_application(
@@ -323,7 +423,10 @@ def get_portfolio_application(
     init_schema(db_path)
     with _conn(db_path) as c:
         row = c.execute(
-            "SELECT * FROM portfolio_application_journal WHERE event_id = ?",
+            """SELECT j.*, p.holdings_before_json, p.account_before_json
+               FROM portfolio_application_journal j
+               LEFT JOIN portfolio_application_preconditions p ON p.event_id=j.event_id
+               WHERE j.event_id = ?""",
             (event_id,),
         ).fetchone()
     return dict(row) if row is not None else None
@@ -343,6 +446,7 @@ def complete_portfolio_application(event_id: str, *, db_path: Optional[Path] = N
 def discard_portfolio_application(event_id: str, *, db_path: Optional[Path] = None) -> None:
     init_schema(db_path)
     with _conn(db_path) as c:
+        c.execute("DELETE FROM portfolio_application_preconditions WHERE event_id = ?", (event_id,))
         c.execute("DELETE FROM portfolio_application_journal WHERE event_id = ?", (event_id,))
 
 

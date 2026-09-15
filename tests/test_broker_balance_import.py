@@ -251,7 +251,7 @@ def test_journal_detects_incomplete_apply(tmp_path, monkeypatch):
     bbi._append_journal({"operation_id": "op1", "status": "committed"})
     bbi._assert_no_incomplete_journal()  # committed → 例外なし
     bbi._append_journal({"operation_id": "op2", "status": "prepared"})
-    with pytest.raises(RuntimeError, match="完了していません"):
+    with pytest.raises(RuntimeError, match="broker_import_recovery_required"):
         bbi._assert_no_incomplete_journal()
 
 

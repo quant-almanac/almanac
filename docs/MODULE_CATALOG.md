@@ -153,4 +153,7 @@ Tax display and action consumers also exist in API, analyst, NISA, ESPP and reba
 | `scripts/` | Initialization, public-safety and documentation checks |
 | `tests/` | Unit, contract, integration and state-isolation tests |
 
+- `analysis_pipeline_observation.py` — Source-bound diagnostics after formal analysis publication; no execution authority.
+- `broker_recovery.py` — Read-only import-journal validation and pending-write barriers.
+- `nav_recording_health.py` — Read-only scheduled NAV publication checks, separate from DD qualification.
 <!-- ROOT_MODULES_END -->

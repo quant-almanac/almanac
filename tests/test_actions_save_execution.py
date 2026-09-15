@@ -1882,6 +1882,8 @@ def test_interrupted_application_recovers_exact_after_state_without_double_apply
     }
     event_ledger.prepare_portfolio_application(
         event_id=event_id,
+        holdings_before=_read(files["holdings"]),
+        account_before=_read(files["account"]),
         holdings_after=holdings_after,
         account_after=account_after,
         event_kwargs=event_kwargs,

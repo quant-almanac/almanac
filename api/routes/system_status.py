@@ -89,6 +89,9 @@ async def get_system_status():
     from model_router import get_model, resolve_adapter
     from risk_policy import POLICY
     from feature_controls import list_feature_statuses
+    from event_ledger import read_portfolio_recovery_status
+    from broker_recovery import read_import_recovery_status
+    from almanac.runtime_config import resolve_db_path
 
     roles = (
         "tier_analysis_long",
@@ -113,6 +116,8 @@ async def get_system_status():
     auto_tune = get_auto_tune_status()
     return {
         "generated_at": datetime.now(timezone.utc).isoformat(),
+        "portfolio_recovery": read_portfolio_recovery_status(db_path=resolve_db_path(BASE_DIR)),
+        "broker_import_recovery": read_import_recovery_status(BASE_DIR / 'broker_balance_journal.jsonl'),
         "data_health": _build_data_health(),
         "auto_tune": auto_tune,
         "model_routes": model_routes,

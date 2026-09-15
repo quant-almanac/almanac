@@ -6,7 +6,8 @@ from datetime import datetime
 from generate_dashboard import generate as update_dashboard
 import time
 
-from utils import reraise_with_secret_redacted
+from functools import wraps
+from utils import reraise_with_secret_redacted, process_lock, LockBusy, atomic_write_json
 
 # 状態ファイルはこのスクリプトの置き場所を基準に解決する。
 # (以前は開発環境のパスが直書きされており、別の場所へ clone すると
@@ -17,6 +18,19 @@ _BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 TELEGRAM_TOKEN = os.environ['TELEGRAM_TOKEN']
 TELEGRAM_CHAT_ID = os.environ['TELEGRAM_CHAT_ID']
 HOLDINGS_FILE = os.path.join(_BASE_DIR, 'holdings.json')
+
+def _guard_balance_command(function):
+    @wraps(function)
+    def guarded(*args, **kwargs):
+        from event_ledger import PortfolioRecoveryRequired, require_portfolio_recovery_clear
+        try:
+            with process_lock('portfolio_ledger'):
+                require_portfolio_recovery_clear()
+                return function(*args, **kwargs)
+        except (PortfolioRecoveryRequired, LockBusy):
+            return '未適用: 残高更新の復旧確認または実行中の処理の完了後に再試行してください。'
+    return guarded
+
 
 def send_telegram(message):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
@@ -41,8 +55,7 @@ def load_holdings():
         return json.load(f)
 
 def save_holdings(holdings):
-    with open(HOLDINGS_FILE, 'w') as f:
-        json.dump(holdings, f, indent=2)
+    atomic_write_json(HOLDINGS_FILE, holdings)
 
 def get_account_info():
     """口座情報を読み込む"""
@@ -54,9 +67,9 @@ def get_account_info():
 
 def save_account_info(info):
     filepath = os.path.join(_BASE_DIR, 'account.json')
-    with open(filepath, 'w') as f:
-        json.dump(info, f, indent=2)
+    atomic_write_json(filepath, info)
 
+@_guard_balance_command
 def cmd_setbalance(parts):
     """/setbalance 3000000 → 口座残高を設定"""
     if len(parts) < 2:
@@ -71,6 +84,7 @@ def cmd_setbalance(parts):
     save_account_info(info)
     return f"✅ 口座残高を設定しました\n💴 残高: ¥{balance:,.0f}\n📊 1トレード上限: ¥{balance * info['risk_per_trade']:,.0f}（残高の{info['risk_per_trade']*100:.0f}%）"
 
+@_guard_balance_command
 def cmd_setrisk(parts):
     """/setrisk 10 → 1トレードのリスク割合を設定（%）"""
     if len(parts) < 2:
@@ -114,6 +128,7 @@ def record_trade(action, ticker, price, shares, pnl_pct=None, pnl_amount=None):
             f'${pnl_amount:+,.0f}' if pnl_amount is not None else ''
         ])
 
+@_guard_balance_command
 def cmd_buy(parts):
     """例: /buy AMZN 204.79 5"""
     if len(parts) < 4:
@@ -157,6 +172,7 @@ def cmd_buy(parts):
     total = entry_price * shares
     return f"✅ <b>{ticker} 登録完了</b>\n💰 エントリー: ${entry_price} × {shares}株\n💴 合計: ${total:,.0f}"
 
+@_guard_balance_command
 def cmd_sell(parts):
     """例: /sell AMZN"""
     if len(parts) < 2:

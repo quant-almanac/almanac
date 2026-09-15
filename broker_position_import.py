@@ -358,6 +358,9 @@ def apply_reconcile(*, rakuten_csv: Path, apply: bool = False, full_snapshot: bo
     reconciled_at = datetime.now().astimezone().isoformat(timespec="seconds")
     snapshot_hash = "sha256:" + hashlib.sha256(rakuten_csv.read_bytes()).hexdigest()
     with process_lock("portfolio_ledger"):
+        if apply:
+            from event_ledger import require_portfolio_recovery_clear
+            require_portfolio_recovery_clear()
         next_holdings, diff = build_reconciled_holdings(
             positions=positions,
             holdings_path=HOLDINGS_FILE,

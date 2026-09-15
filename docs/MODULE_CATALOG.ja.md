@@ -153,4 +153,7 @@ tax表示/action consumerはAPI、analyst、NISA、ESPP、rebalanceにもあり�
 | `scripts/` | init、public safety、documentation check |
 | `tests/` | unit、contract、integration、state isolation |
 
+- `analysis_pipeline_observation.py` — 正式分析の保存後に原本と束縛した診断を記録。発注権限なし。
+- `broker_recovery.py` — インポート記録の読取り検証と未完了時の書込み抑止。
+- `nav_recording_health.py` — DD適格性と分離したNAV記録の読取り監視。
 <!-- ROOT_MODULES_END -->

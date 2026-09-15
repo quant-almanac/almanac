@@ -44,6 +44,7 @@ from pathlib import Path
 from typing import Optional
 
 from utils import atomic_write_json, load_json_strict, process_lock
+from broker_recovery import ImportRecoveryRequired, read_import_operations, require_import_recovery_clear
 
 BASE_DIR = Path(__file__).parent
 ACCOUNT_FILE = BASE_DIR / "account.json"
@@ -52,6 +53,31 @@ RECONCILE_LOG = BASE_DIR / "broker_balance_reconcile_log.jsonl"
 # Codex P1 #9: prepare/commit journal。account→holdings→ledger→log の逐次書込みが
 # 途中で落ちると JSON と台帳が乖離するため、apply を prepared→committed で挟む。
 JOURNAL_FILE = BASE_DIR / "broker_balance_journal.jsonl"
+
+
+def _validate_plan_state(plan: dict) -> None:
+    """Check BOTH files before writing either; legacy plans require both after-images."""
+    def canonical(value):
+        if not isinstance(value, dict):
+            raise ValueError('expected object')
+        return json.dumps(value, sort_keys=True, ensure_ascii=False, allow_nan=False)
+    try:
+        if not isinstance(plan.get('operation_id'), str) or not plan['operation_id']:
+            raise ValueError('operation identity')
+        if not isinstance(plan.get('ledger_events'), list):
+            raise ValueError('events')
+        bound = 'before_account' in plan and 'before_holdings' in plan
+        if ('before_account' in plan) != ('before_holdings' in plan):
+            raise ValueError('partial preconditions')
+        for name, path in (('account', ACCOUNT_FILE), ('holdings', HOLDINGS_FILE)):
+            after = canonical(plan['next_' + name])
+            allowed = [after]
+            if bound:
+                allowed.append(canonical(plan['before_' + name]))
+            if canonical(load_json_strict(path)) not in allowed:
+                raise ValueError('state divergence')
+    except (KeyError, TypeError, ValueError, OSError, RuntimeError) as exc:
+        raise ImportRecoveryRequired('broker_import_state_reconciliation_required') from exc
 
 
 def _num(value, *, default: Optional[float] = None) -> Optional[float]:
@@ -401,42 +427,13 @@ def _append_ledger_events(events: list[dict]) -> list[dict]:
 
 
 def _read_last_journal_record() -> Optional[dict]:
-    """JOURNAL_FILE 上、最後に出現した operation の最新レコードを返す。"""
-    if not JOURNAL_FILE.exists():
-        return None
-    last_by_op: dict[str, dict] = {}
-    order: list[str] = []
-    try:
-        for line in JOURNAL_FILE.read_text(encoding="utf-8").splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                rec = json.loads(line)
-            except Exception:
-                continue
-            op = rec.get("operation_id")
-            if not op:
-                continue
-            if op not in last_by_op:
-                order.append(op)
-            last_by_op[op] = rec
-    except Exception:
-        return None
-    return last_by_op[order[-1]] if order else None
+    rows = read_import_operations(JOURNAL_FILE)
+    return next(reversed(rows.values())) if rows else None
 
 
 def _assert_no_incomplete_journal() -> None:
     """前回 apply が prepared のまま (=途中失敗) なら fail-closed で停止する。"""
-    last = _read_last_journal_record()
-    if last is not None and last.get("status") == "prepared":
-        raise RuntimeError(
-            "前回の broker_balance_import apply が完了していません "
-            f"(operation_id={last.get('operation_id')}, prepared @ {last.get('timestamp')})。"
-            " account.json / holdings.json / event_ledger が部分反映の可能性があります。"
-            " 内容を検証し、解消後に JOURNAL の該当 operation を committed 化 (または該当行削除)"
-            f" してから再実行してください。JOURNAL: {JOURNAL_FILE}"
-        )
+    require_import_recovery_clear(JOURNAL_FILE)
 
 
 def _append_journal(record: dict) -> None:
@@ -464,10 +461,18 @@ def _operation_id(*, mode: str, rakuten: dict, sbi_jpy: Optional[float]) -> str:
 def _apply_plan(plan: dict, *, diff: Optional[dict] = None) -> list:
     """prepared(全書込み内容を記録) → account/holdings/ledger/log → committed を順に実行。
 
-    各書込みは idempotent (JSON は full overwrite、ledger は決定論 event_id で dedup) なので、
-    どのステップで落ちても同じ plan の再適用で完了状態に収束できる。
+    Caller holds portfolio_ledger. Replay requires recorded before/after state.
     """
     op = plan["operation_id"]
+    operations = read_import_operations(JOURNAL_FILE)
+    prior = operations.get(op)
+    if prior is not None and prior['status'] == 'committed':
+        raise ImportRecoveryRequired('broker_import_already_committed')
+    if prior is not None and prior.get('plan') != plan:
+        raise ImportRecoveryRequired('broker_import_plan_conflict')
+    if any(key != op and row['status'] != 'committed' for key, row in operations.items()):
+        raise ImportRecoveryRequired('broker_import_multiple_pending')
+    _validate_plan_state(plan)
     _append_journal({
         "operation_id": op,
         "status": "prepared",
@@ -491,15 +496,17 @@ def _apply_plan(plan: dict, *, diff: Optional[dict] = None) -> list:
 
 
 def _resume_incomplete_journal() -> None:
-    """前回 apply が prepared のまま (=途中失敗) なら、記録済み plan を idempotent に再適用して完了させる。
+    """Resume one bound intent only; divergent/ambiguous state needs reconciliation.
 
-    Codex P2 #9: 旧実装は検知して停止するだけで、JSON 更新後・ledger 書込み前に落ちると
-    再実行時 diff=0 となり cash_flow が永久に欠落し得た。記録済み plan を再適用すれば、
-    意図した最終状態 (account/holdings/ledger) に確実に収束する。
+    Caller holds portfolio_ledger and has checked the execution journal. Legacy
+    plans without before-images require BOTH files already equal to after-images.
     """
-    last = _read_last_journal_record()
-    if last is None or last.get("status") != "prepared":
+    pending = [row for row in read_import_operations(JOURNAL_FILE).values() if row['status'] != 'committed']
+    if not pending:
         return
+    if len(pending) != 1:
+        raise ImportRecoveryRequired('broker_import_multiple_pending')
+    last = pending[0]
     plan = last.get("plan")
     if not isinstance(plan, dict) or "next_account" not in plan:
         # plan を持たない旧 journal は自動 resume 不能 → 手動対応を促す。
@@ -508,6 +515,8 @@ def _resume_incomplete_journal() -> None:
             f"(operation_id={last.get('operation_id')})。手動で台帳を確認し、"
             f" JOURNAL の該当行を解消してください: {JOURNAL_FILE}"
         )
+    if plan.get('operation_id') != last['operation_id']:
+        raise ImportRecoveryRequired('broker_import_plan_identity_mismatch')
     _apply_plan(plan)
 
 
@@ -530,6 +539,8 @@ def apply_reconcile(
         # Codex P2 #9: load → 判定 → 書込み → journal を同一 lock 内で行う。
         # まず前回未完了 op があれば記録済み plan で resume してから新規 op を構築する。
         if apply:
+            from event_ledger import require_execution_recovery_clear
+            require_execution_recovery_clear()
             _resume_incomplete_journal()
 
         next_account, next_holdings, diff = build_reconciled_state(
@@ -549,12 +560,18 @@ def apply_reconcile(
 
         if apply:
             operation_id = _operation_id(mode=mode, rakuten=rakuten, sbi_jpy=sbi_jpy)
+            prior = read_import_operations(JOURNAL_FILE).get(operation_id)
+            if prior is not None and prior['status'] == 'committed':
+                return {'dry_run': False, 'mode': mode, 'idempotent_replay': True,
+                        'planned_ledger_events': [], **diff}
             # ledger event_id を決定論 id で上書き (同一入力の再実行は同一 id → idempotent)。
             for i, ev in enumerate(ledger_event_kwargs):
                 ev["event_id"] = f"{operation_id}:{i}"
             plan = {
                 "operation_id": operation_id,
                 "mode": mode,
+                "before_account": load_json_strict(ACCOUNT_FILE),
+                "before_holdings": load_json_strict(HOLDINGS_FILE),
                 "next_account": next_account,
                 "next_holdings": next_holdings,
                 "ledger_events": ledger_event_kwargs,

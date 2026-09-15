@@ -6,8 +6,11 @@ import { OPS } from '@/components/today/ops/tokens'
 import { OpsPage, Panel, PanelTitle, Chip, Grid, Loading } from '@/components/today/ops/PageKit'
 import FreshnessDots from '@/components/today/ops/FreshnessDots'
 import FeatureControls from '@/components/system/FeatureControls'
+import RecoveryStatus, { recoveryState } from '@/components/system/RecoveryStatus'
 
 interface SystemStatus {
+  portfolio_recovery?: unknown
+  broker_import_recovery?: unknown
   generated_at: string
   data_health: DashboardDataHealth
   auto_tune: {
@@ -39,12 +42,14 @@ export default function DesignPage() {
   const { data, error, isLoading } = useSWR<SystemStatus>('/api/system/status', fetcher, { refreshInterval: 60000 })
   const systemLabel = !data ? '確認中' : data.data_health.ok ? '正常' : data.data_health.missing_count ? '障害' : 'データ遅延'
   const systemColor = !data ? OPS.dim : data.data_health.ok ? OPS.green : data.data_health.missing_count ? OPS.vermilion : OPS.amber
+  const recoveryClear = !error && recoveryState(data?.portfolio_recovery) === 'clear' && recoveryState(data?.broker_import_recovery) === 'clear'
   const schedule = data?.schedules.auto_tune
 
-  return <OpsPage en="SYSTEM STATUS" title="システム" subtitle="ハードコードした設計説明ではなく、現在のモデル、ガード、実行モード、データ鮮度を表示する。" right={<Chip color={systemColor} mono>{systemLabel}</Chip>}>
+  return <OpsPage en="SYSTEM STATUS" title="システム" subtitle="ハードコードした設計説明ではなく、現在のモデル、ガード、実行モード、データ鮮度を表示する。" right={<Chip color={recoveryClear ? systemColor : OPS.amber} mono>{recoveryClear ? systemLabel : '復旧状態を要確認'}</Chip>}>
     {isLoading && <Loading />}
     {error && <Panel><span role="alert" style={{ color: OPS.redSoft }}>/api/system/status を取得できません。</span></Panel>}
     <FeatureControls />
+    <RecoveryStatus portfolio={data?.portfolio_recovery} brokerImport={data?.broker_import_recovery} unavailable={!!error} />
     {data && <>
       <Grid cols={2} gap={16}>
         <Panel pad="18px 20px">

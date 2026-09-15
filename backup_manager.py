@@ -155,6 +155,7 @@ if not set(CONDITIONAL_REQUIRED_TARGETS).issubset(TARGETS):
 # logs/verification_manifests/ 追加時)。
 EVIDENCE_DIRECTORIES = [
     'logs/verification_manifests',
+    'logs/analysis_pipeline_observations',
 ]
 
 SQLITE_TARGETS = [

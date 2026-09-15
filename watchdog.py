@@ -191,6 +191,20 @@ NOTIFY_STALE_SCRIPTS = {
 RECENT_EXECUTION_ISSUE_HOURS = 48
 
 
+def _nav_recording_observation(*, now: float) -> dict:
+    try:
+        from nav_recording_health import read_nav_recording_health
+        return read_nav_recording_health(
+            db_path=resolve_db_path(BASE_DIR), heartbeat_path=HEARTBEAT_PATH,
+            now=datetime.fromtimestamp(now, tz=ZoneInfo("UTC")))
+    except Exception:
+        # Observer failure must not cancel the remaining watchdog battery.
+        # Do not expose exception text which could contain private paths.
+        return {"publication_status": "unknown", "reason": "nav_observer_failed",
+                "dd_evidence_status": "unknown", "dd_recovery_qualified": None,
+                "policy_change_authorized": False}
+
+
 def _check_critical_json() -> list:
     """
     P2-25: 重要 JSON ファイルの schema 妥当性チェック。
@@ -736,11 +750,29 @@ def _check_portfolio_integrity() -> list:
     SQLite 移行前の安全ネットとして、内部台帳のズレを watchdog に載せる。
     """
     try:
+        from event_ledger import read_portfolio_recovery_status
+        recovery = read_portfolio_recovery_status(db_path=resolve_db_path(BASE_DIR))
+    except Exception:
+        recovery = {'status': 'unknown', 'reason': 'recovery_journal_unavailable', 'pending_count': None}
+    recovery_issues = ([] if recovery['status'] == 'clear' else [{
+        'severity': 'critical', 'check': 'portfolio_application_recovery',
+        'message': recovery['reason'], 'pending_count': recovery['pending_count'],
+    }])
+    try:
+        from broker_recovery import read_import_recovery_status
+        import_recovery = read_import_recovery_status(BASE_DIR / 'broker_balance_journal.jsonl')
+    except Exception:
+        import_recovery = {'status': 'unknown', 'reason': 'broker_import_journal_unavailable', 'pending_count': None}
+    if import_recovery['status'] != 'clear':
+        recovery_issues.append({'severity': 'critical', 'check': 'broker_import_recovery',
+                                'message': import_recovery['reason'],
+                                'pending_count': import_recovery['pending_count']})
+    try:
         from portfolio_integrity import run_integrity_check
         result = run_integrity_check(base_dir=BASE_DIR, db_path=resolve_db_path(BASE_DIR))
     except Exception as e:
-        return [{'severity': 'critical', 'check': 'portfolio_integrity', 'message': f'integrity checker failed: {e}'}]
-    return result.get('issues', [])
+        return recovery_issues + [{'severity': 'critical', 'check': 'portfolio_integrity', 'message': f'integrity checker failed: {e}'}]
+    return recovery_issues + result.get('issues', [])
 
 
 def _is_weekend() -> bool:
@@ -982,6 +1014,9 @@ def evaluate_health() -> Dict:
     backup_issues = _check_backup_offsite(hb)
     lane_registry_issues = _check_lane_registry()
     heartbeat_lock_issues = _check_heartbeat_lock_failures(now=now)
+    nav_recording = _nav_recording_observation(now=now)
+    nav_recording_issues = ([] if nav_recording["publication_status"] == "reported" else [
+        {"check": "nav_publication", "reason": nav_recording["reason"]}])
 
     return {
         'stale': stale,
@@ -1004,6 +1039,8 @@ def evaluate_health() -> Dict:
         'backup_issues': backup_issues,
         'lane_registry_issues': lane_registry_issues,
         'heartbeat_lock_issues': heartbeat_lock_issues,
+        'nav_recording': nav_recording,
+        'nav_recording_issues': nav_recording_issues,
     }
 
 
@@ -1084,6 +1121,7 @@ def _notification_report(report: dict) -> dict:
         # 要求しない ―― 監視の書込機構そのものが抑止された事実であり、他の
         # 'errors' と同じ扱い（無条件通知対象）にする。
         'heartbeat_lock_issues': report.get('heartbeat_lock_issues', []),
+        'nav_recording_issues': report.get('nav_recording_issues', []),
     }
 
 
@@ -1103,6 +1141,7 @@ def _notification_problem_count(report: dict) -> int:
         + len(report.get('backup_issues', []))
         + len(report.get('lane_registry_issues', []))
         + len(report.get('heartbeat_lock_issues', []))
+        + len(report.get('nav_recording_issues', []))
     )
 
 
@@ -1130,12 +1169,19 @@ def _notification_fingerprint(report: dict) -> str:
         'heartbeat_lock': sorted(
             (i.get('script'), i.get('reason')) for i in report.get('heartbeat_lock_issues', [])
         ),
+        # Do not fingerprint age/date: an ongoing incident must not defeat
+        # the existing cooldown simply because another day has passed.
+        'nav_recording': sorted(i.get('reason') for i in report.get('nav_recording_issues', [])),
     }
     return _json.dumps(payload, ensure_ascii=False, sort_keys=True)
 
 
 def _build_watchdog_message(report: dict) -> str:
     msg_lines = ['🚨 ALMANAC watchdog 重要アラート']
+    if report.get('nav_recording_issues'):
+        msg_lines.append('\n📊 NAV記録の確認不能（DD適格性とは別の監視）:')
+        for issue in report['nav_recording_issues']:
+            msg_lines.append(f"  • {issue.get('reason')}")
     if report.get('stale'):
         msg_lines.append('\n⏰ 主要ジョブ停止:')
         for s in report['stale'][:5]:
@@ -1247,6 +1293,7 @@ def run_check(notify: bool = True) -> int:
         + len(blocking_backup_issues)
         + len(report.get('lane_registry_issues', []))
         + len(report.get('heartbeat_lock_issues', []))
+        + len(report.get('nav_recording_issues', []))
     )
 
     notify_report = _notification_report(report)
@@ -1321,6 +1368,9 @@ def print_status() -> None:
     print('=== ALMANAC ヘルスチェック ===')
     print(f"OK: {len(report['ok'])} / stale: {len(report['stale'])} / errors: {len(report['errors'])}")
     print(f"FX: {'STALE' if report['fx_stale'] else 'fresh'} ({report['fx_age_hours']}h 前)")
+    nav = report.get('nav_recording', {})
+    print(f"NAV publication: {nav.get('publication_status', 'unknown')} / "
+          f"DD evidence: {nav.get('dd_evidence_status', 'unknown')} (回復許可ではありません)")
     print(f"schema_issues: {len(report.get('schema_issues', []))} / "
           f"parquet_stale: {len(report.get('parquet_stale', []))} / "
           f"price_sanity_issues: {len(report.get('price_sanity_issues', []))} / "
@@ -1355,6 +1405,7 @@ def print_status() -> None:
         'shadow_book_issues',
         'disk_space_issues',
         'backup_issues',
+        'nav_recording_issues',
     ):
         items = report.get(cat, [])
         if items:
