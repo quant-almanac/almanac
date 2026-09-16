@@ -1312,6 +1312,11 @@ def _build_execution_plan_view(plan: dict, board: list[dict], synthesis: dict, n
             "cash_at_or_below_tactical_target": "戦術現金を維持",
             "cash_target_unresolved": "現金目標を確認",
             "no_deployable_cash_authority": "現金権威を確認",
+            # 2026-09 F4: これらは「現金が確認できない」とは別の理由であり、
+            # フォールバック文言（今日の発注 0 件）へ潰さず区別して表示する。
+            "guard_blocks_new_deployment": "ガードが新規リスクを停止中",
+            "cash_evidence_unconfirmed": "現金証拠の鮮度・整合性を確認中",
+            "deployment_horizon_unresolved": "配備期間（レジーム判定）を確認中",
         }
         today_decision = {
             "code": first_no_action_code,

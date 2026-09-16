@@ -216,6 +216,7 @@ def test_check_decision_summary_conservation_accepts_ready_review_and_deferred(t
         "decision_summary": {
             "candidate_count": 4, "executable_count": 1, "review_count": 2,
             "filtered_count": 1, "deferred_count": 1,
+            "policy_accepted_count": 4, "policy_rejected_seed_count": 0,
             "count_conservation_ok": True,
         },
     }})
@@ -229,6 +230,7 @@ def test_check_decision_summary_conservation_flags_missing_readiness_and_bad_cou
         "decision_summary": {
             "candidate_count": 0, "executable_count": 0, "review_count": 0,
             "filtered_count": 0, "deferred_count": 0,
+            "policy_accepted_count": 1, "policy_rejected_seed_count": 0,
             "count_conservation_ok": False,
         },
     }})
@@ -237,6 +239,412 @@ def test_check_decision_summary_conservation_flags_missing_readiness_and_bad_cou
     assert {issue["code"] for issue in issues} == {
         "priority_action_readiness_missing", "decision_summary_count_mismatch",
     }
+
+
+# ── 2026-09 independent review, Finding 2 ──────────────────────────────────
+# check_decision_summary_conservation() independently recomputes
+# candidate_count from priority_actions + _filtered_actions +
+# order_intent_deferred_actions and compares it to decision_summary's own
+# candidate_count. _filtered_actions mixes the policy stage's rejects with
+# phase-1's own filtering, but candidate_count only counts the
+# policy-accepted input -- so this check false-flagged every healthy
+# analysis where the policy stage rejected anything. These tests exercise
+# the REAL producer (analyst._phase1_post_filter) through an actual JSON
+# round-trip, not a hand-built decision_summary, per the review's explicit
+# requirement not to trust a hardcoded producer output.
+
+def _silence_phase1_external_filters(monkeypatch):
+    """Duplicated from tests/test_capital_allocator.py's own helper; tests/
+    is not a package here, so this cannot be imported instead."""
+    import execution_readiness
+
+    import analyst
+
+    monkeypatch.setattr(analyst, "_load_recent_recommendations", lambda days=14: [])
+    monkeypatch.setattr(analyst, "_load_earnings_blackout", lambda within_business_days=5: set())
+    monkeypatch.setattr(analyst, "_done_set_by_direction", lambda days=7: set())
+    monkeypatch.setattr(analyst, "_recent_order_intents_by_direction", lambda days=7: {}, raising=False)
+    monkeypatch.setattr(analyst, "_order_state_conflicts_by_direction", lambda days=7: {}, raising=False)
+    monkeypatch.setattr(analyst, "_load_recent_executions", lambda days=14, now=None: [], raising=False)
+    monkeypatch.setattr(analyst, "_open_action_state_by_direction", lambda: {}, raising=False)
+    monkeypatch.setattr(analyst, "_load_tax_loss_harvest_tickers", lambda min_loss_jpy=30_000: set())
+    monkeypatch.setattr("behavioral_guard.is_rebalance_in_cooldown", lambda vix=None: (False, ""))
+    monkeypatch.setattr(
+        execution_readiness, "apply_execution_readiness",
+        lambda actions, **kwargs: [a.update({"execution_readiness": "ready",
+                                             "execution_block_reasons": []}) for a in actions] and actions,
+    )
+    monkeypatch.setattr("tunable_params.get", lambda key, default=None: (
+        False if key in ("disable_cumulative_recommendations", "disable_stop_loss_recommendations")
+        else default
+    ))
+
+
+def _buy(ticker: str, quantity: int, *, price: float = 355, fx: float = 159.452) -> dict:
+    estimated = round(quantity * price * fx)
+    return {
+        "ticker": ticker, "type": "add", "tier": "Long", "currency": "USD",
+        "quantity": quantity, "requested_buy_quantity": quantity, "decision_price": price,
+        "estimated_notional_jpy": estimated, "amount_hint": f"{quantity}株",
+        "action": f"{ticker}を{quantity}株、約¥{estimated:,}で買付",
+        "reason": f"{quantity}株を約¥{estimated:,}で通常買付",
+        "execution_readiness": "ready", "execution_owner": "owner_a",
+        "execution_broker": "broker_a", "execution_account": "特定", "confidence_pct": 70,
+    }
+
+
+def _run_real_producer_and_save(monkeypatch, tmp_path, synthesis: dict, *, portfolio_total=30_639_000) -> None:
+    """Real analyst._phase1_post_filter, then an actual JSON round-trip
+    through the same file post_run_verify reads -- not a hand-built
+    decision_summary."""
+    import analyst
+
+    monkeypatch.setattr(analyst, "BASE_DIR", tmp_path)
+    _silence_phase1_external_filters(monkeypatch)
+    analyst._phase1_post_filter(synthesis, portfolio_total, base_dir=tmp_path)
+    _write(tmp_path / "ai_portfolio_analysis.json", {"synthesis": synthesis})
+
+
+def test_real_policy_modification_is_not_counted_as_a_rejection(monkeypatch, tmp_path):
+    import policy_engine
+
+    def modify(action, context):
+        return "modify", {**action, "urgency": "low"}, "synthetic modification"
+
+    monkeypatch.setattr(policy_engine, "RULES", [modify])
+    decision = policy_engine.apply_policy_gate([_buy("SYNTH", 4)], policy_engine.PolicyContext())
+    assert len(decision.accepted) == len(decision.modified) == 1
+    assert decision.rejected == []
+    synthesis = {
+        "overall_stance": "neutral",
+        "priority_actions": decision.accepted,
+        "policy_filtered_actions": decision.rejected + decision.modified,
+    }
+    _run_real_producer_and_save(monkeypatch, tmp_path, synthesis)
+    assert synthesis["decision_summary"]["policy_rejected_seed_count"] == 0
+    assert prv.check_decision_summary_conservation(tmp_path) == []
+
+
+def test_real_producer_roundtrip_accepts_a_healthy_accept_and_reject_mix(monkeypatch, tmp_path):
+    """Finding 2, acceptance #1: policy-accepted + policy-rejected coexisting
+    must not false-flag once run through a real save/load round-trip."""
+    synthesis = {
+        "overall_stance": "neutral",
+        "priority_actions": [_buy("SYNTH_A", 4)],
+        "policy_filtered_actions": [{
+            "rule": "_rule_dd_stage", "reason": "loss_guard_stage=data_confidence_caution",
+            "action": _buy("SYNTH_B", 2),
+        }],
+    }
+    _run_real_producer_and_save(monkeypatch, tmp_path, synthesis)
+
+    assert prv.check_decision_summary_conservation(tmp_path) == []
+
+
+def test_real_producer_roundtrip_accepts_all_candidates_policy_rejected(monkeypatch, tmp_path):
+    """Finding 2, acceptance #2: the early-return producer path (0 accepted,
+    all rejected) must also round-trip clean."""
+    synthesis = {
+        "overall_stance": "neutral",
+        "priority_actions": [],
+        "policy_filtered_actions": [
+            {"rule": "_rule_dd_stage", "reason": "loss_guard_stage=stage_1", "action": _buy("SYNTH_A", 4)},
+            {"rule": "_rule_dd_stage", "reason": "loss_guard_stage=stage_1", "action": _buy("SYNTH_B", 2)},
+        ],
+    }
+    _run_real_producer_and_save(monkeypatch, tmp_path, synthesis)
+
+    assert prv.check_decision_summary_conservation(tmp_path) == []
+
+
+def test_real_producer_roundtrip_accepts_no_rejection_at_all(monkeypatch, tmp_path):
+    """Finding 2, acceptance #2: the ordinary case with no policy rejection
+    (policy_rejected_seed_count == 0) must still round-trip clean."""
+    synthesis = {
+        "overall_stance": "neutral",
+        "priority_actions": [_buy("SYNTH_A", 4)],
+    }
+    _run_real_producer_and_save(monkeypatch, tmp_path, synthesis)
+
+    assert prv.check_decision_summary_conservation(tmp_path) == []
+
+
+def test_real_producer_roundtrip_accepts_a_deferred_candidate(monkeypatch, tmp_path):
+    """Finding 2, acceptance #2: a deferred (too-small notional) candidate
+    alongside an accept+reject mix must still round-trip clean."""
+    synthesis = {
+        "overall_stance": "neutral",
+        "priority_actions": [_buy("SYNTH_A", 4), _buy("AAPL", 2, price=470)],  # AAPL: near-minimum notional -> deferred
+        "policy_filtered_actions": [{
+            "rule": "_rule_dd_stage", "reason": "loss_guard_stage=data_confidence_caution",
+            "action": _buy("SYNTH_B", 2),
+        }],
+    }
+    _run_real_producer_and_save(monkeypatch, tmp_path, synthesis)
+
+    saved = json.loads((tmp_path / "ai_portfolio_analysis.json").read_text(encoding="utf-8"))
+    assert saved["synthesis"]["decision_summary"]["deferred_count"] >= 1, "test setup must actually defer AAPL"
+    assert prv.check_decision_summary_conservation(tmp_path) == []
+
+
+def test_real_producer_roundtrip_detects_a_candidate_dropped_after_the_fact(monkeypatch, tmp_path):
+    """Finding 2, acceptance #3: tampering with the SAVED artifact by
+    dropping a kept candidate (without updating decision_summary) must be
+    caught -- via the executable_count/review_count fields that a pure drop
+    still perturbs, since candidate_count's own total is drop/replace-count
+    invariant by construction."""
+    synthesis = {
+        "overall_stance": "neutral",
+        "priority_actions": [_buy("SYNTH_A", 4)],
+        "policy_filtered_actions": [{
+            "rule": "_rule_dd_stage", "reason": "loss_guard_stage=data_confidence_caution",
+            "action": _buy("SYNTH_B", 2),
+        }],
+    }
+    _run_real_producer_and_save(monkeypatch, tmp_path, synthesis)
+    path = tmp_path / "ai_portfolio_analysis.json"
+    saved = json.loads(path.read_text(encoding="utf-8"))
+    assert saved["synthesis"]["priority_actions"], "test setup must have a kept candidate to drop"
+    saved["synthesis"]["priority_actions"] = []   # drop it; decision_summary is left stale
+    _write(path, saved)
+
+    issues = prv.check_decision_summary_conservation(tmp_path)
+    assert any(issue["code"] == "decision_summary_count_mismatch" for issue in issues)
+
+
+def test_real_producer_roundtrip_detects_a_duplicated_filtered_row(monkeypatch, tmp_path):
+    """Finding 2, acceptance #3: duplicating a row within the saved
+    _filtered_actions list must be caught via filtered_count."""
+    synthesis = {
+        "overall_stance": "neutral",
+        "priority_actions": [_buy("SYNTH_A", 4)],
+        "policy_filtered_actions": [{
+            "rule": "_rule_dd_stage", "reason": "loss_guard_stage=data_confidence_caution",
+            "action": _buy("SYNTH_B", 2),
+        }],
+    }
+    _run_real_producer_and_save(monkeypatch, tmp_path, synthesis)
+    path = tmp_path / "ai_portfolio_analysis.json"
+    saved = json.loads(path.read_text(encoding="utf-8"))
+    assert saved["synthesis"]["_filtered_actions"], "test setup must have a filtered candidate to duplicate"
+    saved["synthesis"]["_filtered_actions"] = saved["synthesis"]["_filtered_actions"] * 2
+    _write(path, saved)
+
+    issues = prv.check_decision_summary_conservation(tmp_path)
+    assert any(issue["code"] == "decision_summary_count_mismatch" for issue in issues)
+
+
+def test_real_producer_roundtrip_does_not_catch_a_same_status_substitution(monkeypatch, tmp_path):
+    """Honest limitation, not a regression: this checker only recomputes
+    AGGREGATE counts from the saved lists, so swapping one filtered
+    candidate for a different one that keeps every count identical is
+    invisible to it. Catching that would need a persisted per-candidate
+    identity in the artifact, which is a new shared-contract addition beyond
+    this bug fix's scope (flagged in the handoff report, not implemented
+    here). This test documents the gap rather than silently leaving it
+    unstated."""
+    synthesis = {
+        "overall_stance": "neutral",
+        "priority_actions": [_buy("SYNTH_A", 4)],
+        "policy_filtered_actions": [{
+            "rule": "_rule_dd_stage", "reason": "loss_guard_stage=data_confidence_caution",
+            "action": _buy("SYNTH_B", 2),
+        }],
+    }
+    _run_real_producer_and_save(monkeypatch, tmp_path, synthesis)
+    path = tmp_path / "ai_portfolio_analysis.json"
+    saved = json.loads(path.read_text(encoding="utf-8"))
+    assert saved["synthesis"]["_filtered_actions"][0]["ticker"] == "SYNTH_B"
+    saved["synthesis"]["_filtered_actions"][0] = {
+        **saved["synthesis"]["_filtered_actions"][0], "ticker": "NVDA",
+    }
+    _write(path, saved)
+
+    assert prv.check_decision_summary_conservation(tmp_path) == []
+
+
+def test_real_producer_roundtrip_detects_summary_only_tampering(monkeypatch, tmp_path):
+    """Finding 2, acceptance #4: corrupting decision_summary alone (without
+    touching the underlying lists) must still be caught."""
+    synthesis = {
+        "overall_stance": "neutral",
+        "priority_actions": [_buy("SYNTH_A", 4)],
+    }
+    _run_real_producer_and_save(monkeypatch, tmp_path, synthesis)
+    path = tmp_path / "ai_portfolio_analysis.json"
+    saved = json.loads(path.read_text(encoding="utf-8"))
+    saved["synthesis"]["decision_summary"]["count_conservation_ok"] = True
+    saved["synthesis"]["decision_summary"]["policy_accepted_count"] = 99
+    _write(path, saved)
+
+    issues = prv.check_decision_summary_conservation(tmp_path)
+    assert any(issue["code"] == "decision_summary_count_mismatch" for issue in issues)
+
+
+def test_real_producer_roundtrip_trusts_a_producer_reported_false_even_when_arithmetic_balances(monkeypatch, tmp_path):
+    """The producer's own count_conservation_ok can legitimately be False
+    even when every persisted count still adds up: it also reflects the
+    same-side semantic checks and the row-id conservation check, neither of
+    which this file can independently re-derive from a persisted artifact
+    (the per-row provenance id is intentionally never persisted). A
+    scope-usable artifact must not silently drop that producer-reported
+    signal just because the arithmetic alone looks fine."""
+    synthesis = {
+        "overall_stance": "neutral",
+        "priority_actions": [_buy("SYNTH_A", 4)],
+    }
+    _run_real_producer_and_save(monkeypatch, tmp_path, synthesis)
+    path = tmp_path / "ai_portfolio_analysis.json"
+    saved = json.loads(path.read_text(encoding="utf-8"))
+    ds = saved["synthesis"]["decision_summary"]
+    assert ds["count_conservation_ok"] is True, "test setup must start from a healthy, arithmetically-balanced artifact"
+    ds["count_conservation_ok"] = False   # only this changes; every count is left untouched
+    _write(path, saved)
+
+    issues = prv.check_decision_summary_conservation(tmp_path)
+    assert any(issue["code"] == "decision_summary_count_mismatch" for issue in issues)
+    mismatch = next(i for i in issues if i["code"] == "decision_summary_count_mismatch")
+    assert mismatch["context"]["mismatches"] == {}, "the arithmetic itself must still look balanced"
+
+
+def test_legacy_artifact_without_seed_count_is_unverifiable_not_confirmed_either_way(tmp_path):
+    """Finding 2, acceptance #5: an artifact saved before
+    policy_accepted_count/policy_rejected_seed_count existed must be labeled
+    unverifiable, and that label must be distinct from both 'confirmed
+    healthy' and 'confirmed broken' -- never promoted to verified without
+    grounds, and never treated as a confirmed error either, since the
+    pre-fix producer's own count_conservation_ok was itself known to
+    false-flag healthy runs."""
+    _write(tmp_path / "ai_portfolio_analysis.json", {"synthesis": {
+        "priority_actions": [{"ticker": "SYNTH_A", "type": "add", "execution_readiness": "ready"}],
+        "_filtered_actions": [{"ticker": "SYNTH_B", "type": "add"}],
+        "decision_summary": {
+            # No policy_accepted_count/policy_rejected_seed_count keys at
+            # all -- pre-Finding-2 shape.
+            "candidate_count": 1, "executable_count": 1, "review_count": 0,
+            "filtered_count": 1, "deferred_count": 0,
+            "count_conservation_ok": False,  # the historically-unreliable claim
+        },
+    }})
+
+    issues = prv.check_decision_summary_conservation(tmp_path)
+    codes = {issue["code"] for issue in issues}
+    assert "decision_summary_conservation_unverifiable_legacy_format" in codes
+    assert "decision_summary_count_mismatch" not in codes
+    unverifiable = next(i for i in issues if i["code"] == "decision_summary_conservation_unverifiable_legacy_format")
+    assert unverifiable["severity"] == "warning"
+
+
+# ── 2026-09-16 Codex re-review of Finding 2 (P2) ───────────────────────────
+# A present-but-invalid scope field pair was being folded into the same
+# "unverifiable legacy format" warning as a genuinely absent one, silently
+# dropping the producer's own count_conservation_ok=False report. A
+# corrupted MODERN-format artifact is a confirmed defect, not an open
+# question, and must surface as an error even when every other field looks
+# fine.
+
+def test_real_producer_roundtrip_detects_an_invalid_seed_count_as_an_error_not_legacy(monkeypatch, tmp_path):
+    """The exact repro Codex used: start from a healthy, modern-format
+    artifact and corrupt policy_rejected_seed_count to a negative value
+    while also reporting count_conservation_ok=False. Both fields are
+    PRESENT (one valid, one not) -- this must not be downgraded to the
+    legacy-format warning, and the producer's False must not be dropped."""
+    synthesis = {
+        "overall_stance": "neutral",
+        "priority_actions": [_buy("SYNTH_A", 4)],
+        "policy_filtered_actions": [{
+            "rule": "_rule_dd_stage", "reason": "loss_guard_stage=data_confidence_caution",
+            "action": _buy("SYNTH_B", 2),
+        }],
+    }
+    _run_real_producer_and_save(monkeypatch, tmp_path, synthesis)
+    path = tmp_path / "ai_portfolio_analysis.json"
+    saved = json.loads(path.read_text(encoding="utf-8"))
+    assert saved["synthesis"]["decision_summary"]["policy_accepted_count"] == 1, "test setup sanity check"
+    saved["synthesis"]["decision_summary"]["policy_rejected_seed_count"] = -1
+    saved["synthesis"]["decision_summary"]["count_conservation_ok"] = False
+    _write(path, saved)
+
+    issues = prv.check_decision_summary_conservation(tmp_path)
+    codes = {issue["code"] for issue in issues}
+    assert "decision_summary_conservation_unverifiable_legacy_format" not in codes
+    assert "decision_summary_scope_fields_invalid" in codes
+    invalid = next(i for i in issues if i["code"] == "decision_summary_scope_fields_invalid")
+    assert invalid["severity"] == "error"
+    assert invalid["context"]["count_conservation_ok"] is False
+
+
+def test_partial_scope_fields_is_treated_as_invalid_not_legacy(tmp_path):
+    """Only one of the two paired fields present is not the shape any real
+    producer (old or new) writes -- treat it the same as a corrupted
+    modern-format artifact (error), not as a genuinely old one (warning)."""
+    _write(tmp_path / "ai_portfolio_analysis.json", {"synthesis": {
+        "priority_actions": [{"ticker": "SYNTH_A", "type": "add", "execution_readiness": "ready"}],
+        "decision_summary": {
+            "candidate_count": 1, "executable_count": 1, "review_count": 0,
+            "filtered_count": 0, "deferred_count": 0,
+            "policy_accepted_count": 1,   # present
+            # policy_rejected_seed_count: absent
+            "count_conservation_ok": True,
+        },
+    }})
+
+    issues = prv.check_decision_summary_conservation(tmp_path)
+    codes = {issue["code"] for issue in issues}
+    assert "decision_summary_scope_fields_invalid" in codes
+    assert "decision_summary_conservation_unverifiable_legacy_format" not in codes
+
+
+def test_real_producer_roundtrip_detects_a_same_total_accept_reject_swap(monkeypatch, tmp_path):
+    """Codex's second undetected case: policy_accepted_count/
+    policy_rejected_seed_count changed from the true 1/1 to a self-consistent
+    2/0 (same sum, so the total-conservation law alone cannot catch it).
+    The independent cross-check against the separately-persisted
+    policy_filtered_actions list (untouched by the tamper) must catch it."""
+    synthesis = {
+        "overall_stance": "neutral",
+        "priority_actions": [_buy("SYNTH_A", 4)],
+        "policy_filtered_actions": [{
+            "rule": "_rule_dd_stage", "reason": "loss_guard_stage=data_confidence_caution",
+            "action": _buy("SYNTH_B", 2),
+        }],
+    }
+    _run_real_producer_and_save(monkeypatch, tmp_path, synthesis)
+    path = tmp_path / "ai_portfolio_analysis.json"
+    saved = json.loads(path.read_text(encoding="utf-8"))
+    ds = saved["synthesis"]["decision_summary"]
+    assert (ds["policy_accepted_count"], ds["policy_rejected_seed_count"]) == (1, 1), "test setup sanity check"
+    ds["policy_accepted_count"] = 2
+    ds["policy_rejected_seed_count"] = 0
+    ds["candidate_count"] = 2   # kept self-consistent with the tampered accepted count
+    _write(path, saved)
+
+    issues = prv.check_decision_summary_conservation(tmp_path)
+    assert any(issue["code"] == "decision_summary_count_mismatch" for issue in issues)
+    mismatch = next(i for i in issues if i["code"] == "decision_summary_count_mismatch")
+    assert "policy_rejected_seed_count" in mismatch["context"]["mismatches"]
+    assert "candidate_total" not in mismatch["context"]["mismatches"], "the total alone must still look balanced"
+
+
+def test_real_producer_roundtrip_detects_candidate_count_tampered_alone(monkeypatch, tmp_path):
+    """Codex's third undetected case: candidate_count changed to an
+    unrelated value (999) while policy_accepted_count/
+    policy_rejected_seed_count (the fields this file actually derives
+    conservation from) are left correct."""
+    synthesis = {
+        "overall_stance": "neutral",
+        "priority_actions": [_buy("SYNTH_A", 4)],
+    }
+    _run_real_producer_and_save(monkeypatch, tmp_path, synthesis)
+    path = tmp_path / "ai_portfolio_analysis.json"
+    saved = json.loads(path.read_text(encoding="utf-8"))
+    saved["synthesis"]["decision_summary"]["candidate_count"] = 999
+    _write(path, saved)
+
+    issues = prv.check_decision_summary_conservation(tmp_path)
+    assert any(issue["code"] == "decision_summary_count_mismatch" for issue in issues)
+    mismatch = next(i for i in issues if i["code"] == "decision_summary_count_mismatch")
+    assert mismatch["context"]["mismatches"]["candidate_count"] == {"stored": 999, "actual": 1}
 
 
 def test_check_action_stage_executed_alignment_flags_orphan_stage_rows(tmp_path):

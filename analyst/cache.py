@@ -60,6 +60,9 @@ def load_json(path: Path, default=None):
 
 def save_cache(data: dict) -> None:
     """分析結果をキャッシュに保存し、履歴サマリーを追記する"""
+    from candidate_output_audit import seal_for_save
+
+    data = seal_for_save(data)
     with process_lock("ai_analysis_cache", timeout=30.0):
         hist = load_json(HISTORY_PATH, {"history": []})
         # 後方互換: 旧形式 (list) も dict も両方受け入れる。

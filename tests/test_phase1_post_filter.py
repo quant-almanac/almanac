@@ -2974,7 +2974,12 @@ def test_replay_2026_07_13_separates_state_review_near_minimum_and_true_filters(
             "stale_order_requires_confirmation": 1,
             "near_minimum_notional": 1,
         },
+        "policy_accepted_count": 4,
+        "policy_rejected_seed_count": 0,
         "count_conservation_ok": True,
+        # 2026-09 F8: identity-based reconciliation of the policy -> phase-1
+        # handoff, alongside the (here unaffected) count check above.
+        "candidate_identity_reconciliation": {"ok": True, "reasons": []},
     }
 
 

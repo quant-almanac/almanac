@@ -6,6 +6,8 @@ This is an ownership map, not a claim that every file is live. The lifecycle col
 
 <!-- ROOT_MODULES_START -->
 
+Saved-output audit: `candidate_output_audit.py` binds final candidate content to a host-generated digest manifest; it does not grant execution authority or authenticate an issuer.
+
 ## 1. Entrypoints, user interfaces and operations
 
 | Lifecycle | Modules | Boundary |

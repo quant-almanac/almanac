@@ -1,6 +1,8 @@
 from datetime import datetime
 import os
 
+import pytest
+
 from api.routes import today
 import portfolio_manager
 
@@ -644,6 +646,61 @@ def test_execution_plan_view_surfaces_surplus_cash_pacing_reason() -> None:
     assert view["budgets"]["deployment_months"] == 3
     assert view["budgets"]["deployment_regime_label"] == "mild_bull"
     assert view["budgets"]["surplus_cash_monthly_capacity_jpy"] == 700_000
+
+
+# --------------------------------------------------------------------------
+# F4 (2026-09 objective readiness review): the Today API must label the new
+# structured reason codes distinctly, never fold them into a generic
+# "no action" phrasing that reads like the cash was the problem, and never
+# describe an unrecognised code as success/available.
+# --------------------------------------------------------------------------
+
+def _plan_with_reason(reason_code: str, message: str) -> dict:
+    return {
+        "budgets": {"confirmed_cash_jpy": 9_000_000, "surplus_cash_above_targets_jpy": 5_400_000,
+                   "deployment_multiplier": 0.0},
+        "consumption_summary": {"remaining_normal_jpy": 0, "remaining_opportunity_jpy": 0},
+        "items": [],
+        "warnings": [],
+        "no_action_rationale": [{"reason_code": reason_code, "message": message}],
+    }
+
+
+def test_guard_stop_reason_code_gets_its_own_label_not_the_cash_one():
+    view = today._build_execution_plan_view(
+        _plan_with_reason("guard_blocks_new_deployment", "損失ガードが停止しています。"),
+        board=[], synthesis={}, now=datetime(2026, 7, 30, 8, 0, 0),
+    )
+    assert view["today_decision"]["code"] == "guard_blocks_new_deployment"
+    assert view["today_decision"]["label"] == "ガードが新規リスクを停止中"
+    assert view["today_decision"]["label"] != "現金権威を確認"
+    # The confirmed cash figure passed through to the view is untouched.
+    assert view["budgets"]["confirmed_cash_jpy"] == 9_000_000
+
+
+@pytest.mark.parametrize("reason_code,label", [
+    ("cash_evidence_unconfirmed", "現金証拠の鮮度・整合性を確認中"),
+    ("deployment_horizon_unresolved", "配備期間（レジーム判定）を確認中"),
+])
+def test_other_f4_reason_codes_get_distinct_labels(reason_code, label):
+    view = today._build_execution_plan_view(
+        _plan_with_reason(reason_code, "message"), board=[], synthesis={},
+        now=datetime(2026, 7, 30, 8, 0, 0),
+    )
+    assert view["today_decision"]["code"] == reason_code
+    assert view["today_decision"]["label"] == label
+
+
+def test_an_unknown_reason_code_falls_back_to_a_neutral_label_never_success():
+    view = today._build_execution_plan_view(
+        _plan_with_reason("some_future_reason_code_not_yet_labelled", "message"),
+        board=[], synthesis={}, now=datetime(2026, 7, 30, 8, 0, 0),
+    )
+    assert view["today_decision"]["code"] == "some_future_reason_code_not_yet_labelled"
+    label = view["today_decision"]["label"]
+    assert label == "今日の発注 0 件"
+    for forbidden in ("成功", "利用可能", "available", "success", "ready", "OK", "完了"):
+        assert forbidden not in label
 
 
 def test_build_execution_plan_view_reports_missing_state():

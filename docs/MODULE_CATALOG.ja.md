@@ -6,6 +6,8 @@
 
 <!-- ROOT_MODULES_START -->
 
+保存出力監査: `candidate_output_audit.py` は最終候補をホスト生成のdigest manifestへ束縛します。発注権限や発行者の真正性は保証しません。
+
 ## 1. Entry point・UI・運用
 
 | Lifecycle | Modules | 境界 |

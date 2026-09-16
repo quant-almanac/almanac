@@ -120,12 +120,21 @@ def test_invalid_source_cannot_look_like_an_empty_analysis(raw):
         obs.summarize_analysis_bytes(raw)
 
 
+def _assert_saved_analysis_unchanged_except_host_manifest(paths, expected):
+    from candidate_output_audit import KEY, verify_manifest
+
+    saved = json.loads(paths.read_bytes())
+    assert verify_manifest(saved) == "verified"
+    saved.pop(KEY)
+    assert saved == expected
+
+
 def test_real_cache_save_publishes_bound_sidecar_without_changing_analysis(paths):
     data = payload()
     before = deepcopy(data)
     cache.save_cache(data)
     assert data == before
-    assert json.loads(paths.read_bytes()) == before
+    _assert_saved_analysis_unchanged_except_host_manifest(paths, before)
     report = obs.read_current_observation(paths)
     assert report["status"] == "reported"
     assert report["analysis_id"] == "synthetic-run"
@@ -154,7 +163,7 @@ def test_observer_failure_does_not_stop_cache_or_history(paths, monkeypatch, cap
         raise OSError("SYNTH_PRIVATE_PATH")
     monkeypatch.setattr(obs, "publish_saved_analysis", fail)
     cache.save_cache(payload())
-    assert json.loads(paths.read_bytes()) == payload()
+    _assert_saved_analysis_unchanged_except_host_manifest(paths, payload())
     assert len(json.loads(cache.HISTORY_PATH.read_bytes())["history"]) == 1
     assert "SYNTH_PRIVATE_PATH" not in capsys.readouterr().out
     assert obs.read_current_observation(paths)["status"] == "unavailable"
@@ -166,7 +175,7 @@ def test_actual_artifact_write_failure_preserves_formal_result(paths, monkeypatc
     monkeypatch.setattr(utils, "atomic_write_json", fail)
     # cache has the original imported writer; only the observer uses this one.
     cache.save_cache(payload())
-    assert json.loads(paths.read_bytes()) == payload()
+    _assert_saved_analysis_unchanged_except_host_manifest(paths, payload())
     assert cache.HISTORY_PATH.exists()
     assert obs.read_current_observation(paths)["status"] == "unavailable"
 

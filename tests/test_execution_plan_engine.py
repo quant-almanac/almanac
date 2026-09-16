@@ -1281,6 +1281,114 @@ def test_confirmed_cash_without_tactical_target_fails_closed() -> None:
     assert "scheduled_contributions_excluded_from_discretionary_budget" in plan["warnings"]
 
 
+# --------------------------------------------------------------------------
+# F4 (2026-09 objective readiness review): a confirmed, fully-resolved cash
+# surplus that a guard stop zeroes must not be reported as unconfirmed cash
+# authority.  These tests hold the params/account/regime fixed and only vary
+# ``guard``, so any difference in the reported reason is attributable to the
+# guard input alone.
+# --------------------------------------------------------------------------
+
+_F4_PARAMS = {
+    "default_monthly_budget_jpy": 300_000,
+    "cash_deploy_pct": 0.05,
+    "max_monthly_budget_jpy": 700_000,
+    "weekly_normal_budget_pct": 0.70,
+    "opportunity_reserve_pct": 0.25,
+    "max_single_normal_jpy": 250_000,
+    "max_single_opportunity_jpy": 300_000,
+    "max_single_action_pct_of_portfolio": 0.05,
+    "cash_stale_hours": 72,
+    "monthly_discretionary_budget_jpy": 0,
+}
+_F4_ACCOUNT = {
+    "balance": 9_000_000, "usd_balance": 0, "fx_rate_usdjpy": 150,
+    "last_updated": "2026-07-10T07:00:00",
+}
+_F4_REGIME = {"policy": {"cash_target_pct": 7.0, "portfolio_level": 0}}
+
+
+def _f4_plan(guard):
+    return epe.build_execution_plan(
+        account=_F4_ACCOUNT, guard=guard, rebalance_report={}, bottom_fishing={},
+        nisa={}, action_state={"actions": {}}, executions={"executions": []},
+        params=_F4_PARAMS, now=datetime(2026, 7, 10, 7, 30),
+        market_regime=_F4_REGIME, contribution_occurrences=[],
+    )
+
+
+@pytest.mark.parametrize("guard", [
+    {"portfolio_value": 30_000_000, "new_entry_allowed": False, "trading_allowed": True,
+     "loss_guard_stage": "data_confidence_caution"},
+    {"portfolio_value": 30_000_000, "new_entry_allowed": True, "trading_allowed": False},
+    {"portfolio_value": 30_000_000, "new_entry_allowed": True, "trading_allowed": True,
+     "guardrail_stage": 3},
+    {"portfolio_value": 30_000_000, "new_entry_allowed": True, "trading_allowed": True,
+     "loss_guard_stage": "stage_3"},
+])
+def test_guard_stop_is_not_mislabeled_as_unconfirmed_cash_authority(guard) -> None:
+    plan = _f4_plan(guard)
+    budgets = plan["budgets"]
+
+    # The confirmed, resolved surplus is unaffected by the guard-block fix:
+    # it was real money before the fix and remains exactly the same number.
+    assert budgets["confirmed_cash_jpy"] == 9_000_000
+    assert budgets["cash_target_pct"] == 7.0
+    assert budgets["surplus_cash_above_targets_jpy"] == 5_400_000
+    # The gate itself -- whether new deployment is allowed -- is unchanged.
+    assert budgets["deployment_multiplier"] == 0.0
+    assert budgets["monthly_discretionary_budget_jpy"] == 0
+    assert budgets["normal_pool_available_jpy"] == 0
+    assert plan["items"] == []
+
+    codes = [row["reason_code"] for row in plan["no_action_rationale"]]
+    assert codes[0] == "guard_blocks_new_deployment"
+    assert "no_deployable_cash_authority" not in codes
+    assert "cash_at_or_below_tactical_target" not in codes
+
+
+@pytest.mark.parametrize("guard", [
+    None,
+    {},
+    {"portfolio_value": 30_000_000, "new_entry_allowed": True, "trading_allowed": True,
+     "loss_guard_stage": "ok"},
+])
+def test_non_blocking_guard_never_reports_a_guard_stop(guard) -> None:
+    """Negative control: None, missing keys, and an explicit ok must not fire."""
+    plan = _f4_plan(guard)
+    codes = [row["reason_code"] for row in plan["no_action_rationale"]]
+    assert "guard_blocks_new_deployment" not in codes
+    assert plan["budgets"]["deployment_multiplier"] == 1.0
+
+
+def test_a_real_cash_shortfall_is_still_reported_when_guard_does_not_block() -> None:
+    """Negative control: fixing the guard mislabel must not mask a real breach."""
+    plan = _f4_plan({"portfolio_value": 200_000_000, "new_entry_allowed": True,
+                     "trading_allowed": True})
+    assert plan["budgets"]["surplus_cash_above_targets_jpy"] == 0
+    codes = [row["reason_code"] for row in plan["no_action_rationale"]]
+    assert codes[0] == "cash_at_or_below_tactical_target"
+    assert "guard_blocks_new_deployment" not in codes
+
+
+def test_guard_stop_and_unresolved_target_are_both_kept_when_both_apply() -> None:
+    """Two independent causes at once: neither is dropped for the other."""
+    plan = epe.build_execution_plan(
+        account=_F4_ACCOUNT,
+        guard={"portfolio_value": 30_000_000, "new_entry_allowed": False,
+              "trading_allowed": True},
+        rebalance_report={}, bottom_fishing={}, nisa={}, action_state={"actions": {}},
+        executions={"executions": []}, params=_F4_PARAMS,
+        now=datetime(2026, 7, 10, 7, 30),
+        market_regime=None,          # cash target cannot resolve at all
+        contribution_occurrences=[],
+    )
+    codes = [row["reason_code"] for row in plan["no_action_rationale"]]
+    assert "cash_target_unresolved" in codes
+    assert "guard_blocks_new_deployment" in codes
+    assert plan["budgets"]["deployment_multiplier"] == 0.0
+
+
 def test_confirmed_surplus_cash_creates_paced_monthly_budget() -> None:
     plan = epe.build_execution_plan(
         account={

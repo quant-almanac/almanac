@@ -487,6 +487,15 @@ def derive_budgets(
     so they must not enlarge ALMANAC's discretionary pool.
     """
     warnings: list[str] = []
+    # Structured, machine-checkable record of *why* no new deployment budget
+    # was created.  ``warnings`` above is free text for logs; this list is
+    # what the caller's no-action rationale actually attributes the stop to.
+    # It is appended to at the exact site each condition is detected, never
+    # reconstructed afterwards from other budget numbers -- reconstructing it
+    # from ``surplus_cash_above_targets_jpy`` is what let a guard stop get
+    # mislabeled as "cash authority unknown" even though the surplus figure
+    # computed here was positive and fully resolved (2026-09 review, F4).
+    deployment_block_reasons: list[dict[str, str]] = []
     contribution_summary = contribution_summary if isinstance(contribution_summary, dict) else {}
     explicit_monthly = _jpy(params.get("monthly_discretionary_budget_jpy"))
     monthly_consumption = (
@@ -603,8 +612,19 @@ def derive_budgets(
                 "cash_target_unresolved: confirmed cash not converted into deployment budget"
                 f" ({_why})"
             )
+            deployment_block_reasons.append({
+                "reason_code": "cash_target_unresolved",
+                "message": (
+                    "相場別の戦術現金目標を確定できないため、新規配備枠を作成しません。"
+                    f"（理由: {_why}）"
+                ),
+            })
         elif not deployment_horizon.get("resolved"):
             warnings.append("deployment_horizon_unresolved: ordinary deployment budget disabled")
+            deployment_block_reasons.append({
+                "reason_code": "deployment_horizon_unresolved",
+                "message": "レジーム別の配備期間を確定できないため、新規配備枠を作成しません。",
+            })
         else:
             surplus_cash = max(0, confirmed_cash - required_reserve)
             ordinary_deployable_surplus = max(0, deployment_basis_cash - required_reserve)
@@ -635,6 +655,10 @@ def derive_budgets(
                 )
     elif all_cash_is_surplus:
         warnings.append("cash_authority_unresolved: confirmed cash not converted into deployment budget")
+        deployment_block_reasons.append({
+            "reason_code": "cash_evidence_unconfirmed",
+            "message": "確認済み現金の証拠（鮮度・整合性）が固まっていないため、新規配備枠を作成しません。",
+        })
 
     base_monthly = max(explicit_monthly, surplus_monthly_capacity)
     released_normal = _jpy(contribution_summary.get("released_this_month_normal_jpy"))
@@ -653,6 +677,23 @@ def derive_budgets(
     if _guard_blocks_new_deployment(guard):
         deployment_multiplier = 0.0
         warnings.append("budget_guard_block: trading/new entry guard blocks normal deployment")
+        # This fires independently of whether cash/target resolution above
+        # succeeded -- a confirmed, fully-resolved surplus is still zeroed
+        # here, and the caller must not describe that as unconfirmed cash.
+        _guard_stage = str((guard or {}).get("loss_guard_stage") or "").strip()
+        _guard_reason = str((guard or {}).get("loss_guard_reason_code") or "").strip()
+        _guard_detail = "；".join(
+            filter(None, [f"loss_guard_stage={_guard_stage}" if _guard_stage else "",
+                         f"reason_code={_guard_reason}" if _guard_reason else ""])
+        )
+        deployment_block_reasons.append({
+            "reason_code": "guard_blocks_new_deployment",
+            "message": (
+                "損失ガードまたは新規エントリー停止フラグが新規リスクの配備を停止しています。"
+                "確認済み現金の有無・金額はこの停止と無関係です。"
+                + (f"（{_guard_detail}）" if _guard_detail else "")
+            ),
+        })
     base_monthly = _jpy(base_monthly * deployment_multiplier)
     released_normal = _jpy(released_normal * deployment_multiplier)
     released_opportunity = _jpy(released_opportunity * deployment_multiplier)
@@ -689,6 +730,7 @@ def derive_budgets(
         "max_single_opportunity_action_jpy": max_single_opp,
         "h2_hard_cap_jpy": h2_hard_cap,
         "deployment_multiplier": deployment_multiplier,
+        "deployment_block_reasons": deployment_block_reasons,
         "budget_source": budget_source,
         "all_system_cash_is_surplus": all_cash_is_surplus,
         "confirmed_cash_jpy": confirmed_cash,
@@ -2743,40 +2785,52 @@ def build_execution_plan(
         )
     rationale = no_action_rationale(items, consumption_summary)
     if normal_pool <= 0 and opportunity_pool <= 0:
-        if (
+        # Reasons actually recorded where each condition was detected (guard
+        # stop, unresolved target/horizon/evidence) always take precedence
+        # over the generic fallbacks below, and all of them are kept when more
+        # than one applies -- a single ``elif`` chain here previously forced
+        # one guess from budget numbers alone, which could not distinguish a
+        # confirmed-but-blocked surplus from a genuinely unconfirmed one (F4).
+        structured_reasons = [
+            dict(reason) for reason in (budgets.get("deployment_block_reasons") or [])
+            if isinstance(reason, dict) and reason.get("reason_code")
+        ]
+        if structured_reasons:
+            funding_reasons = structured_reasons
+        elif (
             _jpy(budgets.get("monthly_discretionary_budget_jpy")) > 0
             and base_consumed >= _jpy(budgets.get("monthly_discretionary_budget_jpy"))
         ):
-            funding_reason = {
+            funding_reasons = [{
                 "reason_code": "monthly_surplus_deployment_budget_consumed",
                 "message": (
                     "確認済み余剰現金はありますが、今月の配備ペース上限を"
                     "既存の買付で消化済みです。翌月に自動で再計算します。"
                 ),
-            }
+            }]
         elif budgets.get("cash_target_pct") is None:
             # 「確定できない」だけでは、レジーム判定が古いのか当日保留なのかが
             # 読めない。切り分けに要る理由コードをそのまま出す。
             _unresolved = budgets.get("cash_target_unresolved_reasons") or []
             _detail = f"（理由: {', '.join(_unresolved)}）" if _unresolved else ""
-            funding_reason = {
+            funding_reasons = [{
                 "reason_code": "cash_target_unresolved",
                 "message": (
                     "相場別の戦術現金目標を確定できないため、新規配備枠を作成しません。"
                     + _detail
                 ),
-            }
+            }]
         elif _jpy(budgets.get("surplus_cash_above_targets_jpy")) <= 0:
-            funding_reason = {
+            funding_reasons = [{
                 "reason_code": "cash_at_or_below_tactical_target",
                 "message": "確認済み現金は相場別の戦術現金目標以下のため、新規配備枠はありません。",
-            }
+            }]
         else:
-            funding_reason = {
+            funding_reasons = [{
                 "reason_code": "no_deployable_cash_authority",
                 "message": "確認済みで利用可能な余剰現金を確定できないため、新規配備枠を作成しません。",
-            }
-        rationale = [funding_reason] + rationale
+            }]
+        rationale = funding_reasons + rationale
     return {
         "schema_version": SCHEMA_VERSION,
         "as_of": now.astimezone().isoformat(timespec="seconds"),

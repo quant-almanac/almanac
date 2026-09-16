@@ -7930,6 +7930,170 @@ def _execution_plan_action_cap_jpy(action: dict, execution_plan: dict | None) ->
     return value if math.isfinite(value) and value > 0 else None
 
 
+def _tag_phase1_row_ids(rows: list, *, prefix: str) -> None:
+    """Stamp a stable, pre-normalization provenance id on each candidate row.
+
+    Phase 1 legitimately rewrites ``type`` (buy->add), and legitimately fills
+    in ``execution_account``/``execution_owner``/``execution_broker`` from
+    holdings/NISA-routing lookups (``_bind_action_to_holding``,
+    ``_normalize_entry_action_against_holdings``, ``enrich_action_routing``,
+    ...).  Every one of those call sites rewrites its action via
+    ``dict(action)`` (copy-and-override) or in-place mutation -- never a
+    from-scratch dict literal -- so a key stamped here on the *original*
+    object survives unchanged through any of them.  That is what makes this
+    id usable as a conservation key where the semantic
+    ``(ticker, type, owner, broker, account)`` identity is not: the semantic
+    identity is expected to *change* across exactly these normalizations, so
+    comparing it across the pre/post-Phase-1 boundary manufactures false
+    mismatches on entirely healthy input (2026-09 independent review,
+    Finding 1). This tag is purely a same-call bookkeeping device: a single
+    recursive sweep over the whole ``synthesis`` object (see
+    ``_strip_phase1_row_ids_recursive``, run once immediately before Phase 1
+    returns) removes it from every row -- including any copy made anywhere
+    along the way, not just the main output buckets -- so it never reaches
+    logs or any persisted artifact.
+    """
+    for i, row in enumerate(rows):
+        if isinstance(row, dict):
+            row["_phase1_row_id"] = f"{prefix}#{i}"
+
+
+def _strip_phase1_row_ids_recursive(value: object) -> None:
+    """Remove the internal ``_phase1_row_id`` tag from every dict reachable
+    from ``value`` through nested lists/dicts.
+
+    Applied once, to the whole ``synthesis`` object, immediately before
+    phase-1 returns -- not to each output bucket (``kept``/``filtered``/
+    ``deferred``/``annotated``) individually. A per-bucket strip run partway
+    through the function is blind to any *later* code that copies a still-
+    tagged action dict into a new key: ``synthesis["suppressed_reproposals"]
+    = [dict(a) for a in reproposal_suppressed]`` does exactly this, via
+    ``_suppress_repeated_candidate_failures``, and kept its own untouched
+    copy of the tag even after ``kept``/``filtered`` were stripped (2026-09
+    independent review, Finding 3). Sweeping the fully-built ``synthesis``
+    at the very end, once, is correct regardless of how many such copies
+    exist or where in the function they were made.
+    """
+    if isinstance(value, dict):
+        value.pop("_phase1_row_id", None)
+        for v in value.values():
+            _strip_phase1_row_ids_recursive(v)
+    elif isinstance(value, list):
+        for item in value:
+            _strip_phase1_row_ids_recursive(item)
+
+
+def _reconcile_candidate_identities(
+    *, actions: list, policy_rejected_rows: list, kept: list,
+    own_filtered: list, deferred: list,
+) -> tuple[bool, list[str]]:
+    """Cross-check the policy -> phase-1 handoff, split by where each
+    comparison is actually safe (2026-09 independent review, Finding 1).
+
+    Three independent checks, deliberately not conflated:
+
+    1. Same-side semantic checks, on ``actions`` (policy-accepted) and
+       ``policy_rejected_rows`` (policy-rejected) exactly as the policy stage
+       produced them -- *before* phase-1 has touched either. Comparing
+       semantic ``(ticker, type, owner, broker, account)`` identity here is
+       safe because neither side has been normalized yet: a duplicate within
+       one side, or an overlap between the two sides, is a genuine
+       policy-stage anomaly that phase-1's own rewrites could not cause.
+    2. Provenance conservation: every row the policy stage accepted or
+       rejected must be traceable, by ``_phase1_row_id`` (stamped before any
+       normalization -- see ``_tag_phase1_row_ids``), to exactly one of
+       phase-1's own outcome buckets. Semantic identity is deliberately NOT
+       used for this comparison: phase-1 legitimately rewrites ``type``
+       (buy->add) and legitimately fills in ``execution_account``/
+       ``execution_owner``/``execution_broker`` from holdings/NISA-routing
+       lookups, so comparing semantic identity across this specific boundary
+       manufactured a false mismatch on entirely healthy input -- the bug
+       this rewrite fixes. The row id is stable across exactly those
+       rewrites (see ``_tag_phase1_row_ids``'s docstring), which is why it
+       replaces semantic identity here and only here.
+    3. Final real-order duplication, within ``kept`` alone -- the fully
+       normalized set that actually becomes orders. This is a single-set
+       check, not a cross-boundary one, so it is just as safe as (1).
+
+    A duplicated *value* with two different provenance ids (the same action
+    fed into the policy stage twice) is caught by (1); a *row* that goes
+    missing, is fabricated, or is duplicated across phase-1's own processing
+    is caught by (2); a real order that would double-submit is caught by
+    (3). None of the three can mask a failure the others are responsible
+    for.
+
+    Returns ``(ok, reasons)``. Any row missing its provenance id, or an id
+    that collides, duplicates, or does not round-trip, is a genuine failure
+    -- never silently dropped from consideration.
+    """
+    try:
+        from capital_allocator import _action_identity
+    except Exception:
+        _action_identity = None
+
+    def semantic_ids(rows: list) -> list:
+        if _action_identity is None:
+            return []
+        return [
+            _action_identity(row) for row in rows
+            if isinstance(row, dict) and row.get("ticker")
+        ]
+
+    def row_ids(rows: list) -> tuple[list[str], int]:
+        ids: list[str] = []
+        missing = 0
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            rid = row.get("_phase1_row_id")
+            if rid:
+                ids.append(rid)
+            else:
+                missing += 1
+        return ids, missing
+
+    reasons: list[str] = []
+
+    if _action_identity is None:
+        # Diagnostic-only for the two semantic checks below; if it cannot be
+        # imported, those checks are simply unavailable -- never assumed to
+        # have passed. Provenance conservation below does not need this
+        # import and is still checked on its own.
+        reasons.append("allocator_identity_helper_unavailable")
+    else:
+        accepted_semantic = semantic_ids(actions)
+        rejected_semantic = semantic_ids(policy_rejected_rows)
+        kept_semantic = semantic_ids(kept)
+        if len(set(accepted_semantic)) != len(accepted_semantic):
+            reasons.append("duplicate_identity_within_policy_accepted")
+        if len(set(rejected_semantic)) != len(rejected_semantic):
+            reasons.append("duplicate_identity_within_policy_rejected")
+        if set(accepted_semantic) & set(rejected_semantic):
+            reasons.append("identity_in_both_policy_accepted_and_rejected")
+        if len(set(kept_semantic)) != len(kept_semantic):
+            reasons.append("duplicate_real_order_identity_within_kept")
+
+    accepted_ids, accepted_missing = row_ids(actions)
+    rejected_ids, rejected_missing = row_ids(policy_rejected_rows)
+    outcome_ids, outcome_missing = row_ids(list(kept) + list(own_filtered) + list(deferred))
+    if accepted_missing or rejected_missing:
+        reasons.append("policy_input_row_missing_provenance_id")
+    if outcome_missing:
+        reasons.append("phase1_outcome_row_missing_provenance_id")
+    if len(set(accepted_ids)) != len(accepted_ids):
+        reasons.append("duplicate_provenance_id_within_policy_accepted")
+    if len(set(rejected_ids)) != len(rejected_ids):
+        reasons.append("duplicate_provenance_id_within_policy_rejected")
+    if set(accepted_ids) & set(rejected_ids):
+        reasons.append("provenance_id_in_both_policy_accepted_and_rejected")
+    if len(set(outcome_ids)) != len(outcome_ids):
+        reasons.append("duplicate_provenance_id_across_phase1_outcomes")
+    if set(accepted_ids) != set(outcome_ids):
+        reasons.append("phase1_outcome_provenance_ids_do_not_match_input")
+
+    return not reasons, reasons
+
+
 def _phase1_post_filter(
     synthesis: dict,
     portfolio_total: float,
@@ -8034,8 +8198,14 @@ def _phase1_post_filter(
         else:
             row["filtered_reason"] = policy_reason
         policy_rejected_rows.append(row)
+    _tag_phase1_row_ids(policy_rejected_rows, prefix="rejected")
 
-    actions = synthesis.get("priority_actions") or []
+    # Provenance tags belong to this call, not to caller-owned candidates.
+    # Output buckets replace priority_actions later, so a final synthesis
+    # sweep cannot clean tags left on the original input dictionaries.
+    actions = [dict(a) if isinstance(a, dict) else a
+               for a in (synthesis.get("priority_actions") or [])]
+    _tag_phase1_row_ids([a for a in actions if isinstance(a, dict)], prefix="accepted")
     raw_directions_by_ticker: dict[str, set[str]] = {}
     for raw_action in actions:
         if not isinstance(raw_action, dict) or not raw_action.get("ticker"):
@@ -8097,6 +8267,13 @@ def _phase1_post_filter(
         filtered_count = len(policy_rejected_rows)
         review_count = 0
         deferred_count = 0
+        # No candidate reached phase 1 at all here (every one was already
+        # policy-rejected), so the only thing worth reconciling by identity
+        # is that the policy stage itself did not record one candidate twice.
+        _identity_ok, _identity_reasons = _reconcile_candidate_identities(
+            actions=[], policy_rejected_rows=policy_rejected_rows,
+            kept=[], own_filtered=[], deferred=[],
+        )
         synthesis["decision_summary"] = {
             "candidate_count": candidate_count,
             "executable_count": 0,
@@ -8105,15 +8282,33 @@ def _phase1_post_filter(
             "deferred_count": deferred_count,
             "no_action_classification": "system_constraints" if policy_rejected_rows else "market_no_trade",
             "reason_counts": synthesis.get("_filtered_action_summary") or {},
+            # Explicit policy-stage scope for post_run_verify.py's independent
+            # conservation check (2026-09, Finding 2): unlike candidate_count
+            # above (which is len(policy_rejected_rows) in THIS branch only,
+            # by this branch's own pre-existing convention -- there being no
+            # accepted input to count instead), policy_accepted_count means
+            # the same thing in both branches: how many policy-accepted
+            # candidates phase-1 received (zero here, by construction --
+            # this branch only runs when there were none). Every
+            # _filtered_actions entry here originates from the policy stage,
+            # not from phase-1's own processing (phase-1 never ran its main
+            # loop in this branch).
+            "policy_accepted_count": 0,
+            "policy_rejected_seed_count": len(policy_rejected_rows),
             "count_conservation_ok": (
                 candidate_count == filtered_count + review_count + deferred_count
-            ),
+            ) and _identity_ok,
+            "candidate_identity_reconciliation": {
+                "ok": _identity_ok,
+                "reasons": _identity_reasons,
+            },
         }
         _set_operational_stance(
             synthesis,
             synthesis["decision_summary"]["reason_counts"],
             executable_count=0,
         )
+        _strip_phase1_row_ids_recursive(synthesis)
         return synthesis
 
     # tunable_params から動的に各クールダウン日数を取得
@@ -9186,6 +9381,16 @@ def _phase1_post_filter(
             _attach_estimated_notional(_row)
 
     kept, filtered, deferred, annotated = [], list(policy_rejected_rows), [], []
+    # ``filtered`` above is deliberately SEEDED with the policy stage's own
+    # rejects, purely so the UI can show one unified "why nothing happened"
+    # list. That seed is not part of ``actions`` (the policy-ACCEPTED set
+    # this function receives) and must never be counted as if this function
+    # had filtered it itself -- doing so is what silently broke
+    # ``count_conservation_ok`` (2026-09 review, F8): as soon as the policy
+    # gate rejected anything, len(actions) could never equal
+    # len(kept)+len(filtered)+len(deferred), even when every action really
+    # was accounted for exactly once across both stages.
+    _policy_rejected_seed_count = len(policy_rejected_rows)
     scenario_cap_used: dict[str, float] = {}
     for a in actions:
         if not isinstance(a, dict):
@@ -10081,6 +10286,12 @@ def _phase1_post_filter(
         actions=kept,
         dominant_reason_classes=dominant_reasons["classes"],
     )
+    _own_filtered = filtered[_policy_rejected_seed_count:]
+    _count_conserved = len(actions) == len(kept) + len(_own_filtered) + len(deferred)
+    _identity_ok, _identity_reasons = _reconcile_candidate_identities(
+        actions=actions, policy_rejected_rows=policy_rejected_rows,
+        kept=kept, own_filtered=_own_filtered, deferred=deferred,
+    )
     decision_summary = {
         "candidate_count": len(actions),
         "executable_count": executable_count,
@@ -10089,7 +10300,30 @@ def _phase1_post_filter(
         "deferred_count": len(deferred),
         "no_action_classification": no_action_classification,
         "reason_counts": reason_counts,
-        "count_conservation_ok": len(actions) == len(kept) + len(filtered) + len(deferred),
+        # Explicit policy-stage scope for post_run_verify.py's independent
+        # conservation check (2026-09, Finding 2). policy_accepted_count
+        # means the same thing in both _phase1_post_filter branches (how many
+        # policy-accepted candidates phase-1 received) -- unlike
+        # candidate_count above, which happens to equal it here but means
+        # something different (len(policy_rejected_rows)) in the early-return
+        # branch, by that branch's own pre-existing convention. Every
+        # _filtered_actions entry beyond the first policy_rejected_seed_count
+        # originates from phase-1's own processing, not the policy stage.
+        "policy_accepted_count": len(actions),
+        "policy_rejected_seed_count": _policy_rejected_seed_count,
+        # Both checks must hold: the corrected count (scoped to what this
+        # function actually received, excluding the policy-rejected display
+        # seed) and a provenance-id-based reconciliation across the policy ->
+        # phase-1 handoff plus a same-scope final-duplicate check within kept.
+        # Either failing is a genuine problem, not something to round away --
+        # capital_allocator's legacy retreat stays in effect when it does
+        # (2026-09 review, F8; redesigned per Finding 1 to stop comparing
+        # semantic identity across a boundary phase-1 legitimately rewrites).
+        "count_conservation_ok": _count_conserved and _identity_ok,
+        "candidate_identity_reconciliation": {
+            "ok": _identity_ok,
+            "reasons": _identity_reasons,
+        },
     }
     if dominant_reasons["codes"]:
         decision_summary["dominant_reason_counts"] = dominant_reasons["codes"]
@@ -10228,6 +10462,7 @@ def _phase1_post_filter(
         synthesis["telegram_message_scope"] = "ready_only"
         print("  📱 telegram_message を no-action 用に再構築")
 
+    _strip_phase1_row_ids_recursive(synthesis)
     return synthesis
 
 

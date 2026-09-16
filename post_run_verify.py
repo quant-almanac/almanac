@@ -490,7 +490,58 @@ def check_absent_action_rationales(base_dir: Path = BASE_DIR) -> list[dict]:
 
 
 def check_decision_summary_conservation(base_dir: Path = BASE_DIR) -> list[dict]:
-    """Verify that every AI candidate is accounted for and readiness is explicit."""
+    """Verify that every AI candidate is accounted for and readiness is explicit.
+
+    ``_filtered_actions`` mixes two disjoint stages that this file cannot
+    otherwise tell apart: the policy stage's own rejects (seeded into it
+    verbatim by ``analyst._phase1_post_filter`` purely so the UI can show one
+    unified "why nothing happened" list) and phase-1's own filtering.
+    ``decision_summary["candidate_count"]`` also means different things in
+    ``_phase1_post_filter``'s two branches -- the policy-accepted input count
+    in the normal path, but ``len(policy_rejected_rows)`` in the early-return
+    path (there being no accepted input to count instead; a pre-existing
+    convention this file does not change). Comparing it directly against a
+    single recomputed total therefore either double-counts the policy
+    rejects (the normal path) or picks the wrong branch's convention (the
+    early-return path) -- reporting a false mismatch on entirely healthy
+    output (2026-09 independent review, Finding 2).
+
+    ``decision_summary["policy_accepted_count"]`` and
+    ``["policy_rejected_seed_count"]`` (added alongside this fix) mean the
+    same thing in both branches, which is what makes the conservation law
+    below hold uniformly instead of needing to guess which branch produced
+    the artifact:
+
+        policy_accepted_count + policy_rejected_seed_count
+            == len(priority_actions) + len(_filtered_actions) + len(order_intent_deferred_actions)
+
+    ``candidate_count`` is still cross-checked, but derived per-branch from
+    the two fields above (``policy_rejected_seed_count`` when
+    ``policy_accepted_count`` is 0 -- the early-return branch always has no
+    accepted input -- otherwise ``policy_accepted_count``), rather than
+    compared to a single recomputed total directly.
+
+    ``policy_rejected_seed_count`` is also cross-checked against
+    the rejection entries in ``synthesis["policy_filtered_actions"]`` --
+    this mixed audit list also contains accepted modifications, whose shape
+    is ``original/modified/modifications`` rather than ``action/rule/reason``.
+    Only entries with a dict-valued ``action`` seed Phase1's filtered list.
+    This closes a
+    gap the total-only law above cannot: shifting candidates between the
+    accepted and rejected sides while preserving their combined count (e.g.
+    reporting 2 accepted / 0 rejected in place of the true 1 / 1) leaves
+    ``policy_accepted_count + policy_rejected_seed_count`` unchanged, but
+    changes ``policy_rejected_seed_count`` on its own, which this
+    independent source catches (2026-09 independent review, Codex re-review
+    of Finding 2).
+
+    A missing scope field pair (an artifact saved before this fix) and a
+    *present but invalid* one (a corrupted or tampered modern-format
+    artifact -- e.g. a negative ``policy_rejected_seed_count``) are reported
+    as two distinct, differently-severed conditions, not conflated: the
+    former is unverifiable (warning), the latter is a confirmed problem
+    (error) even if nothing else about the artifact looks wrong.
+    """
     synthesis = _analysis_payload(base_dir)
     if not synthesis:
         return []
@@ -519,8 +570,9 @@ def check_decision_summary_conservation(base_dir: Path = BASE_DIR) -> list[dict]
             examples=missing_readiness[:10],
         ))
 
+    # These do not depend on the policy/phase-1 boundary and are always
+    # checked, legacy artifact or not.
     actual = {
-        "candidate_count": len(priority) + len(filtered) + len(deferred),
         "executable_count": sum(row.get("execution_readiness") == "ready" for row in priority),
         "review_count": sum(row.get("execution_readiness") != "ready" for row in priority) + len(deferred),
         "filtered_count": len(filtered),
@@ -531,7 +583,81 @@ def check_decision_summary_conservation(base_dir: Path = BASE_DIR) -> list[dict]
         for key, value in actual.items()
         if summary.get(key) != value
     }
-    if mismatches or summary.get("count_conservation_ok") is not True:
+
+    def _usable_nonneg_int(value: Any, *, at_most: int | None = None) -> bool:
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            return False
+        return at_most is None or value <= at_most
+
+    accepted_key_present = "policy_accepted_count" in summary
+    seed_key_present = "policy_rejected_seed_count" in summary
+    policy_accepted = summary.get("policy_accepted_count")
+    seed_count = summary.get("policy_rejected_seed_count")
+    scope_usable = _usable_nonneg_int(policy_accepted) and _usable_nonneg_int(seed_count, at_most=len(filtered))
+    conservation_confirmed_bad = False
+
+    if not accepted_key_present and not seed_key_present:
+        # A saved artifact from before these fields existed. Genuinely
+        # unverifiable -- never silently skipped, and never promoted to
+        # "verified" without grounds. A stored count_conservation_ok is also
+        # not trusted here: the pre-Finding-2 producer's own version of that
+        # flag is exactly what could false-flag a healthy run, so an
+        # unverifiable artifact is reported as unverifiable, not as
+        # confirmed bad either.
+        issues.append(_issue(
+            "decision_summary_conservation_unverifiable_legacy_format",
+            "decision_summary predates policy_accepted_count/policy_rejected_seed_count; "
+            "candidate-count conservation cannot be verified for this artifact",
+            "warning",
+            filtered_count=len(filtered),
+        ))
+    elif not scope_usable:
+        # At least one of the two fields IS present, so this is not an old
+        # artifact -- it is a modern-format one with a corrupted or invalid
+        # value (wrong type, negative, or a seed exceeding filtered_count).
+        # That is a confirmed defect, not an open question: report it as an
+        # error, and do not let it be quietly absorbed into "unverifiable".
+        issues.append(_issue(
+            "decision_summary_scope_fields_invalid",
+            "policy_accepted_count/policy_rejected_seed_count are present but not usable "
+            "(must be non-negative ints, with the seed count at most filtered_count) -- "
+            "this is a corrupted or buggy modern-format artifact, not a legacy one",
+            "error",
+            stored_policy_accepted_count=policy_accepted,
+            stored_policy_rejected_seed_count=seed_count,
+            filtered_count=len(filtered),
+            count_conservation_ok=summary.get("count_conservation_ok"),
+        ))
+    else:
+        expected_total = policy_accepted + seed_count
+        actual_total = len(priority) + len(filtered) + len(deferred)
+        if expected_total != actual_total:
+            mismatches["candidate_total"] = {
+                "stored": {"policy_accepted_count": policy_accepted, "policy_rejected_seed_count": seed_count,
+                           "sum": expected_total},
+                "actual": actual_total,
+            }
+
+        expected_candidate_count = seed_count if policy_accepted == 0 else policy_accepted
+        if summary.get("candidate_count") != expected_candidate_count:
+            mismatches["candidate_count"] = {
+                "stored": summary.get("candidate_count"), "actual": expected_candidate_count,
+            }
+
+        policy_filtered_actions = synthesis.get("policy_filtered_actions")
+        if isinstance(policy_filtered_actions, list):
+            actual_policy_rejected = sum(
+                isinstance(row, dict) and isinstance(row.get("action"), dict)
+                for row in policy_filtered_actions
+            )
+            if actual_policy_rejected != seed_count:
+                mismatches["policy_rejected_seed_count"] = {
+                    "stored": seed_count, "actual_from_policy_filtered_actions": actual_policy_rejected,
+                }
+
+        conservation_confirmed_bad = summary.get("count_conservation_ok") is not True
+
+    if mismatches or conservation_confirmed_bad:
         issues.append(_issue(
             "decision_summary_count_mismatch",
             "decision_summary does not conserve final candidate counts",
@@ -540,6 +666,22 @@ def check_decision_summary_conservation(base_dir: Path = BASE_DIR) -> list[dict]
             count_conservation_ok=summary.get("count_conservation_ok"),
         ))
     return issues
+
+
+def check_candidate_output_manifest(base_dir: Path = BASE_DIR) -> list[dict]:
+    from candidate_output_audit import verify_manifest
+
+    artifact = _load_json(base_dir / "ai_portfolio_analysis.json", {})
+    if not isinstance(artifact, dict) or not artifact:
+        return [_issue("candidate_output_unreadable", "Analysis output is unavailable", "error")]
+    status = verify_manifest(artifact)
+    if status == "verified":
+        return []
+    if status == "legacy_unverifiable":
+        return [_issue("candidate_output_manifest_missing",
+                       "Saved output has no integrity manifest; content is unverified", "warning")]
+    return [_issue("candidate_output_manifest_invalid",
+                   "Saved candidate content does not match its manifest or cannot be verified", "error")]
 
 
 def verify_post_run(base_dir: Path = BASE_DIR, *, repair: bool = False) -> dict:
@@ -555,6 +697,7 @@ def verify_post_run(base_dir: Path = BASE_DIR, *, repair: bool = False) -> dict:
     issues.extend(check_synthesis_risk_warnings(base_dir))
     issues.extend(check_absent_action_rationales(base_dir))
     issues.extend(check_decision_summary_conservation(base_dir))
+    issues.extend(check_candidate_output_manifest(base_dir))
     return {
         "ok": not any(item.get("severity") == "error" for item in issues),
         "checked_at": datetime.now().isoformat(timespec="seconds"),
