@@ -2254,6 +2254,26 @@ def test_post_filter_failure_quarantines_actions_outside_priority_actions():
     assert "post-filter 障害" in synthesis["telegram_message"]
 
 
+def test_post_filter_failure_strips_phase1_row_id_before_quarantining():
+    """_quarantine_post_filter_failure is the single fail-closed handler for
+    every exception _phase1_post_filter can raise, in either branch, at any
+    point after tagging and before its own strip call runs. If the tag were
+    still on the row when this handler shallow-copies it into
+    _filtered_actions, it would leak into the persisted analysis and its
+    integrity manifest (2026-09 review)."""
+    synthesis = {
+        "priority_actions": [{
+            "ticker": "META", "type": "buy", "action": "METAを購入",
+            "_phase1_row_id": "accepted#0",
+        }],
+        "telegram_message": "元の本文",
+    }
+
+    analyst._quarantine_post_filter_failure(synthesis, "synthetic failure")
+
+    assert "_phase1_row_id" not in synthesis["_filtered_actions"][0]
+
+
 def test_execution_plan_new_order_attaches_plan_metadata(monkeypatch):
     _silence_external_filters(monkeypatch)
     monkeypatch.setattr(tunable_params, "get", _tp_get_enforce_plan)

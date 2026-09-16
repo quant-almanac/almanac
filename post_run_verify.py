@@ -578,10 +578,20 @@ def check_decision_summary_conservation(base_dir: Path = BASE_DIR) -> list[dict]
         "filtered_count": len(filtered),
         "deferred_count": len(deferred),
     }
+
+    def _int_conserves(stored: Any, real_value: int) -> bool:
+        # Plain `stored != real_value` lets a JSON boolean masquerade as its
+        # numeric value (`True == 1`, `False == 0`), silently passing a
+        # tampered/corrupted `"filtered_count": true`-style field as correct
+        # -- the exact class of bug `_usable_nonneg_int` below exists to
+        # prevent for the newer scope fields, but was not applied here
+        # (2026-09 review).
+        return isinstance(stored, int) and not isinstance(stored, bool) and stored == real_value
+
     mismatches = {
         key: {"stored": summary.get(key), "actual": value}
         for key, value in actual.items()
-        if summary.get(key) != value
+        if not _int_conserves(summary.get(key), value)
     }
 
     def _usable_nonneg_int(value: Any, *, at_most: int | None = None) -> bool:
@@ -673,10 +683,29 @@ def check_candidate_output_manifest(base_dir: Path = BASE_DIR) -> list[dict]:
 
     artifact = _load_json(base_dir / "ai_portfolio_analysis.json", {})
     if not isinstance(artifact, dict) or not artifact:
-        return [_issue("candidate_output_unreadable", "Analysis output is unavailable", "error")]
+        # Consistent with every other analysis-dependent check in this file
+        # (check_synthesis_risk_warnings, check_absent_action_rationales,
+        # check_decision_summary_conservation, ...): "no analysis has run
+        # yet" (missing/unreadable/empty file) is not-yet-applicable, not a
+        # failure. This used to be the one check in the file that broke that
+        # convention, making verify_post_run() unconditionally report
+        # ok=False on any fresh environment or benign missing-file state
+        # (2026-09 review).
+        return []
     status = verify_manifest(artifact)
     if status == "verified":
         return []
+    if status == "unavailable":
+        # seal_for_save's own deliberate, documented benign degrade (e.g.
+        # non-finite values in a row) -- "does not veto cache publication"
+        # per its own docstring, so this must not be reported as tampering.
+        # Still surfaced as a warning: it does mean this run's saved content
+        # is unverified, which is worth knowing even though it isn't a
+        # health-gate failure.
+        return [_issue("candidate_output_manifest_unavailable",
+                       "Saved output's candidate content could not be digested "
+                       "(e.g. non-finite values); integrity is unverified, not tampered",
+                       "warning")]
     if status == "legacy_unverifiable":
         return [_issue("candidate_output_manifest_missing",
                        "Saved output has no integrity manifest; content is unverified", "warning")]

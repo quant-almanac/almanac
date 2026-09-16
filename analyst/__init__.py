@@ -7973,14 +7973,32 @@ def _strip_phase1_row_ids_recursive(value: object) -> None:
     independent review, Finding 3). Sweeping the fully-built ``synthesis``
     at the very end, once, is correct regardless of how many such copies
     exist or where in the function they were made.
+
+    Iterative with an ``id()``-keyed visited set, not plain recursion: a
+    ``synthesis`` accumulated across ~2,500 lines is large enough that an
+    unbounded-depth recursive walk risks ``RecursionError`` on a
+    sufficiently deep structure, and has no protection against an
+    accidental self-reference turning a dict into a cycle -- either of
+    which would previously crash this fail-closed sweep itself, right
+    before ``_phase1_post_filter`` returns (2026-09 review).
     """
-    if isinstance(value, dict):
-        value.pop("_phase1_row_id", None)
-        for v in value.values():
-            _strip_phase1_row_ids_recursive(v)
-    elif isinstance(value, list):
-        for item in value:
-            _strip_phase1_row_ids_recursive(item)
+    stack: list[object] = [value]
+    seen: set[int] = set()
+    while stack:
+        current = stack.pop()
+        if isinstance(current, dict):
+            marker = id(current)
+            if marker in seen:
+                continue
+            seen.add(marker)
+            current.pop("_phase1_row_id", None)
+            stack.extend(current.values())
+        elif isinstance(current, list):
+            marker = id(current)
+            if marker in seen:
+                continue
+            seen.add(marker)
+            stack.extend(current)
 
 
 def _reconcile_candidate_identities(
@@ -8085,6 +8103,15 @@ def _reconcile_candidate_identities(
     if len(set(rejected_ids)) != len(rejected_ids):
         reasons.append("duplicate_provenance_id_within_policy_rejected")
     if set(accepted_ids) & set(rejected_ids):
+        # Cannot happen through the normal _tag_phase1_row_ids path -- ids are
+        # tagged with fixed, disjoint prefixes ("accepted#N" vs "rejected#N"),
+        # so this branch is unreachable via that route alone. It remains a
+        # genuine, tested defensive check (test_reconcile_candidate_identities_
+        # rejects_a_provenance_id_collision_across_accept_and_reject) against
+        # a row that reaches this function with a colliding id by some other
+        # route -- a future tagging bug, or a caller constructing rows
+        # directly -- which the semantic check above cannot substitute for
+        # when _action_identity's import fails (2026-09 review).
         reasons.append("provenance_id_in_both_policy_accepted_and_rejected")
     if len(set(outcome_ids)) != len(outcome_ids):
         reasons.append("duplicate_provenance_id_across_phase1_outcomes")
@@ -10995,9 +11022,19 @@ def _quarantine_post_filter_failure(synthesis: dict, error: Exception | str) -> 
     _filtered_actions へ non_executable で隔離する (post_filter_rejected
     として stage log に載り、record_recommendations / Telegram 実行リスト /
     実行ボタンには載らない)。
+
+    _phase1_post_filter は tag→strip の間に長い未保護区間を持つ両分岐
+    (main-loop: synthesis["priority_actions"]=kept 直後～関数末尾の strip、
+    early-return: synthesis["_filtered_actions"]=policy_rejected_rows 直後～
+    その分岐内の strip) を持ち、その区間で例外が起きるとここが呼ばれる。
+    呼び出し時点の synthesis はまだ _phase1_row_id が付いている可能性が
+    あるため、これは _phase1_post_filter の全例外経路に対する唯一の
+    fail-closed ハンドラとして、ここで一度だけ確実に剥がす
+    (2026-09 review: 個別の strip 呼び出し漏れに依存しない構造的な修正)。
     """
     if not isinstance(synthesis, dict):
         return 0
+    _strip_phase1_row_ids_recursive(synthesis)
     blocked = [a for a in (synthesis.get("priority_actions") or []) if isinstance(a, dict)]
     reason = f"post_filter_error: post-filter が例外で完了せず fail-closed ({str(error)[:200]})"
     quarantined = []
@@ -13943,7 +13980,10 @@ def run_analysis(force: bool = False) -> dict:
     result["earnings_blackout_observation"] = _earnings_shadow.finish_synthesis(
         BASE_DIR, _asl_analysis_id, synthesis,
     )
-    save_cache(result)
+    # save_cache returns the sealed (candidate_output_manifest 付き) 版。
+    # result をこれで更新しないと、この関数の戻り値が実際にディスクへ
+    # 書いた内容と異なってしまう (2026-09 review)。
+    result = save_cache(result) or result
 
     # AI推奨を事後検証ログに記録
     _log_recommendations(synthesis, data["market_meta"])

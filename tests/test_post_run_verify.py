@@ -241,6 +241,29 @@ def test_check_decision_summary_conservation_flags_missing_readiness_and_bad_cou
     }
 
 
+def test_check_decision_summary_conservation_rejects_a_bool_masquerading_as_a_count(tmp_path):
+    """`stored != real_value` alone lets a JSON boolean pass as its numeric
+    value (`True == 1`, `False == 0`), silently accepting a tampered/corrupted
+    `"filtered_count": true` as correct -- the exact class of bug the newer
+    `_usable_nonneg_int` guard exists to prevent for policy_accepted_count/
+    policy_rejected_seed_count, but which was not applied to the four older
+    count fields until now (2026-09 review)."""
+    _write(tmp_path / "ai_portfolio_analysis.json", {"synthesis": {
+        "priority_actions": [{"ticker": "A", "type": "buy", "execution_readiness": "ready"}],
+        "_filtered_actions": [{"ticker": "C", "type": "buy"}],
+        "decision_summary": {
+            "candidate_count": 2, "executable_count": 1, "review_count": 0,
+            "filtered_count": True,  # real count is 1; True == 1 must not pass
+            "deferred_count": 0,
+            "policy_accepted_count": 2, "policy_rejected_seed_count": 0,
+            "count_conservation_ok": True,
+        },
+    }})
+
+    issues = prv.check_decision_summary_conservation(tmp_path)
+    assert "decision_summary_count_mismatch" in {issue["code"] for issue in issues}
+
+
 # ── 2026-09 independent review, Finding 2 ──────────────────────────────────
 # check_decision_summary_conservation() independently recomputes
 # candidate_count from priority_actions + _filtered_actions +

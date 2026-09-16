@@ -1317,6 +1317,9 @@ def _build_execution_plan_view(plan: dict, board: list[dict], synthesis: dict, n
             "guard_blocks_new_deployment": "ガードが新規リスクを停止中",
             "cash_evidence_unconfirmed": "現金証拠の鮮度・整合性を確認中",
             "deployment_horizon_unresolved": "配備期間（レジーム判定）を確認中",
+            # 2026-09 review: derive_budgets の5番目の予算0パス
+            # (resolved だが deployment_months 未解決/regime無効化) も同種。
+            "ordinary_deployment_disabled_for_regime": "レジームにより通常配備を一時停止中",
         }
         today_decision = {
             "code": first_no_action_code,

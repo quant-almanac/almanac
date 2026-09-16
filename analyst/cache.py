@@ -58,8 +58,15 @@ def load_json(path: Path, default=None):
     return default if default is not None else {}
 
 
-def save_cache(data: dict) -> None:
-    """分析結果をキャッシュに保存し、履歴サマリーを追記する"""
+def save_cache(data: dict) -> dict:
+    """分析結果をキャッシュに保存し、履歴サマリーを追記する。
+
+    seal_for_save で封印した (candidate_output_manifest 付き) 版を返す。
+    呼出元 (run_analysis) が返り値をこの結果で更新すれば、呼出元が保持する
+    dict もディスク上の内容と一致する。以前は呼出元の result を更新して
+    いなかったため、run_analysis() の戻り値には manifest が一切乗らない
+    ままだった (2026-09 review)。
+    """
     from candidate_output_audit import seal_for_save
 
     data = seal_for_save(data)
@@ -102,6 +109,7 @@ def save_cache(data: dict) -> None:
         except Exception:
             print("[analysis_observation] unavailable; formal cache is preserved")
         atomic_write_json(HISTORY_PATH, hist)
+    return data
 
 
 def load_history_context() -> str:

@@ -1389,6 +1389,34 @@ def test_guard_stop_and_unresolved_target_are_both_kept_when_both_apply() -> Non
     assert plan["budgets"]["deployment_multiplier"] == 0.0
 
 
+def test_monthly_budget_consumed_is_kept_alongside_an_unrelated_structured_reason() -> None:
+    """Whether this month's pace budget is already spent is an independent
+    fact from *why* derive_budgets otherwise zeroed the pool. Dropping it
+    whenever an unrelated structured reason (here: an unresolved cash
+    target) also applies loses a genuinely more actionable, additional
+    explanation behind a generic one (2026-09 review)."""
+    plan = epe.build_execution_plan(
+        account=_F4_ACCOUNT,
+        guard={"portfolio_value": 30_000_000, "new_entry_allowed": True, "trading_allowed": True},
+        rebalance_report={}, bottom_fishing={}, nisa={}, action_state={"actions": {}},
+        executions={"executions": [{
+            "id": "buy-1",
+            "ticker": "V",
+            "direction": "buy",
+            "status": "executed",
+            "notional_jpy": 500_000,
+            "saved_at": "2026-07-05T10:00:00",
+        }]},
+        params={**_F4_PARAMS, "monthly_discretionary_budget_jpy": 300_000},
+        now=datetime(2026, 7, 10, 7, 30),
+        market_regime=None,          # cash target cannot resolve at all
+        contribution_occurrences=[],
+    )
+    codes = [row["reason_code"] for row in plan["no_action_rationale"]]
+    assert "cash_target_unresolved" in codes
+    assert "monthly_surplus_deployment_budget_consumed" in codes
+
+
 def test_confirmed_surplus_cash_creates_paced_monthly_budget() -> None:
     plan = epe.build_execution_plan(
         account={
@@ -1597,6 +1625,41 @@ def test_dynamic_budget_uses_regime_deployment_horizon(
 
     assert budgets["deployment_months"] == months
     assert budgets["monthly_discretionary_budget_jpy"] == expected
+
+
+def test_regime_disabled_ordinary_deployment_records_a_structured_block_reason() -> None:
+    """When cash target and horizon both resolve but the regime itself
+    disables ordinary deployment (deployment_months is None), this is a 5th
+    path in derive_budgets that zeroes the eventual pool. Without a
+    structured deployment_block_reasons entry here, build_execution_plan's
+    caller falls back to guessing a reason from budget numbers alone --
+    reproducing the exact misattribution F4 fixed for the guard-block case
+    (2026-09 review)."""
+    budgets, _ = epe.derive_budgets(
+        cash_info={"total_cash_jpy": 10_000_000, "valid_for_budget": True},
+        guard={
+            "portfolio_value": 30_000_000,
+            "new_entry_allowed": True,
+            "trading_allowed": True,
+        },
+        params={
+            "monthly_discretionary_budget_jpy": 0,
+            "max_single_normal_jpy": 250_000,
+            "max_single_opportunity_jpy": 300_000,
+            "max_single_action_pct_of_portfolio": 0.05,
+        },
+        scheduled_contributions_jpy=0,
+        horizon=epe.horizon_for(date(2026, 7, 30)),
+        cash_target_policy={
+            "cash_target_pct": 7.0,
+            "portfolio_level": -2,
+            "portfolio_label": "strong_bear",
+        },
+    )
+
+    assert budgets["deployment_months"] is None
+    reason_codes = [r.get("reason_code") for r in budgets["deployment_block_reasons"]]
+    assert "ordinary_deployment_disabled_for_regime" in reason_codes
 
 
 def test_confirmed_new_cash_recalculates_dynamic_budget() -> None:

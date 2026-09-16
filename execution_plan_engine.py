@@ -653,6 +653,17 @@ def derive_budgets(
                 warnings.append(
                     "ordinary_deployment_disabled_for_regime: use active DCA/playbook only"
                 )
+                # This is a 5th path that can leave the eventual pool at zero
+                # (deployment_months unresolved/<=0 even though cash target and
+                # horizon both resolved). Without this, build_execution_plan's
+                # structured_reasons is empty here and the caller falls back to
+                # guessing a reason from budget numbers alone -- reproducing the
+                # exact misattribution F4 fixed for the guard-block case
+                # (2026-09 review).
+                deployment_block_reasons.append({
+                    "reason_code": "ordinary_deployment_disabled_for_regime",
+                    "message": "現在のレジームでは通常配備の期間を確定できないため、新規配備枠を作成しません。",
+                })
     elif all_cash_is_surplus:
         warnings.append("cash_authority_unresolved: confirmed cash not converted into deployment budget")
         deployment_block_reasons.append({
@@ -2795,19 +2806,26 @@ def build_execution_plan(
             dict(reason) for reason in (budgets.get("deployment_block_reasons") or [])
             if isinstance(reason, dict) and reason.get("reason_code")
         ]
-        if structured_reasons:
-            funding_reasons = structured_reasons
-        elif (
+        # Whether this month's discretionary pace budget is already spent is
+        # an independent fact from *why* derive_budgets zeroed the pool (a
+        # guard stop, an unresolved target, etc.) -- both can be true at once,
+        # and dropping this one whenever a structured reason also applies
+        # loses a genuinely more actionable/specific explanation ("this
+        # resets next month automatically") behind a generic one (2026-09
+        # review). So it is computed and included alongside structured_reasons,
+        # never treated as mutually exclusive with it.
+        monthly_pace_reasons = [{
+            "reason_code": "monthly_surplus_deployment_budget_consumed",
+            "message": (
+                "確認済み余剰現金はありますが、今月の配備ペース上限を"
+                "既存の買付で消化済みです。翌月に自動で再計算します。"
+            ),
+        }] if (
             _jpy(budgets.get("monthly_discretionary_budget_jpy")) > 0
             and base_consumed >= _jpy(budgets.get("monthly_discretionary_budget_jpy"))
-        ):
-            funding_reasons = [{
-                "reason_code": "monthly_surplus_deployment_budget_consumed",
-                "message": (
-                    "確認済み余剰現金はありますが、今月の配備ペース上限を"
-                    "既存の買付で消化済みです。翌月に自動で再計算します。"
-                ),
-            }]
+        ) else []
+        if structured_reasons or monthly_pace_reasons:
+            funding_reasons = structured_reasons + monthly_pace_reasons
         elif budgets.get("cash_target_pct") is None:
             # 「確定できない」だけでは、レジーム判定が古いのか当日保留なのかが
             # 読めない。切り分けに要る理由コードをそのまま出す。
