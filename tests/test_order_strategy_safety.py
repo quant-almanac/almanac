@@ -3,6 +3,7 @@ from datetime import datetime
 
 import pytest
 
+import candidate_output_audit as coa
 import execution_safety
 from analyst import llm_client
 from analyst import order_strategy
@@ -278,3 +279,123 @@ def test_order_strategy_retries_once_after_max_tokens(monkeypatch, tmp_path):
 
     assert result["status"] == "ok"
     assert calls == [3000, 6000]
+
+
+def _sealed_analysis(action):
+    """A saved analysis exactly as analyst.cache.save_cache would leave it:
+    sealed with a real candidate_output_manifest over its own content."""
+    unsealed = {
+        "as_of": datetime.now().astimezone().isoformat(),
+        "analysis_id": "analysis-test",
+        "synthesis": {"analysis_id": "analysis-test", "priority_actions": [action]},
+    }
+    sealed = coa.seal_for_save(unsealed)
+    assert coa.verify_manifest(sealed) == "verified"  # test setup sanity
+    return sealed
+
+
+def test_order_strategy_reseals_verified_candidate_output_after_refresh(
+    monkeypatch, tmp_path, us_session_open,
+):
+    """order_strategy.re_evaluate mutates priority_actions in place and saves
+    outside analyst.cache.save_cache's normal seal point. Without resealing,
+    every legitimate nightly refresh would leave the pre-refresh manifest
+    behind, and post_run_verify would report the refreshed (healthy) output
+    as a tampered saved artifact."""
+    cache = tmp_path / "ai_portfolio_analysis.json"
+    source_action = {
+        "ticker": "ROBO", "type": "sell", "urgency": "low",
+        "action": "ROBOを売却", "order_type": "market",
+    }
+    cache.write_text(json.dumps(_sealed_analysis(source_action)), encoding="utf-8")
+    monkeypatch.setattr(order_strategy, "CACHE_PATH", cache)
+    monkeypatch.setattr(order_strategy, "_get_market_meta", lambda: {"vix": 17})
+    monkeypatch.setattr(order_strategy, "_get_current_price_atr", lambda ticker: {
+        "current_price": 82.96, "atr_pct": 1.2, "bid": 81.30, "ask": 84.70,
+        "spread_bps": 408.0,
+    })
+    monkeypatch.setattr(llm_client, "call_claude", lambda **kwargs: json.dumps({
+        "orders": [{
+            "action_id": order_strategy._order_action_id(source_action),
+            "ticker": "ROBO", "order_type": "market", "decision_price": 82.96,
+        }],
+    }))
+
+    result = order_strategy.re_evaluate()
+
+    saved = json.loads(cache.read_text(encoding="utf-8"))
+    action = saved["synthesis"]["priority_actions"][0]
+    assert result["status"] == "ok"
+    # Proves the refresh actually mutated the row (same assertion as the
+    # market->limit conversion test above), not just that resealing ran.
+    assert action["order_type"] == "limit"
+    assert coa.verify_manifest(saved) == "verified"
+
+
+def test_order_strategy_leaves_an_already_invalid_manifest_invalid(
+    monkeypatch, tmp_path, us_session_open,
+):
+    """An artifact whose manifest already does not match its content must
+    not be laundered into 'verified' by an unrelated order-strategy refresh."""
+    cache = tmp_path / "ai_portfolio_analysis.json"
+    source_action = {
+        "ticker": "ROBO", "type": "sell", "urgency": "low",
+        "action": "ROBOを売却", "order_type": "market",
+    }
+    tampered = _sealed_analysis(source_action)
+    tampered[coa.KEY]["summary_digest"] = "0" * 64
+    assert coa.verify_manifest(tampered) == "invalid"  # test setup sanity
+    cache.write_text(json.dumps(tampered), encoding="utf-8")
+    monkeypatch.setattr(order_strategy, "CACHE_PATH", cache)
+    monkeypatch.setattr(order_strategy, "_get_market_meta", lambda: {"vix": 17})
+    monkeypatch.setattr(order_strategy, "_get_current_price_atr", lambda ticker: {
+        "current_price": 82.96, "atr_pct": 1.2, "bid": 81.30, "ask": 84.70,
+        "spread_bps": 408.0,
+    })
+    monkeypatch.setattr(llm_client, "call_claude", lambda **kwargs: json.dumps({
+        "orders": [{
+            "action_id": order_strategy._order_action_id(source_action),
+            "ticker": "ROBO", "order_type": "market", "decision_price": 82.96,
+        }],
+    }))
+
+    order_strategy.re_evaluate()
+
+    saved = json.loads(cache.read_text(encoding="utf-8"))
+    assert coa.verify_manifest(saved) == "invalid"
+
+
+def test_order_strategy_does_not_retroactively_seal_legacy_output(
+    monkeypatch, tmp_path, us_session_open,
+):
+    """An artifact saved before candidate_output_manifest existed must stay
+    unsealed after a refresh -- the refresh is not evidence about content
+    that predates the manifest contract."""
+    cache = tmp_path / "ai_portfolio_analysis.json"
+    source_action = {
+        "ticker": "ROBO", "type": "sell", "urgency": "low",
+        "action": "ROBOを売却", "order_type": "market",
+    }
+    legacy = {
+        "as_of": datetime.now().astimezone().isoformat(),
+        "synthesis": {"analysis_id": "analysis-test", "priority_actions": [source_action]},
+    }
+    assert coa.KEY not in legacy  # test setup sanity
+    cache.write_text(json.dumps(legacy), encoding="utf-8")
+    monkeypatch.setattr(order_strategy, "CACHE_PATH", cache)
+    monkeypatch.setattr(order_strategy, "_get_market_meta", lambda: {"vix": 17})
+    monkeypatch.setattr(order_strategy, "_get_current_price_atr", lambda ticker: {
+        "current_price": 82.96, "atr_pct": 1.2, "bid": 81.30, "ask": 84.70,
+        "spread_bps": 408.0,
+    })
+    monkeypatch.setattr(llm_client, "call_claude", lambda **kwargs: json.dumps({
+        "orders": [{
+            "action_id": order_strategy._order_action_id(source_action),
+            "ticker": "ROBO", "order_type": "market", "decision_price": 82.96,
+        }],
+    }))
+
+    order_strategy.re_evaluate()
+
+    saved = json.loads(cache.read_text(encoding="utf-8"))
+    assert coa.KEY not in saved

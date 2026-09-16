@@ -284,6 +284,20 @@ def _re_evaluate_locked(send_telegram: bool = False) -> dict:
                 "error": str(exc),
                 "updated": 0,
             }
+        # This refresh mutates priority_actions in place further down and
+        # saves outside analyst.cache.save_cache's normal seal point.  A
+        # verified saved-output manifest (candidate_output_audit) is only
+        # still true of the content that existed when it was sealed; after
+        # this function legitimately rewrites order_type/limit_price/etc, an
+        # untouched old manifest would make post_run_verify report the
+        # refreshed (healthy) output as tampered. Decide whether to reseal
+        # from the manifest's state *before* any mutation below: an
+        # already-invalid manifest must stay invalid (never laundered by an
+        # unrelated refresh), and a legacy artifact (no manifest at all)
+        # must not be retroactively sealed -- both per
+        # docs/candidate_output_audit.md.
+        from candidate_output_audit import seal_for_save, verify_manifest
+        _reseal_candidate_output = verify_manifest(data) == "verified"
         actions: list = syn.get("priority_actions") or []
         if not actions:
             # filtered_actions に何件あるかも教える（post-filter で除去された場合）
@@ -486,6 +500,8 @@ def _re_evaluate_locked(send_telegram: bool = False) -> dict:
                     "updated": 0,
                     "skipped": skipped,
                 }
+            if _reseal_candidate_output:
+                data = seal_for_save(data)
             atomic_write_json(CACHE_PATH, data)
 
         # Telegram 通知 (任意)

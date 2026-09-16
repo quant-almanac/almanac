@@ -68,3 +68,15 @@ publication and observation-write failure tests remain enabled.
 
 No full-repository suite, production deployment, push, paid analysis or trading
 operation was performed for this change.
+
+## Order-strategy refresh (in-place save outside `save_cache`)
+
+`analyst.order_strategy.re_evaluate` mutates `priority_actions` in place
+(order_type/limit_price/expiry/execution_reason) and saves under its own
+compare-and-swap lock, not through `analyst.cache.save_cache`. It reseals
+only when the manifest already on the loaded artifact verifies as `verified`
+at that moment: an already-`invalid` manifest is left invalid (never
+laundered by an unrelated refresh), and a `legacy_unverifiable` artifact is
+never retroactively sealed. The reseal decision is made once, right after
+the formal-analysis validity check and before any row is mutated, so it
+reflects the artifact's state prior to this refresh's own changes.
