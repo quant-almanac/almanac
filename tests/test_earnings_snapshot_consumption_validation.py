@@ -27,8 +27,11 @@ import json
 import os
 import time
 from datetime import date, datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 import pytest
+
+_JST = ZoneInfo("Asia/Tokyo")
 
 
 def _current_snapshot(m, holdings, *, result_rows=None, generated_at=None,
@@ -52,7 +55,17 @@ def _current_snapshot(m, holdings, *, result_rows=None, generated_at=None,
     # S2 の未来拒否チェックに引っかかる。単純な「5分前」も日境界をまたぐと
     # （例: 00:02 の5分前は前日）today と一致しなくなる
     # （いずれも 00:0x JST 実行で実際に再現・自己レビューで発見）。
-    _now = datetime.now()
+    #
+    # ⚠️ 生成元 (この関数) は host の TZ に関わらず必ず実 JST を使う必要が
+    # ある: 本番コードが naive timestamp を常に JST として解釈する
+    # (_aware_now は datetime.now(ZoneInfo("Asia/Tokyo")) で実 JST を取る) の
+    # に対し、ここで素の datetime.now() を使うと UTC ホスト (GitHub Actions
+    # の CI ランナー) では host のローカル時刻 (= UTC) がそのまま使われる。
+    # 実 JST の日付が UTC の日付と異なる時間帯 (UTC 15:00-23:59 = JST
+    # 翌日 00:00-08:59) にCIが走ると、today (実JST基準) と generated_at の
+    # 日付 (UTC時計の値をJSTとして誤解釈) が食い違い、本テストが必ず失敗する
+    # (2026-09-17 JST 00:2x に UTC ランナーで実際に再現)。
+    _now = datetime.now(_JST).replace(tzinfo=None)
     _candidate = _now - timedelta(minutes=5)
     if _candidate.date() != _now.date():
         _candidate = datetime.combine(_now.date(), datetime.min.time())
