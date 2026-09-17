@@ -260,9 +260,12 @@ def test_weekend_status_calls_do_not_corrupt_the_following_mondays_guard(
 
 
 # ── _update_rolling30: 無効な日を除外する ──────────────────────────────
+# これらのテストは除外日ロジックだけを見るため、既知の定期積立控除
+# （下の F6 セクション参照）は空スケジュールにして無関係化する。
 
 def test_update_rolling30_excludes_none_pnl_days_from_the_sum(monkeypatch):
     monkeypatch.setattr(bg, "date", _frozen_date(2026, 9, 8))
+    monkeypatch.setattr("contribution_schedule.occurrences", lambda *a, **k: [])
     state = {
         "date": "2026-09-08",  # 火曜。直前営業日は月曜(9/7)
         "pnl_history": [
@@ -284,6 +287,7 @@ def test_update_rolling30_never_raises_typeerror_on_none_entries(monkeypatch):
     """再現: 旧実装は e['pnl_jpy'] を無条件 sum() していたため None 混入で
     TypeError になっていた。"""
     monkeypatch.setattr(bg, "date", _frozen_date(2026, 9, 8))
+    monkeypatch.setattr("contribution_schedule.occurrences", lambda *a, **k: [])
     state = {
         "pnl_history": [{"date": "2026-09-01", "pnl_jpy": None, "basis_valid": False}],
         "daily_pnl_jpy": 0.0,
@@ -294,6 +298,7 @@ def test_update_rolling30_never_raises_typeerror_on_none_entries(monkeypatch):
 
 def test_update_rolling30_excludes_todays_contribution_when_basis_invalid(monkeypatch):
     monkeypatch.setattr(bg, "date", _frozen_date(2026, 9, 8))
+    monkeypatch.setattr("contribution_schedule.occurrences", lambda *a, **k: [])
     state = {
         "pnl_history": [],
         "daily_pnl_jpy": -900_000.0,  # 無効基準による多日差分
@@ -313,6 +318,7 @@ def test_update_rolling30_excludes_todays_contribution_when_never_computed_today
     """基準は新鮮でも、今日一度も計算されていない（portfolio_value_as_of が
     今日を指さない）なら今日分を含めない。"""
     monkeypatch.setattr(bg, "date", _frozen_date(2026, 9, 8))
+    monkeypatch.setattr("contribution_schedule.occurrences", lambda *a, **k: [])
     state = {
         "pnl_history": [],
         "daily_pnl_jpy": 0.0,
@@ -327,6 +333,7 @@ def test_update_rolling30_excludes_todays_contribution_when_never_computed_today
 
 def test_update_rolling30_includes_todays_contribution_when_basis_valid(monkeypatch):
     monkeypatch.setattr(bg, "date", _frozen_date(2026, 9, 8))
+    monkeypatch.setattr("contribution_schedule.occurrences", lambda *a, **k: [])
     state = {
         "pnl_history": [],
         "daily_pnl_jpy": 30_000.0,
@@ -338,6 +345,100 @@ def test_update_rolling30_includes_todays_contribution_when_basis_valid(monkeypa
     bg._update_rolling30(state)
     assert state["monthly_pnl_jpy"] == 30_000.0
     assert state["monthly_pnl_basis_excluded_days"] == 0
+
+
+# ── _update_rolling30: 既知の定期積立を「投資成果」から控除する (F6) ────
+# guard の daily_pnl_jpy は評価額の生の差分で、入出金を除いていない。
+# 定期積立が入った日はその分だけ「利益」に見えてしまい、本当の投資成果を
+# NAV記録のflow-adjusted TWRと比較不能なほど過大評価していた（2026-09
+# レビュー F6）。contribution_schedule.py の確定額スケジュールを窓合計で
+# 控除する。日単位の帰属ではなく窓合計にするのは、nominal な積立日と
+# 実約定日のズレに依存しないため。
+
+def test_update_rolling30_backs_out_scheduled_contributions_from_the_window(monkeypatch):
+    monkeypatch.setattr(bg, "date", _frozen_date(2026, 9, 8))
+    monkeypatch.setattr(
+        "contribution_schedule.occurrences",
+        lambda date_from, date_to: [
+            (date(2026, 8, 25), {"amount": 80_000, "currency": "JPY"}),
+            (date(2026, 9, 1), {"amount": 100_000, "currency": "JPY"}),
+        ],
+    )
+    state = {
+        "date": "2026-09-08",
+        "pnl_history": [{"date": "2026-09-01", "pnl_jpy": 50_000.0}],
+        "daily_pnl_jpy": 0.0,
+        "portfolio_value": 30_000_000.0,
+    }
+    bg._update_rolling30(state)
+    # raw の日次合計(50,000)から、窓内の既知積立合計(80,000+100,000)を控除
+    assert state["monthly_pnl_jpy"] == 50_000.0 - 180_000.0
+    assert state["monthly_pnl_jpy_raw"] == 50_000.0
+    assert state["monthly_pnl_scheduled_contributions_jpy"] == 180_000.0
+
+
+def test_update_rolling30_pct_uses_the_contribution_adjusted_numerator(monkeypatch):
+    monkeypatch.setattr(bg, "date", _frozen_date(2026, 9, 8))
+    monkeypatch.setattr(
+        "contribution_schedule.occurrences",
+        lambda date_from, date_to: [
+            (date(2026, 9, 1), {"amount": 100_000, "currency": "JPY"}),
+        ],
+    )
+    state = {
+        "date": "2026-09-08",
+        "pnl_history": [],
+        "daily_pnl_jpy": 100_000.0,  # ちょうど積立額と同額の評価額増加
+        "portfolio_value": 30_000_000.0,
+        "portfolio_value_as_of": "2026-09-08T09:00:00",
+        "daily_pnl_basis_as_of": "2026-09-07T17:35:00",
+    }
+    bg._update_rolling30(state)
+    # 積立を控除すると投資成果はゼロ
+    assert state["monthly_pnl_jpy"] == 0.0
+    assert state["monthly_pnl_pct"] == 0.0
+    assert state["monthly_pnl_pct_raw"] == pytest.approx(100_000.0 / 30_000_000.0)
+
+
+def test_update_rolling30_ignores_non_jpy_scheduled_entries(monkeypatch):
+    """将来 JPY 以外の積立がスケジュールに増えても、FX換算せず誤って
+    控除しないための境界確認（現状の3件は全て JPY）。"""
+    monkeypatch.setattr(bg, "date", _frozen_date(2026, 9, 8))
+    monkeypatch.setattr(
+        "contribution_schedule.occurrences",
+        lambda date_from, date_to: [
+            (date(2026, 9, 1), {"amount": 1_000, "currency": "USD"}),
+        ],
+    )
+    state = {
+        "date": "2026-09-08",
+        "pnl_history": [{"date": "2026-09-01", "pnl_jpy": 5_000.0}],
+        "daily_pnl_jpy": 0.0,
+        "portfolio_value": 30_000_000.0,
+    }
+    bg._update_rolling30(state)
+    assert state["monthly_pnl_jpy"] == 5_000.0  # USD建てエントリーは控除しない
+    assert state["monthly_pnl_scheduled_contributions_jpy"] == 0.0
+
+
+def test_update_rolling30_survives_contribution_schedule_import_failure(monkeypatch):
+    """スケジュールの解決に失敗しても rolling 計算そのものは壊さない
+    （安全側 = 控除ゼロで従来の生値のまま、例外を伝播させない）。"""
+    monkeypatch.setattr(bg, "date", _frozen_date(2026, 9, 8))
+
+    def _boom(*a, **k):
+        raise RuntimeError("schedule unavailable")
+
+    monkeypatch.setattr("contribution_schedule.occurrences", _boom)
+    state = {
+        "date": "2026-09-08",
+        "pnl_history": [{"date": "2026-09-01", "pnl_jpy": 5_000.0}],
+        "daily_pnl_jpy": 0.0,
+        "portfolio_value": 30_000_000.0,
+    }
+    bg._update_rolling30(state)  # 例外を投げないことそのものがテスト
+    assert state["monthly_pnl_jpy"] == 5_000.0
+    assert state["monthly_pnl_scheduled_contributions_jpy"] == 0.0
 
 
 # ── evaluate(): 基準無効なら loss_guard_state へ None を渡す・KeyError無し ──

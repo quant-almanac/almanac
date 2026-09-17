@@ -492,6 +492,27 @@ def resolve_loss_guard_inputs(guard_state: dict | None, *, as_of_date: str | Non
     return {"daily": daily, "rolling": rolling}
 
 
+def _scheduled_contributions_jpy(date_from: str, date_to: str) -> float:
+    """[date_from, date_to] 内に見込まれる既知の定期積立（JPY建てのみ）の合計額。
+
+    _update_rolling30 が生の評価額差分から investment-only な成分を取り出す
+    ために使う（下記参照）。日単位で特定の積立をどの日に帰属させるかは
+    nominal な想定日と実約定日がズレるため決め打ちできない
+    （contribution_schedule.py 参照）。日別帰属を試みず窓合計で1回だけ
+    控除することで、その日付ズレに依存しない。スケジュール解決自体が
+    失敗しても rolling 計算を壊さないよう、安全側（控除ゼロ = 従来どおり
+    生値のまま）にフォールバックする。
+    """
+    try:
+        from contribution_schedule import occurrences
+        return sum(
+            float(c['amount']) for _, c in occurrences(date_from, date_to)
+            if str(c.get('currency') or 'JPY').upper() == 'JPY'
+        )
+    except Exception:
+        return 0.0
+
+
 def _update_rolling30(state: dict) -> None:
     """
     pnl_history（日次P&Lの履歴）から直近30日のローリングP&Lを計算して state を更新する。
@@ -502,6 +523,17 @@ def _update_rolling30(state: dict) -> None:
     履歴行は合計から除外する。今日分も基準が無効なら除外する ―― 確認済みの
     残り日数分のローリング値を殺さないため、rolling 全体を None にはしない
     （2026-09 レビュー S1b・Codex 指摘1: 判明している制約は維持する）。
+
+    daily_pnl_jpy は評価額の生の差分であり、入出金を除いていない。定期積立が
+    入った日はその分だけ「利益」に見え、実際の投資成果を過小評価した損失
+    として扱えない（NAV記録の flow-adjusted TWR と数ptずれる原因、2026-09
+    レビュー F6）。monthly_pnl_jpy/pct は既知の確定額スケジュール
+    （contribution_schedule.py）を窓合計で控除した investment-only な値に
+    上書きする ―― execution_preflight・analyst・scenario_strategy・
+    market_regime_v2 など monthly_pnl_pct を読む全ての消費者がこの1箇所の
+    修正で恩恵を受ける。控除前の生値は monthly_pnl_*_raw に残す（表示・
+    監査用途、ガード判定には使わない）。想定外の大口出金等スケジュール外の
+    変動は従来どおり控除しない ―― 安全側（不明な変動は損失として扱う）。
     """
     cutoff = (date.today() - timedelta(days=30)).isoformat()
     today_str = date.today().isoformat()
@@ -523,13 +555,18 @@ def _update_rolling30(state: dict) -> None:
     if not today_valid:
         excluded_days += 1
 
-    rolling_jpy = past_total + today_component
+    rolling_jpy_raw = past_total + today_component
+    scheduled_contributions_jpy = _scheduled_contributions_jpy(cutoff, today_str)
+    rolling_jpy = rolling_jpy_raw - scheduled_contributions_jpy
 
     state['monthly_pnl_jpy'] = rolling_jpy
+    state['monthly_pnl_jpy_raw'] = rolling_jpy_raw
+    state['monthly_pnl_scheduled_contributions_jpy'] = scheduled_contributions_jpy
     state['monthly_pnl_basis_excluded_days'] = excluded_days
     state['monthly_pnl_computed_for_date'] = today_str
     pv = state.get('portfolio_value', 0)
     state['monthly_pnl_pct'] = rolling_jpy / pv if pv > 0 else 0.0
+    state['monthly_pnl_pct_raw'] = rolling_jpy_raw / pv if pv > 0 else 0.0
 
 
 def load_state() -> dict:
