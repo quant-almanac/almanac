@@ -137,6 +137,40 @@ def test_loss_guard_stage_blocks_buy_when_canonical_dd_is_unavailable():
     assert d.rejected[0]["rule"] == "_rule_dd_stage"
 
 
+def test_data_confidence_caution_loss_guard_does_not_reject_buy():
+    """An unconfirmed loss-guard basis (e.g. an EOD valuation failure) must
+    not be treated the same as a real threshold breach. It is a visible
+    data-quality caution at execution preflight, not a morning-analysis
+    hard block -- same design as the canonical-DD data_confidence_caution
+    carve-out (2026-09 review, F1)."""
+    ctx = pe.PolicyContext(current_dd=None, loss_guard_stage="data_confidence_caution")
+    d = pe.apply_policy_gate([_action("buy")], ctx)
+    assert len(d.accepted) == 1
+    assert len(d.rejected) == 0
+
+
+def test_data_confidence_caution_loss_guard_does_not_mask_a_real_dd_breach():
+    """The loss-guard caution carve-out must not accidentally suppress an
+    independently-confirmed, genuinely bad canonical drawdown stage."""
+    ctx = pe.PolicyContext(
+        current_dd=-0.081, loss_guard_stage="data_confidence_caution",
+        canonical_drawdown_stage="block",
+    )
+    d = pe.apply_policy_gate([_action("buy")], ctx)
+    assert len(d.rejected) == 1
+    assert d.rejected[0]["rule"] == "_rule_dd_stage"
+
+
+def test_a_genuinely_known_bad_loss_guard_stage_still_rejects_buy():
+    """Negative control: only data_confidence_caution is carved out --
+    stage_1/2/3 and daily_block must still hard-reject exactly as before."""
+    for stage in ("stage_1", "stage_2", "stage_3", "daily_block"):
+        ctx = pe.PolicyContext(current_dd=None, loss_guard_stage=stage)
+        d = pe.apply_policy_gate([_action("buy")], ctx)
+        assert len(d.rejected) == 1, stage
+        assert d.rejected[0]["rule"] == "_rule_dd_stage"
+
+
 def test_loss_guard_and_drawdown_block_new_short_but_allow_cover():
     scenarios = [
         pe.PolicyContext(current_dd=None, loss_guard_stage="stage_3", current_short_positions=0),

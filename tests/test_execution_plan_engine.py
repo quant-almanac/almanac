@@ -1627,6 +1627,25 @@ def test_dynamic_budget_uses_regime_deployment_horizon(
     assert budgets["monthly_discretionary_budget_jpy"] == expected
 
 
+@pytest.mark.parametrize(
+    ("new_entry_allowed", "expected"),
+    [
+        (False, True),   # known-bad (a real threshold breach) -- still blocks
+        (None, False),   # unknown (e.g. EOD valuation failure) -- must not
+        (True, False),
+    ],
+)
+def test_guard_blocks_new_deployment_distinguishes_unknown_from_known_bad(
+    new_entry_allowed, expected,
+) -> None:
+    """guard_state.json's new_entry_allowed is now a real three-valued signal
+    (True/False/None) instead of always a bool. None must not be treated the
+    same as a confirmed block: an unconfirmed loss-guard basis is a
+    data-quality caution, not a known threshold breach (2026-09 review, F1)."""
+    guard = {"new_entry_allowed": new_entry_allowed, "trading_allowed": True}
+    assert epe._guard_blocks_new_deployment(guard) is expected
+
+
 def test_regime_disabled_ordinary_deployment_records_a_structured_block_reason() -> None:
     """When cash target and horizon both resolve but the regime itself
     disables ordinary deployment (deployment_months is None), this is a 5th

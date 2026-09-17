@@ -227,7 +227,14 @@ def _rule_dd_stage(action: dict, ctx: PolicyContext):
     """
     if action.get("type", "").lower() not in _RISK_INCREASING_TYPES:
         return None
-    if ctx.loss_guard_stage and ctx.loss_guard_stage != "ok":
+    # An unconfirmed loss-guard basis (e.g. an EOD valuation failure) is a
+    # visible data-quality caution at execution preflight -- risk_policy.
+    # classify_execution_risk already returns confirmation_required, not
+    # hard_reject, for this identical stage -- not a morning-analysis hard
+    # block. Same design as the canonical-DD data_confidence_caution
+    # carve-out a few lines below; a genuinely known-bad stage (stage_1/2/3,
+    # daily_block) still rejects (2026-09 review, F1).
+    if ctx.loss_guard_stage and ctx.loss_guard_stage not in {"ok", "data_confidence_caution"}:
         return ("reject", f"loss_guard_stage={ctx.loss_guard_stage}（日次/30日P&Lショック制御）により新規リスク停止。")
     dd_stage = ctx.canonical_drawdown_stage or classify_drawdown(ctx.current_dd).get("dd_stage")
     try:

@@ -1530,6 +1530,11 @@ def _fmt_guard_warnings(guard: dict) -> str:
 
     if not guard.get("trading_allowed", True):
         lines.append("## 🚨 ガードレール: 全トレード停止（月間損失閾値-8%超過）")
+    elif guard.get("new_entry_allowed") is None:
+        # new_entry_allowed=None は「損失閾値超過」ではなく「日次/30日P&Lの
+        # 確認基準が不足」―― 実際の閾値超過だと誤ってAIの文脈に注入すると、
+        # 分析がありもしない損失を根拠に推論してしまう(2026-09 review, F1)。
+        lines.append("## ⚠️ ガードレール: 新規エントリー要確認（日次/30日P&Lの確認基準が不足。損失閾値超過ではない）")
     elif not guard.get("new_entry_allowed", True):
         # 原因を判定: アクティブトレード数超過 vs 日次損失超過
         if "アクティブトレード" in alert_msgs:

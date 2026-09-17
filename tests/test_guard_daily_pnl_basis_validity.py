@@ -403,4 +403,7 @@ def test_evaluate_does_not_crash_when_loss_guard_returns_data_confidence_caution
 
     assert result["loss_guard_stage"] == "data_confidence_caution"
     assert result["guardrail_stage"] == 0
-    assert result["new_entry_allowed"] is False  # bool(None) == False, 安全側
+    # bool(None) == False で「不明」を「既知の閾値超過」と同一視していたのを
+    # 修正: 三値のまま保存し、readerが「要確認」と「reject」を区別できるように
+    # する (2026-09 review, F1)。
+    assert result["new_entry_allowed"] is None

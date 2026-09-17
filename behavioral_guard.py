@@ -805,7 +805,14 @@ def evaluate(state: dict) -> dict:
         # never a drawdown value; data_gatherer publishes the renamed fields.
         "actual_dd_stage": decision["actual_dd_stage"],
         "guardrail_stage": stage,
-        "new_entry_allowed": bool(decision["new_risk_allowed"]),
+        # Preserve the three-valued signal loss_guard_state() already
+        # returns (True/False/None): coercing None (unknown -- e.g. an EOD
+        # valuation failure) to False here collapsed "unknown" into "known
+        # bad", forcing new_entry_allowed=False identically to a real
+        # threshold breach. Every reader of guard_state.json's
+        # new_entry_allowed must treat None as "needs confirmation", not as
+        # either "allowed" or "known blocked" (2026-09 review, F1).
+        "new_entry_allowed": decision["new_risk_allowed"],
         "trading_allowed": True,
         "risk_factor": 1.0,
         "nisa_exception_allowed": False,
