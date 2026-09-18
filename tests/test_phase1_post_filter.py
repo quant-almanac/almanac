@@ -1283,6 +1283,39 @@ def test_generic_nisa_buy_does_not_bind_position_key_without_route() -> None:
     assert bound["execution_position_binding"] == "withheld_unresolved_nisa_route"
 
 
+def test_holding_lookup_matches_broker_stored_in_japanese_against_canonical_request() -> None:
+    """holdings.json stores broker as the raw CSV label (e.g. "楽天証券"), never
+    the canonical English form ("rakuten") that actions carry as
+    execution_broker. _holding_info_for_action canonicalized only the
+    requested side, so this comparison always failed for every real
+    holdings.json row and marked an actually-owned, actually-attributed
+    position as holding_scope_unresolved -- observed live blocking a COST
+    tax-loss sell whose account/owner otherwise matched exactly
+    (2026-09 review, candidate throughput)."""
+    action = {
+        "ticker": "COST", "tier": "Medium", "type": "sell",
+        "execution_account": "特定", "execution_owner": "husband",
+        "execution_broker": "rakuten",
+    }
+    holdings = {
+        "COST": {
+            "ticker": "COST",
+            "shares": 3,
+            "lots": [{
+                "key": "COST_toku", "ticker": "COST", "shares": 3,
+                "account": "特定", "investment_type": "medium",
+                "owner": "husband", "broker": "楽天証券",
+            }],
+        },
+    }
+
+    info = analyst._holding_info_for_action(action, holdings)
+
+    assert info.get("holding_scope_unresolved") is not True
+    assert info.get("key") == "COST_toku"
+    assert info.get("shares") == 3
+
+
 def test_notional_equation_is_recomputed_from_limit_price() -> None:
     action = {
         "ticker": "1306.T",

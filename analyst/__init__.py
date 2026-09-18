@@ -7518,16 +7518,19 @@ def _holding_info_for_action(action: dict, holdings_price_map: dict) -> dict:
     )
     try:
         from execution_safety import canonical_broker, canonical_owner
-
-        requested_owner = canonical_owner(
-            action.get("execution_owner") or action.get("target_owner") or action.get("owner")
-        )
-        requested_broker = canonical_broker(
-            action.get("execution_broker") or action.get("target_broker") or action.get("broker")
-        )
     except Exception:
-        requested_owner = str(action.get("execution_owner") or action.get("owner") or "").strip().lower()
-        requested_broker = str(action.get("execution_broker") or action.get("broker") or "").strip().lower()
+        def canonical_owner(value: object) -> str:
+            return str(value or "").strip().lower()
+
+        def canonical_broker(value: object) -> str:
+            return str(value or "").strip().lower()
+
+    requested_owner = canonical_owner(
+        action.get("execution_owner") or action.get("target_owner") or action.get("owner")
+    )
+    requested_broker = canonical_broker(
+        action.get("execution_broker") or action.get("target_broker") or action.get("broker")
+    )
     matched = lots
     if requested_tier:
         matched = [
@@ -7537,9 +7540,15 @@ def _holding_info_for_action(action: dict, holdings_price_map: dict) -> dict:
     if requested_account:
         matched = [row for row in matched if _account_matches(requested_account, row.get("account"))]
     if requested_owner:
-        matched = [row for row in matched if str(row.get("owner") or "") == requested_owner]
+        # holdings.json stores broker/owner as the raw CSV label ("楽天証券",
+        # not "rakuten"); canonicalizing only the requested side and comparing
+        # against the raw row value meant this filter could never match any
+        # real holdings row whose owner/broker wasn't already stored in
+        # canonical form -- silently marking real, unambiguous positions as
+        # holding_scope_unresolved (2026-09 review, candidate throughput).
+        matched = [row for row in matched if canonical_owner(row.get("owner")) == requested_owner]
     if requested_broker:
-        matched = [row for row in matched if str(row.get("broker") or "") == requested_broker]
+        matched = [row for row in matched if canonical_broker(row.get("broker")) == requested_broker]
 
     if not matched:
         unresolved = dict(aggregate)
