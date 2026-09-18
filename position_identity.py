@@ -287,6 +287,36 @@ def is_complete_broker_confirmed_fill(row: dict, *, require_applied: bool = True
     )
 
 
+def is_self_reported_applied_cash_fill(row: dict) -> bool:
+    """Whether this self-reported (not broker-CSV-confirmed) fill can extend
+    *cash* authority on its own.
+
+    Deliberately narrower in scope than ``is_complete_broker_confirmed_fill``:
+    this exists only for cash-buying-power authority (execution_readiness's
+    ``_cash_snapshot_execution_authority``), never for the holdings-quantity/
+    cost-basis authority in ``_resolve_position_execution_authority`` -- that
+    one must keep requiring full broker confirmation, per the 2026-07-30
+    decision documented in tests/test_position_identity.py (a stale AVGO/XLF
+    snapshot once looked fresh from an unrelated LLY fill; holdings quantity
+    feeds NISA-room and cost-basis math with no independent downstream
+    check). Cash has one: evaluate_cash_buying_power separately compares the
+    *current* account.json balance against the requested notional, so a wrong
+    self-report is still caught there, not trusted forever.
+    """
+    if str(row.get("status") or "").lower() != "executed":
+        return False
+    if not bool(row.get("portfolio_applied") or row.get("portfolio_updated")):
+        return False
+    if row.get("execution_reconciliation_status") == "review":
+        return False
+    try:
+        if float(row.get("quantity")) <= 0 or float(row.get("price")) <= 0:
+            return False
+    except (TypeError, ValueError):
+        return False
+    return True
+
+
 def _broker_event_authority_time(row: dict) -> datetime | None:
     from execution_safety import parse_timestamp
 

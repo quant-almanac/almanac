@@ -549,7 +549,10 @@ def _cash_snapshot_execution_authority(
         )
 
         rows = load_effective_execution_records(base_dir=base_dir)
-        from position_identity import is_complete_broker_confirmed_fill
+        from position_identity import (
+            is_complete_broker_confirmed_fill,
+            is_self_reported_applied_cash_fill,
+        )
         from execution_safety import parse_timestamp
     except Exception:
         return {
@@ -637,6 +640,18 @@ def _cash_snapshot_execution_authority(
                 else "broker_confirmed_fill"
             )
             continue
+        if (
+            row_owner == owner
+            and row_broker == broker
+            and event_time is not None
+            and is_self_reported_applied_cash_fill(row)
+        ):
+            if event_time.tzinfo is None:
+                event_time = event_time.replace(tzinfo=ZoneInfo("Asia/Tokyo"))
+            event_time = event_time.astimezone(authority_as_of.tzinfo)
+            authority_as_of = max(authority_as_of, event_time)
+            authority_source = "self_reported_applied_fill"
+            continue
         return {
             "authority_as_of": authority_as_of,
             "authority_source": authority_source,
@@ -647,6 +662,7 @@ def _cash_snapshot_execution_authority(
                 "execution_id": row.get("id") or row.get("action_state_id"),
                 "temporal_order": temporal,
                 "broker_confirmation_complete": is_complete_broker_confirmed_fill(row),
+                "self_reported_applied_complete": is_self_reported_applied_cash_fill(row),
             },
         }
     return {

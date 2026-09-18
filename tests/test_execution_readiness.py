@@ -630,6 +630,186 @@ def test_usd_fill_does_not_advance_jpy_cash_authority(tmp_path):
     assert result["cash_resource_as_of"] == "2026-07-27T09:00:00+09:00"
 
 
+# ── self-reported (not yet broker-CSV-confirmed) fills can advance cash
+# authority once applied to the portfolio -- broker CSV reconciliation has
+# been silently absent for months (no CSV ever dropped in
+# data/broker_ingest/), so requiring it indefinitely froze cash-requiring
+# candidates for every wallet with a recent self-reported trade. Cash is a
+# continuously-recomputed balance (account.json), not a point-in-time
+# quantity/cost-basis fact like a holding, and evaluate_cash_buying_power
+# still separately checks the *current* balance against the requested
+# notional -- so a wrong self-report is caught there, not silently trusted
+# forever (2026-09 review, candidate throughput).
+
+def test_self_reported_applied_fill_advances_cash_authority_without_broker_confirmation(tmp_path):
+    now = datetime(2026, 7, 28, 9, 0, tzinfo=JST)
+    (tmp_path / "holdings.json").write_text(json.dumps({
+        "CASH_JPY_SBI_WIFE": {
+            "ticker": "CASH_JPY_SBI_WIFE",
+            "shares": 47_000,
+            "available_to_trade_jpy": 47_000,
+            "currency": "JPY",
+            "balance_status": "confirmed",
+            "reconciliation_required": False,
+            "source_as_of": "2026-07-27T09:00:00+09:00",
+        },
+    }), encoding="utf-8")
+    (tmp_path / "action_executions.json").write_text(json.dumps({
+        "executions": [{
+            "id": "self-reported-fill",
+            "ticker": "1489.T",
+            "status": "executed",
+            "direction": "buy",
+            "account": "NISA成長投資枠",
+            "execution_owner": "wife",
+            "execution_broker": "sbi",
+            "price": 3_000,
+            "quantity": 1,
+            "portfolio_applied": True,
+            "saved_at": "2026-07-27T12:05:00+09:00",
+        }],
+    }), encoding="utf-8")
+
+    result = evaluate_cash_buying_power({
+        "ticker": "1489.T",
+        "type": "buy",
+        "quantity": 1,
+        "limit_price": 3_000,
+        "execution_owner": "wife",
+        "execution_broker": "sbi",
+        "execution_account": "NISA成長投資枠",
+    }, base_dir=tmp_path, now=now)
+
+    assert result["readiness"] == "ready"
+    assert result["cash_resource_authority_source"] == "self_reported_applied_fill"
+    assert result["cash_resource_as_of"] == "2026-07-27T12:05:00+09:00"
+
+
+def test_self_reported_fill_not_yet_applied_still_invalidates_cash_authority(tmp_path):
+    now = datetime(2026, 7, 28, 9, 0, tzinfo=JST)
+    (tmp_path / "holdings.json").write_text(json.dumps({
+        "CASH_JPY_SBI_WIFE": {
+            "ticker": "CASH_JPY_SBI_WIFE",
+            "shares": 50_000,
+            "currency": "JPY",
+            "balance_status": "confirmed",
+            "reconciliation_required": False,
+            "source_as_of": "2026-07-27T09:00:00+09:00",
+        },
+    }), encoding="utf-8")
+    (tmp_path / "action_executions.json").write_text(json.dumps({
+        "executions": [{
+            "id": "not-yet-applied",
+            "ticker": "1489.T",
+            "status": "executed",
+            "execution_owner": "wife",
+            "execution_broker": "sbi",
+            "execution_account": "NISA成長投資枠",
+            "price": 3_000,
+            "quantity": 1,
+            "saved_at": "2026-07-27T12:00:00+09:00",
+        }],
+    }), encoding="utf-8")
+
+    result = evaluate_cash_buying_power({
+        "ticker": "1489.T",
+        "type": "buy",
+        "quantity": 1,
+        "limit_price": 3_000,
+        "execution_owner": "wife",
+        "execution_broker": "sbi",
+        "execution_account": "NISA成長投資枠",
+    }, base_dir=tmp_path, now=now)
+
+    assert result["readiness"] == "blocked"
+    assert result["reasons"][0]["code"] == "cash_resource_snapshot_invalidated"
+
+
+def test_self_reported_fill_under_review_still_invalidates_cash_authority(tmp_path):
+    now = datetime(2026, 7, 28, 9, 0, tzinfo=JST)
+    (tmp_path / "holdings.json").write_text(json.dumps({
+        "CASH_JPY_SBI_WIFE": {
+            "ticker": "CASH_JPY_SBI_WIFE",
+            "shares": 50_000,
+            "currency": "JPY",
+            "balance_status": "confirmed",
+            "reconciliation_required": False,
+            "source_as_of": "2026-07-27T09:00:00+09:00",
+        },
+    }), encoding="utf-8")
+    (tmp_path / "action_executions.json").write_text(json.dumps({
+        "executions": [{
+            "id": "under-review",
+            "ticker": "1489.T",
+            "status": "executed",
+            "execution_owner": "wife",
+            "execution_broker": "sbi",
+            "execution_account": "NISA成長投資枠",
+            "price": 3_000,
+            "quantity": 1,
+            "portfolio_applied": True,
+            "saved_at": "2026-07-27T12:00:00+09:00",
+        }],
+    }), encoding="utf-8")
+    # A corrupt route-correction overlay makes every record's reconciliation
+    # status "review" (load_effective_execution_records fails closed).
+    (tmp_path / "execution_reconciliation_state.json").write_text(
+        "{broken", encoding="utf-8",
+    )
+
+    result = evaluate_cash_buying_power({
+        "ticker": "1489.T",
+        "type": "buy",
+        "quantity": 1,
+        "limit_price": 3_000,
+        "execution_owner": "wife",
+        "execution_broker": "sbi",
+        "execution_account": "NISA成長投資枠",
+    }, base_dir=tmp_path, now=now)
+
+    assert result["readiness"] == "blocked"
+    assert result["reasons"][0]["code"] == "cash_resource_snapshot_invalidated"
+
+
+def test_self_reported_fill_missing_quantity_still_invalidates_cash_authority(tmp_path):
+    now = datetime(2026, 7, 28, 9, 0, tzinfo=JST)
+    (tmp_path / "holdings.json").write_text(json.dumps({
+        "CASH_JPY_SBI_WIFE": {
+            "ticker": "CASH_JPY_SBI_WIFE",
+            "shares": 50_000,
+            "currency": "JPY",
+            "balance_status": "confirmed",
+            "reconciliation_required": False,
+            "source_as_of": "2026-07-27T09:00:00+09:00",
+        },
+    }), encoding="utf-8")
+    (tmp_path / "action_executions.json").write_text(json.dumps({
+        "executions": [{
+            "id": "no-quantity",
+            "ticker": "1489.T",
+            "status": "executed",
+            "execution_owner": "wife",
+            "execution_broker": "sbi",
+            "execution_account": "NISA成長投資枠",
+            "portfolio_applied": True,
+            "saved_at": "2026-07-27T12:00:00+09:00",
+        }],
+    }), encoding="utf-8")
+
+    result = evaluate_cash_buying_power({
+        "ticker": "1489.T",
+        "type": "buy",
+        "quantity": 1,
+        "limit_price": 3_000,
+        "execution_owner": "wife",
+        "execution_broker": "sbi",
+        "execution_account": "NISA成長投資枠",
+    }, base_dir=tmp_path, now=now)
+
+    assert result["readiness"] == "blocked"
+    assert result["reasons"][0]["code"] == "cash_resource_snapshot_invalidated"
+
+
 def test_exit_quantity_over_requested_account_inventory_is_blocked(tmp_path):
     now = datetime(2026, 7, 14, 6, 0, tzinfo=JST)
     _write_base(tmp_path, now)
