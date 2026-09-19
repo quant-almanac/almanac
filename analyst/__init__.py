@@ -2326,6 +2326,18 @@ Mediumティアとして以下のJSON形式で分析してください:
         return {"error": str(e), "health": "caution", "summary": "分析エラー", "priority_actions": [], "ginn_vol": _ginn_vol_dict, "ginn_vol_model": _ginn_vol_model_dict}
 
 
+def _margin_status_or_unavailable(margin: dict | None) -> str:
+    """margin_manager が返した維持率ステータス。取得できていなければ "unavailable"。
+
+    data_gatherer は get_summary() が例外を投げると ``margin = {}`` にする。
+    従来ここは ``margin.get("margin_status", "safe")`` で、取得失敗を「安全」と
+    AI（と返却される margin_health）へ申告していた ―― 欠損データから作った
+    偽の安全宣言。不明は不明のまま渡す（2026-09 review, P3）。
+    """
+    status = (margin or {}).get("margin_status")
+    return status if isinstance(status, str) and status else "unavailable"
+
+
 def _analyze_margin_long(data: dict, shared_ctx: str = "") -> dict:
     """信用買い一次判断。設定モデルが book-aware に評価し、最終 Opus が採否を決める。"""
     margin = data.get("margin", {}) or {}
@@ -2348,7 +2360,7 @@ def _analyze_margin_long(data: dict, shared_ctx: str = "") -> dict:
     margin_detail = {
         "blocked": blocked,
         "block_reason": screening.get("margin_long_block_reason", ""),
-        "status": margin.get("margin_status", "safe"),
+        "status": _margin_status_or_unavailable(margin),
         "maintenance_ratio": margin.get("maintenance_ratio"),
         "collateral": margin.get("collateral", 0),
         "total_unrealized": margin.get("total_unrealized", 0),
@@ -2359,7 +2371,7 @@ def _analyze_margin_long(data: dict, shared_ctx: str = "") -> dict:
     if blocked or not candidates:
         return {
             "health": "good" if not blocked else "caution",
-            "margin_health": margin_detail.get("status", "safe"),
+            "margin_health": margin_detail.get("status", "unavailable"),
             "summary": "信用買い候補なし" if not blocked else f"信用買いブロック: {margin_detail.get('block_reason')}",
             "priority_actions": [],
             "margin_long_picks": [],
@@ -2382,7 +2394,7 @@ def _analyze_margin_long(data: dict, shared_ctx: str = "") -> dict:
 {json.dumps(data.get('cash_info', {}), ensure_ascii=False)}
 
 ### 判断ルール
-- margin_health が warning/danger/emergency の場合、新規 margin_buy は原則禁止。
+- margin_health が warning/danger/emergency、または unavailable（証拠金状況を取得できていない）の場合、新規 margin_buy は原則禁止。
 - 候補 score≥100 でも、金利コスト・流動性・決算・ボラティリティに見合わなければ reject/hold でよい。
 - type は `margin_buy` または `buy` のみ。現金で十分かつレバレッジ不要なら `buy` とする。
 - 投信 (SLIM_/MNXACT/IFREE_/NOMURA_) は信用買い不可。
@@ -2391,7 +2403,7 @@ def _analyze_margin_long(data: dict, shared_ctx: str = "") -> dict:
 以下のJSON形式で回答してください:
 {{
   "health": "good|caution|critical",
-  "margin_health": "safe|warning|danger|emergency",
+  "margin_health": "safe|warning|danger|emergency|unavailable",
   "summary": "3文以内",
   "margin_long_picks": [{{"rank":1,"ticker":"XXX","strategy":"戦略名","reason":"採用/監視理由","stop_loss_pct":-7,"urgency":"high|medium|low","score":120,"confidence_pct":70}}],
   "priority_actions": [{{"rank":1,"urgency":"high|medium|low","type":"margin_buy|buy","ticker":"XXX","action":"具体的なアクション","reason":"根拠","amount_hint":"整数株単位のみ","return_20d_rank":"top|middle|bottom","confidence_pct":75}}],
@@ -2421,7 +2433,7 @@ def _analyze_margin_long(data: dict, shared_ctx: str = "") -> dict:
         return {
             "error": str(e),
             "health": "caution",
-            "margin_health": margin_detail.get("status", "safe"),
+            "margin_health": margin_detail.get("status", "unavailable"),
             "summary": "信用買い分析エラー",
             "priority_actions": [],
             "margin_long_picks": [],
@@ -2628,7 +2640,7 @@ def _analyze_short_selling(data: dict, shared_ctx: str = "") -> dict:
     margin = data["margin"]
 
     margin_detail = {
-        "status": margin.get("margin_status", "safe"),
+        "status": _margin_status_or_unavailable(margin),
         "maintenance_ratio": margin.get("maintenance_ratio"),
         "collateral": margin.get("collateral", 0),
         "total_unrealized": margin.get("total_unrealized", 0),
@@ -2657,6 +2669,7 @@ def _analyze_short_selling(data: dict, shared_ctx: str = "") -> dict:
 ### 信用建玉・証拠金状況
 {json.dumps(margin_detail, ensure_ascii=False)}
 ⚠️ maintenance_ratio が 130% 未満 → 新規空売り禁止。110% 未満 → 追証アラート発令。
+⚠️ status が unavailable（証拠金状況を取得できていない）の場合は余力を確認できないため、新規空売りは提案しない。
 
 {earnings_text_ss}
 
@@ -2669,7 +2682,7 @@ def _analyze_short_selling(data: dict, shared_ctx: str = "") -> dict:
 ---
 以下のJSON形式で分析してください:
 {{
-  "margin_health": "safe|warning|danger|emergency",
+  "margin_health": "safe|warning|danger|emergency|unavailable",
   "margin_summary": "証拠金評価",
   "short_opportunities": [{{"rank":1,"ticker":"XXX","urgency":"high|medium|low","entry_zone":"価格帯","target_price":"目標","stop_loss":"損切り","rsi":null,"risk_reward":"1:X","catalyst":"触媒","reason":"根拠","return_20d_rank":"20営業日後の相対順位(top=上位30%/middle=中位/bottom=下位30%)","confidence_pct":"確信度(0-100の数値)"}}],
   "margin_actions": [{{"urgency":"high|medium|low","action":"アクション","reason":"根拠"}}],

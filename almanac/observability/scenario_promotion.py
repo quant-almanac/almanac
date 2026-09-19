@@ -36,6 +36,7 @@ class ScenarioPromotionStats:
     observed_hypotheses: int
     observe_only_hypotheses: int
     measured_episodes: int
+    cost_adjusted_episodes: int
     hit_rate: float | None
     mean_excess_return_bps: float | None
     median_excess_return_bps: float | None
@@ -128,6 +129,21 @@ def _finite_excess_return_bps(row: Mapping[str, Any]) -> float | None:
     return value
 
 
+def _row_is_cost_adjusted(row: Mapping[str, Any]) -> bool:
+    """Whether this outcome's contribution to the mean/hit-rate above actually
+    came from after_cost_excess_return_bps, not a gross-return fallback.
+
+    P3 review found after_cost_excess_return_bps populated in 0% of
+    production outcome rows -- every mean/hit-rate this module has ever
+    reported was gross-only, with nothing surfacing that fact. Tracked
+    per-scenario as cost_adjusted_episodes so a reader (or the promotion
+    decision itself, once P3's cost model lands) can tell honest cost-
+    adjusted stats from a silent gross substitute (2026-09 review, P3).
+    """
+    raw = row.get("after_cost_excess_return_bps")
+    return isinstance(raw, (int, float)) and math.isfinite(float(raw))
+
+
 def _mean(values: list[float]) -> float | None:
     return (sum(values) / len(values)) if values else None
 
@@ -148,6 +164,7 @@ def _stats_to_dict(stats: ScenarioPromotionStats) -> dict[str, Any]:
         "observed_hypotheses": stats.observed_hypotheses,
         "observe_only_hypotheses": stats.observe_only_hypotheses,
         "measured_episodes": stats.measured_episodes,
+        "cost_adjusted_episodes": stats.cost_adjusted_episodes,
         "hit_rate": stats.hit_rate,
         "mean_excess_return_bps": stats.mean_excess_return_bps,
         "median_excess_return_bps": stats.median_excess_return_bps,
@@ -188,6 +205,7 @@ def aggregate_scenario_promotion(
     result: dict[str, ScenarioPromotionStats] = {}
     for scenario_id, hids in sorted(scenario_to_hids.items()):
         values: list[float] = []
+        cost_adjusted_episodes = 0
         for hypothesis_id in sorted(hids):
             row = outcomes_by_key.get((hypothesis_id, int(primary_horizon_days)))
             if row is None:
@@ -195,6 +213,8 @@ def aggregate_scenario_promotion(
             value = _finite_excess_return_bps(row)
             if value is not None:
                 values.append(value)
+                if _row_is_cost_adjusted(row):
+                    cost_adjusted_episodes += 1
 
         wins = sum(1 for value in values if value > 0)
         hit_rate = (wins / len(values)) if values else None
@@ -220,6 +240,7 @@ def aggregate_scenario_promotion(
             observed_hypotheses=len(hids),
             observe_only_hypotheses=observe_only_count,
             measured_episodes=len(values),
+            cost_adjusted_episodes=cost_adjusted_episodes,
             hit_rate=hit_rate,
             mean_excess_return_bps=mean_bps,
             median_excess_return_bps=median_bps,
