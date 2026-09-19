@@ -775,16 +775,44 @@ def _check_portfolio_integrity() -> list:
     return recovery_issues + result.get('issues', [])
 
 
-def _is_weekend() -> bool:
-    """土日か？（JST 基準）"""
-    # time.localtime() はシステム timezone 使用。macOS は JST 設定前提。
+def _is_weekend(*, now_ts: float | None = None) -> bool:
+    """土日か？（JST 基準）
+
+    ``now_ts`` を渡すとその瞬間を JST 換算で判定する（ホストのTZ環境変数に
+    依存しない）。省略時は従来通り ``time.localtime()``（macOS は JST
+    設定前提）。evaluate_heartbeats は自身が受け取った ``now`` をここへ渡す
+    ―― 渡さないと、テストが注入した ``now`` が平日を指していても、実際の
+    実行時刻（例: 実際の土曜日）で判定されてしまい、猶予が意図せず発動する
+    （2026-09 レビュー、テストのTZ/曜日依存を確認して発見）。
+    """
+    if now_ts is not None:
+        return datetime.fromtimestamp(now_ts, tz=ZoneInfo("Asia/Tokyo")).weekday() >= 5
     return time.localtime().tm_wday >= 5
 
 
-def _is_monday_morning_grace() -> bool:
-    """月曜 9:00 前は週末分の stale を猶予（週末の未実行を責めない）"""
+def _is_monday_morning_grace(*, now_ts: float | None = None) -> bool:
+    """月曜 9:00 前は週末分の stale を猶予（週末の未実行を責めない）
+
+    ``now_ts``の扱いは _is_weekend と同じ（下記参照）。
+    """
+    if now_ts is not None:
+        dt = datetime.fromtimestamp(now_ts, tz=ZoneInfo("Asia/Tokyo"))
+        return dt.weekday() == 0 and dt.hour < 9
     lt = time.localtime()
     return lt.tm_wday == 0 and lt.tm_hour < 9
+
+
+def _weekend_check(fn, *, now_ts: float) -> bool:
+    """_is_weekend/_is_monday_morning_grace を明示的な瞬間で呼ぶ。
+
+    テストが ``monkeypatch.setattr(wd, "_is_weekend", lambda: True)`` の
+    ように無引数の代替を差し込む既存パターンと両立するため、``now_ts``
+    キーワード引数を受け付けない呼び出し先には無引数でフォールバックする。
+    """
+    try:
+        return fn(now_ts=now_ts)
+    except TypeError:
+        return fn()
 
 
 def _daily_deadline_dt_jst(hhmm: str, *, now_ts: float) -> Optional[datetime]:
@@ -830,7 +858,7 @@ def evaluate_heartbeats(heartbeats: dict | None = None, *, now: float | None = N
         entry = hb.get(script)
         if entry is None:
             # 週末はどのスクリプトにも一律で猶予する（そもそも稼働日ではない）。
-            if _is_weekend():
+            if _weekend_check(_is_weekend, now_ts=now):
                 continue
             deadline = cfg.get('expected_after_jst')
             if deadline and _is_before_daily_deadline_jst(deadline, now_ts=now):
@@ -849,7 +877,7 @@ def evaluate_heartbeats(heartbeats: dict | None = None, *, now: float | None = N
             # の 06:45 締切は月曜9:00までの猶予期間にすっぽり収まるため、
             # 月曜だけ never_run 検知が実質無効化されていた
             # （2026-09 レビュー Codex 3ラウンド目 指摘 #7a・実機再現）。
-            if not deadline and _is_monday_morning_grace():
+            if not deadline and _weekend_check(_is_monday_morning_grace, now_ts=now):
                 continue
             stale.append({
                 'script': script,
@@ -878,7 +906,7 @@ def evaluate_heartbeats(heartbeats: dict | None = None, *, now: float | None = N
                 # （2026-09 レビュー Codex 指摘 #7）。
                 missed_todays_deadline = last_dt.date() < now_dt.date() and now_dt >= deadline_dt
 
-        if cfg.get('weekday_only') and _is_weekend():
+        if cfg.get('weekday_only') and _weekend_check(_is_weekend, now_ts=now):
             # 週末はどのスクリプトにも一律で猶予する（そもそも稼働日ではない）。
             # ただし error/warn_is_error の可視性は猶予中でも失わない
             # （旧実装は status=='error' しか見ておらず、warn_is_error の
@@ -893,7 +921,7 @@ def evaluate_heartbeats(heartbeats: dict | None = None, *, now: float | None = N
                 ok.append(script)
             continue
 
-        if cfg.get('weekday_only') and _is_monday_morning_grace() and not missed_todays_deadline:
+        if cfg.get('weekday_only') and _weekend_check(_is_monday_morning_grace, now_ts=now) and not missed_todays_deadline:
             # 月曜朝の一律猶予は、自スクリプトの締切をまだ過ぎていない場合
             # にだけ適用する。実行履歴がある分岐でもこれを外していなかった
             # ため、earnings_proximity の06:45締切は月曜9:00までの猶予に

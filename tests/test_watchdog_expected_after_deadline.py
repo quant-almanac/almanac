@@ -10,8 +10,16 @@ expected_after_jst は「その日の予定実行が完了しているべき時�
 として抑止し、時刻を過ぎてなお未実行なら通常どおり検知する。
 
 ホスト TZ に依存せず判定すること（2026-09 レビュー・Codex 指摘2 と同根の問題:
-_is_weekend / _is_monday_morning_grace は time.localtime() ベースで元々 TZ 依存だが、
-この新機能はそれを踏襲しない）。
+_is_weekend / _is_monday_morning_grace は time.localtime() ベースで元々 TZ 依存
+だった。この新機能は当初それを踏襲していなかったが、evaluate_heartbeats 自身が
+呼ぶ _is_weekend()/_is_monday_morning_grace() は now_ts を渡さず real wall-clock
+のままだったため、テストが注入した ``now`` が平日を指していても実際の実行日
+（例: 実際の土曜日にテストを走らせた場合）で判定され、意図しない猶予が発動して
+このファイルのテスト自体が曜日依存で落ちていた。_is_weekend/
+_is_monday_morning_grace に ``now_ts`` キーワード引数を追加し、
+evaluate_heartbeats がここから受け取った ``now`` をそこへ渡すことで解消
+（既存の無引数 monkeypatch との後方互換は _weekend_check の TypeError
+フォールバックで維持、2026-09 レビュー）。
 """
 from __future__ import annotations
 
@@ -27,6 +35,39 @@ JST = ZoneInfo("Asia/Tokyo")
 
 def _epoch_at_jst(y, m, d, hh, mm) -> float:
     return datetime(y, m, d, hh, mm, tzinfo=JST).timestamp()
+
+
+# --- _is_weekend / _is_monday_morning_grace: now_ts must win over real time ---
+#
+# Both predicates used time.localtime() only, ignoring any explicit instant a
+# caller (evaluate_heartbeats) wanted evaluated. Running this file's own tests
+# on an actual real-world Saturday/Sunday made _is_weekend() return True
+# regardless of what weekday the test's injected `now` represented, silently
+# swallowing every stale/never_run assertion below (reproduced: this exact
+# failure mode on 2026-09-19, a real Saturday, 2026-09 review).
+
+def test_is_weekend_honors_explicit_now_ts_not_real_clock():
+    tuesday = _epoch_at_jst(2026, 9, 8, 12, 0)
+    saturday = _epoch_at_jst(2026, 9, 12, 12, 0)
+    assert wd._is_weekend(now_ts=tuesday) is False
+    assert wd._is_weekend(now_ts=saturday) is True
+
+
+def test_is_monday_morning_grace_honors_explicit_now_ts_not_real_clock():
+    monday_early = _epoch_at_jst(2026, 9, 14, 7, 0)
+    monday_late = _epoch_at_jst(2026, 9, 14, 10, 0)
+    tuesday_early = _epoch_at_jst(2026, 9, 8, 7, 0)
+    assert wd._is_monday_morning_grace(now_ts=monday_early) is True
+    assert wd._is_monday_morning_grace(now_ts=monday_late) is False
+    assert wd._is_monday_morning_grace(now_ts=tuesday_early) is False
+
+
+def test_weekend_check_falls_back_to_the_no_arg_form_for_legacy_monkeypatches(monkeypatch):
+    """Existing tests replace _is_weekend with a bare ``lambda: True/False``
+    (no now_ts parameter). _weekend_check must still honor that override
+    rather than raising, so this fix doesn't break those tests."""
+    monkeypatch.setattr(wd, "_is_weekend", lambda: True)
+    assert wd._weekend_check(wd._is_weekend, now_ts=_epoch_at_jst(2026, 9, 8, 12, 0)) is True
 
 
 @pytest.fixture
